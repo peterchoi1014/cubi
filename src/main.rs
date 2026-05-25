@@ -5,6 +5,8 @@ mod commands;
 mod executor;
 mod file_mentions;
 mod git_cmds;
+#[allow(dead_code)]
+mod llm;
 mod lsp_client;
 mod mcp_client;
 mod mcp_config;
