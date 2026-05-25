@@ -18,7 +18,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -3232,10 +3232,19 @@ impl ChatCLI {
             .iter()
             .map(|(k, v)| serde_json::json!({ "kind": k, "command": v }))
             .collect();
-        match fs::write(
-            &out_path,
-            serde_json::to_string_pretty(&payload).unwrap_or_default(),
-        ) {
+        let serialized = match serde_json::to_string_pretty(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "  {} Could not serialize {}: {}",
+                    "✗".bright_red(),
+                    out_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        match fs::write(&out_path, serialized) {
             Ok(()) => println!(
                 "\n  {} Saved to {}",
                 "✓".bright_green(),
@@ -3385,6 +3394,11 @@ impl ChatCLI {
         let path = args.trim();
         if path.is_empty() {
             println!("{} Usage: /teleport <path>", "Info:".bright_yellow());
+            return;
+        }
+        let candidate = PathBuf::from(path);
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&candidate) {
+            eprintln!("{} {}", "Error:".bright_red(), e);
             return;
         }
         match std::env::set_current_dir(path) {
