@@ -1,4 +1,4 @@
-use crate::agent_loop::{self, MAX_AGENT_STEPS};
+use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::git_cmds;
@@ -1257,18 +1257,58 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 );
 
-                let result_text = match self.mcp_manager.as_mut() {
-                    Some(mcp) => match mcp
-                        .call_tool(&call.function.name, call.function.arguments.clone())
+                let result_text = if call.function.name == AGENT_TOOL_NAME {
+                    // Meta-tool: spawn a focused subagent with fresh
+                    // context. Handled here (not in `McpManager`) because
+                    // it needs the executor to drive its own inner loop.
+                    let goal = call.function.arguments["goal"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let max_steps = call.function.arguments["max_steps"]
+                        .as_u64()
+                        .map(|n| n as usize)
+                        .unwrap_or(SUBAGENT_DEFAULT_STEPS);
+                    if goal.is_empty() {
+                        "[tool error] `agent_run` requires a non-empty `goal`".to_string()
+                    } else {
+                        println!(
+                            "  {} subagent goal: {}",
+                            "↳".bright_magenta(),
+                            goal.chars().take(120).collect::<String>().bright_white()
+                        );
+                        match agent_loop::run_subagent(
+                            &self.executor,
+                            &mut self.mcp_manager,
+                            &goal,
+                            max_steps,
+                        )
                         .await
-                    {
-                        Ok(r) => agent_loop::render_tool_result(&r),
-                        Err(e) => format!("[tool error] {e}"),
-                    },
-                    None => format!(
-                        "[tool error] no MCP manager available to execute `{}`",
-                        call.function.name
-                    ),
+                        {
+                            Ok(report) => {
+                                println!(
+                                    "  {} subagent done",
+                                    "↳".bright_magenta()
+                                );
+                                report
+                            }
+                            Err(e) => format!("[tool error] subagent failed: {e}"),
+                        }
+                    }
+                } else {
+                    match self.mcp_manager.as_mut() {
+                        Some(mcp) => match mcp
+                            .call_tool(&call.function.name, call.function.arguments.clone())
+                            .await
+                        {
+                            Ok(r) => agent_loop::render_tool_result(&r),
+                            Err(e) => format!("[tool error] {e}"),
+                        },
+                        None => format!(
+                            "[tool error] no MCP manager available to execute `{}`",
+                            call.function.name
+                        ),
+                    }
                 };
 
                 // Print a short preview so the user can see what came back
