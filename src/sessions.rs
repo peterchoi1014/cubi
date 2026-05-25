@@ -35,6 +35,10 @@ pub struct SessionFile {
     /// Unix seconds at session start. Kept separately from `id` so the
     /// UI doesn't have to parse the formatted id.
     pub started_at: u64,
+    /// Working directory where the session was created. Older checkpoints may
+    /// not have this field; callers fall back to the on-disk bucket.
+    #[serde(default)]
+    pub cwd: String,
     /// Model in use at the time the snapshot was written.
     pub model: String,
     /// Full conversation history.
@@ -54,12 +58,14 @@ pub struct SessionFile {
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: String,
-    pub started_at: u64,
     pub model: String,
     pub message_count: usize,
-    /// Path on disk. Kept for future `/sessions delete <id>` and
-    /// debugging output; `#[allow(dead_code)]` while no command uses it.
-    #[allow(dead_code)]
+    /// Unix seconds from the checkpoint file's modification time.
+    pub modified_at: u64,
+    /// Working directory where the session was created, or a best-effort
+    /// bucket name for older checkpoints.
+    pub cwd: String,
+    /// Path on disk. Used for deletion and diagnostics.
     pub path: PathBuf,
     /// First user message, truncated to ~80 chars for the listing.
     pub preview: String,
@@ -74,6 +80,8 @@ pub struct SessionMeta {
 struct SessionMetaFile {
     id: String,
     started_at: u64,
+    #[serde(default)]
+    cwd: String,
     model: String,
     history: Vec<PreviewMessage>,
 }
@@ -94,6 +102,7 @@ struct PreviewMessage {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     dir: PathBuf,
+    cwd: PathBuf,
 }
 
 impl SessionStore {
@@ -110,6 +119,7 @@ impl SessionStore {
         let home = dirs::home_dir()?;
         Some(Self {
             dir: home.join(".cubi").join("sessions").join(cwd_key(cwd)),
+            cwd: cwd.to_path_buf(),
         })
     }
 
@@ -129,6 +139,7 @@ impl SessionStore {
         SessionFile {
             id,
             started_at: secs,
+            cwd: self.cwd.display().to_string(),
             model,
             history: Vec::new(),
         }
@@ -188,6 +199,12 @@ impl SessionStore {
             let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
                 continue;
             };
+            let modified_at = modified_secs(&path).unwrap_or(file.started_at);
+            let cwd = if file.cwd.is_empty() {
+                self.cwd.display().to_string()
+            } else {
+                file.cwd.clone()
+            };
             let preview = file
                 .history
                 .iter()
@@ -196,15 +213,16 @@ impl SessionStore {
                 .unwrap_or_default();
             out.push(SessionMeta {
                 id: file.id,
-                started_at: file.started_at,
                 model: file.model,
                 message_count: file.history.len(),
+                modified_at,
+                cwd,
                 path,
                 preview,
             });
         }
         // Newest first.
-        out.sort_by_key(|m| std::cmp::Reverse(m.started_at));
+        out.sort_by_key(|m| std::cmp::Reverse(m.modified_at));
         Ok(out)
     }
 
@@ -217,6 +235,128 @@ impl SessionStore {
         };
         self.load(&latest.id)
     }
+
+    /// Lists every checkpoint under `~/.cubi/sessions`, newest first.
+    pub fn list_all() -> Result<Vec<SessionMeta>> {
+        let Some(root) = sessions_root() else {
+            return Ok(Vec::new());
+        };
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for bucket in
+            fs::read_dir(&root).with_context(|| format!("Failed to read {}", root.display()))?
+        {
+            let bucket = bucket?;
+            let dir = bucket.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let bucket_name = dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            for entry in
+                fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
+                    continue;
+                };
+                let preview = file
+                    .history
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| truncate(&m.content, 80))
+                    .unwrap_or_default();
+                out.push(SessionMeta {
+                    id: file.id,
+                    model: file.model,
+                    message_count: file.history.len(),
+                    modified_at: modified_secs(&path).unwrap_or(file.started_at),
+                    cwd: if file.cwd.is_empty() {
+                        bucket_name.clone()
+                    } else {
+                        file.cwd
+                    },
+                    path,
+                    preview,
+                });
+            }
+        }
+        out.sort_by_key(|m| std::cmp::Reverse(m.modified_at));
+        Ok(out)
+    }
+
+    /// Latest session in the current cwd, falling back to global newest.
+    pub fn latest_for_current_dir_preferred(&self) -> Result<Option<SessionFile>> {
+        let cwd = self.cwd.display().to_string();
+        let all = Self::list_all()?;
+        if let Some(meta) = all.iter().find(|m| m.cwd == cwd) {
+            return load_from_path(&meta.path).map(Some);
+        }
+        if let Some(session) = self.latest()? {
+            return Ok(Some(session));
+        }
+        let Some(meta) = all.into_iter().next() else {
+            return Ok(None);
+        };
+        load_from_path(&meta.path).map(Some)
+    }
+
+    /// Deletes a session by full id or unique prefix. Returns matching
+    /// candidates when the prefix is missing or ambiguous.
+    pub fn delete_by_prefix(prefix: &str) -> Result<DeleteSessionResult> {
+        let matches: Vec<SessionMeta> = Self::list_all()?
+            .into_iter()
+            .filter(|m| m.id == prefix || m.id.starts_with(prefix))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(DeleteSessionResult::NotFound),
+            [meta] => {
+                fs::remove_file(&meta.path)
+                    .with_context(|| format!("Failed to delete {}", meta.path.display()))?;
+                Ok(DeleteSessionResult::Deleted(meta.clone()))
+            }
+            _ => Ok(DeleteSessionResult::Ambiguous(matches)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DeleteSessionResult {
+    Deleted(SessionMeta),
+    NotFound,
+    Ambiguous(Vec<SessionMeta>),
+}
+
+fn sessions_root() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".cubi").join("sessions"))
+}
+
+fn load_from_path(path: &Path) -> Result<SessionFile> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("Failed to parse {}", path.display()))
+}
+
+fn modified_secs(path: &Path) -> Option<u64> {
+    path.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -267,8 +407,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("cubi-sess-{label}-{nanos}"));
-        SessionStore { dir }
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = project_root
+            .join("target")
+            .join("test-sessions")
+            .join(format!("cubi-sess-{label}-{nanos}"));
+        SessionStore {
+            dir,
+            cwd: project_root,
+        }
     }
 
     fn user(text: &str) -> Message {
