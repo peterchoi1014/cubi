@@ -52,6 +52,9 @@ pub enum Cmd {
     Sessions,
     Resume,
     Trust,
+    Diff,
+    Commit,
+    Review,
     Quit,
 }
 
@@ -199,6 +202,24 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/trust [revoke]",
         help: "Trust this project (or pass `revoke` to undo)",
         cmd: Cmd::Trust,
+    },
+    SlashCommandSpec {
+        name: "/diff",
+        usage: "/diff [path]",
+        help: "Show `git diff` for the working tree",
+        cmd: Cmd::Diff,
+    },
+    SlashCommandSpec {
+        name: "/commit",
+        usage: "/commit [-a] <msg>",
+        help: "Run git commit (-a stages tracked files first)",
+        cmd: Cmd::Commit,
+    },
+    SlashCommandSpec {
+        name: "/review",
+        usage: "/review",
+        help: "Ask the model to review the current `git diff`",
+        cmd: Cmd::Review,
     },
     SlashCommandSpec {
         name: "/mcp-tools",
