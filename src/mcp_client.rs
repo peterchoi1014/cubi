@@ -175,7 +175,7 @@ impl StdioClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "ai-chat-cli",
-                    "version": "0.2.0"
+                    "version": "0.3.0"
                 }
             }
         });
@@ -358,7 +358,7 @@ impl HttpClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "ai-chat-cli",
-                    "version": "0.2.0"
+                    "version": "0.3.0"
                 }
             }
         });

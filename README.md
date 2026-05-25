@@ -22,18 +22,22 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
   git (`worktree`), web (`web_fetch`, `web_search`), long-lived `bash` REPL
   (`repl_start`/`eval`/`close`), Jupyter `notebook` (`list`/`read`/`insert`/
   `replace`/`delete`), LSP-backed code intel (`lsp` for hover/definition/
-  references via your language server), time (`sleep`, `schedule`), structured
-  output (`brief`, `synthetic_output`), inter-agent messaging (`send_message`,
-  `recv_messages`, `remote_trigger`), OS notifications (`notify`), plus a
-  `think` no-op and an `agent_run` meta-tool for spawning focused subagents
+  references via your language server), time (`sleep`, `schedule`,
+  `prevent_sleep`), structured output (`brief`, `synthetic_output`),
+  inter-agent messaging (`send_message`, `recv_messages`, `remote_trigger`),
+  OS notifications (`notify`), plus a `think` no-op and an `agent_run`
+  meta-tool for spawning focused subagents
 - 🔌 **MCP (Model Context Protocol) support** - Load external tool servers from
   `~/.ai-chat-cli/mcp.json` and call them with `/mcp-tools`, `/mcp-call`,
-  `/mcp-reload`
+  `/mcp-reload`; list and render MCP prompts with `/mcp-prompts`
 - 🌿 **Git workflow** - `/diff`, `/commit`, `/review`, `/worktree`, `/branch`,
   `/tag`, `/files` shell out to your installed `git` and respect plan mode
-- 🛡️ **Project trust + plan mode** - Tools refuse to write/exec outside trusted
-  directories; `/plan` toggles a read-only mode that blocks every write/exec path.
-  Manage trust with `/trust` (current dir) and `/add-dir <path>` (additional dirs)
+- 🛡️ **Project trust + plan mode + admin policy** - Tools refuse to write/exec
+  outside trusted directories; `/plan` toggles a read-only mode that blocks
+  every write/exec path. Manage trust with `/trust` (current dir) and
+  `/add-dir <path>` (additional dirs). Admins can push a read-only
+  `policy.json` (`/etc/ai-chat-cli/policy.json` or `~/.ai-chat-cli/policy.json`)
+  whose tool deny-list overrides any user allow; inspect with `/policy`
 - 🧠 **Project memory + persistent memdir** - Auto-injected `AICHAT.md` per
   project (`/memory`, `/memory-reload`, `/init`) plus cross-session notes in
   `~/.ai-chat-cli/memdir/` (`/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`)
@@ -42,7 +46,27 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
 - 💾 **Conversation Management** - Save and load chat sessions as JSON files
   (`/save`, `/load`); export to Markdown (`/export`); every turn is
   auto-checkpointed and recoverable via `/sessions` / `/resume`; trim or
-  summarize context with `/rewind` and `/compact`
+  summarize context with `/rewind` (also rolls back any `edit_file` /
+  `write_file` mutations from the rewound turns) and `/compact`
+- 🧩 **Plugins + Skills** - Drop reusable Markdown skill packs at
+  `~/.ai-chat-cli/skills/` and namespaced command bundles at
+  `~/.ai-chat-cli/plugins/<name>/commands/*.md` (invoked as
+  `/<plugin>:<command>`); reload both with `/reload-plugins`
+- 🎨 **Themes + output styles** - `/theme auto|light|dark` and
+  `/output-style concise|markdown|explanatory` persist in
+  `~/.ai-chat-cli/config.json`; the chosen output style is injected as a
+  system steering prompt on every turn
+- 🪝 **Hooks** - `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`,
+  `SessionStart`, `Notification`; manage with `/hooks list|add|rm`
+- 🔁 **Cross-machine settings sync** - Wrap `~/.ai-chat-cli/` in git with
+  `/settings-sync init <remote>`, then `/settings-sync push` / `pull`
+  to move config, memdir, skills, and plugins between machines
+- 📊 **Opt-in telemetry** - Set `telemetry = true` in
+  `~/.ai-chat-cli/config.json` (or `AICHAT_TELEMETRY=1`) to log every tool
+  call as one JSON line in `~/.ai-chat-cli/telemetry.log`
+- 💡 **Tip-of-the-day** - A short tip is shown on startup (TTY only); see
+  more with `/tip` and supplement the built-in pool by dropping plaintext
+  files in `~/.ai-chat-cli/tips/`
 - 📦 **Batch Processing** - Process multiple prompts from text files
 - 🔄 **Model Switching** - Switch between different AI models on the fly
 - 🎨 **Colored Output** - Syntax-highlighted responses with emoji indicators
@@ -331,6 +355,10 @@ groups below mirror that registry.
 | `/copy` | Copy the last assistant message to the system clipboard |
 | `/release-notes` | Print release notes for the current version |
 | `/stickers` | Print a friendly ASCII sticker sheet |
+| `/settings-sync init <remote> \| push [msg] \| pull \| status` | Git-backed sync of `~/.ai-chat-cli/` across machines |
+| `/policy` | Show the read-only admin policy overlay (deny-list + source path) |
+| `/tip` | Print a quick tip about using ai-chat-cli |
+| `/mcp-prompts [server[:name]]` | List MCP prompts, or fetch a specific one |
 
 #### Examples
 

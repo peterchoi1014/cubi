@@ -4112,12 +4112,20 @@ impl ChatCLI {
     fn show_release_notes(&self) {
         println!(
             "\n{} v{}\n\n\
-             - Cross-platform `shell` tool (POSIX sh / PowerShell)\n\
-             - Time tools: `sleep`, `schedule` (cron-style)\n\
-             - Structured output helpers: `brief`, `synthetic_output`\n\
-             - Inter-agent messaging: `send_message`, `recv_messages`, `remote_trigger`\n\
-             - OS notification: `notify` (osascript / notify-send / PowerShell)\n\
-             - 36 new slash commands wired into the registry (see /help)\n",
+             - Plugin system: namespaced `/<plugin>:<command>` triggers\n   \
+               loaded from ~/.ai-chat-cli/plugins/<name>/commands/*.md\n\
+             - Themable output styles: `/theme`, `/output-style`, `/color`,\n   \
+               and `/vim` now persist to ~/.ai-chat-cli/config.json\n\
+             - `prevent_sleep` built-in tool (caffeinate / systemd-inhibit /\n   \
+               SetThreadExecutionState)\n\
+             - Opt-in telemetry: tool calls log to ~/.ai-chat-cli/telemetry.log\n\
+             - Tip-of-the-day at startup + on-demand via `/tip`\n\
+             - Admin policy overlay (~/.ai-chat-cli/policy.json,\n   \
+               /etc/ai-chat-cli/policy.json, $AICHAT_POLICY_FILE); inspect via `/policy`\n\
+             - Git-backed cross-machine sync via `/settings-sync`\n\
+             - File-mutation rollback on `/rewind` (edit_file / write_file)\n\
+             - MCP prompts (`prompts/list` + `prompts/get`) via `/mcp-prompts`\n\
+             - Versioned config migrations framework\n",
             "Release notes:".bright_yellow().bold(),
             env!("CARGO_PKG_VERSION")
         );
