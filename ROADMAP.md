@@ -58,10 +58,10 @@ Currently shipped (pre-PR): `/help`, `/clear`, `/history`, `/model`, `/save`,
 
 Shipped in this PR:
 
-- [x] `/plan`, `/todos`, `/todo-add`, `/todo-done`, `/todo-clear`
-- [x] `/init`, `/memory`
-- [x] `/status`, `/version`, `/export`
-- [x] `/ask` (user-driven clarifying-question stand-in)
+- [x] `/plan`, `/todos`, `/todo-add`, `/todo-done`, `/todo-rm`, `/todo-clear`
+- [x] `/init`, `/memory`, `/memory-reload`
+- [x] `/status`, `/version`, `/export` (with overwrite protection)
+- [x] `/ask` (user-driven clarifying-question stand-in, single-turn)
 
 Still to add (grouped by area):
 

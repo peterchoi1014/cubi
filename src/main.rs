@@ -88,7 +88,14 @@ async fn main() -> Result<()> {
 
     // Create and run CLI
     let mut cli = ChatCLI::new(executor, mcp_manager);
-    cli.run().await?;
+    let run_result = cli.run().await;
+
+    // Shut down MCP cleanly while we still have an async context. The Drop
+    // impl is only a best-effort fallback and intentionally does not spin up
+    // a nested runtime.
+    cli.shutdown().await;
+
+    run_result?;
 
     Ok(())
 }
