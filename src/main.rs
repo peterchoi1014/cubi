@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     let mut resume_request: Option<String> = None;
     match argv.first().and_then(|a| a.to_str()) {
         None => {}
-        Some("--version") | Some("-V") | Some("version") => {
+        Some("--version") | Some("-V") | Some("-v") | Some("version") => {
             println!("cubi {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
