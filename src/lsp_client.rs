@@ -85,7 +85,10 @@ fn render_hover_contents(contents: &Value) -> String {
         None
     }
     if let Some(arr) = contents.as_array() {
-        arr.iter().filter_map(one).collect::<Vec<_>>().join("\n---\n")
+        arr.iter()
+            .filter_map(one)
+            .collect::<Vec<_>>()
+            .join("\n---\n")
     } else if let Some(s) = one(contents) {
         s
     } else {
@@ -233,10 +236,7 @@ pub async fn run_lsp_query(
         // Format depending on the action.
         let rendered = match action {
             LspAction::Hover => {
-                let contents = response
-                    .get("contents")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let contents = response.get("contents").cloned().unwrap_or(Value::Null);
                 if contents.is_null() {
                     "(no hover information at that position)".to_string()
                 } else {
@@ -297,21 +297,12 @@ pub fn detect_language_id(path: &Path) -> String {
     .to_string()
 }
 
-async fn write_request(
-    stdin: &mut ChildStdin,
-    id: i64,
-    method: &str,
-    params: Value,
-) -> Result<()> {
+async fn write_request(stdin: &mut ChildStdin, id: i64, method: &str, params: Value) -> Result<()> {
     let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     write_frame(stdin, &msg).await
 }
 
-async fn write_notification(
-    stdin: &mut ChildStdin,
-    method: &str,
-    params: Value,
-) -> Result<()> {
+async fn write_notification(stdin: &mut ChildStdin, method: &str, params: Value) -> Result<()> {
     let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
     write_frame(stdin, &msg).await
 }
@@ -384,9 +375,7 @@ impl LspReader {
                 .context("LSP stdout closed while reading header")?;
             headers.push(byte[0]);
             // Look for the terminating CRLF CRLF.
-            if headers.len() >= 4
-                && &headers[headers.len() - 4..] == b"\r\n\r\n"
-            {
+            if headers.len() >= 4 && &headers[headers.len() - 4..] == b"\r\n\r\n" {
                 break;
             }
         }
@@ -423,9 +412,15 @@ mod tests {
     fn lsp_action_parses_aliases() {
         assert_eq!(LspAction::from_str("hover"), Some(LspAction::Hover));
         assert_eq!(LspAction::from_str("def"), Some(LspAction::Definition));
-        assert_eq!(LspAction::from_str("definition"), Some(LspAction::Definition));
+        assert_eq!(
+            LspAction::from_str("definition"),
+            Some(LspAction::Definition)
+        );
         assert_eq!(LspAction::from_str("refs"), Some(LspAction::References));
-        assert_eq!(LspAction::from_str("references"), Some(LspAction::References));
+        assert_eq!(
+            LspAction::from_str("references"),
+            Some(LspAction::References)
+        );
         assert_eq!(LspAction::from_str("nonsense"), None);
     }
 

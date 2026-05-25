@@ -661,12 +661,11 @@ impl BuiltinToolRegistry {
     fn worktree_tool() -> BuiltinTool {
         BuiltinTool {
             name: "worktree".to_string(),
-            description:
-                "Manage git worktrees. Subcommands: 'list' shows all worktrees; \
+            description: "Manage git worktrees. Subcommands: 'list' shows all worktrees; \
                  'add' creates a new worktree at the given path (optionally on a \
                  named branch) and auto-trusts it for write/exec tools; \
                  'remove' deletes a worktree by path."
-                    .to_string(),
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -721,7 +720,9 @@ impl BuiltinToolRegistry {
                         stdout
                     }))
                 } else {
-                    Ok(ToolResult::error(format!("git worktree list failed: {stderr}")))
+                    Ok(ToolResult::error(format!(
+                        "git worktree list failed: {stderr}"
+                    )))
                 }
             }
             "add" => {
@@ -745,11 +746,7 @@ impl BuiltinToolRegistry {
                 }
                 // Auto-trust the new path so the model can immediately edit
                 // files / run commands there without a separate /trust step.
-                let trusted_msg = match self
-                    .permissions
-                    .lock()
-                    .unwrap()
-                    .trust_dir(Path::new(path))
+                let trusted_msg = match self.permissions.lock().unwrap().trust_dir(Path::new(path))
                 {
                     Ok(true) => {
                         // Persist the new trust entry so the approval
@@ -843,9 +840,10 @@ impl BuiltinToolRegistry {
     fn web_search_tool() -> BuiltinTool {
         BuiltinTool {
             name: "web_search".to_string(),
-            description: "Web search via DuckDuckGo (no API key). Returns the top results as a plain-text \
+            description:
+                "Web search via DuckDuckGo (no API key). Returns the top results as a plain-text \
                           list of `title — snippet — url` lines. Refused in plan mode."
-                .to_string(),
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1691,8 +1689,10 @@ fn strip_html(input: &str) -> String {
         let b = bytes[i];
         if b == b'<' {
             // Detect <script ...> and <style ...> openings to drop their bodies.
-            let rest_lower: String =
-                bytes[i..(i + 8).min(bytes.len())].iter().map(|c| c.to_ascii_lowercase() as char).collect();
+            let rest_lower: String = bytes[i..(i + 8).min(bytes.len())]
+                .iter()
+                .map(|c| c.to_ascii_lowercase() as char)
+                .collect();
             if rest_lower.starts_with("<script") {
                 skip_until = Some(b"</script>");
                 i += 1;
@@ -1753,11 +1753,8 @@ fn strip_html(input: &str) -> String {
 fn percent_encode_query(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
     for b in input.bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~';
+        let unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~';
         if unreserved {
             out.push(b as char);
         } else {
@@ -1887,9 +1884,7 @@ mod tests {
     /// the cwd (REPL, web tools) rather than a specific path argument.
     fn registry_trusting_cwd(plan_on: bool) -> BuiltinToolRegistry {
         let mut perms = Permissions::default();
-        perms
-            .trust_dir(&std::env::current_dir().unwrap())
-            .unwrap();
+        perms.trust_dir(&std::env::current_dir().unwrap()).unwrap();
         BuiltinToolRegistry::new(
             Arc::new(Mutex::new(perms)),
             Arc::new(AtomicBool::new(plan_on)),
@@ -2086,7 +2081,8 @@ mod tests {
         assert!(result.is_error.is_none(), "got {:?}", result);
         // The porcelain output always at least includes a `worktree ` line.
         assert!(
-            result.content[0].text.contains("worktree ") || result.content[0].text == "(no worktrees)",
+            result.content[0].text.contains("worktree ")
+                || result.content[0].text == "(no worktrees)",
             "got: {}",
             result.content[0].text
         );

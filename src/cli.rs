@@ -1286,10 +1286,7 @@ impl ChatCLI {
                         .await
                         {
                             Ok(report) => {
-                                println!(
-                                    "  {} subagent done",
-                                    "↳".bright_magenta()
-                                );
+                                println!("  {} subagent done", "↳".bright_magenta());
                                 report
                             }
                             Err(e) => format!("[tool error] subagent failed: {e}"),
