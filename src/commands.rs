@@ -738,6 +738,27 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
 ];
 
+/// Returns every registered command name that starts with `typed`.
+///
+/// `typed` may include the leading slash or not — both `"/re"` and
+/// `"re"` are accepted. Used for both "did you mean?" hints on
+/// ambiguous prefixes and tab-completion in the REPL.
+pub fn prefix_matches(typed: &str) -> Vec<&'static str> {
+    let stripped = typed.strip_prefix('/').unwrap_or(typed);
+    if stripped.is_empty() {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter_map(|s| {
+            s.name
+                .strip_prefix('/')
+                .filter(|n| n.starts_with(stripped))
+                .map(|_| s.name)
+        })
+        .collect()
+}
+
 /// Parses an input line that starts with `/` into a `(Cmd, args)` pair.
 ///
 /// * `args` is everything after the first whitespace, with leading/trailing
