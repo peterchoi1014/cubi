@@ -3,11 +3,16 @@ mod builtin_tools;
 mod cli;
 mod commands;
 mod executor;
+mod file_mentions;
 mod git_cmds;
+mod hooks;
+#[allow(dead_code)]
+mod llm;
 mod lsp_client;
 mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
+mod memdir;
 mod ollama;
 mod onboarding;
 mod permissions;

@@ -1,8 +1,11 @@
 use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
+use crate::file_mentions::{self, UserCommand};
 use crate::git_cmds;
+use crate::hooks::HookRegistry;
 use crate::mcp_manager::McpManager;
+use crate::memdir::Memdir;
 use crate::ollama::Message;
 use crate::permissions::Permissions;
 use crate::project_memory;
@@ -32,6 +35,12 @@ pub struct ChatCLI {
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
     todos: TodoList,
+    /// Cross-session persistent memory store (`~/.ai-chat-cli/memdir/`).
+    memdir: Memdir,
+    /// User-defined Markdown commands loaded from disk.
+    user_commands: Vec<UserCommand>,
+    /// Hook registry for lifecycle events.
+    hooks: HookRegistry,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -56,6 +65,9 @@ impl ChatCLI {
             history: Vec::new(),
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
+            memdir: Memdir::load(),
+            user_commands: file_mentions::load_user_commands(),
+            hooks: HookRegistry::load(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -64,6 +76,9 @@ impl ChatCLI {
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
         cli.inject_project_memory();
+
+        // Auto-inject cross-session memdir into context, if non-empty.
+        cli.inject_memdir();
 
         // Auto-inject MCP tools into context
         if let Some(mcp) = &cli.mcp_manager
@@ -111,6 +126,9 @@ impl ChatCLI {
     pub async fn run(&mut self) -> Result<()> {
         self.print_welcome();
 
+        // Fire SessionStart hooks.
+        self.hooks.fire_session_start(self.executor.get_model());
+
         let mut rl = DefaultEditor::new()?;
 
         loop {
@@ -134,6 +152,10 @@ impl ChatCLI {
 
                     // Handle commands
                     if input.starts_with('/') {
+                        // Check user-defined commands first.
+                        if self.try_user_command(input) {
+                            continue;
+                        }
                         if !self.handle_command(input).await? {
                             break;
                         }
@@ -143,8 +165,11 @@ impl ChatCLI {
                     // Add line to readline history
                     rl.add_history_entry(input)?;
 
+                    // Expand @file mentions in user input.
+                    let expanded = file_mentions::expand_file_mentions(input);
+
                     // Add user message to history
-                    self.history.push(Message::text("user", input));
+                    self.history.push(Message::text("user", &expanded));
 
                     // Run the agent: stream model output, execute any
                     // requested tools, loop until the model returns plain
@@ -167,7 +192,56 @@ impl ChatCLI {
             }
         }
 
+        // Fire Stop hooks.
+        self.hooks.fire_stop();
+
         Ok(())
+    }
+
+    /// Tries to match a `/command` against user-defined Markdown commands.
+    /// Returns `true` if a user command was matched and handled.
+    fn try_user_command(&mut self, input: &str) -> bool {
+        let input = input.trim();
+        let (head, args) = match input.find(char::is_whitespace) {
+            Some(i) => (&input[..i], input[i..].trim()),
+            None => (input, ""),
+        };
+        // Strip the leading `/` to get the command name.
+        let cmd_name = head.strip_prefix('/').unwrap_or(head).to_lowercase();
+
+        let matched = self
+            .user_commands
+            .iter()
+            .find(|c| c.name == cmd_name)
+            .cloned();
+
+        let Some(user_cmd) = matched else {
+            return false;
+        };
+
+        // Inject the Markdown body as a single-turn system message.
+        let body = if args.is_empty() {
+            user_cmd.body.clone()
+        } else {
+            format!("{}\n\nUser argument: {}", user_cmd.body, args)
+        };
+
+        self.history.push(Message::text(
+            "system",
+            format!(
+                "{} User command /{} (from {}):\n\n{}",
+                SINGLE_TURN_SYSTEM_TAG,
+                user_cmd.name,
+                user_cmd.path.display(),
+                body
+            ),
+        ));
+        println!(
+            "{} Applied user command /{}",
+            "✓".bright_green(),
+            user_cmd.name.bright_cyan()
+        );
+        true
     }
 
     async fn handle_command(&mut self, input: &str) -> Result<bool> {
@@ -431,6 +505,54 @@ impl ChatCLI {
                 self.todos.clear();
                 self.persist_todos();
                 println!("{} Cleared todos", "✓".bright_green());
+            }
+            Cmd::Memdir => {
+                self.memdir.render();
+            }
+            Cmd::MemdirAdd => {
+                if args.is_empty() {
+                    println!("{} Usage: /memdir-add <text>", "Info:".bright_yellow());
+                } else {
+                    let source = std::env::current_dir()
+                        .ok()
+                        .map(|p| p.display().to_string());
+                    self.memdir.add(args, source.as_deref());
+                    self.persist_memdir();
+                    self.inject_memdir();
+                    println!("{} Memory added", "✓".bright_green());
+                }
+            }
+            Cmd::MemdirRm => {
+                if args.is_empty() {
+                    println!("{} Usage: /memdir-rm <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.memdir.remove(n) {
+                                self.persist_memdir();
+                                self.inject_memdir();
+                                println!("{} Removed memory {}", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No memory with index {}", "Error:".bright_red(), n);
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("{} Usage: /memdir-rm <index>", "Error:".bright_red());
+                        }
+                    }
+                }
+            }
+            Cmd::MemdirClear => {
+                self.memdir.clear();
+                self.persist_memdir();
+                self.inject_memdir();
+                println!("{} Cleared all memories", "✓".bright_green());
+            }
+            Cmd::Rewind => {
+                self.rewind(args);
+            }
+            Cmd::Compact => {
+                self.compact().await;
             }
             Cmd::Ask => {
                 if args.is_empty() {
@@ -1082,6 +1204,193 @@ impl ChatCLI {
         }
     }
 
+    fn persist_memdir(&self) {
+        if let Err(e) = self.memdir.save() {
+            eprintln!(
+                "{} Failed to persist memdir: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+    }
+
+    /// `/rewind [n]` — removes the last `n` user-assistant exchange pairs
+    /// from history (default 1). System messages are never removed.
+    fn rewind(&mut self, args: &str) {
+        let n: usize = if args.is_empty() {
+            1
+        } else {
+            match args.parse::<usize>() {
+                Ok(0) => {
+                    println!("{} Nothing to rewind.", "ℹ".bright_blue());
+                    return;
+                }
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("{} Usage: /rewind [n]", "Error:".bright_red());
+                    return;
+                }
+            }
+        };
+
+        // Count how many non-system messages exist.
+        let non_system: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system")
+            .map(|(i, _)| i)
+            .collect();
+
+        // Each "exchange" is roughly a user + assistant pair (2 messages),
+        // but tool messages add more. We remove the last `n * 2` non-system
+        // messages (or all of them if n is too large).
+        let to_remove = (n * 2).min(non_system.len());
+        if to_remove == 0 {
+            println!("{} Nothing to rewind.", "ℹ".bright_blue());
+            return;
+        }
+
+        // Indices to remove (from the tail of non-system messages).
+        let remove_set: std::collections::HashSet<usize> = non_system
+            [non_system.len() - to_remove..]
+            .iter()
+            .copied()
+            .collect();
+
+        let prev_len = self.history.len();
+        self.history = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !remove_set.contains(i))
+            .map(|(_, m)| m.clone())
+            .collect();
+        let removed = prev_len - self.history.len();
+        println!(
+            "{} Rewound {} message{} ({} exchange{})",
+            "✓".bright_green(),
+            removed,
+            if removed == 1 { "" } else { "s" },
+            n.min(non_system.len() / 2),
+            if n == 1 { "" } else { "s" }
+        );
+        self.checkpoint_session();
+    }
+
+    /// `/compact` — summarizes older conversation turns into a single
+    /// system message, preserving the last few exchanges in full fidelity.
+    /// Uses the model itself to generate the summary.
+    async fn compact(&mut self) {
+        // We keep the last N non-system messages intact and summarize
+        // everything before that.
+        const KEEP_RECENT: usize = 6; // ~3 exchanges
+
+        let non_system_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system")
+            .map(|(i, _)| i)
+            .collect();
+
+        if non_system_indices.len() <= KEEP_RECENT {
+            println!(
+                "{} Conversation is too short to compact ({} non-system messages).",
+                "ℹ".bright_blue(),
+                non_system_indices.len()
+            );
+            return;
+        }
+
+        // Split: messages to summarize vs. messages to keep.
+        let cutoff_idx = non_system_indices[non_system_indices.len() - KEEP_RECENT];
+        let to_summarize: Vec<&Message> = self.history[..cutoff_idx]
+            .iter()
+            .filter(|m| m.role != "system")
+            .collect();
+
+        if to_summarize.is_empty() {
+            println!("{} Nothing to compact.", "ℹ".bright_blue());
+            return;
+        }
+
+        // Build a condensed transcript for the summarizer.
+        let mut transcript = String::new();
+        for msg in &to_summarize {
+            let role_label = match msg.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                _ => &msg.role,
+            };
+            // Truncate very long messages for the summarizer (char-safe).
+            let content = if msg.content.chars().count() > 500 {
+                let truncated: String = msg.content.chars().take(500).collect();
+                format!("{}…", truncated)
+            } else {
+                msg.content.clone()
+            };
+            transcript.push_str(&format!("{}: {}\n", role_label, content));
+        }
+
+        println!(
+            "{} Compacting {} messages into a summary…",
+            "⚙".bright_blue(),
+            to_summarize.len()
+        );
+
+        let summary_prompt = vec![
+            Message::text(
+                "system",
+                "You are a summarizer. Produce a concise bullet-point summary of the \
+                 following conversation. Preserve key decisions, facts, and outcomes. \
+                 Do NOT include conversational filler. Output only the summary.",
+            ),
+            Message::text("user", transcript),
+        ];
+
+        match self.executor.chat(summary_prompt).await {
+            Ok(summary) => {
+                // Rebuild history: keep all messages at their original positions,
+                // but replace old non-system messages before cutoff with a single
+                // summary. Messages at/after cutoff are preserved as-is.
+                let mut new_history: Vec<Message> = Vec::new();
+
+                // Keep system messages that appeared before the cutoff.
+                for msg in &self.history[..cutoff_idx] {
+                    if msg.role == "system" {
+                        new_history.push(msg.clone());
+                    }
+                }
+
+                // Insert the compacted summary.
+                new_history.push(Message::text(
+                    "system",
+                    format!(
+                        "SYSTEM: Compacted summary of earlier conversation:\n\n{}",
+                        summary
+                    ),
+                ));
+
+                // Append all messages from cutoff onward (recent messages kept intact).
+                new_history.extend(self.history[cutoff_idx..].iter().cloned());
+
+                self.history = new_history;
+
+                println!(
+                    "{} Compacted. History now has {} messages.",
+                    "✓".bright_green(),
+                    self.history.len()
+                );
+                self.checkpoint_session();
+            }
+            Err(e) => {
+                eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+            }
+        }
+    }
+
     /// Records a clarifying question from the user. Until the model can
     /// invoke `ask_user` itself, this command lets the user front-load a
     /// pointed question that the next turn's system context highlights.
@@ -1188,6 +1497,39 @@ impl ChatCLI {
         self.history.insert(insert_at, msg);
     }
 
+    /// Prefix used to locate previously injected memdir system messages.
+    const MEMDIR_PREFIX: &'static str = "SYSTEM: Cross-session memories";
+
+    /// Injects memdir context into the system messages (or removes it if
+    /// the memdir is now empty). Safe to call multiple times.
+    fn inject_memdir(&mut self) {
+        // Drop any prior memdir entries.
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(Self::MEMDIR_PREFIX)));
+
+        let Some(ctx) = self.memdir.as_context_string() else {
+            return;
+        };
+
+        // `as_context_string()` already includes the header, so use the prefix
+        // only as a tag for future removal — the actual content comes from ctx.
+        let msg = Message::text(
+            "system",
+            format!(
+                "{} (from ~/.ai-chat-cli/memdir/):\n{}",
+                Self::MEMDIR_PREFIX,
+                ctx
+            ),
+        );
+
+        let insert_at = self
+            .history
+            .iter()
+            .position(|m| m.role != "system")
+            .unwrap_or(self.history.len());
+        self.history.insert(insert_at, msg);
+    }
+
     /// Drives one user turn through the native tool-calling agent loop.
     ///
     /// * Streams the assistant's tokens to stdout as they arrive.
@@ -1268,7 +1610,20 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 );
 
-                let result_text = if call.function.name == AGENT_TOOL_NAME {
+                // Fire PreToolUse hook — may deny the call.
+                use crate::hooks::HookDecision;
+                let hook_decision = self
+                    .hooks
+                    .fire_pre_tool_use(&call.function.name, &call.function.arguments);
+
+                let result_text = if let HookDecision::Deny(reason) = hook_decision {
+                    println!(
+                        "  {} {}",
+                        "✗".bright_red(),
+                        "denied by PreToolUse hook".bright_red()
+                    );
+                    format!("[tool denied] {reason}")
+                } else if call.function.name == AGENT_TOOL_NAME {
                     // Meta-tool: spawn a focused subagent with fresh
                     // context. Handled here (not in `McpManager`) because
                     // it needs the executor to drive its own inner loop.
@@ -1318,6 +1673,12 @@ impl ChatCLI {
                         ),
                     }
                 };
+
+                // Fire PostToolUse hook.
+                let is_error = result_text.starts_with("[tool error]")
+                    || result_text.starts_with("[tool denied]");
+                self.hooks
+                    .fire_post_tool_use(&call.function.name, &result_text, is_error);
 
                 // Print a short preview so the user can see what came back
                 // without us dumping a 10 KB log into the terminal.

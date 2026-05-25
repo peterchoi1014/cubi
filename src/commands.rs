@@ -55,6 +55,12 @@ pub enum Cmd {
     Diff,
     Commit,
     Review,
+    Memdir,
+    MemdirAdd,
+    MemdirRm,
+    MemdirClear,
+    Rewind,
+    Compact,
     Quit,
 }
 
@@ -220,6 +226,42 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/review",
         help: "Ask the model to review the current `git diff`",
         cmd: Cmd::Review,
+    },
+    SlashCommandSpec {
+        name: "/memdir",
+        usage: "/memdir",
+        help: "List cross-session persistent memories",
+        cmd: Cmd::Memdir,
+    },
+    SlashCommandSpec {
+        name: "/memdir-add",
+        usage: "/memdir-add <text>",
+        help: "Add a persistent memory",
+        cmd: Cmd::MemdirAdd,
+    },
+    SlashCommandSpec {
+        name: "/memdir-rm",
+        usage: "/memdir-rm <n>",
+        help: "Remove memory by index",
+        cmd: Cmd::MemdirRm,
+    },
+    SlashCommandSpec {
+        name: "/memdir-clear",
+        usage: "/memdir-clear",
+        help: "Clear all persistent memories",
+        cmd: Cmd::MemdirClear,
+    },
+    SlashCommandSpec {
+        name: "/rewind",
+        usage: "/rewind [n]",
+        help: "Remove the last n exchanges (default 1)",
+        cmd: Cmd::Rewind,
+    },
+    SlashCommandSpec {
+        name: "/compact",
+        usage: "/compact",
+        help: "Summarize old turns to reduce context length",
+        cmd: Cmd::Compact,
     },
     SlashCommandSpec {
         name: "/mcp-tools",
