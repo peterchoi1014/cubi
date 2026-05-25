@@ -29,10 +29,10 @@ pub fn migrate_config(cfg: &mut AppConfig) -> bool {
         changed = true;
     }
 
-    // Forward compat clamp: if a *newer* binary wrote `config_version`
-    // greater than we recognise, leave the data alone but make sure the
-    // version is reset so we don't try to "migrate" it again on the
-    // next downgrade.
+    // Forward compat: if a *newer* binary wrote `config_version`
+    // greater than we recognise, leave the data and version untouched.
+    // This older binary should not "clamp" the version down, because
+    // that can mask that the config may contain fields we don't know.
     if cfg.config_version > CURRENT_CONFIG_VERSION {
         // Intentionally do not lower it — that would let an older
         // binary silently drop fields it doesn't understand.

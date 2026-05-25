@@ -678,11 +678,11 @@ impl BuiltinToolRegistry {
 
         let new_content = content.replace(old_text, new_text);
 
-        // Capture the pre-image *before* mutating so /rewind can restore.
+        fs::write(path, new_content).context(format!("Failed to write file: {}", path))?;
+        // Capture the pre-image only after a successful mutation so failed
+        // writes don't create phantom rollback entries.
         self.journal
             .record(PathBuf::from(path), Some(content.into_bytes()));
-
-        fs::write(path, new_content).context(format!("Failed to write file: {}", path))?;
 
         Ok(ToolResult::success(format!(
             "File edited successfully: {}",
@@ -714,12 +714,19 @@ impl BuiltinToolRegistry {
             fs::create_dir_all(parent).context("Failed to create parent directories")?;
         }
 
-        // Capture the pre-image (or `None` if the file didn't exist) so
-        // `/rewind` can restore or delete the file.
-        let previous = fs::read(path).ok();
-        self.journal.record(PathBuf::from(path), previous);
+        // Capture the pre-image before writing. Distinguish true "missing"
+        // from other read failures so we don't mis-journal unreadable files
+        // as if they never existed.
+        let previous = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).context(format!("Failed to read file: {}", path)),
+        };
 
         fs::write(path, content).context(format!("Failed to write file: {}", path))?;
+        // Record only after a successful write so rewind tracks real
+        // mutations.
+        self.journal.record(PathBuf::from(path), previous);
 
         Ok(ToolResult::success(format!(
             "File written successfully: {} ({} bytes)",

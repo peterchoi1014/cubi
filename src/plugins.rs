@@ -110,7 +110,7 @@ fn load_commands(commands_dir: &std::path::Path) -> Vec<PluginCommand> {
         else {
             continue;
         };
-        if name.is_empty() || name.contains(':') {
+        if name.is_empty() || name.contains(char::is_whitespace) || name.contains(':') {
             continue;
         }
         let description = body
@@ -216,6 +216,19 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("ignored.txt"), "nope").unwrap();
         fs::write(dir.join("ok.md"), "# Hi\n").unwrap();
+        let plugins = load_from(&root);
+        assert_eq!(plugins[0].commands.len(), 1);
+        assert_eq!(plugins[0].commands[0].name, "ok");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn skips_command_names_with_whitespace() {
+        let root = temp_root("spaces");
+        let dir = root.join("p").join("commands");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("my cmd.md"), "# should skip\n").unwrap();
+        fs::write(dir.join("ok.md"), "# ok\n").unwrap();
         let plugins = load_from(&root);
         assert_eq!(plugins[0].commands.len(), 1);
         assert_eq!(plugins[0].commands[0].name, "ok");

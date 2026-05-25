@@ -12,7 +12,7 @@
 //! 3. `~/.ai-chat-cli/policy.json` (per-user fallback, useful for the
 //!    Windows case where step 2 doesn't exist).
 //!
-//! The deny list it carries is checked **after** the user's allow/deny
+//! The deny list it carries is checked **before** the user's allow/deny
 //! list in `Permissions::check_tool_allowed`, so a malicious user
 //! config can't undo it.
 
@@ -81,7 +81,10 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_file(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -93,9 +96,10 @@ mod tests {
 
     #[test]
     fn missing_file_yields_empty_policy() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
         // Point at a path that definitely doesn't exist.
         let p = tmp_file("missing");
-        // SAFETY: tests are single-threaded for our crate.
         unsafe {
             std::env::set_var("AICHAT_POLICY_FILE", &p);
         }
@@ -104,10 +108,15 @@ mod tests {
         unsafe {
             std::env::remove_var("AICHAT_POLICY_FILE");
         }
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
+        }
     }
 
     #[test]
     fn loads_deny_list_from_env_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
         let p = tmp_file("deny");
         fs::write(
             &p,
@@ -126,10 +135,15 @@ mod tests {
         unsafe {
             std::env::remove_var("AICHAT_POLICY_FILE");
         }
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
+        }
     }
 
     #[test]
     fn corrupt_file_is_treated_as_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
         let p = tmp_file("corrupt");
         fs::write(&p, "not json {{{").unwrap();
         unsafe {
@@ -140,6 +154,9 @@ mod tests {
         fs::remove_file(&p).ok();
         unsafe {
             std::env::remove_var("AICHAT_POLICY_FILE");
+        }
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
         }
     }
 }
