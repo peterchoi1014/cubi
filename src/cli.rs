@@ -423,6 +423,21 @@ impl ChatCLI {
                     env!("CARGO_PKG_VERSION")
                 );
             }
+            Cmd::Doctor => {
+                self.run_doctor().await;
+            }
+            Cmd::Env => {
+                self.show_env();
+            }
+            Cmd::Config => {
+                self.show_config();
+            }
+            Cmd::Permissions => {
+                self.show_permissions();
+            }
+            Cmd::Bug => {
+                self.show_bug_url(args);
+            }
             Cmd::Status => {
                 self.show_status();
             }
@@ -586,6 +601,21 @@ impl ChatCLI {
             }
             Cmd::Review => {
                 self.run_review().await;
+            }
+            Cmd::Worktree => {
+                self.run_worktree(args);
+            }
+            Cmd::Branch => {
+                self.run_branch(args);
+            }
+            Cmd::Tag => {
+                self.run_tag(args);
+            }
+            Cmd::Files => {
+                self.run_files();
+            }
+            Cmd::AddDir => {
+                self.handle_add_dir(args);
             }
             Cmd::Export => {
                 if args.is_empty() {
@@ -842,6 +872,370 @@ impl ChatCLI {
             if trusted_count == 1 { "" } else { "s" }
         );
         println!();
+    }
+
+    /// `/doctor` — runs a sanity check on the runtime environment.
+    /// Each probe prints a ✓ / ✗ line; the function never returns an error
+    /// so users always see the full report.
+    async fn run_doctor(&self) {
+        println!("\n{}", "Doctor:".bright_yellow().bold());
+
+        // 1. Ollama reachability + model listing.
+        let ollama = crate::ollama::OllamaClient::new();
+        let model = self.executor.get_model();
+        match ollama.list_models().await {
+            Ok(models) => {
+                println!(
+                    "  {} Ollama reachable at {} ({} model{} installed)",
+                    "✓".bright_green(),
+                    "http://localhost:11434".bright_cyan(),
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" }
+                );
+                // Mirror the startup check in main.rs (prefix match handles
+                // `name` vs `name:latest`).
+                if models.iter().any(|m| m.starts_with(model)) {
+                    println!(
+                        "  {} Current model '{}' is installed",
+                        "✓".bright_green(),
+                        model.bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "  {} Current model '{}' is not installed (try `ollama pull {}`)",
+                        "✗".bright_red(),
+                        model.bright_cyan(),
+                        model
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  {} Ollama unreachable at {}: {}",
+                    "✗".bright_red(),
+                    "http://localhost:11434".bright_cyan(),
+                    e
+                );
+                println!(
+                    "  {} Skipping model check (Ollama not reachable)",
+                    "ℹ".bright_blue()
+                );
+            }
+        }
+
+        // 2. Config directory writable.
+        match dirs::home_dir().map(|h| h.join(".ai-chat-cli")) {
+            Some(dir) => match fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    // Use a unique probe filename and `create_new` so we never
+                    // truncate a pre-existing file the user may have placed here.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let probe = dir.join(format!(
+                        ".doctor-write-probe-{}-{}",
+                        std::process::id(),
+                        nanos
+                    ));
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&probe)
+                    {
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            let write_res = f.write_all(b"ok");
+                            drop(f);
+                            let _ = fs::remove_file(&probe);
+                            match write_res {
+                                Ok(()) => println!(
+                                    "  {} Config dir writable: {}",
+                                    "✓".bright_green(),
+                                    dir.display().to_string().bright_cyan()
+                                ),
+                                Err(e) => println!(
+                                    "  {} Config dir not writable ({}): {}",
+                                    "✗".bright_red(),
+                                    dir.display(),
+                                    e
+                                ),
+                            }
+                        }
+                        Err(e) => println!(
+                            "  {} Config dir not writable ({}): {}",
+                            "✗".bright_red(),
+                            dir.display(),
+                            e
+                        ),
+                    }
+                }
+                Err(e) => println!(
+                    "  {} Could not create config dir {}: {}",
+                    "✗".bright_red(),
+                    dir.display(),
+                    e
+                ),
+            },
+            None => println!("  {} Could not resolve home directory", "✗".bright_red()),
+        }
+
+        // 3. `git` on PATH.
+        match std::process::Command::new("git").arg("--version").output() {
+            Ok(out) if out.status.success() => {
+                let v = String::from_utf8_lossy(&out.stdout);
+                println!(
+                    "  {} {} on PATH ({})",
+                    "✓".bright_green(),
+                    "git".bright_cyan(),
+                    v.trim()
+                );
+            }
+            Ok(out) => println!(
+                "  {} `git --version` exited with status {}",
+                "✗".bright_red(),
+                out.status
+            ),
+            Err(e) => println!(
+                "  {} {} not found on PATH: {}",
+                "✗".bright_red(),
+                "git".bright_cyan(),
+                e
+            ),
+        }
+
+        println!();
+    }
+
+    /// `/env` — prints the resolved runtime: model, project dir, trust
+    /// status, plan mode, MCP server count, AICHAT.md presence, memdir
+    /// entries, session checkpoint count, todo count.
+    fn show_env(&self) {
+        let cwd = std::env::current_dir().ok();
+        let perms = self.permissions.lock().unwrap();
+        let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
+        let trusted_count = perms.trusted_count();
+        drop(perms);
+
+        let mcp_tool_count = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.list_tools().len())
+            .unwrap_or(0);
+
+        let aichat_path = project_memory::read_memory_with_path()
+            .ok()
+            .flatten()
+            .map(|(p, _)| p);
+
+        let session_count = self
+            .session_store
+            .as_ref()
+            .and_then(|s| s.list().ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        println!("\n{}", "Environment:".bright_yellow().bold());
+        println!(
+            "  {}: {} {}",
+            "binary".bright_cyan(),
+            "ai-chat-cli".bright_white(),
+            format!("v{}", env!("CARGO_PKG_VERSION")).bright_black()
+        );
+        println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
+        println!(
+            "  {}: {}",
+            "cwd".bright_cyan(),
+            cwd.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string())
+        );
+        println!(
+            "  {}: {} ({} trusted root{} total)",
+            "cwd trust".bright_cyan(),
+            if trusted_here {
+                "trusted".bright_green()
+            } else {
+                "not trusted".bright_red()
+            },
+            trusted_count,
+            if trusted_count == 1 { "" } else { "s" }
+        );
+        println!(
+            "  {}: {}",
+            "plan mode".bright_cyan(),
+            if self.plan_mode.load(Ordering::SeqCst) {
+                "on".bright_green()
+            } else {
+                "off".bright_black()
+            }
+        );
+        println!(
+            "  {}: {}",
+            "history messages".bright_cyan(),
+            self.history.len()
+        );
+        println!("  {}: {}", "mcp tools".bright_cyan(), mcp_tool_count);
+        println!(
+            "  {}: {} ({} pending)",
+            "todos".bright_cyan(),
+            self.todos.len(),
+            self.todos.pending()
+        );
+        println!(
+            "  {}: {} entries",
+            "memdir".bright_cyan(),
+            self.memdir.len()
+        );
+        println!(
+            "  {}: {}",
+            "session checkpoints".bright_cyan(),
+            session_count
+        );
+        match aichat_path {
+            Some(p) => println!(
+                "  {}: {}",
+                "project memory".bright_cyan(),
+                p.display().to_string().bright_cyan()
+            ),
+            None => println!(
+                "  {}: {}",
+                "project memory".bright_cyan(),
+                "(none — run /init to create AICHAT.md)".bright_black()
+            ),
+        }
+        println!();
+    }
+
+    /// `/config` — print the contents of `~/.ai-chat-cli/config.json`.
+    fn show_config(&self) {
+        let Some(path) = crate::onboarding::AppConfig::storage_path() else {
+            eprintln!(
+                "{} Could not resolve home directory.",
+                "Error:".bright_red()
+            );
+            return;
+        };
+        println!(
+            "\n{} ({}):",
+            "Config".bright_yellow().bold(),
+            path.display().to_string().bright_cyan()
+        );
+        println!("{}", "-".repeat(60).bright_black());
+        match fs::read_to_string(&path) {
+            Ok(raw) => println!("{}", raw.trim_end()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!(
+                "{} No config file yet — it is written on first onboarding.",
+                "ℹ".bright_blue()
+            ),
+            Err(e) => eprintln!("{} Failed to read config: {}", "Error:".bright_red(), e),
+        }
+        println!("{}\n", "-".repeat(60).bright_black());
+    }
+
+    /// `/permissions` — list trusted directories and the built-in tools
+    /// gated by the trust store.
+    fn show_permissions(&self) {
+        let perms = self.permissions.lock().unwrap();
+        let roots: Vec<_> = perms.trusted_roots().cloned().collect();
+        drop(perms);
+
+        let store_path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("trusted_dirs.json"));
+
+        println!("\n{}", "Permissions:".bright_yellow().bold());
+        if let Some(p) = &store_path {
+            println!(
+                "  {}: {}",
+                "trust store".bright_cyan(),
+                p.display().to_string().bright_cyan()
+            );
+        }
+        if roots.is_empty() {
+            println!(
+                "  {} No directories are currently trusted. Run /trust in a project to approve it.",
+                "ℹ".bright_blue()
+            );
+        } else {
+            println!(
+                "  {} {} trusted root{}:",
+                "✓".bright_green(),
+                roots.len(),
+                if roots.len() == 1 { "" } else { "s" }
+            );
+            for (i, r) in roots.iter().enumerate() {
+                println!("    {}. {}", i + 1, r.display().to_string().bright_cyan());
+            }
+        }
+        println!(
+            "  {}: bash, write_file, edit_file (write/exec only inside a trusted root)",
+            "gated tools".bright_cyan()
+        );
+        println!(
+            "  {} Plan mode also blocks these tools regardless of trust.",
+            "ℹ".bright_blue()
+        );
+        println!();
+    }
+
+    /// `/bug` — print a pre-filled GitHub Issues URL for this repo with
+    /// the runtime info from `/env` URL-encoded into the body. Optional
+    /// `args` become the issue title.
+    fn show_bug_url(&self, args: &str) {
+        let title = if args.trim().is_empty() {
+            "Bug report".to_string()
+        } else {
+            args.trim().to_string()
+        };
+
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let mcp_tool_count = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.list_tools().len())
+            .unwrap_or(0);
+        let plan_mode = if self.plan_mode.load(Ordering::SeqCst) {
+            "on"
+        } else {
+            "off"
+        };
+
+        let body = format!(
+            "## Describe the bug\n\
+             <!-- A clear and concise description. -->\n\n\
+             ## To reproduce\n\
+             1. ...\n\n\
+             ## Expected behavior\n\
+             ...\n\n\
+             ## Environment\n\
+             - ai-chat-cli: v{version}\n\
+             - model: {model}\n\
+             - cwd: {cwd}\n\
+             - plan mode: {plan_mode}\n\
+             - mcp tools: {mcp}\n\
+             - os: {os} ({arch})\n",
+            version = env!("CARGO_PKG_VERSION"),
+            model = self.executor.get_model(),
+            cwd = cwd,
+            plan_mode = plan_mode,
+            mcp = mcp_tool_count,
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+        );
+
+        let url = format!(
+            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?title={}&body={}",
+            url_encode(&title),
+            url_encode(&body),
+        );
+
+        println!("\n{}", "Bug report:".bright_yellow().bold());
+        println!(
+            "  {} Open this URL to file an issue with runtime info pre-filled:\n",
+            "ℹ".bright_blue()
+        );
+        println!("  {}\n", url.bright_cyan());
     }
 
     /// Handles `/trust` and `/trust revoke`. Both forms operate on the
@@ -1159,6 +1553,335 @@ impl ChatCLI {
                          the change for a complete review.",
                         "ℹ".bright_blue(),
                         MAX_DIFF_CHARS
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/worktree [list|add <path> [branch]|remove <path>]` — thin wrapper
+    /// over `git worktree`. Mutating subcommands (`add`/`remove`) are
+    /// refused in plan mode and require the cwd to be trusted, mirroring
+    /// the `worktree` builtin tool. `add` also auto-trusts the new path
+    /// so subsequent write/exec tool calls there don't fail.
+    fn run_worktree(&self, args: &str) {
+        let Some(action) = git_cmds::parse_worktree_args(args) else {
+            println!(
+                "{} Usage: /worktree [list | add <path> [branch] | remove <path>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::WorktreeAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /worktree {}. Toggle off with /plan first.",
+                "✗".bright_red(),
+                match action {
+                    git_cmds::WorktreeAction::Add { .. } => "add",
+                    git_cmds::WorktreeAction::Remove { .. } => "remove",
+                    git_cmds::WorktreeAction::List => unreachable!(),
+                }
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::WorktreeAction::List => git_cmds::worktree_list(),
+            git_cmds::WorktreeAction::Add { path, branch } => git_cmds::worktree_add(path, branch),
+            git_cmds::WorktreeAction::Remove { path } => git_cmds::worktree_remove(path),
+        };
+
+        let out = match result {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+
+        if !out.exit_ok {
+            eprintln!(
+                "{} git worktree failed: {}",
+                "Error:".bright_red(),
+                out.stderr.trim()
+            );
+            if !out.stdout.trim().is_empty() {
+                eprintln!("{}", out.stdout.trim());
+            }
+            return;
+        }
+
+        if let git_cmds::WorktreeAction::Add { path, .. } = action {
+            // Auto-trust the new worktree path, matching the `worktree`
+            // builtin tool's behavior.
+            let trust_msg = {
+                let mut perms = self.permissions.lock().unwrap();
+                match perms.trust_dir(Path::new(path)) {
+                    Ok(true) => match perms.save() {
+                        Ok(()) => " (auto-trusted)".to_string(),
+                        Err(e) => format!(" (auto-trusted in-memory but failed to persist: {e})"),
+                    },
+                    Ok(false) => " (already trusted)".to_string(),
+                    Err(e) => format!(" (could not auto-trust: {e})"),
+                }
+            };
+            println!(
+                "{} Worktree created at {}{}",
+                "✓".bright_green(),
+                path.bright_cyan(),
+                trust_msg
+            );
+        } else if let git_cmds::WorktreeAction::Remove { path } = action {
+            println!(
+                "{} Worktree removed: {}",
+                "✓".bright_green(),
+                path.bright_cyan()
+            );
+        }
+
+        if !out.stdout.trim().is_empty() {
+            print!("{}", out.stdout);
+        }
+        if !out.stderr.trim().is_empty() {
+            eprintln!("{}", out.stderr.trim().bright_black());
+        }
+    }
+
+    /// `/branch [list|create <name>|switch <name>]` — thin wrapper over
+    /// `git branch` / `git switch`. Mutating subcommands are plan-mode
+    /// gated and require trust, same as `/commit`.
+    fn run_branch(&self, args: &str) {
+        let Some(action) = git_cmds::parse_branch_args(args) else {
+            println!(
+                "{} Usage: /branch [list | create <name> | switch <name>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::BranchAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /branch {}. Toggle off with /plan first.",
+                "✗".bright_red(),
+                match action {
+                    git_cmds::BranchAction::Create { .. } => "create",
+                    git_cmds::BranchAction::Switch { .. } => "switch",
+                    git_cmds::BranchAction::List => unreachable!(),
+                }
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::BranchAction::List => git_cmds::branch_list(),
+            git_cmds::BranchAction::Create { name } => git_cmds::branch_create(name),
+            git_cmds::BranchAction::Switch { name } => git_cmds::branch_switch(name),
+        };
+
+        match result {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git branch failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if !out.stdout.trim().is_empty() {
+                    print!("{}", out.stdout);
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim().bright_black());
+                }
+                match action {
+                    git_cmds::BranchAction::Create { name } => println!(
+                        "{} Branch {} created.",
+                        "✓".bright_green(),
+                        name.bright_cyan()
+                    ),
+                    git_cmds::BranchAction::Switch { name } => println!(
+                        "{} Switched to branch {}.",
+                        "✓".bright_green(),
+                        name.bright_cyan()
+                    ),
+                    git_cmds::BranchAction::List => {}
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/tag [list|<name>|create <name> [-m <msg>]]` — thin wrapper over
+    /// `git tag`. Creation is plan-mode gated and requires trust.
+    fn run_tag(&self, args: &str) {
+        let Some(action) = git_cmds::parse_tag_args(args) else {
+            println!(
+                "{} Usage: /tag [list | <name> | create <name> [-m <msg>]]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::TagAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /tag create. Toggle off with /plan first.",
+                "✗".bright_red()
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::TagAction::List => git_cmds::tag_list(),
+            git_cmds::TagAction::Create { name, message } => git_cmds::tag_create(name, message),
+        };
+
+        match result {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git tag failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if !out.stdout.trim().is_empty() {
+                    print!("{}", out.stdout);
+                }
+                if let git_cmds::TagAction::Create { name, .. } = action {
+                    println!("{} Tag {} created.", "✓".bright_green(), name.bright_cyan());
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/files` — list files tracked by git in this project, via
+    /// `git ls-files`. Lets the user (and the model, if they ask) get a
+    /// quick project inventory without leaving the chat.
+    fn run_files(&self) {
+        match git_cmds::ls_files() {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git ls-files failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                let trimmed = out.stdout.trim();
+                if trimmed.is_empty() {
+                    println!("{} No tracked files in this repo.", "ℹ".bright_blue());
+                    return;
+                }
+                let count = trimmed.lines().count();
+                print!("{}", out.stdout);
+                println!(
+                    "{} {} tracked files.",
+                    "ℹ".bright_blue(),
+                    count.to_string().bright_cyan()
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/add-dir <path>` — trust an additional directory for write/exec
+    /// tools. Companion to `/trust`, which only operates on the cwd.
+    fn handle_add_dir(&self, args: &str) {
+        let path_str = args.trim();
+        if path_str.is_empty() {
+            println!("{} Usage: /add-dir <path>", "Info:".bright_yellow());
+            return;
+        }
+        let path = Path::new(path_str);
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "{} Could not resolve {}: {}",
+                    "Error:".bright_red(),
+                    path_str,
+                    e
+                );
+                return;
+            }
+        };
+        if !canonical.is_dir() {
+            eprintln!(
+                "{} {} is not a directory",
+                "Error:".bright_red(),
+                canonical.display()
+            );
+            return;
+        }
+        let mut perms = self.permissions.lock().unwrap();
+        match perms.trust_dir(&canonical) {
+            Ok(added) => {
+                if let Err(e) = perms.save() {
+                    eprintln!(
+                        "{} Failed to persist trust store: {}",
+                        "Warn:".bright_yellow(),
+                        e
+                    );
+                }
+                if added {
+                    println!(
+                        "{} trusted {}",
+                        "✓".bright_green(),
+                        canonical.display().to_string().bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "{} {} was already trusted",
+                        "ℹ".bright_blue(),
+                        canonical.display().to_string().bright_cyan()
                     );
                 }
             }
@@ -1844,6 +2567,26 @@ fn parse_force_and_filename(rest: &str) -> Option<(bool, &str)> {
     Some((false, trimmed))
 }
 
+/// Minimal RFC 3986 percent-encoder for query/body params used by `/bug`.
+/// Encodes everything except the unreserved set (`A-Z a-z 0-9 - _ . ~`).
+/// Kept here to avoid pulling in the `percent-encoding` or `urlencoding`
+/// crates for one URL.
+fn url_encode(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1911,6 +2654,24 @@ mod tests {
         assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
         assert_eq!(cli_history[1].role, "user");
         assert_eq!(cli_history[2].role, "assistant");
+    }
+
+    // ---- url_encode ----
+
+    #[test]
+    fn url_encode_passes_through_unreserved() {
+        assert_eq!(url_encode("abcXYZ-_.~012"), "abcXYZ-_.~012");
+    }
+
+    #[test]
+    fn url_encode_escapes_reserved_and_unicode() {
+        // Space, slash, colon, newline, and a multi-byte character all
+        // round-trip via percent-encoding.
+        assert_eq!(url_encode(" "), "%20");
+        assert_eq!(url_encode("a/b:c"), "a%2Fb%3Ac");
+        assert_eq!(url_encode("x\ny"), "x%0Ay");
+        // U+00E9 (é) is 0xC3 0xA9 in UTF-8.
+        assert_eq!(url_encode("é"), "%C3%A9");
     }
 
     // ---- overwrite guard ----
