@@ -587,6 +587,21 @@ impl ChatCLI {
             Cmd::Review => {
                 self.run_review().await;
             }
+            Cmd::Worktree => {
+                self.run_worktree(args);
+            }
+            Cmd::Branch => {
+                self.run_branch(args);
+            }
+            Cmd::Tag => {
+                self.run_tag(args);
+            }
+            Cmd::Files => {
+                self.run_files();
+            }
+            Cmd::AddDir => {
+                self.handle_add_dir(args);
+            }
             Cmd::Export => {
                 if args.is_empty() {
                     println!(
@@ -1159,6 +1174,335 @@ impl ChatCLI {
                          the change for a complete review.",
                         "ℹ".bright_blue(),
                         MAX_DIFF_CHARS
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/worktree [list|add <path> [branch]|remove <path>]` — thin wrapper
+    /// over `git worktree`. Mutating subcommands (`add`/`remove`) are
+    /// refused in plan mode and require the cwd to be trusted, mirroring
+    /// the `worktree` builtin tool. `add` also auto-trusts the new path
+    /// so subsequent write/exec tool calls there don't fail.
+    fn run_worktree(&self, args: &str) {
+        let Some(action) = git_cmds::parse_worktree_args(args) else {
+            println!(
+                "{} Usage: /worktree [list | add <path> [branch] | remove <path>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::WorktreeAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /worktree {}. Toggle off with /plan first.",
+                "✗".bright_red(),
+                match action {
+                    git_cmds::WorktreeAction::Add { .. } => "add",
+                    git_cmds::WorktreeAction::Remove { .. } => "remove",
+                    git_cmds::WorktreeAction::List => unreachable!(),
+                }
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::WorktreeAction::List => git_cmds::worktree_list(),
+            git_cmds::WorktreeAction::Add { path, branch } => git_cmds::worktree_add(path, branch),
+            git_cmds::WorktreeAction::Remove { path } => git_cmds::worktree_remove(path),
+        };
+
+        let out = match result {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+
+        if !out.exit_ok {
+            eprintln!(
+                "{} git worktree failed: {}",
+                "Error:".bright_red(),
+                out.stderr.trim()
+            );
+            if !out.stdout.trim().is_empty() {
+                eprintln!("{}", out.stdout.trim());
+            }
+            return;
+        }
+
+        if let git_cmds::WorktreeAction::Add { path, .. } = action {
+            // Auto-trust the new worktree path, matching the `worktree`
+            // builtin tool's behavior.
+            let trust_msg = {
+                let mut perms = self.permissions.lock().unwrap();
+                match perms.trust_dir(Path::new(path)) {
+                    Ok(true) => match perms.save() {
+                        Ok(()) => " (auto-trusted)".to_string(),
+                        Err(e) => format!(" (auto-trusted in-memory but failed to persist: {e})"),
+                    },
+                    Ok(false) => " (already trusted)".to_string(),
+                    Err(e) => format!(" (could not auto-trust: {e})"),
+                }
+            };
+            println!(
+                "{} Worktree created at {}{}",
+                "✓".bright_green(),
+                path.bright_cyan(),
+                trust_msg
+            );
+        } else if let git_cmds::WorktreeAction::Remove { path } = action {
+            println!(
+                "{} Worktree removed: {}",
+                "✓".bright_green(),
+                path.bright_cyan()
+            );
+        }
+
+        if !out.stdout.trim().is_empty() {
+            print!("{}", out.stdout);
+        }
+        if !out.stderr.trim().is_empty() {
+            eprintln!("{}", out.stderr.trim().bright_black());
+        }
+    }
+
+    /// `/branch [list|create <name>|switch <name>]` — thin wrapper over
+    /// `git branch` / `git switch`. Mutating subcommands are plan-mode
+    /// gated and require trust, same as `/commit`.
+    fn run_branch(&self, args: &str) {
+        let Some(action) = git_cmds::parse_branch_args(args) else {
+            println!(
+                "{} Usage: /branch [list | create <name> | switch <name>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::BranchAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /branch {}. Toggle off with /plan first.",
+                "✗".bright_red(),
+                match action {
+                    git_cmds::BranchAction::Create { .. } => "create",
+                    git_cmds::BranchAction::Switch { .. } => "switch",
+                    git_cmds::BranchAction::List => unreachable!(),
+                }
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::BranchAction::List => git_cmds::branch_list(),
+            git_cmds::BranchAction::Create { name } => git_cmds::branch_create(name),
+            git_cmds::BranchAction::Switch { name } => git_cmds::branch_switch(name),
+        };
+
+        match result {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git branch failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if !out.stdout.trim().is_empty() {
+                    print!("{}", out.stdout);
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim().bright_black());
+                }
+                match action {
+                    git_cmds::BranchAction::Create { name } => println!(
+                        "{} Branch {} created.",
+                        "✓".bright_green(),
+                        name.bright_cyan()
+                    ),
+                    git_cmds::BranchAction::Switch { name } => println!(
+                        "{} Switched to branch {}.",
+                        "✓".bright_green(),
+                        name.bright_cyan()
+                    ),
+                    git_cmds::BranchAction::List => {}
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/tag [list|<name>|create <name> [-m <msg>]]` — thin wrapper over
+    /// `git tag`. Creation is plan-mode gated and requires trust.
+    fn run_tag(&self, args: &str) {
+        let Some(action) = git_cmds::parse_tag_args(args) else {
+            println!(
+                "{} Usage: /tag [list | <name> | create <name> [-m <msg>]]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let mutating = !matches!(action, git_cmds::TagAction::List);
+        if mutating && self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /tag create. Toggle off with /plan first.",
+                "✗".bright_red()
+            );
+            return;
+        }
+        if mutating {
+            let cwd = match std::env::current_dir() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                    return;
+                }
+            };
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        }
+
+        let result = match action {
+            git_cmds::TagAction::List => git_cmds::tag_list(),
+            git_cmds::TagAction::Create { name, message } => git_cmds::tag_create(name, message),
+        };
+
+        match result {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git tag failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if !out.stdout.trim().is_empty() {
+                    print!("{}", out.stdout);
+                }
+                if let git_cmds::TagAction::Create { name, .. } = action {
+                    println!("{} Tag {} created.", "✓".bright_green(), name.bright_cyan());
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/files` — list files tracked by git in this project, via
+    /// `git ls-files`. Lets the user (and the model, if they ask) get a
+    /// quick project inventory without leaving the chat.
+    fn run_files(&self) {
+        match git_cmds::ls_files() {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git ls-files failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                let trimmed = out.stdout.trim();
+                if trimmed.is_empty() {
+                    println!("{} No tracked files in this repo.", "ℹ".bright_blue());
+                    return;
+                }
+                let count = trimmed.lines().count();
+                print!("{}", out.stdout);
+                println!(
+                    "{} {} tracked files.",
+                    "ℹ".bright_blue(),
+                    count.to_string().bright_cyan()
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/add-dir <path>` — trust an additional directory for write/exec
+    /// tools. Companion to `/trust`, which only operates on the cwd.
+    fn handle_add_dir(&self, args: &str) {
+        let path_str = args.trim();
+        if path_str.is_empty() {
+            println!("{} Usage: /add-dir <path>", "Info:".bright_yellow());
+            return;
+        }
+        let path = Path::new(path_str);
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "{} Could not resolve {}: {}",
+                    "Error:".bright_red(),
+                    path_str,
+                    e
+                );
+                return;
+            }
+        };
+        if !canonical.is_dir() {
+            eprintln!(
+                "{} {} is not a directory",
+                "Error:".bright_red(),
+                canonical.display()
+            );
+            return;
+        }
+        let mut perms = self.permissions.lock().unwrap();
+        match perms.trust_dir(&canonical) {
+            Ok(added) => {
+                if let Err(e) = perms.save() {
+                    eprintln!(
+                        "{} Failed to persist trust store: {}",
+                        "Warn:".bright_yellow(),
+                        e
+                    );
+                }
+                if added {
+                    println!(
+                        "{} trusted {}",
+                        "✓".bright_green(),
+                        canonical.display().to_string().bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "{} {} was already trusted",
+                        "ℹ".bright_blue(),
+                        canonical.display().to_string().bright_cyan()
                     );
                 }
             }

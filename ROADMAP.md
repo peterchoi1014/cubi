@@ -31,7 +31,7 @@ for future PRs.
       *(user-driven `/ask <question>` for now; model-triggered version comes
       with native tool-calling)*
 - [x] **Git worktree tool** — `worktree` builtin (list/add/remove), auto-trusts
-      new paths; CLI-side `/worktree` is still TODO
+      new paths; `/worktree` slash command also shipped
 - [x] **`web_fetch`, `web_search`** — network tools (permission-gated)
       *(HTTP(S) GET with 64 KB cap; DuckDuckGo lite-mode scrape — no API key)*
 - [x] **LSP-backed code intel tool** — hover / definition / references
@@ -70,14 +70,22 @@ Shipped in this PR:
 - [x] `/sessions`, `/resume` (auto-saved per-project checkpoints)
 - [x] `/diff`, `/commit`, `/review` (git workflow; `/commit` is plan-mode-aware)
 - [x] `/trust` (project-trust gate for write/exec tools)
+- [x] `/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`
+      (cross-session persistent memory at `~/.ai-chat-cli/memdir/`)
+- [x] `/rewind`, `/compact` (history surgery + automatic summarization)
+- [x] `/worktree` (list/add/remove; auto-trusts new path, plan-mode-aware)
+- [x] `/branch` (list/create/switch; mutating actions plan-mode-aware)
+- [x] `/tag` (list/create; create plan-mode-aware)
+- [x] `/files` (lists tracked files via `git ls-files`)
+- [x] `/add-dir` (trust an additional directory for write/exec tools)
 
 Still to add (grouped by area):
 
-- **Project / workspace:** `/add-dir`, `/files`, `/init-verifiers`
-- **Git workflow:** `/commit-push-pr`, `/branch`, `/tag`, `/pr_comments`,
+- **Project / workspace:** `/init-verifiers`
+- **Git workflow:** `/commit-push-pr`, `/pr_comments`,
   `/security-review`, `/autofix-pr`, `/issue`, `/undo`
-- **Agent control:** `/agents`, `/tasks`, `/teleport`, `/rewind`, `/passes`,
-  `/effort`, `/compact`
+- **Agent control:** `/agents`, `/tasks`, `/teleport`, `/passes`,
+  `/effort`
 - **Output / theming:** `/theme`, `/color`, `/output-style`, `/statusline`,
   `/keybindings`, `/vim`
 - **Auth / accounts:** `/login`, `/logout`, `/oauth-refresh`,
@@ -114,7 +122,10 @@ Markdown commands as first-class plugins (cf. leaked
    Per-tool allow/deny lists and enterprise policy are still open.
 3. **Memory & compaction** (`services/compact/`, `SessionMemory/`,
    `extractMemories/`, `memdir/`) — automatic in-session compaction plus
-   cross-session persistent memory at `~/.ai-chat-cli/memdir/`.
+   cross-session persistent memory at `~/.ai-chat-cli/memdir/`. ✅ Shipped:
+   `src/memdir.rs` + `/memdir*` slash commands; `/compact` summarizes old
+   turns to reduce context length. Automatic (model-driven) extraction of
+   memories from conversation history is still open.
 4. **Proactive completions** (`PromptSuggestion/`, `fileSuggestions.ts`) —
    suggest next prompts and `@file` references while the user types.
 5. **Multi-agent layer** (`utils/swarm/`, `coordinator/`, `assistant/`,
@@ -133,7 +144,8 @@ Markdown commands as first-class plugins (cf. leaked
 13. **Themable output styles** (`outputStyles/`) — concise / explanatory /
     markdown / etc., per-session.
 14. **Hooks** — `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`,
-    `SessionStart`, `Notification`.
+    `SessionStart`, `Notification`. ✅ Foundation shipped in `src/hooks.rs`;
+    user-facing `/hooks` management command still open.
 15. **Plugin system** (`plugins/`, `services/plugins/`, `reload-plugins`) —
     `~/.ai-chat-cli/plugins/*` discoverable bundles.
 16. **Headless / remote mode** (`server/`, `remote/`, `upstreamproxy/`,
@@ -170,14 +182,17 @@ Markdown commands as first-class plugins (cf. leaked
 4. `/init` + `AICHAT.md` + memdir + onboarding flow. ✅ Onboarding wizard
    shipped; memdir (cross-session persistent memory) is still open.
 5. Auto-saved sessions + `/resume` + `/rewind` checkpoints + compaction.
-   ✅ Sessions + `/resume` shipped; `/rewind` and compaction are still open.
+   ✅ Sessions + `/resume` + `/rewind` + `/compact` all shipped. File-mutation
+   rollback on rewind is still open.
 6. Slash-command registry + custom Markdown commands + `@file` mentions +
-   prompt suggestions. ✅ Registry shipped (`src/commands.rs`); user-defined
-   Markdown commands and `@file` mentions still open.
+   prompt suggestions. ✅ Registry shipped (`src/commands.rs`); `@file`
+   mentions shipped (`src/file_mentions.rs`); user-defined Markdown commands
+   and proactive prompt suggestions still open.
 7. Subagents (`AgentTool`) + task management tools. ✅ `agent_run` meta-tool
    shipped (fresh-context inner loop; recursion disallowed).
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.
-   ✅ `/diff`, `/commit`, `/review` + `worktree` builtin shipped.
+   ✅ `/diff`, `/commit`, `/review`, `/worktree`, `/branch`, `/tag`, `/files`,
+   `/add-dir` + `worktree` builtin shipped. `/commit-push-pr` still open.
 9. Multi-provider LLM abstraction + token estimator + rate-limit / retry.
 10. Web tools (`web_fetch`, `web_search`) + LSP service & tool + REPL tool +
     notebook tool. ✅ All four shipped as built-in tools.
