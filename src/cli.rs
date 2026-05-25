@@ -5,6 +5,8 @@ use rustyline::DefaultEditor;
 use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
+use crate::project_memory;
+use crate::todos::TodoList;
 use std::fs;
 use serde_json;
 
@@ -12,6 +14,8 @@ pub struct ChatCLI {
     executor: AIExecutor,
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
+    todos: TodoList,
+    plan_mode: bool,
 }
 
 impl ChatCLI {
@@ -20,8 +24,22 @@ impl ChatCLI {
             executor,
             history: Vec::new(),
             mcp_manager,
+            todos: TodoList::new(),
+            plan_mode: false,
         };
-    
+
+        // Auto-inject project memory (AICHAT.md) into context, if present.
+        if let Ok(Some(memory)) = project_memory::read_memory() {
+            cli.history.push(Message {
+                role: "system".to_string(),
+                content: format!(
+                    "SYSTEM: Project memory loaded from {}:\n\n{}",
+                    project_memory::MEMORY_FILENAME,
+                    memory.trim()
+                ),
+            });
+        }
+
         // Auto-inject MCP tools into context
         if let Some(mcp) = &cli.mcp_manager {
             if mcp.has_tools() {
@@ -229,6 +247,82 @@ impl ChatCLI {
                 println!("  Write hello world in Python");
                 println!("  Explain recursion");
             }
+            "/version" => {
+                println!("{} {}", "ai-chat-cli".bright_cyan(), env!("CARGO_PKG_VERSION"));
+            }
+            "/status" => {
+                self.show_status();
+            }
+            "/plan" => {
+                self.toggle_plan_mode();
+            }
+            "/init" => {
+                self.run_init();
+            }
+            "/memory" => {
+                self.show_memory();
+            }
+            "/todos" => {
+                self.todos.render();
+            }
+            cmd if cmd.starts_with("/todo-add ") => {
+                let text = cmd.strip_prefix("/todo-add ").unwrap().trim();
+                if text.is_empty() {
+                    println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
+                } else {
+                    self.todos.add(text);
+                    println!("{} Added todo", "✓".bright_green());
+                }
+            }
+            "/todo-add" => {
+                println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
+            }
+            cmd if cmd.starts_with("/todo-done ") => {
+                let arg = cmd.strip_prefix("/todo-done ").unwrap().trim();
+                match arg.parse::<usize>() {
+                    Ok(n) => {
+                        if self.todos.mark_done(n) {
+                            println!("{} Marked todo {} as done", "✓".bright_green(), n);
+                        } else {
+                            eprintln!(
+                                "{} No todo with index {}",
+                                "Error:".bright_red(),
+                                n
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "{} Usage: /todo-done <index>",
+                            "Error:".bright_red()
+                        );
+                    }
+                }
+            }
+            "/todo-done" => {
+                println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
+            }
+            "/todo-clear" => {
+                self.todos.clear();
+                println!("{} Cleared todos", "✓".bright_green());
+            }
+            cmd if cmd.starts_with("/export ") => {
+                let filename = cmd.strip_prefix("/export ").unwrap().trim();
+                if filename.is_empty() {
+                    println!("{} Usage: /export <filename.md>", "Info:".bright_yellow());
+                } else if let Err(e) = self.export_markdown(filename) {
+                    eprintln!("{} Failed to export: {}", "Error:".bright_red(), e);
+                } else {
+                    println!(
+                        "{} Conversation exported to {}",
+                        "✓".bright_green(),
+                        filename.bright_cyan()
+                    );
+                }
+            }
+            "/export" => {
+                println!("{} Usage: /export <filename.md>", "Info:".bright_yellow());
+            }
             _ => {
                 println!("{} {}", "Unknown command:".bright_red(), cmd);
                 println!("Type {} for available commands", "/help".bright_cyan());
@@ -347,13 +441,24 @@ impl ChatCLI {
         println!("{}", "=".repeat(60).bright_cyan());
         println!("\n{}", "Commands:".bright_yellow().bold());
         println!("  {} - Show this help message", "/help".bright_cyan());
+        println!("  {} - Show session status", "/status".bright_cyan());
+        println!("  {} - Toggle plan mode (read-only)", "/plan".bright_cyan());
+        println!("  {} - Create starter AICHAT.md", "/init".bright_cyan());
+        println!("  {} - Show project memory (AICHAT.md)", "/memory".bright_cyan());
+        println!("  {} / {} / {} / {} - manage todos",
+            "/todos".bright_cyan(),
+            "/todo-add".bright_cyan(),
+            "/todo-done".bright_cyan(),
+            "/todo-clear".bright_cyan());
         println!("  {} - Clear conversation history", "/clear".bright_cyan());
         println!("  {} - Show conversation history", "/history".bright_cyan());
+        println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
         println!("  {} - List available MCP tools", "/mcp-tools".bright_cyan());
         println!("  {} <t> <a> - Call MCP tool", "/mcp-call".bright_cyan());
         println!("  {} - Reload MCP configuration", "/mcp-reload".bright_cyan());
         println!("  {} - Show current model", "/model".bright_cyan());
         println!("  {} <name> - Switch to different model", "/model".bright_cyan());
+        println!("  {} - Show version", "/version".bright_cyan());
         println!("  {} - Exit the chat", "/quit".bright_cyan());
         println!("\n{}\n", "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white());
     }
@@ -361,13 +466,26 @@ impl ChatCLI {
     fn show_help(&self) {
         println!("\n{}", "Available Commands:".bright_yellow().bold());
         println!("  {} - Show this help message", "/help".bright_cyan());
+        println!("  {} - Show session status", "/status".bright_cyan());
+        println!("  {} - Toggle plan mode (read-only)", "/plan".bright_cyan());
+        println!("  {} - Create starter AICHAT.md", "/init".bright_cyan());
+        println!("  {} - Show project memory (AICHAT.md)", "/memory".bright_cyan());
+        println!("  {} - List todos", "/todos".bright_cyan());
+        println!("  {} <text> - Add a todo", "/todo-add".bright_cyan());
+        println!("  {} <n> - Mark todo n as done", "/todo-done".bright_cyan());
+        println!("  {} - Clear todos", "/todo-clear".bright_cyan());
         println!("  {} - Clear conversation history", "/clear".bright_cyan());
         println!("  {} - Show conversation history", "/history".bright_cyan());
+        println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
+        println!("  {} <f.json> - Save conversation", "/save".bright_cyan());
+        println!("  {} <f.json> - Load conversation", "/load".bright_cyan());
+        println!("  {} <f> - Process batch file", "/batch".bright_cyan());
         println!("  {} - List available MCP tools", "/mcp-tools".bright_cyan());
         println!("  {} <t> <a> - Call MCP tool", "/mcp-call".bright_cyan());
         println!("  {} - Reload MCP configuration", "/mcp-reload".bright_cyan());
         println!("  {} - Show current model", "/model".bright_cyan());
         println!("  {} <name> - Switch to different model", "/model".bright_cyan());
+        println!("  {} - Show version", "/version".bright_cyan());
         println!("  {} - Exit the chat\n", "/quit".bright_cyan());
     }
 
@@ -390,6 +508,124 @@ impl ChatCLI {
             println!("{} [{}]: {}", role, i + 1, msg.content);
         }
         println!("{}\n", "-".repeat(60).bright_black());
+    }
+
+    fn show_status(&self) {
+        let mcp_tool_count = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.list_tools().len())
+            .unwrap_or(0);
+        println!("\n{}", "Status:".bright_yellow().bold());
+        println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
+        println!("  {}: {}", "messages".bright_cyan(), self.history.len());
+        println!(
+            "  {}: {}",
+            "plan mode".bright_cyan(),
+            if self.plan_mode { "on".bright_green() } else { "off".bright_black() }
+        );
+        println!(
+            "  {}: {} ({} pending)",
+            "todos".bright_cyan(),
+            self.todos.len(),
+            self.todos.pending()
+        );
+        println!("  {}: {}", "mcp tools".bright_cyan(), mcp_tool_count);
+        println!();
+    }
+
+    fn toggle_plan_mode(&mut self) {
+        self.plan_mode = !self.plan_mode;
+        if self.plan_mode {
+            self.history.push(Message {
+                role: "system".to_string(),
+                content:
+                    "SYSTEM: Plan mode is ON. Do not modify files or run \
+                     destructive commands. Produce a plan and wait for the \
+                     user to confirm before applying changes."
+                        .to_string(),
+            });
+            println!(
+                "{} Plan mode {}",
+                "✓".bright_green(),
+                "enabled".bright_green()
+            );
+        } else {
+            self.history.push(Message {
+                role: "system".to_string(),
+                content: "SYSTEM: Plan mode is OFF. Normal tool use is allowed."
+                    .to_string(),
+            });
+            println!(
+                "{} Plan mode {}",
+                "✓".bright_green(),
+                "disabled".bright_black()
+            );
+        }
+    }
+
+    fn run_init(&self) {
+        match project_memory::write_starter_if_absent() {
+            Ok(true) => println!(
+                "{} Wrote starter {} in current directory",
+                "✓".bright_green(),
+                project_memory::MEMORY_FILENAME.bright_cyan()
+            ),
+            Ok(false) => println!(
+                "{} {} already exists; left untouched",
+                "ℹ".bright_blue(),
+                project_memory::MEMORY_FILENAME.bright_cyan()
+            ),
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn show_memory(&self) {
+        match project_memory::read_memory() {
+            Ok(Some(contents)) => {
+                println!(
+                    "\n{} ({}):",
+                    "Project memory".bright_yellow().bold(),
+                    project_memory::MEMORY_FILENAME.bright_cyan()
+                );
+                println!("{}", "-".repeat(60).bright_black());
+                println!("{}", contents);
+                println!("{}\n", "-".repeat(60).bright_black());
+            }
+            Ok(None) => println!(
+                "{} No {} found. Run /init to create one.",
+                "ℹ".bright_blue(),
+                project_memory::MEMORY_FILENAME.bright_cyan()
+            ),
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn export_markdown(&self, filename: &str) -> Result<()> {
+        let mut out = String::new();
+        out.push_str("# ai-chat-cli conversation\n\n");
+        out.push_str(&format!("- model: `{}`\n", self.executor.get_model()));
+        out.push_str(&format!("- messages: {}\n\n", self.history.len()));
+        out.push_str("---\n\n");
+        for msg in &self.history {
+            let heading = match msg.role.as_str() {
+                "user" => "## You",
+                "assistant" => "## AI",
+                "system" => "## System",
+                other => {
+                    out.push_str(&format!("## {}\n\n", other));
+                    out.push_str(&msg.content);
+                    out.push_str("\n\n");
+                    continue;
+                }
+            };
+            out.push_str(heading);
+            out.push_str("\n\n");
+            out.push_str(&msg.content);
+            out.push_str("\n\n");
+        }
+        fs::write(filename, out)?;
+        Ok(())
     }
 }
 
