@@ -1,3 +1,4 @@
+use crate::agent_loop::{self, MAX_AGENT_STEPS};
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::git_cmds;
@@ -145,43 +146,11 @@ impl ChatCLI {
                     // Add user message to history
                     self.history.push(Message::text("user", input));
 
-                    // Get AI response
-                    print!("{} ", "AI:".bright_blue().bold());
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-
-                    let stream_result = self
-                        .executor
-                        .chat_stream(self.history.clone(), None, |tok| {
-                            // Print each token as it arrives. Flushing keeps
-                            // the UX snappy on line-buffered terminals.
-                            print!("{}", tok.bright_white());
-                            let _ = std::io::stdout().flush();
-                        })
-                        .await;
-
-                    match stream_result {
-                        Ok(msg) => {
-                            // Trailing blank line so the next prompt isn't
-                            // glued to the model's last token.
-                            println!("\n");
-
-                            // Add assistant response to history
-                            self.history.push(Message::text("assistant", msg.content));
-
-                            // Drop any system messages tagged as single-turn
-                            // (e.g. from `/ask`) so they don't keep nudging
-                            // every subsequent turn.
-                            self.strip_single_turn_system_messages();
-
-                            // Auto-checkpoint the session after every
-                            // successful turn so a crash never loses the
-                            // conversation.
-                            self.checkpoint_session();
-                        }
-                        Err(e) => {
-                            eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
-                        }
+                    // Run the agent: stream model output, execute any
+                    // requested tools, loop until the model returns plain
+                    // content (or we hit the safety cap).
+                    if let Err(e) = self.agent_turn().await {
+                        eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -1206,6 +1175,140 @@ impl ChatCLI {
             .position(|m| m.role != "system")
             .unwrap_or(self.history.len());
         self.history.insert(insert_at, msg);
+    }
+
+    /// Drives one user turn through the native tool-calling agent loop.
+    ///
+    /// * Streams the assistant's tokens to stdout as they arrive.
+    /// * If the model returns `tool_calls`, executes each one through the
+    ///   [`McpManager`] (which routes built-in vs. external tools), appends
+    ///   the result as a `role:"tool"` message, and loops.
+    /// * Honors plan mode at the call site: write/exec tools already refuse
+    ///   in plan mode (see `BuiltinToolRegistry`), so the loop simply
+    ///   reflects those refusals back to the model and lets it adapt.
+    /// * Caps iterations at [`MAX_AGENT_STEPS`] so a confused model can't
+    ///   spin forever.
+    ///
+    /// On a successful exchange (any number of tool round-trips), the final
+    /// assistant message is appended to history, single-turn system hints
+    /// are stripped, and the session is checkpointed.
+    async fn agent_turn(&mut self) -> Result<()> {
+        use std::io::Write;
+
+        // Build the tool list once per turn. Older / non-tool-capable models
+        // ignore it silently, so this is safe to always send.
+        let tools = self
+            .mcp_manager
+            .as_ref()
+            .and_then(agent_loop::build_tool_specs);
+
+        // Track whether we've printed visible content on this turn so we
+        // can choose when to add separating blank lines.
+        let mut any_output = false;
+
+        for step in 0..MAX_AGENT_STEPS {
+            // Only print the "AI:" prefix once per user turn — multi-step
+            // turns continue inline below the previous tool block.
+            if step == 0 {
+                print!("{} ", "AI:".bright_blue().bold());
+                let _ = std::io::stdout().flush();
+            }
+
+            let mut got_token = false;
+            let msg = self
+                .executor
+                .chat_stream(self.history.clone(), tools.clone(), |tok| {
+                    print!("{}", tok.bright_white());
+                    let _ = std::io::stdout().flush();
+                    got_token = true;
+                })
+                .await?;
+            if got_token {
+                any_output = true;
+            }
+
+            let calls = msg.tool_calls.clone().unwrap_or_default();
+
+            // Persist the assistant message verbatim — including any
+            // tool_calls — so the next iteration's context matches what the
+            // model sent us.
+            self.history.push(msg);
+
+            if calls.is_empty() {
+                // Plain text response: we're done with this turn.
+                if any_output {
+                    println!("\n");
+                }
+                break;
+            }
+
+            // The model asked us to run one or more tools. Visually break
+            // the stream so the user can tell the tools apart from the
+            // model's prose.
+            if any_output {
+                println!();
+            }
+
+            for call in calls {
+                println!(
+                    "{} {} {}",
+                    "⚙".bright_blue(),
+                    "tool:".bright_blue(),
+                    call.function.name.bright_cyan()
+                );
+
+                let result_text = match self.mcp_manager.as_mut() {
+                    Some(mcp) => match mcp
+                        .call_tool(&call.function.name, call.function.arguments.clone())
+                        .await
+                    {
+                        Ok(r) => agent_loop::render_tool_result(&r),
+                        Err(e) => format!("[tool error] {e}"),
+                    },
+                    None => format!(
+                        "[tool error] no MCP manager available to execute `{}`",
+                        call.function.name
+                    ),
+                };
+
+                // Print a short preview so the user can see what came back
+                // without us dumping a 10 KB log into the terminal.
+                let preview: String = result_text.chars().take(400).collect();
+                let ellipsis = if result_text.len() > preview.len() {
+                    " …"
+                } else {
+                    ""
+                };
+                println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
+
+                self.history
+                    .push(Message::tool_result(&call.function.name, result_text));
+            }
+
+            // Loop back: feed the tool outputs into the next model call.
+            any_output = false;
+
+            // Diagnostic if we hit the cap mid-loop. The body of the loop
+            // executed the tools for this step; if `step + 1 == MAX`, the
+            // next call_stream is what we're skipping, so warn here.
+            if step + 1 == MAX_AGENT_STEPS {
+                eprintln!(
+                    "{} agent loop hit step cap ({}); stopping. Ask me to continue \
+                     if you want me to keep going.",
+                    "Warn:".bright_yellow(),
+                    MAX_AGENT_STEPS
+                );
+            }
+        }
+
+        // Drop any system messages tagged as single-turn (e.g. from `/ask`)
+        // so they don't keep nudging every subsequent turn.
+        self.strip_single_turn_system_messages();
+
+        // Auto-checkpoint the session after every successful turn so a
+        // crash never loses the conversation.
+        self.checkpoint_session();
+        Ok(())
     }
 
     /// Cleanly shuts down any owned MCP connections. Call this from an
