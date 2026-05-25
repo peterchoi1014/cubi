@@ -77,6 +77,9 @@ impl BuiltinToolRegistry {
             Self::edit_file_tool(),
             Self::write_file_tool(),
             Self::think_tool(),
+            Self::worktree_tool(),
+            Self::web_fetch_tool(),
+            Self::web_search_tool(),
         ];
 
         Self {
@@ -108,6 +111,9 @@ impl BuiltinToolRegistry {
             "edit_file" => self.execute_edit_file(args),
             "write_file" => self.execute_write_file(args),
             "think" => self.execute_think(args),
+            "worktree" => self.execute_worktree(args),
+            "web_fetch" => self.execute_web_fetch(args).await,
+            "web_search" => self.execute_web_search(args).await,
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -603,6 +609,509 @@ impl BuiltinToolRegistry {
             thoughts
         )))
     }
+
+    // ---- Worktree tool ----
+    //
+    // Wraps `git worktree` (list/add/remove). Add auto-trusts the new
+    // worktree path so subsequent write/exec tool calls there don't fail
+    // the permissions check. Remove does *not* auto-revoke trust, on the
+    // theory that you might still want to write into the original cwd.
+
+    fn worktree_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "worktree".to_string(),
+            description:
+                "Manage git worktrees. Subcommands: 'list' shows all worktrees; \
+                 'add' creates a new worktree at the given path (optionally on a \
+                 named branch) and auto-trusts it for write/exec tools; \
+                 'remove' deletes a worktree by path."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove"],
+                        "description": "Operation to perform"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Worktree path (required for add/remove)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name for `add` (optional)"
+                    }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+
+    fn execute_worktree(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let action = args["action"]
+            .as_str()
+            .context("Missing 'action' parameter")?;
+
+        if matches!(action, "add" | "remove") && self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("worktree")));
+        }
+
+        // Mutating worktree operations need a trusted cwd, same as `bash`.
+        if matches!(action, "add" | "remove") {
+            let cwd = std::env::current_dir().context("Could not read cwd")?;
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+                return Ok(ToolResult::error(format!("{}", e)));
+            }
+        }
+
+        match action {
+            "list" => {
+                let out = Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .output()
+                    .context("Failed to run git worktree list")?;
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if out.status.success() {
+                    Ok(ToolResult::success(if stdout.trim().is_empty() {
+                        "(no worktrees)".to_string()
+                    } else {
+                        stdout
+                    }))
+                } else {
+                    Ok(ToolResult::error(format!("git worktree list failed: {stderr}")))
+                }
+            }
+            "add" => {
+                let path = args["path"]
+                    .as_str()
+                    .context("Missing 'path' parameter for `add`")?;
+                let mut cmd = Command::new("git");
+                cmd.args(["worktree", "add", path]);
+                if let Some(branch) = args["branch"].as_str() {
+                    cmd.arg(branch);
+                }
+                let out = cmd.output().context("Failed to run git worktree add")?;
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if !out.status.success() {
+                    return Ok(ToolResult::error(format!(
+                        "git worktree add failed: {}{}",
+                        stdout.trim(),
+                        stderr.trim()
+                    )));
+                }
+                // Auto-trust the new path so the model can immediately edit
+                // files / run commands there without a separate /trust step.
+                let trusted_msg = match self
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .trust_dir(Path::new(path))
+                {
+                    Ok(true) => {
+                        // Persist the new trust entry so the approval
+                        // survives a CLI restart.
+                        if let Err(e) = self.permissions.lock().unwrap().save() {
+                            format!(" (auto-trusted in-memory but failed to persist: {e})")
+                        } else {
+                            " (auto-trusted)".to_string()
+                        }
+                    }
+                    Ok(false) => " (already trusted)".to_string(),
+                    Err(e) => format!(" (could not auto-trust: {e})"),
+                };
+                Ok(ToolResult::success(format!(
+                    "Worktree created at {path}{trusted_msg}\n{}{}",
+                    stdout.trim(),
+                    if stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", stderr.trim())
+                    }
+                )))
+            }
+            "remove" => {
+                let path = args["path"]
+                    .as_str()
+                    .context("Missing 'path' parameter for `remove`")?;
+                let out = Command::new("git")
+                    .args(["worktree", "remove", path])
+                    .output()
+                    .context("Failed to run git worktree remove")?;
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if out.status.success() {
+                    Ok(ToolResult::success(format!(
+                        "Worktree removed: {path}\n{}",
+                        stdout.trim()
+                    )))
+                } else {
+                    Ok(ToolResult::error(format!(
+                        "git worktree remove failed: {}{}",
+                        stdout.trim(),
+                        stderr.trim()
+                    )))
+                }
+            }
+            other => Ok(ToolResult::error(format!(
+                "Unknown worktree action '{other}'. Use list, add, or remove."
+            ))),
+        }
+    }
+
+    // ---- Web tools ----
+    //
+    // `web_fetch` is a permission-gated HTTP GET capped at 64 KB; `web_search`
+    // is a no-API-key DuckDuckGo lite-mode scrape, also capped. Both refuse
+    // in plan mode (network egress is observable behavior) and depend on a
+    // trusted cwd as a coarse "is this an approved project" check.
+
+    fn web_fetch_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "web_fetch".to_string(),
+            description: "Fetch a URL (HTTP GET only) and return the response body, capped at 64 KB. \
+                          Strips HTML tags to plain text when content-type is HTML, otherwise returns \
+                          the raw body. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute URL, must be http:// or https://"
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn execute_web_fetch(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let url = args["url"].as_str().context("Missing 'url' parameter")?;
+        if let Some(err) = self.network_preflight("web_fetch", url) {
+            return Ok(err);
+        }
+        match http_get_text(url, MAX_WEB_BYTES).await {
+            Ok(text) => Ok(ToolResult::success(text)),
+            Err(e) => Ok(ToolResult::error(format!("web_fetch failed: {e}"))),
+        }
+    }
+
+    fn web_search_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "web_search".to_string(),
+            description: "Web search via DuckDuckGo (no API key). Returns the top results as a plain-text \
+                          list of `title — snippet — url` lines. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Free-text search query"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn execute_web_search(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let query = args["query"]
+            .as_str()
+            .context("Missing 'query' parameter")?;
+        if query.trim().is_empty() {
+            return Ok(ToolResult::error("query must be non-empty".to_string()));
+        }
+        // Use the URL as the preflight target so the user can see what
+        // host the tool is about to hit. The query gets percent-encoded
+        // because DuckDuckGo expects standard form encoding.
+        let encoded = percent_encode_query(query);
+        let url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
+        if let Some(err) = self.network_preflight("web_search", &url) {
+            return Ok(err);
+        }
+        match http_get_text(&url, MAX_WEB_BYTES).await {
+            Ok(html) => {
+                let results = parse_ddg_lite_results(&html);
+                if results.is_empty() {
+                    Ok(ToolResult::success(
+                        "No results extracted (DuckDuckGo may have throttled or rate-limited the request)."
+                            .to_string(),
+                    ))
+                } else {
+                    Ok(ToolResult::success(results.join("\n")))
+                }
+            }
+            Err(e) => Ok(ToolResult::error(format!("web_search failed: {e}"))),
+        }
+    }
+
+    /// Shared safety preflight for the network tools. Returns `Some(error)`
+    /// if the call should be refused; `None` if it may proceed.
+    fn network_preflight(&self, tool: &str, url: &str) -> Option<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Some(ToolResult::error(Self::plan_mode_refusal(tool)));
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Some(ToolResult::error(format!(
+                "Refusing `{tool}`: only http(s) URLs are allowed."
+            )));
+        }
+        // Network egress is gated by cwd trust as a coarse "is this an
+        // approved project" check — same model as `bash`. Lets the user
+        // keep the network off in an untrusted directory.
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                return Some(ToolResult::error(format!("Could not read cwd: {e}")));
+            }
+        };
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            return Some(ToolResult::error(format!("{e}")));
+        }
+        None
+    }
+}
+
+/// Cap on the response body we'll buffer from a web tool. Keeps a single
+/// rogue URL from blowing the model's context window or the process's RAM.
+const MAX_WEB_BYTES: usize = 64 * 1024;
+
+/// HTTP GET with a body cap. If the response is HTML, the tags are
+/// stripped to plain text before being returned.
+async fn http_get_text(url: &str, max_bytes: usize) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("ai-chat-cli/0.1")
+        .build()?;
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.bytes().await?;
+    let truncated = bytes.len() > max_bytes;
+    let body = if truncated {
+        String::from_utf8_lossy(&bytes[..max_bytes]).to_string()
+    } else {
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let mut text = if content_type.contains("html") {
+        strip_html(&body)
+    } else {
+        body
+    };
+    if truncated {
+        text.push_str(&format!(
+            "\n\n[response truncated at {max_bytes} bytes; full status was {}]",
+            status
+        ));
+    }
+    if !status.is_success() {
+        // Surface the HTTP status as the first line so the model can react
+        // (404 vs 500 vs 403 all imply different next steps).
+        text.insert_str(0, &format!("HTTP {}\n\n", status));
+    }
+    Ok(text)
+}
+
+/// Crude HTML → text conversion: drops `<script>` / `<style>` blocks, then
+/// strips every remaining tag and collapses whitespace. Good enough for
+/// search-result snippets and short articles; not a real HTML parser.
+fn strip_html(input: &str) -> String {
+    // Lowercase scan helps the script/style match, but we want to slice
+    // from the original string to preserve case in the output.
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut in_tag = false;
+    let mut skip_until: Option<&'static [u8]> = None;
+    while i < bytes.len() {
+        if let Some(end_tag) = skip_until {
+            // Look for the closing tag (case-insensitive ASCII).
+            if i + end_tag.len() <= bytes.len()
+                && bytes[i..i + end_tag.len()].eq_ignore_ascii_case(end_tag)
+            {
+                i += end_tag.len();
+                skip_until = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let b = bytes[i];
+        if b == b'<' {
+            // Detect <script ...> and <style ...> openings to drop their bodies.
+            let rest_lower: String =
+                bytes[i..(i + 8).min(bytes.len())].iter().map(|c| c.to_ascii_lowercase() as char).collect();
+            if rest_lower.starts_with("<script") {
+                skip_until = Some(b"</script>");
+                i += 1;
+                continue;
+            }
+            if rest_lower.starts_with("<style") {
+                skip_until = Some(b"</style>");
+                i += 1;
+                continue;
+            }
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+        if b == b'>' {
+            in_tag = false;
+            // Tag boundaries act as whitespace so adjacent words don't
+            // glue together when we strip the markup.
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+        if !in_tag {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+    // Decode the handful of HTML entities that crop up in DDG output.
+    let decoded = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    // Collapse runs of whitespace so the output is readable.
+    let mut collapsed = String::with_capacity(decoded.len());
+    let mut prev_ws = false;
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                collapsed.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_ws = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+/// Minimal percent-encoding for a search query: encodes any byte outside
+/// the unreserved set per RFC 3986 §2.3. Avoids pulling in a separate
+/// `percent-encoding` crate for one call site.
+fn percent_encode_query(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for b in input.bytes() {
+        let unreserved = b.is_ascii_alphanumeric()
+            || b == b'-'
+            || b == b'_'
+            || b == b'.'
+            || b == b'~';
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Pulls a best-effort list of "title — url" pairs out of DuckDuckGo's
+/// "lite" search results page. The page is mostly a flat table of `<a>`
+/// tags with a small consistent class. We extract every link whose href
+/// looks like an outbound result and dedupe.
+fn parse_ddg_lite_results(html: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Strategy: scan for `<a ... href="..." ...>TITLE</a>` and keep the
+    // ones whose href starts with http(s) and isn't a DDG-internal link.
+    let mut i = 0;
+    while let Some(rel) = html[i..].find("<a ") {
+        let start = i + rel;
+        let after_a = start + 3;
+        // Find href attribute.
+        let tag_end = match html[after_a..].find('>') {
+            Some(p) => after_a + p,
+            None => break,
+        };
+        let attrs = &html[after_a..tag_end];
+        let href = attrs
+            .find("href=\"")
+            .and_then(|p| {
+                let q = p + 6;
+                attrs[q..].find('"').map(|e| &attrs[q..q + e])
+            })
+            .unwrap_or("");
+        // Find content between `<a ...>` and `</a>`.
+        let content_start = tag_end + 1;
+        let content_end = match html[content_start..].find("</a>") {
+            Some(p) => content_start + p,
+            None => break,
+        };
+        let title = strip_html(&html[content_start..content_end]);
+        // DDG's lite redirects via /l/?kh=...&uddg=<encoded-url>. Try to
+        // unwrap that so we surface the real destination.
+        let resolved = unwrap_ddg_redirect(href).unwrap_or_else(|| href.to_string());
+        if !title.is_empty()
+            && (resolved.starts_with("http://") || resolved.starts_with("https://"))
+            && !resolved.contains("duckduckgo.com")
+            && seen.insert(resolved.clone())
+        {
+            results.push(format!("{title} — {resolved}"));
+        }
+        i = content_end + 4;
+        // Hard cap so an enormous response doesn't generate thousands of lines.
+        if results.len() >= 10 {
+            break;
+        }
+    }
+    results
+}
+
+/// Unwraps DuckDuckGo lite-mode redirect links of the form
+/// `/l/?kh=...&uddg=<percent-encoded-url>` into the destination URL.
+/// Returns `None` if the link isn't a DDG redirect (in which case the
+/// caller should use the original `href` directly).
+fn unwrap_ddg_redirect(href: &str) -> Option<String> {
+    let needle = "uddg=";
+    let idx = href.find(needle)?;
+    let after = &href[idx + needle.len()..];
+    // The encoded URL runs until the next `&` or end-of-string.
+    let raw_encoded = match after.find('&') {
+        Some(end) => &after[..end],
+        None => after,
+    };
+    Some(percent_decode(raw_encoded))
+}
+
+/// Minimal percent-decoder. Like `percent_encode_query`, kept in-tree to
+/// avoid pulling another crate for a single call site.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 #[cfg(test)]
@@ -727,6 +1236,172 @@ mod tests {
         assert!(result.is_error.is_none(), "got {:?}", result);
         assert_eq!(fs::read_to_string(&target).unwrap(), "yay");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Web tool helpers ----
+
+    #[test]
+    fn percent_encode_passes_unreserved_bytes() {
+        assert_eq!(percent_encode_query("abcXYZ123-_.~"), "abcXYZ123-_.~");
+    }
+
+    #[test]
+    fn percent_encode_escapes_spaces_and_symbols() {
+        assert_eq!(percent_encode_query("a b/c?d"), "a%20b%2Fc%3Fd");
+    }
+
+    #[test]
+    fn percent_decode_roundtrips_common_chars() {
+        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        // Malformed escapes leave the bytes intact rather than panicking.
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn strip_html_removes_tags_and_collapses_whitespace() {
+        let input = "<p>Hello   <b>world</b>!</p>";
+        assert_eq!(strip_html(input), "Hello world !");
+    }
+
+    #[test]
+    fn strip_html_drops_script_and_style_bodies() {
+        let input = "<style>body{color:red}</style>before<script>alert(1)</script>after";
+        let out = strip_html(input);
+        assert!(!out.contains("alert"), "got: {out}");
+        assert!(!out.contains("color"), "got: {out}");
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn strip_html_decodes_basic_entities() {
+        let out = strip_html("<p>5 &lt; 10 &amp; 20 &gt; 15</p>");
+        assert!(out.contains("5 < 10 & 20 > 15"), "got: {out}");
+    }
+
+    #[test]
+    fn unwrap_ddg_redirect_returns_destination() {
+        let href = "/l/?kh=-1&uddg=https%3A%2F%2Fexample.com%2Fpage&rut=foo";
+        assert_eq!(
+            unwrap_ddg_redirect(href).as_deref(),
+            Some("https://example.com/page")
+        );
+    }
+
+    #[test]
+    fn unwrap_ddg_redirect_returns_none_for_plain_link() {
+        assert!(unwrap_ddg_redirect("https://example.com/").is_none());
+    }
+
+    #[test]
+    fn parse_ddg_lite_results_extracts_unique_external_links() {
+        // Cut-down lite-mode-shaped HTML with one redirect link, one
+        // direct external link, one DDG-internal link, and one repeat.
+        let html = r#"
+            <html><body>
+            <a href="/l/?uddg=https%3A%2F%2Fexample.com%2Fone&rut=x">First Title</a>
+            <a href="https://example.org/two">Second Title</a>
+            <a href="https://duckduckgo.com/internal">Internal</a>
+            <a href="/l/?uddg=https%3A%2F%2Fexample.com%2Fone&rut=x">First Title duplicate</a>
+            </body></html>
+        "#;
+        let results = parse_ddg_lite_results(html);
+        assert_eq!(results.len(), 2, "got: {results:?}");
+        assert!(results[0].contains("First Title"));
+        assert!(results[0].contains("https://example.com/one"));
+        assert!(results[1].contains("Second Title"));
+        assert!(results[1].contains("https://example.org/two"));
+    }
+
+    // ---- Worktree tool ----
+
+    #[tokio::test]
+    async fn worktree_list_runs_in_a_git_repo() {
+        // We're inside the ai-chat-cli repo, so `git worktree list` works.
+        let dir = std::env::current_dir().unwrap();
+        let registry = registry_with_trust(&dir, false);
+        let result = registry
+            .execute("worktree", json!({ "action": "list" }))
+            .await
+            .expect("call ok");
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        // The porcelain output always at least includes a `worktree ` line.
+        assert!(
+            result.content[0].text.contains("worktree ") || result.content[0].text == "(no worktrees)",
+            "got: {}",
+            result.content[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_refused_in_plan_mode() {
+        let dir = unique_tmp("worktree-plan");
+        let registry = registry_with_trust(&dir, true);
+        let result = registry
+            .execute(
+                "worktree",
+                json!({ "action": "add", "path": "/tmp/should-not-be-created" }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("plan mode is ON"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn worktree_rejects_unknown_action() {
+        let dir = unique_tmp("worktree-unknown");
+        let registry = registry_with_trust(&dir, false);
+        let result = registry
+            .execute("worktree", json!({ "action": "destroy" }))
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("Unknown worktree action"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Web tool refusals ----
+
+    #[tokio::test]
+    async fn web_fetch_refused_in_plan_mode() {
+        let dir = unique_tmp("web-plan");
+        let registry = registry_with_trust(&dir, true);
+        let result = registry
+            .execute("web_fetch", json!({ "url": "https://example.com/" }))
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("plan mode is ON"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_non_http_schemes() {
+        let dir = unique_tmp("web-scheme");
+        let registry = registry_with_trust(&dir, false);
+        let result = registry
+            .execute("web_fetch", json!({ "url": "file:///etc/passwd" }))
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("http(s)"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn web_search_rejects_empty_query() {
+        let dir = unique_tmp("web-empty");
+        let registry = registry_with_trust(&dir, false);
+        let result = registry
+            .execute("web_search", json!({ "query": "" }))
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("non-empty"));
         fs::remove_dir_all(&dir).ok();
     }
 }
