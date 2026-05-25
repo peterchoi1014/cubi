@@ -236,17 +236,11 @@ mod tests {
     }
 
     fn user(text: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: text.to_string(),
-        }
+        Message::text("user", text)
     }
 
     fn assistant(text: &str) -> Message {
-        Message {
-            role: "assistant".to_string(),
-            content: text.to_string(),
-        }
+        Message::text("assistant", text)
     }
 
     #[test]

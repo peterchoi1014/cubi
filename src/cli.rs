@@ -77,10 +77,7 @@ impl ChatCLI {
                 "\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>",
             );
 
-            cli.history.push(Message {
-                role: "system".to_string(),
-                content: msg,
-            });
+            cli.history.push(Message::text("system", msg));
         }
 
         cli
@@ -146,23 +143,31 @@ impl ChatCLI {
                     rl.add_history_entry(input)?;
 
                     // Add user message to history
-                    self.history.push(Message {
-                        role: "user".to_string(),
-                        content: input.to_string(),
-                    });
+                    self.history.push(Message::text("user", input));
 
                     // Get AI response
                     print!("{} ", "AI:".bright_blue().bold());
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
 
-                    match self.executor.chat(self.history.clone()).await {
-                        Ok(response) => {
-                            println!("{}\n", response.bright_white());
+                    let stream_result = self
+                        .executor
+                        .chat_stream(self.history.clone(), None, |tok| {
+                            // Print each token as it arrives. Flushing keeps
+                            // the UX snappy on line-buffered terminals.
+                            print!("{}", tok.bright_white());
+                            let _ = std::io::stdout().flush();
+                        })
+                        .await;
+
+                    match stream_result {
+                        Ok(msg) => {
+                            // Trailing blank line so the next prompt isn't
+                            // glued to the model's last token.
+                            println!("\n");
 
                             // Add assistant response to history
-                            self.history.push(Message {
-                                role: "assistant".to_string(),
-                                content: response,
-                            });
+                            self.history.push(Message::text("assistant", msg.content));
 
                             // Drop any system messages tagged as single-turn
                             // (e.g. from `/ask`) so they don't keep nudging
@@ -539,10 +544,7 @@ impl ChatCLI {
             println!("\n[{}/{}] {}", i + 1, prompts.len(), prompt);
             match self
                 .executor
-                .chat(vec![Message {
-                    role: "user".to_string(),
-                    content: prompt.clone(),
-                }])
+                .chat(vec![Message::text("user", prompt.clone())])
                 .await
             {
                 Ok(response) => {
@@ -1025,21 +1027,20 @@ impl ChatCLI {
             ""
         };
         let review_messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: "You are a focused code reviewer. Read the diff and respond with: \
-                          (1) a one-sentence summary, (2) bugs or correctness issues, \
-                          (3) style/clarity nits, (4) any tests that look missing. \
-                          Be terse — use bullet points, no preamble."
-                    .to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: format!(
+            Message::text(
+                "system",
+                "You are a focused code reviewer. Read the diff and respond with: \
+                 (1) a one-sentence summary, (2) bugs or correctness issues, \
+                 (3) style/clarity nits, (4) any tests that look missing. \
+                 Be terse — use bullet points, no preamble.",
+            ),
+            Message::text(
+                "user",
+                format!(
                     "Please review this `git diff`:\n\n```diff\n{}\n```{}",
                     diff_for_model, truncation_note
                 ),
-            },
+            ),
         ];
 
         println!(
@@ -1071,23 +1072,22 @@ impl ChatCLI {
         let prev = self.plan_mode.fetch_xor(true, Ordering::SeqCst);
         let now_on = !prev;
         if now_on {
-            self.history.push(Message {
-                role: "system".to_string(),
-                content: "SYSTEM: Plan mode is ON. Do not modify files or run \
-                     destructive commands. Produce a plan and wait for the \
-                     user to confirm before applying changes."
-                    .to_string(),
-            });
+            self.history.push(Message::text(
+                "system",
+                "SYSTEM: Plan mode is ON. Do not modify files or run \
+                 destructive commands. Produce a plan and wait for the \
+                 user to confirm before applying changes.",
+            ));
             println!(
                 "{} Plan mode {}",
                 "✓".bright_green(),
                 "enabled".bright_green()
             );
         } else {
-            self.history.push(Message {
-                role: "system".to_string(),
-                content: "SYSTEM: Plan mode is OFF. Normal tool use is allowed.".to_string(),
-            });
+            self.history.push(Message::text(
+                "system",
+                "SYSTEM: Plan mode is OFF. Normal tool use is allowed.",
+            ));
             println!(
                 "{} Plan mode {}",
                 "✓".bright_green(),
@@ -1110,14 +1110,14 @@ impl ChatCLI {
     /// so it is removed after the next assistant response and doesn't
     /// re-emphasize the same question on every subsequent turn.
     fn ask_user(&mut self, question: &str) {
-        self.history.push(Message {
-            role: "system".to_string(),
-            content: format!(
+        self.history.push(Message::text(
+            "system",
+            format!(
                 "{} The user has a clarifying question they want addressed \
                  directly and concisely on the next turn:\n\n{}",
                 SINGLE_TURN_SYSTEM_TAG, question
             ),
-        });
+        ));
         println!(
             "{} Question recorded. It will be highlighted on the next turn only.",
             "✓".bright_green()
@@ -1187,15 +1187,15 @@ impl ChatCLI {
             return;
         };
 
-        let msg = Message {
-            role: "system".to_string(),
-            content: format!(
+        let msg = Message::text(
+            "system",
+            format!(
                 "{} {}:\n\n{}",
                 PROJECT_MEMORY_PREFIX,
                 path.display(),
                 memory.trim()
             ),
-        };
+        );
 
         // Find the boundary: the first non-system message. We want the
         // project-memory entry to sit with the other system messages,
@@ -1337,24 +1337,15 @@ mod tests {
     use super::*;
 
     fn user(s: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("user", s)
     }
 
     fn assistant(s: &str) -> Message {
-        Message {
-            role: "assistant".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("assistant", s)
     }
 
     fn system(s: &str) -> Message {
-        Message {
-            role: "system".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("system", s)
     }
 
     // ---- parse_force_and_filename ----
