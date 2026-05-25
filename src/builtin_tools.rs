@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
@@ -116,6 +117,15 @@ impl BuiltinToolRegistry {
             Self::repl_close_tool(),
             Self::notebook_tool(),
             Self::lsp_tool(),
+            Self::shell_tool(),
+            Self::sleep_tool(),
+            Self::schedule_tool(),
+            Self::brief_tool(),
+            Self::synthetic_output_tool(),
+            Self::send_message_tool(),
+            Self::recv_messages_tool(),
+            Self::remote_trigger_tool(),
+            Self::notify_tool(),
         ];
 
         Self {
@@ -157,6 +167,15 @@ impl BuiltinToolRegistry {
             "repl_close" => self.execute_repl_close(args).await,
             "notebook" => self.execute_notebook(args),
             "lsp" => self.execute_lsp(args).await,
+            "shell" => self.execute_shell(args).await,
+            "sleep" => self.execute_sleep(args).await,
+            "schedule" => self.execute_schedule(args),
+            "brief" => self.execute_brief(args),
+            "synthetic_output" => self.execute_synthetic_output(args),
+            "send_message" => self.execute_send_message(args),
+            "recv_messages" => self.execute_recv_messages(args),
+            "remote_trigger" => self.execute_remote_trigger(args),
+            "notify" => self.execute_notify(args),
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -1504,6 +1523,780 @@ impl BuiltinToolRegistry {
             Err(e) => Ok(ToolResult::error(format!("lsp failed: {e}"))),
         }
     }
+
+    // ---- Cross-platform shell tool ----
+
+    fn shell_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "shell".to_string(),
+            description: "Run a command in the host platform's native shell: bash/sh on Unix, PowerShell (`pwsh` or `powershell`) on Windows. Subject to the same project-trust and plan-mode gates as `bash`.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute, in the syntax of the host shell."
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (default 30, max 300)."
+                    }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn execute_shell(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let command = args["command"]
+            .as_str()
+            .context("Missing 'command' parameter")?;
+        let timeout_secs = args["timeout"].as_u64().unwrap_or(30).min(300);
+
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("shell")));
+        }
+
+        let cwd = std::env::current_dir().context("Could not read cwd")?;
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            return Ok(ToolResult::error(format!("{}", e)));
+        }
+
+        let dangerous_patterns = ["rm -rf /", "dd if=", "mkfs", "format", "> /dev/"];
+        for pattern in &dangerous_patterns {
+            if command.contains(pattern) {
+                return Ok(ToolResult::error(format!(
+                    "Command blocked for security: contains '{}'",
+                    pattern
+                )));
+            }
+        }
+
+        let (program, flag) = host_shell();
+        let command = command.to_string();
+        let flag = flag.to_string();
+        let program = program.to_string();
+        let execution = async move {
+            let child = TokioCommand::new(&program)
+                .arg(&flag)
+                .arg(&command)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .context("Failed to execute command")?;
+            let output = child
+                .wait_with_output()
+                .await
+                .context("Failed to execute command")?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let mut result = String::new();
+            result.push_str(&stdout);
+            if !stderr.is_empty() {
+                if !result.is_empty() {
+                    result.push_str("\nSTDERR:\n");
+                }
+                result.push_str(&stderr);
+            }
+            if output.status.success() {
+                Ok(ToolResult::success(result))
+            } else {
+                Ok(ToolResult::error(format!(
+                    "Command failed with exit code {} (shell: {})\n{}",
+                    output.status.code().unwrap_or(-1),
+                    program,
+                    result
+                )))
+            }
+        };
+
+        match timeout(Duration::from_secs(timeout_secs), execution).await {
+            Ok(r) => r,
+            Err(_) => Ok(ToolResult::error(format!(
+                "Command timed out after {} seconds",
+                timeout_secs
+            ))),
+        }
+    }
+
+    // ---- Time tools ----
+
+    fn sleep_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "sleep".to_string(),
+            description: "Pause execution for the given number of seconds (capped at 60). Useful for letting an external process settle before re-reading its state.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "How long to sleep, in seconds. Hard-capped at 60."
+                    }
+                },
+                "required": ["seconds"]
+            }),
+        }
+    }
+
+    async fn execute_sleep(&self, args: serde_json::Value) -> Result<ToolResult> {
+        // Accept ints or floats so the model can ask for 0.5s as well as 3s.
+        let seconds = args["seconds"]
+            .as_f64()
+            .or_else(|| args["seconds"].as_u64().map(|n| n as f64))
+            .context("Missing 'seconds' parameter")?;
+        let Some(capped) = capped_sleep_seconds(seconds) else {
+            return Ok(ToolResult::error("'seconds' must be >= 0".to_string()));
+        };
+        let ms = (capped * 1000.0) as u64;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        Ok(ToolResult::success(format!("slept {capped:.3}s")))
+    }
+
+    fn schedule_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "schedule".to_string(),
+            description: "Manage persistent scheduled triggers stored in `~/.ai-chat-cli/schedule.json`. Actions: `list`, `add` (with `name`, `when` cron-like string, and `command`), `remove` (by `name`). The CLI itself does not run them — an external runner (cron, systemd timer, launchd) reads the file.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "add", "remove"] },
+                    "name": { "type": "string", "description": "Unique entry name (required for add/remove)." },
+                    "when": { "type": "string", "description": "Cron-like schedule expression, e.g. '*/5 * * * *'." },
+                    "command": { "type": "string", "description": "Shell command to run when the schedule fires." }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+
+    fn execute_schedule(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let action = args["action"]
+            .as_str()
+            .context("Missing 'action' parameter")?;
+        let path = match schedule_path() {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult::error(
+                    "Could not resolve ~/.ai-chat-cli/schedule.json".to_string(),
+                ));
+            }
+        };
+        let mut entries = read_json_array_or_empty(&path, "schedule entries")?;
+
+        match action {
+            "list" => {
+                if entries.is_empty() {
+                    return Ok(ToolResult::success("(no scheduled entries)".to_string()));
+                }
+                let mut s = String::new();
+                for e in &entries {
+                    s.push_str(&format!(
+                        "- {} :: {} :: {}\n",
+                        e["name"].as_str().unwrap_or("?"),
+                        e["when"].as_str().unwrap_or("?"),
+                        e["command"].as_str().unwrap_or("?"),
+                    ));
+                }
+                Ok(ToolResult::success(s.trim_end().to_string()))
+            }
+            "add" => {
+                if self.plan_mode.load(Ordering::SeqCst) {
+                    return Ok(ToolResult::error(Self::plan_mode_refusal("schedule.add")));
+                }
+                let name = args["name"]
+                    .as_str()
+                    .context("'name' is required for add")?
+                    .to_string();
+                let when = args["when"]
+                    .as_str()
+                    .context("'when' is required for add")?
+                    .to_string();
+                let command = args["command"]
+                    .as_str()
+                    .context("'command' is required for add")?
+                    .to_string();
+                if !validate_cron_like(&when) {
+                    return Ok(ToolResult::error(format!(
+                        "Invalid cron expression: '{when}' (expected 5 whitespace-separated fields)"
+                    )));
+                }
+                entries.retain(|e| e["name"].as_str() != Some(&name));
+                entries.push(json!({"name": name, "when": when, "command": command}));
+                write_json(&path, &entries)?;
+                Ok(ToolResult::success(format!(
+                    "scheduled entry saved ({} total)",
+                    entries.len()
+                )))
+            }
+            "remove" => {
+                if self.plan_mode.load(Ordering::SeqCst) {
+                    return Ok(ToolResult::error(Self::plan_mode_refusal(
+                        "schedule.remove",
+                    )));
+                }
+                let name = args["name"]
+                    .as_str()
+                    .context("'name' is required for remove")?;
+                let before = entries.len();
+                entries.retain(|e| e["name"].as_str() != Some(name));
+                if entries.len() == before {
+                    return Ok(ToolResult::error(format!("no entry named '{name}'")));
+                }
+                write_json(&path, &entries)?;
+                Ok(ToolResult::success(format!("removed '{name}'")))
+            }
+            other => Ok(ToolResult::error(format!(
+                "Unknown schedule action '{other}' (expected list|add|remove)"
+            ))),
+        }
+    }
+
+    // ---- Structured output helpers ----
+
+    fn brief_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "brief".to_string(),
+            description: "Distill a long piece of text into a short structured brief: title (first non-empty line), bullet points (one per remaining non-empty paragraph), and a one-line summary. Pure text reducer — no model call.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The text to summarize." },
+                    "max_bullets": { "type": "number", "description": "Maximum bullets to keep (default 5)." }
+                },
+                "required": ["text"]
+            }),
+        }
+    }
+
+    fn execute_brief(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let text = args["text"].as_str().context("Missing 'text' parameter")?;
+        let max_bullets = args["max_bullets"].as_u64().unwrap_or(5) as usize;
+        let brief = build_brief(text, max_bullets);
+        Ok(ToolResult::success(brief.to_string()))
+    }
+
+    fn synthetic_output_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "synthetic_output".to_string(),
+            description: "Given a JSON Schema and a free-form context string, returns a JSON object whose fields match the schema's `properties`. String fields are filled with the trimmed context, numeric/boolean fields get type-appropriate defaults, and unknown types fall back to null. Pure deterministic helper — no model call.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "object", "description": "JSON Schema with a top-level `properties` map." },
+                    "context": { "type": "string", "description": "Free-form text used to fill string fields." }
+                },
+                "required": ["schema"]
+            }),
+        }
+    }
+
+    fn execute_synthetic_output(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let schema = &args["schema"];
+        let context = args["context"].as_str().unwrap_or("").trim().to_string();
+        let out = synthesize_from_schema(schema, &context);
+        Ok(ToolResult::success(serde_json::to_string_pretty(&out)?))
+    }
+
+    // ---- Inter-agent messaging ----
+
+    fn send_message_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "send_message".to_string(),
+            description: "Append a JSON message to another agent's mailbox at `~/.ai-chat-cli/messages/<recipient>.json`. The recipient reads with `recv_messages`.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Recipient agent name (alphanumeric, dash, underscore)." },
+                    "body": { "type": "string", "description": "Message body." },
+                    "from": { "type": "string", "description": "Optional sender name." }
+                },
+                "required": ["to", "body"]
+            }),
+        }
+    }
+
+    fn execute_send_message(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let to = args["to"].as_str().context("Missing 'to' parameter")?;
+        let body = args["body"].as_str().context("Missing 'body' parameter")?;
+        let from = args["from"].as_str().unwrap_or("anonymous").to_string();
+        if !is_safe_agent_name(to) {
+            return Ok(ToolResult::error(
+                "'to' must match [A-Za-z0-9_-]+".to_string(),
+            ));
+        }
+        let path = match messages_path(to) {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult::error(
+                    "Could not resolve ~/.ai-chat-cli/messages".to_string(),
+                ));
+            }
+        };
+        let _lock = acquire_file_lock(&path)?;
+        let mut msgs = read_json_array_or_empty(&path, "mailbox")?;
+        msgs.push(json!({
+            "from": from,
+            "body": body,
+            "ts": unix_timestamp(),
+        }));
+        write_json(&path, &msgs)?;
+        Ok(ToolResult::success(format!(
+            "delivered to {to} ({} pending)",
+            msgs.len()
+        )))
+    }
+
+    fn recv_messages_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "recv_messages".to_string(),
+            description: "Read pending messages for the given recipient from `~/.ai-chat-cli/messages/<recipient>.json`. With `drain: true`, the mailbox is emptied after reading.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipient": { "type": "string", "description": "Recipient agent name." },
+                    "drain": { "type": "boolean", "description": "If true, empty the mailbox after reading (default false)." }
+                },
+                "required": ["recipient"]
+            }),
+        }
+    }
+
+    fn execute_recv_messages(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let recipient = args["recipient"]
+            .as_str()
+            .context("Missing 'recipient' parameter")?;
+        let drain = args["drain"].as_bool().unwrap_or(false);
+        if !is_safe_agent_name(recipient) {
+            return Ok(ToolResult::error(
+                "'recipient' must match [A-Za-z0-9_-]+".to_string(),
+            ));
+        }
+        let path = match messages_path(recipient) {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult::error(
+                    "Could not resolve ~/.ai-chat-cli/messages".to_string(),
+                ));
+            }
+        };
+        let _lock = if drain {
+            Some(acquire_file_lock(&path)?)
+        } else {
+            None
+        };
+        let msgs = read_json_array_or_empty(&path, "mailbox")?;
+        if drain && path.exists() {
+            // Truncate rather than delete, so concurrent senders see a valid
+            // (empty) array instead of falling back to defaults mid-write.
+            write_json(&path, &Vec::<serde_json::Value>::new())?;
+        }
+        Ok(ToolResult::success(serde_json::to_string_pretty(&msgs)?))
+    }
+
+    fn remote_trigger_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "remote_trigger".to_string(),
+            description: "Write a trigger file to `~/.ai-chat-cli/triggers/<name>.json` containing a payload and timestamp. Other processes poll the directory to fire on the trigger.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Trigger name (alphanumeric, dash, underscore)." },
+                    "payload": { "description": "Arbitrary JSON payload to attach to the trigger." }
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn execute_remote_trigger(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let name = args["name"].as_str().context("Missing 'name' parameter")?;
+        if !is_safe_agent_name(name) {
+            return Ok(ToolResult::error(
+                "'name' must match [A-Za-z0-9_-]+".to_string(),
+            ));
+        }
+        let payload = args.get("payload").cloned().unwrap_or(json!(null));
+        let path = match triggers_path(name) {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult::error(
+                    "Could not resolve ~/.ai-chat-cli/triggers".to_string(),
+                ));
+            }
+        };
+        let value = json!({ "name": name, "payload": payload, "ts": unix_timestamp() });
+        write_json(&path, &value)?;
+        Ok(ToolResult::success(format!(
+            "trigger '{name}' written to {}",
+            path.display()
+        )))
+    }
+
+    // ---- OS notification ----
+
+    fn notify_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "notify".to_string(),
+            description: "Send a desktop notification via the host OS: `osascript` on macOS, `notify-send` on Linux, PowerShell balloon on Windows. Silently degrades to a no-op message if the underlying tool is unavailable.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Notification title." },
+                    "message": { "type": "string", "description": "Notification body." }
+                },
+                "required": ["message"]
+            }),
+        }
+    }
+
+    fn execute_notify(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let title = args["title"].as_str().unwrap_or("ai-chat-cli").to_string();
+        let message = args["message"]
+            .as_str()
+            .context("Missing 'message' parameter")?
+            .to_string();
+
+        match send_os_notification(&title, &message) {
+            Ok(s) => Ok(ToolResult::success(s)),
+            Err(e) => Ok(ToolResult::error(format!("notify failed: {e}"))),
+        }
+    }
+}
+
+// ---- Helpers for the new tools ----
+
+/// Returns `(program, flag)` suitable for invoking a single shell command on
+/// the host OS, preferring PowerShell on Windows and POSIX `sh` elsewhere.
+fn host_shell() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        if is_program_on_path("pwsh") {
+            ("pwsh", "-Command")
+        } else {
+            ("powershell", "-Command")
+        }
+    } else {
+        ("sh", "-c")
+    }
+}
+
+fn schedule_path() -> Option<std::path::PathBuf> {
+    Some(app_home_dir()?.join(".ai-chat-cli").join("schedule.json"))
+}
+
+fn messages_path(recipient: &str) -> Option<std::path::PathBuf> {
+    Some(
+        app_home_dir()?
+            .join(".ai-chat-cli")
+            .join("messages")
+            .join(format!("{recipient}.json")),
+    )
+}
+
+fn triggers_path(name: &str) -> Option<std::path::PathBuf> {
+    Some(
+        app_home_dir()?
+            .join(".ai-chat-cli")
+            .join("triggers")
+            .join(format!("{name}.json")),
+    )
+}
+
+fn write_json<P: AsRef<Path>, T: Serialize>(path: P, value: &T) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(value)?;
+    let parent = path
+        .parent()
+        .context(format!("resolve parent for {}", path.display()))?;
+    let tmp_name = format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("write_json"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp_path = parent.join(tmp_name);
+    fs::write(&tmp_path, raw).with_context(|| format!("write {}", tmp_path.display()))?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+fn app_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+        Some(
+            TEST_HOME
+                .get_or_init(|| {
+                    let path = std::env::temp_dir()
+                        .join(format!("ai-chat-cli-test-home-{}", std::process::id()));
+                    let _ = fs::create_dir_all(&path);
+                    path
+                })
+                .clone(),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        dirs::home_dir()
+    }
+}
+
+fn read_json_array_or_empty(path: &Path, context: &str) -> Result<Vec<serde_json::Value>> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse {context} JSON at {}", path.display()))
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ))
+}
+
+struct FileLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
+    let lock = lock_path(path);
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(FileLockGuard { path: lock }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("timed out acquiring lock {}", lock.display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e).with_context(|| format!("lock {}", lock.display())),
+        }
+    }
+}
+
+fn is_program_on_path(program: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        {
+            for candidate in [program.to_string(), format!("{program}.exe")] {
+                if dir.join(candidate).is_file() {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if dir.join(program).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_safe_agent_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() < 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn capped_sleep_seconds(seconds: f64) -> Option<f64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        None
+    } else {
+        Some(seconds.min(60.0))
+    }
+}
+
+/// Validates that `expr` looks like a 5-field cron expression: minute, hour,
+/// day-of-month, month, day-of-week. We do *not* fully parse each field —
+/// the actual runner is external — but reject obvious shape errors so a
+/// typo doesn't silently get persisted.
+fn validate_cron_like(expr: &str) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    fields.len() == 5 && fields.iter().all(|f| !f.is_empty())
+}
+
+/// Produces a structured Markdown brief from `text`. The first non-empty
+/// line becomes the title; subsequent non-empty paragraphs (separated by
+/// blank lines) become bullets, capped at `max_bullets`. A one-line summary
+/// (the first sentence of the title) is appended.
+fn build_brief(text: &str, max_bullets: usize) -> serde_json::Value {
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    let title = lines
+        .iter()
+        .find(|l| !l.is_empty())
+        .copied()
+        .unwrap_or("")
+        .to_string();
+
+    // Bullets: gather distinct non-empty lines after the title.
+    let mut bullets: Vec<String> = Vec::new();
+    let mut seen_title = false;
+    for l in &lines {
+        if l.is_empty() {
+            continue;
+        }
+        if !seen_title {
+            seen_title = true;
+            continue;
+        }
+        bullets.push((*l).to_string());
+        if bullets.len() >= max_bullets {
+            break;
+        }
+    }
+
+    // Summary: first sentence of title (or whole title if no period).
+    let summary = match title.find('.') {
+        Some(p) => title[..p].trim().to_string(),
+        None => title.clone(),
+    };
+
+    json!({
+        "title": title,
+        "bullets": bullets,
+        "summary": summary,
+    })
+}
+
+/// Walks a JSON Schema's top-level `properties` map and produces a JSON
+/// object with one field per property. Filled values are type-appropriate
+/// (strings get `context`, numbers get 0, booleans get false, arrays get
+/// `[]`, objects get `{}`, everything else gets null).
+fn synthesize_from_schema(schema: &serde_json::Value, context: &str) -> serde_json::Value {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (key, spec) in props {
+        let ty = spec
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("string");
+        let value = match ty {
+            "string" => json!(context),
+            "integer" | "number" => json!(0),
+            "boolean" => json!(false),
+            "array" => json!([]),
+            "object" => json!({}),
+            _ => json!(null),
+        };
+        out.insert(key.clone(), value);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Best-effort OS notification. Returns an Ok message describing what was
+/// attempted; errors only when the OS notification tool fails to spawn.
+fn send_os_notification(title: &str, message: &str) -> Result<String> {
+    if cfg!(target_os = "macos") {
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            escape_applescript(message),
+            escape_applescript(title)
+        );
+        let status = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok("notification sent via osascript".to_string()),
+            Ok(s) => Ok(format!("osascript exited {}", s.code().unwrap_or(-1))),
+            Err(e) => Ok(format!("osascript unavailable: {e}")),
+        }
+    } else if cfg!(target_os = "linux") {
+        let status = Command::new("notify-send")
+            .arg(title)
+            .arg(message)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok("notification sent via notify-send".to_string()),
+            Ok(s) => Ok(format!("notify-send exited {}", s.code().unwrap_or(-1))),
+            Err(e) => Ok(format!("notify-send unavailable: {e}")),
+        }
+    } else if cfg!(target_os = "windows") {
+        // Use Windows Forms balloon tip via PowerShell. Fully self-contained,
+        // no external module required.
+        let ps = format!(
+            "[reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; \
+             $n.Visible = $true; \
+             $n.BalloonTipTitle = '{}'; $n.BalloonTipText = '{}'; \
+             $n.ShowBalloonTip(5000); Start-Sleep -Seconds 1; $n.Dispose()",
+            title.replace('\'', "''"),
+            message.replace('\'', "''")
+        );
+        let status = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(&ps)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok("notification sent via powershell".to_string()),
+            Ok(s) => Ok(format!("powershell exited {}", s.code().unwrap_or(-1))),
+            Err(e) => Ok(format!("powershell unavailable: {e}")),
+        }
+    } else {
+        Ok(format!(
+            "no native notification backend for this OS ({})",
+            std::env::consts::OS
+        ))
+    }
+}
+
+fn escape_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ---- Notebook helpers (free functions for ease of testing) ----
@@ -2563,5 +3356,348 @@ mod tests {
         assert_eq!(r.is_error, Some(true));
         assert!(r.content[0].text.contains("plan mode is ON"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- New tool helpers (shell / sleep / schedule / brief /
+    // synthetic_output / send_message / recv_messages / remote_trigger /
+    // notify) ----
+
+    #[test]
+    fn host_shell_matches_target_os() {
+        let (program, flag) = host_shell();
+        if cfg!(windows) {
+            assert!(program == "pwsh" || program == "powershell");
+            assert_eq!(flag, "-Command");
+        } else {
+            assert_eq!(program, "sh");
+            assert_eq!(flag, "-c");
+        }
+    }
+
+    #[test]
+    fn is_safe_agent_name_accepts_basic_identifiers() {
+        assert!(is_safe_agent_name("alice"));
+        assert!(is_safe_agent_name("alice_2"));
+        assert!(is_safe_agent_name("alice-bob_2"));
+        assert!(!is_safe_agent_name(""));
+        assert!(!is_safe_agent_name("alice/../etc"));
+        assert!(!is_safe_agent_name("alice bob"));
+        assert!(!is_safe_agent_name("alice.json"));
+        // Cap at 63 characters.
+        assert!(!is_safe_agent_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn validate_cron_like_requires_five_fields() {
+        assert!(validate_cron_like("* * * * *"));
+        assert!(validate_cron_like("*/5 * * * *"));
+        assert!(validate_cron_like("0 0 1 1 0"));
+        assert!(!validate_cron_like(""));
+        assert!(!validate_cron_like("* * * *"));
+        assert!(!validate_cron_like("* * * * * *"));
+    }
+
+    #[test]
+    fn build_brief_extracts_title_bullets_and_summary() {
+        let text = "Title line. With more detail.\n\nFirst point\nSecond point\nThird point\nFourth point\nFifth point\nSixth point";
+        let brief = build_brief(text, 3);
+        assert_eq!(brief["title"], "Title line. With more detail.");
+        assert_eq!(brief["summary"], "Title line");
+        let bullets = brief["bullets"].as_array().unwrap();
+        assert_eq!(bullets.len(), 3);
+        assert_eq!(bullets[0], "First point");
+        assert_eq!(bullets[2], "Third point");
+    }
+
+    #[test]
+    fn build_brief_handles_empty_input() {
+        let brief = build_brief("", 5);
+        assert_eq!(brief["title"], "");
+        assert_eq!(brief["bullets"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn synthesize_from_schema_fills_typed_defaults() {
+        let schema = json!({
+            "properties": {
+                "name":    { "type": "string" },
+                "count":   { "type": "integer" },
+                "ratio":   { "type": "number" },
+                "ok":      { "type": "boolean" },
+                "tags":    { "type": "array" },
+                "meta":    { "type": "object" },
+                "blob":    {}
+            }
+        });
+        let out = synthesize_from_schema(&schema, "hello");
+        assert_eq!(out["name"], "hello");
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["ratio"], 0);
+        assert_eq!(out["ok"], false);
+        assert!(out["tags"].as_array().unwrap().is_empty());
+        assert!(out["meta"].as_object().unwrap().is_empty());
+        // No type → string field omitted defaults to string→context.
+        assert_eq!(out["blob"], "hello");
+    }
+
+    #[test]
+    fn synthesize_from_schema_handles_missing_properties() {
+        let out = synthesize_from_schema(&json!({}), "x");
+        assert!(out.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sleep_blocks_for_requested_duration() {
+        let registry = registry_trusting_cwd(false);
+        let start = std::time::Instant::now();
+        let r = registry
+            .execute("sleep", json!({ "seconds": 0.1 }))
+            .await
+            .expect("ok");
+        let elapsed = start.elapsed();
+        assert!(r.is_error.is_none(), "got {:?}", r);
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "sleep returned too fast: {elapsed:?}"
+        );
+        assert!(r.content[0].text.contains("slept"));
+    }
+
+    #[test]
+    fn sleep_caps_at_sixty_seconds() {
+        assert_eq!(capped_sleep_seconds(90.0), Some(60.0));
+        assert_eq!(capped_sleep_seconds(0.0), Some(0.0));
+        assert_eq!(capped_sleep_seconds(-1.0), None);
+    }
+
+    #[tokio::test]
+    async fn sleep_rejects_negative_seconds() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute("sleep", json!({ "seconds": -1 }))
+            .await
+            .expect("ok");
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn brief_tool_returns_structured_json() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute(
+                "brief",
+                json!({ "text": "Headline.\n\nfact a\nfact b", "max_bullets": 2 }),
+            )
+            .await
+            .expect("ok");
+        assert!(r.is_error.is_none());
+        let parsed: serde_json::Value = serde_json::from_str(&r.content[0].text).unwrap();
+        assert_eq!(parsed["title"], "Headline.");
+        let bullets = parsed["bullets"].as_array().unwrap();
+        assert_eq!(bullets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn synthetic_output_tool_emits_object() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute(
+                "synthetic_output",
+                json!({
+                    "schema": {
+                        "properties": {
+                            "title": { "type": "string" },
+                            "count": { "type": "integer" }
+                        }
+                    },
+                    "context": "hi"
+                }),
+            )
+            .await
+            .expect("ok");
+        assert!(r.is_error.is_none());
+        let parsed: serde_json::Value = serde_json::from_str(&r.content[0].text).unwrap();
+        assert_eq!(parsed["title"], "hi");
+        assert_eq!(parsed["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_invalid_recipient() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute(
+                "send_message",
+                json!({ "to": "alice/../etc", "body": "ping" }),
+            )
+            .await
+            .expect("ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("[A-Za-z0-9_-]+"));
+    }
+
+    #[tokio::test]
+    async fn recv_messages_with_drain_clears_mailbox() {
+        // Use a unique recipient name so we don't collide with the user's
+        // real mailbox.
+        let recipient = format!(
+            "test-{}",
+            unix_timestamp().to_string() + &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let safe: String = recipient
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let registry = registry_trusting_cwd(false);
+
+        let send = registry
+            .execute(
+                "send_message",
+                json!({ "to": safe, "body": "hi there", "from": "tester" }),
+            )
+            .await
+            .expect("ok");
+        assert!(send.is_error.is_none(), "got {:?}", send);
+
+        let recv = registry
+            .execute("recv_messages", json!({ "recipient": safe, "drain": true }))
+            .await
+            .expect("ok");
+        assert!(recv.is_error.is_none(), "got {:?}", recv);
+        let msgs: Vec<serde_json::Value> = serde_json::from_str(&recv.content[0].text).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["body"], "hi there");
+
+        // Mailbox should now be empty.
+        let again = registry
+            .execute("recv_messages", json!({ "recipient": safe }))
+            .await
+            .expect("ok");
+        let msgs2: Vec<serde_json::Value> = serde_json::from_str(&again.content[0].text).unwrap();
+        assert!(msgs2.is_empty());
+
+        // Cleanup mailbox file we created in $HOME.
+        if let Some(p) = messages_path(&safe) {
+            fs::remove_file(&p).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_add_then_remove_round_trips() {
+        let registry = registry_trusting_cwd(false);
+        let unique_name = format!("test-sched-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let add = registry
+            .execute(
+                "schedule",
+                json!({
+                    "action": "add",
+                    "name": unique_name,
+                    "when": "*/5 * * * *",
+                    "command": "echo hi"
+                }),
+            )
+            .await
+            .expect("ok");
+        assert!(add.is_error.is_none(), "got {:?}", add);
+
+        let list = registry
+            .execute("schedule", json!({ "action": "list" }))
+            .await
+            .expect("ok");
+        assert!(list.is_error.is_none());
+        assert!(list.content[0].text.contains(&unique_name));
+
+        let rm = registry
+            .execute(
+                "schedule",
+                json!({ "action": "remove", "name": unique_name }),
+            )
+            .await
+            .expect("ok");
+        assert!(rm.is_error.is_none(), "got {:?}", rm);
+    }
+
+    #[tokio::test]
+    async fn schedule_rejects_bad_cron_expression() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute(
+                "schedule",
+                json!({
+                    "action": "add",
+                    "name": "x",
+                    "when": "every minute",
+                    "command": "echo hi"
+                }),
+            )
+            .await
+            .expect("ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("Invalid cron"));
+    }
+
+    #[tokio::test]
+    async fn shell_executes_simple_command_on_unix() {
+        if cfg!(windows) {
+            return;
+        }
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute("shell", json!({ "command": "echo from-shell" }))
+            .await
+            .expect("ok");
+        assert!(r.is_error.is_none(), "got {:?}", r);
+        assert!(r.content[0].text.contains("from-shell"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocked_in_plan_mode() {
+        let registry = registry_trusting_cwd(true);
+        let r = registry
+            .execute("shell", json!({ "command": "echo no" }))
+            .await
+            .expect("ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("plan mode is ON"));
+    }
+
+    #[tokio::test]
+    async fn remote_trigger_writes_payload_file() {
+        let registry = registry_trusting_cwd(false);
+        let name = format!("test-trigger-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let r = registry
+            .execute(
+                "remote_trigger",
+                json!({ "name": name, "payload": { "x": 1 } }),
+            )
+            .await
+            .expect("ok");
+        assert!(r.is_error.is_none(), "got {:?}", r);
+
+        let path = triggers_path(&name).unwrap();
+        assert!(path.exists());
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["payload"]["x"], 1);
+        fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn notify_returns_message_not_an_error() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute("notify", json!({ "title": "t", "message": "hello" }))
+            .await
+            .expect("ok");
+        // We can't guarantee a notifier exists in CI, but the tool must
+        // degrade gracefully (success or descriptive non-fatal message)
+        // rather than crash.
+        assert!(r.is_error.is_none(), "got {:?}", r);
     }
 }

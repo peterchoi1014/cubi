@@ -14,7 +14,7 @@ source tree.
 > documentation, the MCP spec, and our own design.
 
 Items already shipped are marked `[x]`. Everything else is open work
-for future PRs. Current crate version: **0.1.0**.
+for future PRs. Current crate version: **0.2.0**.
 
 ---
 
@@ -40,14 +40,23 @@ for future PRs. Current crate version: **0.1.0**.
       *(`notebook` builtin: list/read/insert/replace/delete; pure JSON, no Jupyter dep)*
 - [x] **Persistent REPL tool** — long-lived shell / Python / Node session
       *(bash-only for now; `repl_start` / `repl_eval` / `repl_close`)*
-- [ ] **Cross-platform shell tool** — `bash` vs `pwsh` based on host OS
-- [ ] **Time tools** — `Sleep`, `ScheduleCron`
+- [x] **Cross-platform shell tool** — `bash` vs `pwsh` based on host OS
+      *(`shell` builtin: POSIX `sh -c` on Unix, `pwsh -Command` on Windows;
+      same plan-mode + trust gates as `bash`)*
+- [x] **Time tools** — `Sleep`, `ScheduleCron`
+      *(`sleep` blocks up to 60s; `schedule` manages a list of cron-like
+      entries in `~/.ai-chat-cli/schedule.json` for an external runner)*
 - [x] **Skills system** — reusable Markdown skill packs in
       `~/.ai-chat-cli/skills/*` + `SkillTool`
 - [x] **Tool-search tool** — model searches the registry instead of receiving
       the full tool list in every prompt
-- [ ] **Structured output helpers** — `Brief`, `SyntheticOutput`
-- [ ] **Inter-agent messaging** — `SendMessage`, `RemoteTrigger`
+- [x] **Structured output helpers** — `Brief`, `SyntheticOutput`
+      *(`brief` distills text into title/bullets/summary; `synthetic_output`
+      fills a JSON Schema's properties with type-appropriate defaults — both
+      deterministic, no extra model call)*
+- [x] **Inter-agent messaging** — `SendMessage`, `RemoteTrigger`
+      *(`send_message` / `recv_messages` use `~/.ai-chat-cli/messages/`;
+      `remote_trigger` drops payload+ts files in `~/.ai-chat-cli/triggers/`)*
 - [x] **MCP resources & prompts** — `resources/list`, `resources/read`,
       per-server OAuth, interactive approval *(resources + interactive approval shipped; prompts/OAuth remain open)*
 
@@ -83,24 +92,26 @@ Shipped in this PR:
 
 Still to add (grouped by area):
 
-- **Project / workspace:** `/init-verifiers`
-- **Git workflow:** `/commit-push-pr` ✅, `/issue` ✅, `/undo` ✅, `/pr_comments`,
-  `/security-review`, `/autofix-pr`
-- **Agent control:** `/agents`, `/tasks`, `/teleport`, `/passes`,
-  `/effort`
-- **Output / theming:** `/theme`, `/color`, `/output-style`, `/statusline`,
-  `/keybindings`, `/vim`
-- **Auth / accounts:** `/login`, `/logout`, `/oauth-refresh`,
-  `/privacy-settings`
-- **MCP / plugins / skills:** `/mcp`, `/plugin`, `/reload-plugins`, `/skills` ✅,
-  `/hooks` ✅
-- **Diagnostics / perf:** `/stats` ✅, `/usage` ✅, `/cost`, `/perf-issue`,
-  `/heapdump`, `/debug-tool-call`, `/doctor` ✅, `/env` ✅, `/bug` ✅,
-  `/permissions` ✅, `/config` ✅
-- **Lifecycle:** `/upgrade`, `/install`, `/install-github-app`,
-  `/install-slack-app`, `/sandbox-toggle`, `/reset-limits`
-- **Social / sharing:** `/share`, `/copy`, `/feedback`, `/release-notes`,
-  `/stickers`
+- **Project / workspace:** `/init-verifiers` ✅
+- **Git workflow:** `/commit-push-pr` ✅, `/issue` ✅, `/undo` ✅,
+  `/pr_comments` ✅, `/security-review` ✅, `/autofix-pr` ✅
+- **Agent control:** `/agents` ✅, `/tasks` ✅, `/teleport` ✅,
+  `/passes` ✅, `/effort` ✅
+- **Output / theming:** `/theme` ✅, `/color` ✅, `/output-style` ✅,
+  `/statusline` ✅, `/keybindings` ✅, `/vim` ✅ *(config flag only;
+  full vim-mode TUI still needs a ratatui port)*
+- **Auth / accounts:** `/login` ✅, `/logout` ✅, `/oauth-refresh` ✅
+  *(no OAuth backend yet — informational)*, `/privacy-settings` ✅
+- **MCP / plugins / skills:** `/mcp` ✅, `/plugin` ✅, `/reload-plugins` ✅,
+  `/skills` ✅, `/hooks` ✅
+- **Diagnostics / perf:** `/stats` ✅, `/usage` ✅, `/cost` ✅,
+  `/perf-issue` ✅, `/heapdump` ✅, `/debug-tool-call` ✅, `/doctor` ✅,
+  `/env` ✅, `/bug` ✅, `/permissions` ✅, `/config` ✅
+- **Lifecycle:** `/upgrade` ✅, `/install` ✅, `/install-github-app` ✅,
+  `/install-slack-app` ✅, `/sandbox-toggle` ✅ *(alias for `/plan`)*,
+  `/reset-limits` ✅
+- **Social / sharing:** `/share` ✅, `/copy` ✅, `/feedback` ✅,
+  `/release-notes` ✅, `/stickers` ✅
 
 Foundation work: the flat `match` in `cli.rs::handle_command` is now a
 `SlashCommand` registry (`src/commands.rs`) — adding a command requires a row
@@ -137,7 +148,9 @@ Markdown commands as first-class plugins (cf. leaked
 7. **LSP bridge** (`services/lsp/`) — diagnostics after `edit_file`,
    jump-to-definition.
 8. **Notifications + sleep prevention** (`notifier.ts`, `preventSleep.ts`) —
-   OS notifications on long-run completion, `caffeinate`-style awake.
+   OS notifications on long-run completion, `caffeinate`-style awake. ✅
+   `notify` builtin tool shipped (osascript/notify-send/PowerShell);
+   sleep-prevention still open.
 9. **Interactive MCP approval** (`mcpServerApproval.tsx`).
 10. **Telemetry / debug log** (`analytics/`, `diagnosticTracking.ts`,
     `internalLogging.ts`) — opt-in; aligns with future `tracing` proposal.
