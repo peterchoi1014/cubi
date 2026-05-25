@@ -560,10 +560,7 @@ impl BuiltinToolRegistry {
         if matches.is_empty() {
             Ok(ToolResult::success(format!("No tools matched '{}'", query)))
         } else {
-            Ok(ToolResult::success(matches.join(
-                "
-",
-            )))
+            Ok(ToolResult::success(matches.join("\n")))
         }
     }
 

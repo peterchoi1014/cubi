@@ -391,8 +391,7 @@ impl HttpClient {
             "method": "resources/list",
             "params": {}
         });
-        let url = format!("{}/resources/list", self.url.trim_end_matches('/'));
-        let response = self.send_request_to(&url, request).await?;
+        let response = self.send_request(request).await?;
         Ok(serde_json::from_value(
             response["result"]["resources"].clone(),
         )?)
@@ -405,8 +404,7 @@ impl HttpClient {
             "method": "resources/read",
             "params": {"uri": uri}
         });
-        let url = format!("{}/resources/read", self.url.trim_end_matches('/'));
-        let response = self.send_request_to(&url, request).await?;
+        let response = self.send_request(request).await?;
         Ok(serde_json::from_value(
             response["result"]["contents"].clone(),
         )?)

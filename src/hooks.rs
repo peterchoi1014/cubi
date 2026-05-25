@@ -54,7 +54,7 @@
 //! }
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -329,10 +329,10 @@ pub fn save_global(hooks: &[HookDef]) -> Result<()> {
     let path =
         global_hooks_path().ok_or_else(|| anyhow::anyhow!("Could not resolve home directory"))?;
     let mut cfg = if path.exists() {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<HooksConfig>(&raw).ok())
-            .unwrap_or_default()
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read hooks file: {}", path.display()))?;
+        serde_json::from_str::<HooksConfig>(&raw)
+            .with_context(|| format!("Failed to parse hooks file: {}", path.display()))?
     } else {
         HooksConfig::default()
     };
