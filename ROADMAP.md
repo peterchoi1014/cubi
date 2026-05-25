@@ -298,17 +298,17 @@ These items are tracked above but cannot realistically be completed in a
 single automated pass. They are listed here so the next contributor has a
 clear starting point:
 
+- **OAuth backend** (Section A MCP OAuth; touches /login flows). No OAuth
+  provider is wired up yet.
+- **Headless / remote / server / daemon mode** (Section C #16).
 - **Full TUI rewrite to ratatui** (Section C #18 / Section D #12). Plumbing
   for themes, output-style presets, and palettes is in place; the port
   itself remains future work.
+- **Proactive prompt suggestions** (Section C #4). Needs TUI integration.
 - **Vim-mode TUI** (Section C #12). Config flag persists; full keybinding
   layer waits on the ratatui port.
 - **Voice input** (Section C #11). Needs an audio pipeline.
 - **Multi-agent layer over tmux / iTerm** (Section C #5). In-process
   subagents are shipped via `agent_run`.
-- **Headless / remote / server / daemon mode** (Section C #16).
 - **Deep-link / Chrome native-messaging bridge** (Section C #19). Needs a
   separate native-messaging host binary.
-- **OAuth backend** (Section A MCP OAuth; touches /login flows). No OAuth
-  provider is wired up yet.
-- **Proactive prompt suggestions** (Section C #4). Needs TUI integration.
