@@ -147,17 +147,29 @@ fn storage_path_for(cwd: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Produces a filesystem-safe key for a cwd. Path separators and other
-/// awkward characters are replaced by `_` in a position-preserving way, so
-/// two different paths always map to two different keys.
+/// Produces a filesystem-safe, collision-resistant key for a cwd.
+///
+/// The sanitized form (alphanumerics, `-`, `.` preserved; everything else
+/// replaced by `_`) is suffixed with a stable hash of the original path so
+/// that two different paths whose sanitized forms collide (for example
+/// `/tmp/a/b` and `/tmp/a_b`, both of which sanitize to `_tmp_a_b`) still
+/// receive distinct keys.
 fn cwd_key(cwd: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     let raw = cwd.to_string_lossy();
-    raw.chars()
+    let sanitized: String = raw
+        .chars()
         .map(|c| match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' => c,
             _ => '_',
         })
-        .collect()
+        .collect();
+
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("{sanitized}-{:016x}", hasher.finish())
 }
 
 fn read_list(path: &Path) -> Result<Vec<TodoItem>> {
@@ -246,6 +258,17 @@ mod tests {
         assert!(!a.contains('/'));
         assert!(!a.contains('\\'));
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn cwd_key_distinguishes_sanitization_collisions() {
+        // Both inputs sanitize to `_tmp_a_b`; the hash suffix must keep them
+        // apart so two real projects never share one todo file.
+        let nested = cwd_key(Path::new("/tmp/a/b"));
+        let flat = cwd_key(Path::new("/tmp/a_b"));
+        assert_ne!(nested, flat);
+        // Stability: same input always hashes the same key.
+        assert_eq!(nested, cwd_key(Path::new("/tmp/a/b")));
     }
 
     fn unique_suffix() -> String {

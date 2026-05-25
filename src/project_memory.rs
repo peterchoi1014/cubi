@@ -60,12 +60,73 @@ Keep it short and focused on things the assistant should always know.\n\
 
 #[cfg(test)]
 mod tests {
-    use super::STARTER_TEMPLATE;
+    use super::*;
+    use std::sync::Mutex;
+
+    // `read_memory` / `write_starter_if_absent` operate on the process's
+    // current working directory, which is global mutable state. Serialize
+    // any test that touches the FS via this mutex so parallel test threads
+    // don't race each other.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn starter_template_has_expected_sections() {
         assert!(STARTER_TEMPLATE.contains("# Project memory for ai-chat-cli"));
         assert!(STARTER_TEMPLATE.contains("## Build / test / lint"));
         assert!(STARTER_TEMPLATE.contains("## Conventions"));
+    }
+
+    #[test]
+    fn write_starter_then_read_roundtrip() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ai-chat-cli-mem-test-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // First call writes the starter.
+        let wrote = write_starter_if_absent().unwrap();
+        assert!(wrote, "expected starter to be created");
+
+        // Second call must be idempotent and leave the file alone.
+        let wrote_again = write_starter_if_absent().unwrap();
+        assert!(!wrote_again, "expected second call to be a no-op");
+
+        // Read it back through the public API.
+        let contents = read_memory().unwrap().expect("memory should exist");
+        assert!(contents.contains("# Project memory for ai-chat-cli"));
+
+        // Restore cwd before cleanup so other tests aren't stranded.
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_memory_returns_none_when_absent() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ai-chat-cli-mem-absent-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = read_memory().unwrap();
+        assert!(result.is_none(), "expected None when AICHAT.md is absent");
+
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 }
