@@ -104,6 +104,17 @@ cargo run --release
 ./target/release/ai-chat-cli
 ```
 
+### Choosing a model
+
+By default the CLI uses `llama3.2:1b`. Override at startup with the
+`AI_CHAT_CLI_MODEL` environment variable, or switch interactively with the
+`/model` command:
+
+```bash
+# Pick a different default just for this session
+AI_CHAT_CLI_MODEL=mistral:7b cargo run --release
+```
+
 You should see:
 
 ```
@@ -467,13 +478,19 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
+See [`ROADMAP.md`](ROADMAP.md) for the full plan (built-in tools, slash
+commands, subsystems, and implementation priorities derived from an
+architectural review of similar tools).
+
+Highlights still to come:
+
 - [ ] Streaming responses for real-time output
 - [ ] RAG (Retrieval Augmented Generation) support
 - [ ] Multi-modal support (images, audio)
 - [ ] Web interface
 - [ ] Distributed inference across remote workers
 - [ ] Conversation search and tagging
-- [ ] Export to different formats (Markdown, PDF)
+- [ ] Export to different formats (PDF)
 - [ ] Plugin system for extensibility
 
 ---

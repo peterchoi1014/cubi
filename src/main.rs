@@ -5,6 +5,8 @@ mod mcp_config;
 mod mcp_client;
 mod mcp_manager;
 mod builtin_tools;
+mod todos;
+mod project_memory;
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -12,10 +14,18 @@ use executor::AIExecutor;
 use cli::ChatCLI;
 use mcp_manager::McpManager;
 
+/// Default model used when the user has not configured one. Can be overridden
+/// at runtime by setting the `AI_CHAT_CLI_MODEL` environment variable.
+const DEFAULT_MODEL: &str = "llama3.2:1b";
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Configuration
-    let model = "llama3.2:1b";
+    // Resolve the model from $AI_CHAT_CLI_MODEL, falling back to DEFAULT_MODEL.
+    // This removes the previous hard-coded lock-in and is the first small
+    // step toward the configurable onboarding flow tracked in ROADMAP.md.
+    let model_owned = std::env::var("AI_CHAT_CLI_MODEL")
+        .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model: &str = &model_owned;
     let cpu_workers = 6;
 
     println!("{}", "Initializing AI Chat CLI...".bright_cyan());
@@ -78,7 +88,14 @@ async fn main() -> Result<()> {
 
     // Create and run CLI
     let mut cli = ChatCLI::new(executor, mcp_manager);
-    cli.run().await?;
+    let run_result = cli.run().await;
+
+    // Shut down MCP cleanly while we still have an async context. The Drop
+    // impl is only a best-effort fallback and intentionally does not spin up
+    // a nested runtime.
+    cli.shutdown().await;
+
+    run_result?;
 
     Ok(())
 }
