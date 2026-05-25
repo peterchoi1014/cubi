@@ -42,16 +42,9 @@ jobs:
       - name: cargo build
         run: cargo build --all-targets --locked
 
-      - name: cargo test
-        run: cargo test --all-targets --locked
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       - name: smoke-test --version / --help / unknown flag
         run: |
           set -e
-          cargo build --locked --bin cubi
           BIN=target/debug/cubi
 
           # --version: must start with "cubi " followed by the Cargo
@@ -74,3 +67,28 @@ jobs:
           if [ "$status" -ne 2 ]; then
             echo "unknown flag should exit 2, got $status"; exit 1
           fi
+
+          # completions: each supported shell must exit 0 and emit a
+          # non-empty script containing the binary name. An unknown shell
+          # must exit with status 2.
+          for shell in bash zsh fish; do
+            out="$("$BIN" completions "$shell")"
+            if [ -z "$out" ]; then
+              echo "completions $shell produced empty output"; exit 1
+            fi
+            echo "$out" | grep -q "cubi" \
+              || { echo "completions $shell missing 'cubi' reference"; exit 1; }
+          done
+          set +e
+          "$BIN" completions tcsh
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "unknown shell should exit 2, got $status"; exit 1
+          fi
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings

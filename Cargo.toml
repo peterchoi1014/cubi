@@ -12,9 +12,13 @@ keywords = ["ai", "cli", "ollama", "llm", "mcp"]
 categories = ["command-line-utilities"]
 rust-version = "1.85"
 exclude = [
-    "docs/assets/*",
+    ".copilot/*",
     ".github/*",
+    ".sessions/*",
+    "docs/assets/*",
+    "screenshots/*",
     "target/*",
+    "tests/fixtures/*",
 ]
 
 [[bin]]
