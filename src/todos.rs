@@ -2,7 +2,7 @@
 //!
 //! Tracks a short checklist of items the user (or, in the future, the model)
 //! is working through. The list is keyed by the current working directory and
-//! persisted to `~/.ai-chat-cli/todos/<cwd-key>.json` so that `/todos`
+//! persisted to `~/.cubi/todos/<cwd-key>.json` so that `/todos`
 //! survives restarts within the same project.
 
 use anyhow::{Context, Result};
@@ -80,7 +80,7 @@ impl TodoList {
 
     /// Loads the todo list for the given working directory, persisting any
     /// subsequent mutations to the matching file under
-    /// `~/.ai-chat-cli/todos/`. If no file exists yet, returns an empty list
+    /// `~/.cubi/todos/`. If no file exists yet, returns an empty list
     /// wired up to that path so the first `save` will create it.
     pub fn load_for_cwd(cwd: &Path) -> Self {
         let storage_path = storage_path_for(cwd);
@@ -156,7 +156,7 @@ impl TodoList {
 fn storage_path_for(cwd: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     Some(
-        home.join(".ai-chat-cli")
+        home.join(".cubi")
             .join("todos")
             .join(format!("{}.json", cwd_key(cwd))),
     )
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("ai-chat-cli-todos-test-{}", unique_suffix()));
+        let dir = std::env::temp_dir().join(format!("cubi-todos-test-{}", unique_suffix()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("todos.json");
 

@@ -43,12 +43,12 @@ impl OAuthToken {
 
 impl OAuthStore {
     pub fn storage_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("AICHAT_OAUTH_FILE")
+        if let Ok(p) = std::env::var("CUBI_OAUTH_FILE")
             && !p.trim().is_empty()
         {
             return Some(PathBuf::from(p));
         }
-        Some(dirs::home_dir()?.join(".ai-chat-cli").join("oauth.json"))
+        Some(dirs::home_dir()?.join(".cubi").join("oauth.json"))
     }
 
     pub fn load() -> Self {
@@ -153,7 +153,7 @@ pub fn normalize_provider(provider: &str) -> String {
 
 pub fn provider_env_var(provider: &str) -> String {
     format!(
-        "AICHAT_{}_API_KEY",
+        "CUBI_{}_API_KEY",
         normalize_provider(provider).to_ascii_uppercase()
     )
 }
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn provider_normalization_and_env_mapping() {
         assert_eq!(normalize_provider("  GitHub  "), "github");
-        assert_eq!(provider_env_var("  GitHub  "), "AICHAT_GITHUB_API_KEY");
+        assert_eq!(provider_env_var("  GitHub  "), "CUBI_GITHUB_API_KEY");
     }
 
     #[test]
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let path = std::env::temp_dir().join(format!(
-            "ai-chat-cli-oauth-{}.json",
+            "cubi-oauth-{}.json",
             now_unix().saturating_mul(1_000_000_000)
                 + SystemTime::now()
                     .duration_since(UNIX_EPOCH)

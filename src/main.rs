@@ -2,6 +2,7 @@ mod agent_loop;
 mod builtin_tools;
 mod cli;
 mod commands;
+mod compat;
 mod executor;
 mod file_mentions;
 mod file_rollback;
@@ -44,7 +45,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Default model used when the user has not configured one. Can be overridden
-/// at runtime by setting the `AI_CHAT_CLI_MODEL` environment variable.
+/// at runtime by setting the `CUBI_MODEL` environment variable.
 ///
 /// Picked because Qwen3 4B currently has the best native tool-calling
 /// reliability of any small (<5B) model on Ollama — important because the
@@ -56,6 +57,12 @@ const DEFAULT_MODEL: &str = "qwen3:4b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
+    // to their new CUBI_* names and rename ~/.cubi/ → ~/.cubi/
+    // exactly once. Both no-op if there's nothing to migrate.
+    compat::promote_legacy_env();
+    compat::migrate_config_dir();
+
     // Initialize permissions early — the onboarding wizard may want to
     // mutate it when the user trusts the cwd.
     let permissions = Arc::new(Mutex::new(Permissions::load()));
@@ -82,13 +89,13 @@ async fn main() -> Result<()> {
     // into the env-var slots that the rest of the CLI already reads.
     if let Some(t) = &config.theme {
         // SAFETY: single-threaded during startup.
-        unsafe { std::env::set_var("AICHAT_THEME", t) };
+        unsafe { std::env::set_var("CUBI_THEME", t) };
     }
     if let Some(s) = &config.output_style {
-        unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", s) };
+        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", s) };
     }
     if let Some(c) = &config.color {
-        unsafe { std::env::set_var("AICHAT_COLOR", c) };
+        unsafe { std::env::set_var("CUBI_COLOR", c) };
         match c.as_str() {
             "off" => colored::control::set_override(false),
             "on" => colored::control::set_override(true),
@@ -96,11 +103,11 @@ async fn main() -> Result<()> {
         }
     }
     if let Some(v) = &config.vim_mode {
-        unsafe { std::env::set_var("AICHAT_VIM_MODE", v) };
+        unsafe { std::env::set_var("CUBI_VIM_MODE", v) };
     }
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
-    // shells, or when `AI_CHAT_CLI_NO_ONBOARD=1` is set.
+    // shells, or when `CUBI_NO_ONBOARD=1` is set.
     let ollama_client = ollama::OllamaClient::new();
     if let Err(e) = onboarding::run_if_needed(&mut config, &ollama_client, &permissions).await {
         eprintln!(
@@ -129,7 +136,7 @@ async fn main() -> Result<()> {
     if executor.provider_name() == "openai" {
         let base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
-            .or_else(|| std::env::var("AI_CHAT_CLI_BASE_URL").ok())
+            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         println!(
             "{} Using OpenAI-compatible provider at {}",
@@ -214,7 +221,7 @@ async fn main() -> Result<()> {
                 Some(manager)
             } else {
                 println!(
-                    "{} No MCP tools configured (create ~/.ai-chat-cli/mcp.json)",
+                    "{} No MCP tools configured (create ~/.cubi/mcp.json)",
                     "ℹ".bright_blue()
                 );
                 None

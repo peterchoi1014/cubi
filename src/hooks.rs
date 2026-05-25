@@ -1,4 +1,4 @@
-//! Hook system for ai-chat-cli.
+//! Hook system for cubi.
 //!
 //! Hooks allow users to run custom logic at defined lifecycle points:
 //!
@@ -10,8 +10,8 @@
 //!
 //! ## Hook definition
 //!
-//! Hooks are defined in `~/.ai-chat-cli/hooks.json` (global) or
-//! `.ai-chat-cli/hooks.json` (project-local, overrides global). Each hook
+//! Hooks are defined in `~/.cubi/hooks.json` (global) or
+//! `.cubi/hooks.json` (project-local, overrides global). Each hook
 //! is a shell command that receives context via environment variables.
 //! The hook's exit code determines behavior:
 //!
@@ -137,20 +137,20 @@ impl HookRegistry {
     pub fn load() -> Self {
         let mut hooks = Vec::new();
 
-        // Project-local: .ai-chat-cli/hooks.json in cwd
+        // Project-local: .cubi/hooks.json in cwd
         // If a local config exists, it overrides the global config entirely.
         let mut found_local = false;
         if let Ok(cwd) = std::env::current_dir() {
-            let local_path = cwd.join(".ai-chat-cli").join("hooks.json");
+            let local_path = cwd.join(".cubi").join("hooks.json");
             if let Some(cfg) = Self::load_file(&local_path) {
                 hooks.extend(cfg.hooks);
                 found_local = true;
             }
         }
 
-        // Global: ~/.ai-chat-cli/hooks.json (only used when no local config exists)
+        // Global: ~/.cubi/hooks.json (only used when no local config exists)
         if !found_local && let Some(home) = dirs::home_dir() {
-            let global_path = home.join(".ai-chat-cli").join("hooks.json");
+            let global_path = home.join(".cubi").join("hooks.json");
             if let Some(cfg) = Self::load_file(&global_path) {
                 hooks.extend(cfg.hooks);
             }
@@ -324,7 +324,7 @@ impl HookRegistry {
     }
 }
 
-/// Writes the global hooks config at `~/.ai-chat-cli/hooks.json`.
+/// Writes the global hooks config at `~/.cubi/hooks.json`.
 pub fn save_global(hooks: &[HookDef]) -> Result<()> {
     let path =
         global_hooks_path().ok_or_else(|| anyhow::anyhow!("Could not resolve home directory"))?;
@@ -347,7 +347,7 @@ pub fn save_global(hooks: &[HookDef]) -> Result<()> {
 /// Path to the global hooks config.
 #[allow(dead_code)]
 pub fn global_hooks_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("hooks.json"))
+    dirs::home_dir().map(|h| h.join(".cubi").join("hooks.json"))
 }
 
 /// Path to the project-local hooks config.
@@ -355,7 +355,7 @@ pub fn global_hooks_path() -> Option<PathBuf> {
 pub fn local_hooks_path() -> Option<PathBuf> {
     std::env::current_dir()
         .ok()
-        .map(|c| c.join(".ai-chat-cli").join("hooks.json"))
+        .map(|c| c.join(".cubi").join("hooks.json"))
 }
 
 #[cfg(test)]

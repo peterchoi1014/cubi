@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "ai-chat-cli"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "colored",
- "dirs",
- "futures-util",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -110,6 +94,22 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cubi"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "dirs",
+ "futures-util",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "dirs"

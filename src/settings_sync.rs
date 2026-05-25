@@ -1,6 +1,6 @@
 //! Git-backed cross-machine settings sync.
 //!
-//! Roadmap item C#24: lets the user keep `~/.ai-chat-cli/` in a private
+//! Roadmap item C#24: lets the user keep `~/.cubi/` in a private
 //! git repo (typically a bare repo on GitHub Gist or a self-hosted
 //! remote) so config, memdir, todos, and skills move with them between
 //! machines. This is intentionally a thin wrapper around `git` rather
@@ -17,7 +17,7 @@ use std::process::Command;
 
 fn settings_root() -> Result<PathBuf> {
     dirs::home_dir()
-        .map(|h| h.join(".ai-chat-cli"))
+        .map(|h| h.join(".cubi"))
         .context("Could not resolve home directory")
 }
 
@@ -40,7 +40,7 @@ fn run_git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Initialise `~/.ai-chat-cli` as a git repository and wire up
+/// Initialise `~/.cubi` as a git repository and wire up
 /// `origin`. Idempotent: re-running on an already-initialised tree
 /// just updates the remote.
 pub fn init(remote: &str) -> Result<String> {
