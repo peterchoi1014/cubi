@@ -31,7 +31,7 @@ const ENV_RENAMES: &[(&str, &str)] = &[
     ("CUBI_BASE_URL", "AI_CHAT_CLI_BASE_URL"),
     ("CUBI_API_KEY", "AI_CHAT_CLI_API_KEY"),
     ("CUBI_PROVIDER", "AI_CHAT_CLI_PROVIDER"),
-    ("CUBI_NO_ONBOARD", "AICHAT_NO_ONBOARD"),
+    ("CUBI_NO_ONBOARD", "AI_CHAT_CLI_NO_ONBOARD"),
     ("CUBI_THEME", "AICHAT_THEME"),
     ("CUBI_OUTPUT_STYLE", "AICHAT_OUTPUT_STYLE"),
     ("CUBI_COLOR", "AICHAT_COLOR"),
@@ -87,13 +87,14 @@ pub fn cubi_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".cubi"))
 }
 
-/// Legacy config directory (`~/.cubi/`). Returned for migration
-/// purposes; production code should not read from this path directly.
+/// Legacy config directory from the pre-rebrand era (`~/.ai-chat-cli/`).
+/// Returned for migration purposes; production code should not read from
+/// this path directly.
 pub fn legacy_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cubi"))
+    Some(dirs::home_dir()?.join(".ai-chat-cli"))
 }
 
-/// Rename `~/.cubi/` → `~/.cubi/` exactly once, when the new
+/// Rename `~/.ai-chat-cli/` → `~/.cubi/` exactly once, when the new
 /// location does not yet exist. No-op if the legacy directory is
 /// missing, the new directory is already populated, or the rename
 /// fails (we log a warning and let downstream code create a fresh

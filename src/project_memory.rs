@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 pub const MEMORY_FILENAME: &str = "CUBI.md";
 /// Legacy filename still honored on read so users with an existing
 /// project memory file in their project don't lose their memory after upgrading.
-pub const LEGACY_MEMORY_FILENAME: &str = "CUBI.md";
+pub const LEGACY_MEMORY_FILENAME: &str = "AICHAT.md";
 
 /// Path to `CUBI.md` in the current working directory (write target for
 /// `/init`). Reads should prefer [`find_memory_path`], which also walks up
