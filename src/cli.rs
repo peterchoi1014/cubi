@@ -478,6 +478,12 @@ impl ChatCLI {
                 self.persist_memdir();
                 println!("{} Cleared all memories", "✓".bright_green());
             }
+            Cmd::Rewind => {
+                self.rewind(args);
+            }
+            Cmd::Compact => {
+                self.compact().await;
+            }
             Cmd::Ask => {
                 if args.is_empty() {
                     println!("{} Usage: /ask <question>", "Info:".bright_yellow());
@@ -1135,6 +1141,176 @@ impl ChatCLI {
                 "Warn:".bright_yellow(),
                 e
             );
+        }
+    }
+
+    /// `/rewind [n]` — removes the last `n` user-assistant exchange pairs
+    /// from history (default 1). System messages are never removed.
+    fn rewind(&mut self, args: &str) {
+        let n: usize = if args.is_empty() {
+            1
+        } else {
+            match args.parse::<usize>() {
+                Ok(0) => {
+                    println!("{} Nothing to rewind.", "ℹ".bright_blue());
+                    return;
+                }
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("{} Usage: /rewind [n]", "Error:".bright_red());
+                    return;
+                }
+            }
+        };
+
+        // Count how many non-system messages exist.
+        let non_system: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system")
+            .map(|(i, _)| i)
+            .collect();
+
+        // Each "exchange" is roughly a user + assistant pair (2 messages),
+        // but tool messages add more. We remove the last `n * 2` non-system
+        // messages (or all of them if n is too large).
+        let to_remove = (n * 2).min(non_system.len());
+        if to_remove == 0 {
+            println!("{} Nothing to rewind.", "ℹ".bright_blue());
+            return;
+        }
+
+        // Indices to remove (from the tail of non-system messages).
+        let remove_set: std::collections::HashSet<usize> = non_system
+            [non_system.len() - to_remove..]
+            .iter()
+            .copied()
+            .collect();
+
+        let prev_len = self.history.len();
+        self.history = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !remove_set.contains(i))
+            .map(|(_, m)| m.clone())
+            .collect();
+        let removed = prev_len - self.history.len();
+        println!(
+            "{} Rewound {} message{} ({} exchange{})",
+            "✓".bright_green(),
+            removed,
+            if removed == 1 { "" } else { "s" },
+            n.min(non_system.len() / 2),
+            if n == 1 { "" } else { "s" }
+        );
+        self.checkpoint_session();
+    }
+
+    /// `/compact` — summarizes older conversation turns into a single
+    /// system message, preserving the last few exchanges in full fidelity.
+    /// Uses the model itself to generate the summary.
+    async fn compact(&mut self) {
+        // We keep the last N non-system messages intact and summarize
+        // everything before that.
+        const KEEP_RECENT: usize = 6; // ~3 exchanges
+
+        let non_system_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system")
+            .map(|(i, _)| i)
+            .collect();
+
+        if non_system_indices.len() <= KEEP_RECENT {
+            println!(
+                "{} Conversation is too short to compact ({} non-system messages).",
+                "ℹ".bright_blue(),
+                non_system_indices.len()
+            );
+            return;
+        }
+
+        // Split: messages to summarize vs. messages to keep.
+        let cutoff_idx = non_system_indices[non_system_indices.len() - KEEP_RECENT];
+        let to_summarize: Vec<&Message> = self.history[..cutoff_idx]
+            .iter()
+            .filter(|m| m.role != "system")
+            .collect();
+
+        if to_summarize.is_empty() {
+            println!("{} Nothing to compact.", "ℹ".bright_blue());
+            return;
+        }
+
+        // Build a condensed transcript for the summarizer.
+        let mut transcript = String::new();
+        for msg in &to_summarize {
+            let role_label = match msg.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                _ => &msg.role,
+            };
+            // Truncate very long messages for the summarizer.
+            let content = if msg.content.len() > 500 {
+                format!("{}…", &msg.content[..500])
+            } else {
+                msg.content.clone()
+            };
+            transcript.push_str(&format!("{}: {}\n", role_label, content));
+        }
+
+        println!(
+            "{} Compacting {} messages into a summary…",
+            "⚙".bright_blue(),
+            to_summarize.len()
+        );
+
+        let summary_prompt = vec![
+            Message::text(
+                "system",
+                "You are a summarizer. Produce a concise bullet-point summary of the \
+                 following conversation. Preserve key decisions, facts, and outcomes. \
+                 Do NOT include conversational filler. Output only the summary.",
+            ),
+            Message::text("user", transcript),
+        ];
+
+        match self.executor.chat(summary_prompt).await {
+            Ok(summary) => {
+                // Remove old non-system messages before cutoff.
+                let system_msgs: Vec<Message> = self
+                    .history
+                    .iter()
+                    .filter(|m| m.role == "system")
+                    .cloned()
+                    .collect();
+                let kept_recent: Vec<Message> = self.history[cutoff_idx..].to_vec();
+
+                // Rebuild: system messages + summary + recent messages.
+                self.history = system_msgs;
+                self.history.push(Message::text(
+                    "system",
+                    format!(
+                        "SYSTEM: Compacted summary of earlier conversation:\n\n{}",
+                        summary
+                    ),
+                ));
+                self.history.extend(kept_recent);
+
+                println!(
+                    "{} Compacted. History now has {} messages.",
+                    "✓".bright_green(),
+                    self.history.len()
+                );
+                self.checkpoint_session();
+            }
+            Err(e) => {
+                eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+            }
         }
     }
 
