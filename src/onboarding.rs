@@ -1,8 +1,8 @@
 //! First-run onboarding wizard + persistent user config.
 //!
 //! Before this module existed, the only way to override the hard-coded
-//! `llama3.2:1b` default was the `AI_CHAT_CLI_MODEL` environment variable.
-//! New users got dropped onto whichever model the binary shipped with and
+//! default model was the `AI_CHAT_CLI_MODEL` environment variable. New
+//! users got dropped onto whichever model the binary shipped with and
 //! had no opportunity to (a) trust their project for write/exec tools or
 //! (b) opt in to a starter `AICHAT.md`.
 //!
@@ -119,6 +119,34 @@ pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// Heuristic check: returns `true` when `model` matches a known family
+/// that does NOT reliably emit native `tool_calls` against Ollama's
+/// `tools:` field. Used to print a startup warning when the active model
+/// is being asked to drive the agent loop in `agent_loop.rs`.
+///
+/// Conservative on purpose — only the families with documented poor
+/// tool-calling behavior at small sizes are flagged. Anything else falls
+/// through as "probably fine" so we don't nag users running tool-capable
+/// models we just haven't seen yet.
+pub fn is_known_non_tool_capable(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Strip any `:tag` suffix so we match on the family name.
+    let family = m.split(':').next().unwrap_or(&m);
+    // Tiny llama3.2 variants (1b, 3b-without-tools-tuning) are the main
+    // offender that triggered this check.
+    if family == "llama3.2"
+        && let Some(tag) = m.split(':').nth(1)
+    {
+        // The 1b tag is known-bad; 3b is borderline but works for
+        // simple cases — only flag 1b to avoid false positives.
+        return tag.starts_with("1b");
+    }
+    matches!(
+        family,
+        "tinyllama" | "smollm" | "smollm2" | "gemma" | "gemma2" | "gemma3" | "phi" | "phi3"
+    ) || family.starts_with("orca-mini")
+}
+
 /// Runs the first-run wizard if appropriate, mutating `config` and the
 /// shared `permissions` store as the user makes choices. Idempotent
 /// across runs because the wizard sets `config.onboarded = true` on its
@@ -164,8 +192,20 @@ pub async fn run_if_needed(
         Ok(models) if !models.is_empty() => {
             println!("{}", "Available Ollama models:".bright_yellow().bold());
             for (i, m) in models.iter().enumerate() {
-                println!("  {}. {}", i + 1, m.bright_cyan());
+                let label = if is_known_non_tool_capable(m) {
+                    format!("{}  {}", m, "(chat only — no tools)".bright_black())
+                } else {
+                    m.bright_cyan().to_string()
+                };
+                println!("  {}. {}", i + 1, label);
             }
+            println!(
+                "{} Recommended for tool-calling: {}. Alternatives: {} or {}.",
+                "ℹ".bright_blue(),
+                "qwen3:4b".bright_cyan(),
+                "qwen2.5:3b".bright_cyan(),
+                "phi4-mini".bright_cyan(),
+            );
             let pick = prompt(&format!(
                 "Pick a default model [1-{}] (press Enter to skip): ",
                 models.len()
@@ -353,6 +393,36 @@ mod tests {
         assert_eq!(resolve_model(&cfg2, "fallback"), "foo");
         if let Some(v) = prev {
             unsafe { std::env::set_var("AI_CHAT_CLI_MODEL", v) };
+        }
+    }
+
+    #[test]
+    fn known_non_tool_capable_flags_expected_families() {
+        for m in [
+            "llama3.2:1b",
+            "llama3.2:1b-instruct-q4_0",
+            "tinyllama",
+            "tinyllama:1.1b",
+            "smollm2:1.7b",
+            "gemma3:1b",
+            "phi3:mini",
+        ] {
+            assert!(is_known_non_tool_capable(m), "expected flag for {m}");
+        }
+    }
+
+    #[test]
+    fn known_non_tool_capable_passes_tool_capable_models() {
+        for m in [
+            "qwen3:4b",
+            "qwen2.5:3b",
+            "qwen2.5:7b",
+            "llama3.1:8b",
+            "llama3.2:3b",
+            "mistral:7b-instruct-v0.3",
+            "phi4-mini",
+        ] {
+            assert!(!is_known_non_tool_capable(m), "unexpected flag for {m}");
         }
     }
 }

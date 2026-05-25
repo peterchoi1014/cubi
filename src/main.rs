@@ -44,7 +44,14 @@ use std::sync::{Arc, Mutex};
 
 /// Default model used when the user has not configured one. Can be overridden
 /// at runtime by setting the `AI_CHAT_CLI_MODEL` environment variable.
-const DEFAULT_MODEL: &str = "llama3.2:1b";
+///
+/// Picked because Qwen3 4B currently has the best native tool-calling
+/// reliability of any small (<5B) model on Ollama — important because the
+/// agent loop in `agent_loop.rs` advertises ~27 built-in tools plus any MCP
+/// tools via Ollama's `tools:` field. Tiny non-tool-trained models (the
+/// previous `llama3.2:1b` default) routinely garbled their replies into
+/// pseudo-JSON instead of either calling a tool or answering normally.
+const DEFAULT_MODEL: &str = "qwen3:4b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -169,6 +176,23 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Warn when the active model is known to not reliably support native
+    // tool calling. The agent loop in `agent_loop.rs` advertises ~27
+    // built-in tools plus any MCP tools, and small chat-only models tend
+    // to echo schemas back as content instead of emitting `tool_calls`.
+    if onboarding::is_known_non_tool_capable(model) {
+        eprintln!(
+            "{} Model '{}' is not known to reliably support tool calling. \
+             Responses may be malformed when tools are attached. \
+             Consider switching to {} (best), {}, or {}.",
+            "Warning:".bright_yellow(),
+            model.bright_cyan(),
+            "qwen3:4b".bright_cyan(),
+            "qwen2.5:3b".bright_cyan(),
+            "phi4-mini".bright_cyan(),
+        );
     }
 
     // Initialize MCP. We hand it a shared FileJournal so the CLI's
