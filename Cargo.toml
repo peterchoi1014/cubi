@@ -9,10 +9,6 @@ name = "cubi"
 path = "src/main.rs"
 
 [dependencies]
-# Repartir for distributed task execution
-#repartir = "2.0.0"
-#tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "fs"] }
-
 # For async timeout
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
 

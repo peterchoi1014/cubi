@@ -1,6 +1,6 @@
-# AI Chat CLI
+# Cubi
 
-A powerful command-line AI chat application built with Rust, featuring local AI model inference through Ollama and distributed task execution capabilities via Repartir.
+A pocket-sized AI for your shell. Cubi is a Rust-based command-line AI chat application with local model inference through Ollama, a streaming native-tool-calling agent loop, and MCP support.
 
 <div align="center">
 
@@ -170,9 +170,11 @@ CUBI_MODEL=mistral:7b cargo run --release
 You should see:
 
 ```
-============================================================
-  AI Chat CLI - Powered by Repartir
-============================================================
+   ┌───────┐
+   │ ▣   ▣ │   Cubi
+   │   ◡   │   a pocket-sized AI for your shell
+   └───────┘
+    ░░░░░░░
 
 Type /help to list all available slash commands.
 
@@ -519,7 +521,6 @@ cubi/
 │   ├── file_mentions.rs   # `@file` mentions + user-defined Markdown commands
 │   ├── git_cmds.rs        # Shell-out helpers for the git slash commands
 │   ├── onboarding.rs      # First-run setup
-│   └── distributed.rs     # (Reserved) distributed task plumbing
 ├── Cargo.toml             # Dependencies
 ├── ROADMAP.md             # Architectural roadmap & shipped/open items
 └── README.md              # This file
@@ -669,14 +670,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙏 Acknowledgments
 
 - **[Ollama](https://ollama.ai/)** - Local AI model runtime
-- **[Repartir](https://github.com/paiml/repartir)** - Distributed computing framework
 - **Rust Community** - For amazing tools and libraries
 
 ## 📚 Resources
 
 - [Ollama Documentation](https://github.com/ollama/ollama/blob/main/docs/api.md)
 - [Rust Book](https://doc.rust-lang.org/book/)
-- [Repartir Documentation](https://paiml.github.io/repartir/)
 
 ## 🗺️ Roadmap
 
