@@ -2,9 +2,14 @@
 //!
 //! This module defines an [`LlmBackend`] enum that abstracts over different
 //! LLM backends (Ollama, OpenAI-compatible APIs, etc.). The existing
-//! `OllamaClient` implements this trait, and a new `OpenAiClient` provides
-//! access to any OpenAI-compatible endpoint (OpenAI, Anthropic via proxy,
-//! local vLLM, etc.).
+//! `OllamaClient` is wrapped, and a new `OpenAiClient` provides access to
+//! any OpenAI-compatible endpoint (OpenAI, Anthropic via proxy, local vLLM,
+//! etc.).
+//!
+//! **Note:** This module is not yet wired into `AIExecutor`. It serves as
+//! the foundation for multi-provider support. To use it, call
+//! [`create_provider()`] and use the returned [`LlmBackend`] directly.
+//! Full integration into the runtime is planned for a future release.
 //!
 //! ## Token estimation
 //!
@@ -230,8 +235,20 @@ impl OpenAiClient {
             .map(|m| OaiRequestMessage {
                 role: m.role.clone(),
                 content: m.content.clone(),
-                name: m.tool_name.clone(),
-                tool_call_id: m.tool_name.clone(), // OpenAI uses tool_call_id for tool results
+                // `name` is only relevant for tool-result messages.
+                name: if m.role == "tool" {
+                    m.tool_name.clone()
+                } else {
+                    None
+                },
+                // `tool_call_id` must only be set on role:"tool" messages and
+                // should match the tool call's id. We use tool_name as a
+                // fallback identifier when the full call id isn't available.
+                tool_call_id: if m.role == "tool" {
+                    m.tool_name.clone()
+                } else {
+                    None
+                },
             })
             .collect()
     }
@@ -493,7 +510,12 @@ pub fn create_provider() -> LlmBackend {
         );
     }
 
-    LlmBackend::Ollama(OllamaClient::new())
+    // Use AI_CHAT_CLI_BASE_URL to override Ollama's default endpoint if set.
+    let ollama = match std::env::var("AI_CHAT_CLI_BASE_URL") {
+        Ok(url) if !url.is_empty() => OllamaClient::with_base_url(url),
+        _ => OllamaClient::new(),
+    };
+    LlmBackend::Ollama(ollama)
 }
 
 // ─── Token estimator ────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 //! Hooks allow users to run custom logic at defined lifecycle points:
 //!
 //! * **PreToolUse** — fires before a built-in or MCP tool executes.
-//!   Can approve, deny, or modify the call.
+//!   Can approve or deny the call (via exit code).
 //! * **PostToolUse** — fires after a tool returns. Can inspect/log the result.
 //! * **SessionStart** — fires when a new chat session begins.
 //! * **Stop** — fires when the session ends (user quits or EOF).
@@ -12,12 +12,21 @@
 //!
 //! Hooks are defined in `~/.ai-chat-cli/hooks.json` (global) or
 //! `.ai-chat-cli/hooks.json` (project-local, overrides global). Each hook
-//! is a shell command that receives context via environment variables and
-//! stdin (JSON). The hook's exit code determines behavior:
+//! is a shell command that receives context via environment variables.
+//! The hook's exit code determines behavior:
 //!
 //! * Exit 0 → proceed normally
 //! * Exit 1 → for PreToolUse: deny the tool call (the model sees a refusal)
 //! * Exit 2+ → ignored (logged as warning)
+//!
+//! Environment variables provided to hooks:
+//! * `HOOK_EVENT` — the lifecycle event name
+//! * `HOOK_TOOL_NAME` — (PreToolUse/PostToolUse) the tool being invoked
+//! * `HOOK_TOOL_ARGS` — (PreToolUse) JSON-encoded tool arguments
+//! * `HOOK_TOOL_RESULT` — (PostToolUse) the tool's output
+//! * `HOOK_TOOL_ERROR` — (PostToolUse) "true" if the tool errored
+//! * `HOOK_MODEL` — (SessionStart) the model name
+//! * `HOOK_CWD` — (SessionStart) the working directory
 //!
 //! ## Configuration format
 //!
@@ -119,15 +128,18 @@ impl HookRegistry {
         let mut hooks = Vec::new();
 
         // Project-local: .ai-chat-cli/hooks.json in cwd
+        // If a local config exists, it overrides the global config entirely.
+        let mut found_local = false;
         if let Ok(cwd) = std::env::current_dir() {
             let local_path = cwd.join(".ai-chat-cli").join("hooks.json");
             if let Some(cfg) = Self::load_file(&local_path) {
                 hooks.extend(cfg.hooks);
+                found_local = true;
             }
         }
 
-        // Global: ~/.ai-chat-cli/hooks.json
-        if let Some(home) = dirs::home_dir() {
+        // Global: ~/.ai-chat-cli/hooks.json (only used when no local config exists)
+        if !found_local && let Some(home) = dirs::home_dir() {
             let global_path = home.join(".ai-chat-cli").join("hooks.json");
             if let Some(cfg) = Self::load_file(&global_path) {
                 hooks.extend(cfg.hooks);
