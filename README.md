@@ -17,12 +17,15 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
 - ⚡ **Streaming + native tool-calling agent loop** - Tokens stream live; the
   model can call built-in or MCP tools, see the results, and keep going (up
   to 12 round-trips per turn)
-- 🧰 **Built-in tools** - shell (`bash`), filesystem (`read_file`, `write_file`,
-  `edit_file`, `list_files`, `search_glob`, `grep`), git (`worktree`), web
-  (`web_fetch`, `web_search`), long-lived `bash` REPL (`repl_start`/`eval`/`close`),
-  Jupyter `notebook` (`list`/`read`/`insert`/`replace`/`delete`), and LSP-backed
-  code intel (`lsp` for hover/definition/references via your language server),
-  plus a `think` no-op and an `agent_run` meta-tool for spawning focused subagents
+- 🧰 **Built-in tools** - shell (`bash`, `shell` for cross-platform), filesystem
+  (`read_file`, `write_file`, `edit_file`, `list_files`, `search_glob`, `grep`),
+  git (`worktree`), web (`web_fetch`, `web_search`), long-lived `bash` REPL
+  (`repl_start`/`eval`/`close`), Jupyter `notebook` (`list`/`read`/`insert`/
+  `replace`/`delete`), LSP-backed code intel (`lsp` for hover/definition/
+  references via your language server), time (`sleep`, `schedule`), structured
+  output (`brief`, `synthetic_output`), inter-agent messaging (`send_message`,
+  `recv_messages`, `remote_trigger`), OS notifications (`notify`), plus a
+  `think` no-op and an `agent_run` meta-tool for spawning focused subagents
 - 🔌 **MCP (Model Context Protocol) support** - Load external tool servers from
   `~/.ai-chat-cli/mcp.json` and call them with `/mcp-tools`, `/mcp-call`,
   `/mcp-reload`
@@ -245,19 +248,59 @@ groups below mirror that registry.
 | --- | --- |
 | `/diff [path]` | Show `git diff` for the working tree |
 | `/commit [-a] <msg>` | Run `git commit` (`-a` stages tracked files first) |
+| `/commit-push-pr [-a] <msg>` | Commit, push, and print a GitHub PR URL |
+| `/undo [hard]` | Undo the latest commit (or hard reset HEAD~1) |
 | `/review` | Ask the model to review the current `git diff` |
+| `/security-review` | Ask the model to security-review the current `git diff` |
+| `/pr_comments [pr#]` | Show PR review comments via `gh pr view --comments` |
+| `/autofix-pr [pr#]` | Fetch PR review comments and ask the model to propose fixes |
 | `/worktree [list \| add <path> [branch] \| remove <path>]` | Manage git worktrees (`add` auto-trusts the new path) |
 | `/branch [list \| create <name> \| switch <name>]` | List, create, or switch git branches |
 | `/tag [list \| <name> \| create <name> [-m <msg>]]` | List or create git tags |
 | `/files` | List files tracked by git in this project |
+| `/init-verifiers` | Detect project verifier commands and save to `.aichat-verifiers.json` |
 
 #### MCP (Model Context Protocol)
 
 | Command | Description |
 | --- | --- |
+| `/mcp` | Show overall MCP status (servers, tools, resources) |
 | `/mcp-tools` | List available MCP tools |
 | `/mcp-call <tool> <json-args>` | Call an MCP tool |
 | `/mcp-reload` | Reload MCP configuration from `~/.ai-chat-cli/mcp.json` |
+| `/mcp-resources [server]` | List MCP resources |
+| `/mcp-read <uri>` | Read an MCP resource by URI |
+| `/plugin` | List plugins discovered in `~/.ai-chat-cli/plugins/` |
+| `/reload-plugins` | Rescan the plugins / skills directory |
+| `/skills [list \| run <name>]` | List or run reusable Markdown skills |
+| `/hooks [list \| add <event> <cmd> \| rm <n>]` | Manage lifecycle hooks |
+
+#### Agent control & theming
+
+| Command | Description |
+| --- | --- |
+| `/agents` | List background / sub-agent sessions |
+| `/tasks` | Alias for `/todos` |
+| `/teleport <path>` | Change `cwd` to a (preferably trusted) directory |
+| `/passes [n]` | Show or set the agent-loop max passes (1..=12) |
+| `/effort [low \| medium \| high]` | Set agent effort (maps to pass budget) |
+| `/theme [auto \| light \| dark]` | Show or set the colored-output theme |
+| `/color [on \| off]` | Toggle colored output for this session |
+| `/output-style [concise \| markdown \| explanatory]` | Set the assistant output style |
+| `/statusline` | Show the contents of the status line |
+| `/keybindings` | Show the active rustyline keybindings |
+| `/vim [on \| off]` | Toggle vim-style readline editing |
+
+#### Auth & privacy
+
+| Command | Description |
+| --- | --- |
+| `/login [provider]` | Print how to record an API key (env-var based) |
+| `/logout [provider]` | Forget the in-process API key for a provider |
+| `/oauth-refresh` | Show OAuth status (no OAuth backend yet) |
+| `/privacy-settings [telemetry on \| off]` | Show or set local privacy preferences |
+| `/sandbox-toggle` | Alias for `/plan` (strict-sandbox mode) |
+| `/reset-limits` | Clear in-process rate-limit / retry backoff state |
 
 #### Diagnostics & transparency
 
@@ -267,7 +310,27 @@ groups below mirror that registry.
 | `/env` | Show resolved runtime info (version, model, cwd, plan mode, etc.) |
 | `/config` | Print the current `~/.ai-chat-cli/config.json` |
 | `/permissions` | List trusted directories and gated built-in tools |
+| `/tool-allow <name>` / `/tool-deny <name>` | Per-tool allow / deny in the trust store |
+| `/stats` / `/usage` | Show session statistics |
+| `/cost` | Show estimated session cost (always $0 for local Ollama) |
+| `/perf-issue [summary]` | Print a pre-filled GitHub perf-issue URL |
+| `/heapdump` | Print process resident-set / heap info if available |
+| `/debug-tool-call [on \| off]` | Toggle verbose tool-call debug logging |
 | `/bug [summary]` | Print a pre-filled GitHub issue URL with environment details |
+| `/issue [title]` | Print a pre-filled GitHub feature-request URL |
+| `/feedback [text]` | Print the feedback URL |
+
+#### Lifecycle & sharing
+
+| Command | Description |
+| --- | --- |
+| `/upgrade` | Print upgrade instructions |
+| `/install` | Print install instructions |
+| `/install-github-app` / `/install-slack-app` | Placeholders (no app shipped) |
+| `/share <file.md>` | Export this conversation to a shareable Markdown file |
+| `/copy` | Copy the last assistant message to the system clipboard |
+| `/release-notes` | Print release notes for the current version |
+| `/stickers` | Print a friendly ASCII sticker sheet |
 
 #### Examples
 
