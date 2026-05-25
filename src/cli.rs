@@ -124,7 +124,6 @@ impl ChatCLI {
         // the schema back as content when they see it twice. Keep this
         // path empty unless we discover a model that benefits from the
         // duplication.
-        let _ = &cli.mcp_manager;
 
         cli
     }
@@ -3141,7 +3140,7 @@ impl ChatCLI {
             let mut printed_prefix = step > 0;
 
             let mut got_token = false;
-            let msg = self
+            let stream_result = self
                 .executor
                 .chat_stream(self.history.clone(), tools.clone(), |tok| {
                     if !got_token {
@@ -3158,8 +3157,9 @@ impl ChatCLI {
                     let _ = std::io::stdout().flush();
                     got_token = true;
                 })
-                .await?;
+                .await;
             spinner.stop().await;
+            let msg = stream_result?;
             if got_token {
                 any_output = true;
             }
