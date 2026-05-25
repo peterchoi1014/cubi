@@ -21,6 +21,7 @@ const FRAME_MS: u64 = 80;
 /// Handle to a running spinner. Drop or call [`Spinner::stop`] to retire it.
 pub struct Spinner {
     stop: Arc<AtomicBool>,
+    cleared: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
     active: bool,
 }
@@ -30,19 +31,29 @@ impl Spinner {
     /// TTY the spinner is a no-op so CI / piped runs don't get garbled.
     pub fn start(label: impl Into<String>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let cleared = Arc::new(AtomicBool::new(false));
         let active = std::io::stderr().is_terminal();
         if !active {
             return Self {
                 stop,
+                cleared,
                 handle: None,
                 active: false,
             };
         }
         let label = label.into();
         let s = stop.clone();
+        let c = cleared.clone();
         let handle = tokio::spawn(async move {
             let mut i = 0usize;
             while !s.load(Ordering::SeqCst) {
+                if c.load(Ordering::SeqCst) {
+                    // Caller has already taken over the line (e.g. began
+                    // streaming output). Park until asked to stop so we
+                    // don't draw any more frames over their text.
+                    tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
+                    continue;
+                }
                 let frame = FRAMES[i % FRAMES.len()];
                 // `\r` returns to col 0; `\x1b[2K` clears the line so an
                 // earlier longer label can't leave trailing characters.
@@ -51,12 +62,17 @@ impl Spinner {
                 tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
                 i = i.wrapping_add(1);
             }
-            // Final wipe so nothing is left on the status line.
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
+            // Only do a final wipe if the caller hasn't already cleared
+            // the line. Otherwise we'd race with their stdout writes and
+            // potentially scrub the first line of real output.
+            if !c.load(Ordering::SeqCst) {
+                eprint!("\r\x1b[2K");
+                let _ = std::io::stderr().flush();
+            }
         });
         Self {
             stop,
+            cleared,
             handle: Some(handle),
             active: true,
         }
@@ -64,18 +80,22 @@ impl Spinner {
 
     /// Returns the shared flag the caller can flip from a non-async
     /// context (e.g. a streaming-token callback) to ask the spinner to
-    /// stop. The background task will clean up its line on its next tick.
+    /// stop. The background task will exit on its next tick without
+    /// touching the terminal — pair this with [`Spinner::clear_line`]
+    /// from the same callback to wipe the status line atomically.
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         self.stop.clone()
     }
 
-    /// Synchronously wipes the spinner's line right now. Use this from
-    /// the streaming callback so the first real output token isn't
-    /// printed on the same line as a half-drawn frame.
+    /// Synchronously wipes the spinner's line right now and marks the
+    /// line as "owned" by the caller, so the background task will neither
+    /// draw new frames nor perform a final wipe (which would otherwise
+    /// race with the caller's stdout writes).
     pub fn clear_line(&self) {
         if self.active {
             eprint!("\r\x1b[2K");
             let _ = std::io::stderr().flush();
+            self.cleared.store(true, Ordering::SeqCst);
         }
     }
 

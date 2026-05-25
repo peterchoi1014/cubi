@@ -121,13 +121,13 @@ ollama serve
 ### 2. Download an AI Model
 
 ```bash
-# Recommended: Fast and lightweight (1.3GB)
-ollama pull llama3.2:1b
+# Recommended default: tool-call-capable, balanced size (~2.6GB)
+ollama pull qwen3:4b
 
 # Or choose another model:
-ollama pull llama3.2:3b    # Medium size (2GB)
-ollama pull phi3:mini      # Microsoft's small model (2.3GB)
-ollama pull mistral:7b     # High quality (4.1GB)
+ollama pull qwen2.5:3b     # Smaller tool-capable model (~1.9GB)
+ollama pull phi4-mini      # Microsoft's small tool-capable model (~2.5GB)
+ollama pull mistral:7b     # High quality (~4.1GB)
 ```
 
 ### 3. Clone and Build
@@ -158,9 +158,9 @@ cargo run --release
 
 ### Choosing a model
 
-By default the CLI uses `llama3.2:1b`. Override at startup with the
-`CUBI_MODEL` environment variable, or switch interactively with the
-`/model` command:
+By default the CLI uses `qwen3:4b` (a tool-call-capable model). Override
+at startup with the `CUBI_MODEL` environment variable, or switch
+interactively with the `/model` command:
 
 ```bash
 # Pick a different default just for this session
@@ -366,7 +366,7 @@ groups below mirror that registry.
 
 ```
 You: /model
-Current model: llama3.2:1b
+Current model: qwen3:4b
 
 You: /model mistral:7b
 ✓ Switched to model: mistral:7b
@@ -452,11 +452,11 @@ Popular models you can use with Ollama:
 
 | Model | Size | Speed | Quality | Use Case |
 |-------|------|-------|---------|----------|
-| `llama3.2:1b` | 1.3GB | ⚡⚡⚡ | ⭐⭐ | Quick responses, limited hardware |
-| `llama3.2:3b` | 2GB | ⚡⚡ | ⭐⭐⭐ | Balanced performance |
-| `phi3:mini` | 2.3GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's efficient model |
+| `qwen3:4b` | 2.6GB | ⚡⚡ | ⭐⭐⭐⭐ | **Default** — tool-capable, balanced |
+| `qwen2.5:3b` | 1.9GB | ⚡⚡⚡ | ⭐⭐⭐ | Smaller tool-capable model |
+| `phi4-mini` | 2.5GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's tool-capable mini |
 | `mistral:7b` | 4.1GB | ⚡ | ⭐⭐⭐⭐ | High-quality responses |
-| `llama3:8b` | 4.7GB | ⚡ | ⭐⭐⭐⭐ | Latest Llama model |
+| `llama3.1:8b` | 4.7GB | ⚡ | ⭐⭐⭐⭐ | General-purpose tool-capable |
 
 Install any model with:
 ```bash
@@ -609,7 +609,7 @@ ollama serve
 
 ### Model not found
 
-**Error**: `Model 'llama3.2:1b' not found`
+**Error**: `Model 'qwen3:4b' not found`
 
 **Solution**:
 ```bash
@@ -617,13 +617,13 @@ ollama serve
 ollama list
 
 # Pull the required model
-ollama pull llama3.2:1b
+ollama pull qwen3:4b
 ```
 
 ### Slow responses
 
 **Solutions**:
-1. Use a smaller model: `llama3.2:1b` instead of `mistral:7b`
+1. Use a smaller tool-capable model: `qwen2.5:3b` instead of `qwen3:4b`
 2. Close other applications to free up RAM
 3. Use GPU acceleration if available (Ollama automatic)
 
