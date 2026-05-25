@@ -22,11 +22,24 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
   (`web_fetch`, `web_search`), long-lived `bash` REPL (`repl_start`/`eval`/`close`),
   Jupyter `notebook` (`list`/`read`/`insert`/`replace`/`delete`), and LSP-backed
   code intel (`lsp` for hover/definition/references via your language server),
-  plus a `think` no-op and a `agent_run` meta-tool for spawning focused subagents
+  plus a `think` no-op and an `agent_run` meta-tool for spawning focused subagents
+- 🔌 **MCP (Model Context Protocol) support** - Load external tool servers from
+  `~/.ai-chat-cli/mcp.json` and call them with `/mcp-tools`, `/mcp-call`,
+  `/mcp-reload`
+- 🌿 **Git workflow** - `/diff`, `/commit`, `/review`, `/worktree`, `/branch`,
+  `/tag`, `/files` shell out to your installed `git` and respect plan mode
 - 🛡️ **Project trust + plan mode** - Tools refuse to write/exec outside trusted
-  directories; `/plan` toggles a read-only mode that blocks every write/exec path
-- 💾 **Conversation Management** - Save and load chat sessions as JSON files;
-  every turn is auto-checkpointed and recoverable via `/sessions` / `/resume`
+  directories; `/plan` toggles a read-only mode that blocks every write/exec path.
+  Manage trust with `/trust` (current dir) and `/add-dir <path>` (additional dirs)
+- 🧠 **Project memory + persistent memdir** - Auto-injected `AICHAT.md` per
+  project (`/memory`, `/memory-reload`, `/init`) plus cross-session notes in
+  `~/.ai-chat-cli/memdir/` (`/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`)
+- ✅ **Todos** - `/todos`, `/todo-add`, `/todo-done`, `/todo-rm`, `/todo-clear`
+  with on-disk per-project persistence
+- 💾 **Conversation Management** - Save and load chat sessions as JSON files
+  (`/save`, `/load`); export to Markdown (`/export`); every turn is
+  auto-checkpointed and recoverable via `/sessions` / `/resume`; trim or
+  summarize context with `/rewind` and `/compact`
 - 📦 **Batch Processing** - Process multiple prompts from text files
 - 🔄 **Model Switching** - Switch between different AI models on the fly
 - 🎨 **Colored Output** - Syntax-highlighted responses with emoji indicators
@@ -134,16 +147,7 @@ You should see:
   AI Chat CLI - Powered by Repartir
 ============================================================
 
-Commands:
-  /help - Show this help message
-  /clear - Clear conversation history
-  /history - Show conversation history
-  /model - Show current model
-  /model <n> - Switch to different model
-  /save <f> - Save conversation to file
-  /load <f> - Load conversation from file
-  /batch <f> - Process batch file
-  /quit - Exit the chat
+Type /help to list all available slash commands.
 
 Start chatting! (Ctrl+C to interrupt, /quit to exit)
 
@@ -175,19 +179,87 @@ AI: You're welcome! Feel free to ask if you have more questions.
 
 ### Commands
 
-#### `/help` - Show available commands
+The slash-command surface is a single source of truth defined in
+[`src/commands.rs`](src/commands.rs); `/help` lists everything at runtime. The
+groups below mirror that registry.
 
-```
-You: /help
+#### General
 
-Available Commands:
-  /help - Show this help message
-  /clear - Clear conversation history
-  /history - Show conversation history
-  ...
-```
+| Command | Description |
+| --- | --- |
+| `/help` | Show all available commands |
+| `/status` | Show session status (model, trust, plan mode, counts) |
+| `/version` | Show version |
+| `/quit` (alias `/exit`) | Exit the chat |
 
-#### `/model` - View or switch models
+#### Model & history
+
+| Command | Description |
+| --- | --- |
+| `/model [name]` | Show or switch the active Ollama model |
+| `/history` | Show conversation history |
+| `/clear` | Clear conversation history |
+| `/rewind [n]` | Remove the last `n` exchanges (default 1) |
+| `/compact` | Summarize old turns to reduce context length |
+
+#### Conversation persistence
+
+| Command | Description |
+| --- | --- |
+| `/save [-f] <f.json>` | Save conversation (`-f` overwrites) |
+| `/load <f.json>` | Load conversation |
+| `/export [-f] <f.md>` | Export conversation as Markdown |
+| `/batch <f>` | Process a file of prompts (one per line) |
+| `/sessions` | List auto-saved sessions for this project |
+| `/resume [id]` | Resume the latest (or named) auto-saved session |
+
+#### Project memory & todos
+
+| Command | Description |
+| --- | --- |
+| `/init` | Create a starter `AICHAT.md` |
+| `/memory` | Show project memory (`AICHAT.md`) |
+| `/memory-reload` | Re-read `AICHAT.md` from disk |
+| `/memdir` | List cross-session persistent memories |
+| `/memdir-add <text>` | Add a persistent memory |
+| `/memdir-rm <n>` | Remove memory by index |
+| `/memdir-clear` | Clear all persistent memories |
+| `/todos` | List todos |
+| `/todo-add <text>` | Add a todo |
+| `/todo-done <n>` | Mark todo `n` as done |
+| `/todo-rm <n>` | Remove todo `n` |
+| `/todo-clear` | Clear all todos |
+| `/ask <q>` | Record a single-turn clarifying question |
+
+#### Plan mode & trust
+
+| Command | Description |
+| --- | --- |
+| `/plan` | Toggle plan mode (read-only; refuses write/exec tools) |
+| `/trust [revoke]` | Trust the current project directory (or undo) |
+| `/add-dir <path>` | Trust an additional directory for write/exec tools |
+
+#### Git workflow
+
+| Command | Description |
+| --- | --- |
+| `/diff [path]` | Show `git diff` for the working tree |
+| `/commit [-a] <msg>` | Run `git commit` (`-a` stages tracked files first) |
+| `/review` | Ask the model to review the current `git diff` |
+| `/worktree [list \| add <path> [branch] \| remove <path>]` | Manage git worktrees (`add` auto-trusts the new path) |
+| `/branch [list \| create <name> \| switch <name>]` | List, create, or switch git branches |
+| `/tag [list \| <name> \| create <name> [-m <msg>]]` | List or create git tags |
+| `/files` | List files tracked by git in this project |
+
+#### MCP (Model Context Protocol)
+
+| Command | Description |
+| --- | --- |
+| `/mcp-tools` | List available MCP tools |
+| `/mcp-call <tool> <json-args>` | Call an MCP tool |
+| `/mcp-reload` | Reload MCP configuration from `~/.ai-chat-cli/mcp.json` |
+
+#### Examples
 
 ```
 You: /model
@@ -195,32 +267,15 @@ Current model: llama3.2:1b
 
 You: /model mistral:7b
 ✓ Switched to model: mistral:7b
-```
 
-#### `/history` - View conversation history
-
-```
 You: /history
 
 Conversation History:
 ------------------------------------------------------------
 You [1]: What is Rust?
 AI [2]: Rust is a systems programming language...
-You [3]: Can you show me an example?
-AI [4]: Sure! Here's an example...
 ------------------------------------------------------------
-```
 
-#### `/clear` - Clear conversation history
-
-```
-You: /clear
-Conversation history cleared.
-```
-
-#### `/quit` or `/exit` - Exit the application
-
-```
 You: /quit
 Goodbye!
 ```
@@ -342,20 +397,53 @@ ollama list
 ```
 ai-chat-cli/
 ├── src/
-│   ├── main.rs           # Application entry point
-│   ├── cli.rs            # Terminal interface & command handling
-│   ├── executor.rs       # AI task executor
-│   └── ollama.rs         # Ollama API client
-├── Cargo.toml            # Dependencies
-└── README.md             # This file
+│   ├── main.rs            # Application entry point
+│   ├── cli.rs             # Terminal UI, command dispatch, agent-loop driver
+│   ├── commands.rs        # Slash-command registry (single source of truth)
+│   ├── agent_loop.rs      # Streaming tool-calling loop + `agent_run` meta-tool
+│   ├── executor.rs        # AI executor & model switching
+│   ├── llm.rs             # Provider abstraction
+│   ├── ollama.rs          # Ollama HTTP client (streaming + tool calls)
+│   ├── builtin_tools.rs   # bash, fs, web, repl, notebook, worktree, lsp, think
+│   ├── lsp_client.rs      # JSON-RPC client used by the `lsp` builtin tool
+│   ├── mcp_client.rs      # MCP transport (stdio + HTTP)
+│   ├── mcp_config.rs      # `~/.ai-chat-cli/mcp.json` loader
+│   ├── mcp_manager.rs     # MCP server lifecycle & tool routing
+│   ├── permissions.rs     # Project trust store + plan-mode gates
+│   ├── project_memory.rs  # AICHAT.md discovery & loading
+│   ├── memdir.rs          # Cross-session persistent memory store
+│   ├── sessions.rs        # Per-project auto-saved session checkpoints
+│   ├── todos.rs           # Per-project todo list
+│   ├── hooks.rs           # Lifecycle hook registry (PreToolUse, etc.)
+│   ├── file_mentions.rs   # `@file` mentions + user-defined Markdown commands
+│   ├── git_cmds.rs        # Shell-out helpers for the git slash commands
+│   ├── onboarding.rs      # First-run setup
+│   └── distributed.rs     # (Reserved) distributed task plumbing
+├── Cargo.toml             # Dependencies
+├── ROADMAP.md             # Architectural roadmap & shipped/open items
+└── README.md              # This file
 ```
 
 ### Key Components
 
-- **CLI Module** (`cli.rs`) - Handles user interaction, command parsing, and colored output
-- **Executor Module** (`executor.rs`) - Manages AI inference tasks and model switching
-- **Ollama Client** (`ollama.rs`) - Communicates with Ollama API for model inference
-- **Main** (`main.rs`) - Initializes components and starts the application
+- **CLI** (`cli.rs`) — terminal UI, slash-command dispatch, drives the
+  streaming agent loop and persists sessions.
+- **Slash-command registry** (`commands.rs`) — every command's trigger, usage,
+  help line, and `Cmd` tag in one table so `/help`, the welcome banner, and
+  dispatch can't drift apart.
+- **Agent loop** (`agent_loop.rs`) — runs the tool-calling loop (≤12
+  round-trips per turn) and exposes the `agent_run` meta-tool for subagents.
+- **Built-in tools** (`builtin_tools.rs`) — shell, filesystem, web, REPL,
+  Jupyter notebook, git worktree, and LSP code-intel implementations.
+- **MCP layer** (`mcp_client.rs`, `mcp_config.rs`, `mcp_manager.rs`) — loads
+  external MCP servers and exposes their tools to the model.
+- **Permissions** (`permissions.rs`) — trust store consulted by every
+  write/exec tool; also enforces `/plan` mode.
+- **Memory & sessions** (`project_memory.rs`, `memdir.rs`, `sessions.rs`,
+  `todos.rs`) — AICHAT.md auto-injection, cross-session memdir, per-project
+  session checkpoints, and todos.
+- **Executor & Ollama client** (`executor.rs`, `llm.rs`, `ollama.rs`) — model
+  switching and streaming chat-completion calls with tool support.
 
 ## 🛠️ Development
 
@@ -390,16 +478,17 @@ cargo fmt
 
 ### Dependencies
 
-Main dependencies:
+Main dependencies (see `Cargo.toml` for the complete list):
 
-- `tokio` - Async runtime
-- `reqwest` - HTTP client for Ollama API
-- `serde` / `serde_json` - JSON serialization
-- `colored` - Terminal colors
-- `rustyline` - Readline-like input
-- `anyhow` - Error handling
-
-See `Cargo.toml` for complete list.
+- `tokio` — async runtime (rt-multi-thread, macros, process, io-util, time)
+- `reqwest` — HTTP client for Ollama and MCP (with `stream` feature)
+- `futures-util` — stream combinators for token-by-token streaming
+- `serde` / `serde_json` — JSON serialization
+- `colored` — terminal colors
+- `rustyline` — readline-style input with history
+- `anyhow` — error handling
+- `dirs` — cross-platform home/config directory resolution
+- `uuid` — request IDs
 
 ## 🐛 Troubleshooting
 
@@ -494,16 +583,16 @@ See [`ROADMAP.md`](ROADMAP.md) for the full plan (built-in tools, slash
 commands, subsystems, and implementation priorities derived from an
 architectural review of similar tools).
 
-Highlights still to come:
+Highlights still to come (see [`ROADMAP.md`](ROADMAP.md) for the full list):
 
-- [ ] Streaming responses for real-time output
 - [ ] RAG (Retrieval Augmented Generation) support
 - [ ] Multi-modal support (images, audio)
 - [ ] Web interface
 - [ ] Distributed inference across remote workers
 - [ ] Conversation search and tagging
-- [ ] Export to different formats (PDF)
-- [ ] Plugin system for extensibility
+- [ ] Export to additional formats (PDF)
+- [ ] Plugin / skills system for extensibility
+- [ ] Cross-platform shell tool (`pwsh` on Windows)
 
 ---
 
