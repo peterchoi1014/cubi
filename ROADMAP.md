@@ -13,8 +13,8 @@ source tree.
 > implementations must be original work written against public Anthropic
 > documentation, the MCP spec, and our own design.
 
-Items already shipped in this PR are marked `[x]`. Everything else is open work
-for future PRs.
+Items already shipped are marked `[x]`. Everything else is open work
+for future PRs. Current crate version: **0.1.0**.
 
 ---
 
@@ -42,14 +42,14 @@ for future PRs.
       *(bash-only for now; `repl_start` / `repl_eval` / `repl_close`)*
 - [ ] **Cross-platform shell tool** — `bash` vs `pwsh` based on host OS
 - [ ] **Time tools** — `Sleep`, `ScheduleCron`
-- [ ] **Skills system** — reusable Markdown skill packs in
+- [x] **Skills system** — reusable Markdown skill packs in
       `~/.ai-chat-cli/skills/*` + `SkillTool`
-- [ ] **Tool-search tool** — model searches the registry instead of receiving
+- [x] **Tool-search tool** — model searches the registry instead of receiving
       the full tool list in every prompt
 - [ ] **Structured output helpers** — `Brief`, `SyntheticOutput`
 - [ ] **Inter-agent messaging** — `SendMessage`, `RemoteTrigger`
-- [ ] **MCP resources & prompts** — `resources/list`, `resources/read`,
-      per-server OAuth, interactive approval
+- [x] **MCP resources & prompts** — `resources/list`, `resources/read`,
+      per-server OAuth, interactive approval *(resources + interactive approval shipped; prompts/OAuth remain open)*
 
 → Foundation: central tool registry (analogous to leaked `src/tools.ts` /
 `src/Tool.ts`) + `enabled_tools` config so users can disable any tool.
@@ -84,17 +84,17 @@ Shipped in this PR:
 Still to add (grouped by area):
 
 - **Project / workspace:** `/init-verifiers`
-- **Git workflow:** `/commit-push-pr`, `/pr_comments`,
-  `/security-review`, `/autofix-pr`, `/issue`, `/undo`
+- **Git workflow:** `/commit-push-pr` ✅, `/issue` ✅, `/undo` ✅, `/pr_comments`,
+  `/security-review`, `/autofix-pr`
 - **Agent control:** `/agents`, `/tasks`, `/teleport`, `/passes`,
   `/effort`
 - **Output / theming:** `/theme`, `/color`, `/output-style`, `/statusline`,
   `/keybindings`, `/vim`
 - **Auth / accounts:** `/login`, `/logout`, `/oauth-refresh`,
   `/privacy-settings`
-- **MCP / plugins / skills:** `/mcp`, `/plugin`, `/reload-plugins`, `/skills`,
-  `/hooks`
-- **Diagnostics / perf:** `/stats`, `/usage`, `/cost`, `/perf-issue`,
+- **MCP / plugins / skills:** `/mcp`, `/plugin`, `/reload-plugins`, `/skills` ✅,
+  `/hooks` ✅
+- **Diagnostics / perf:** `/stats` ✅, `/usage` ✅, `/cost`, `/perf-issue`,
   `/heapdump`, `/debug-tool-call`, `/doctor` ✅, `/env` ✅, `/bug` ✅,
   `/permissions` ✅, `/config` ✅
 - **Lifecycle:** `/upgrade`, `/install`, `/install-github-app`,
@@ -121,19 +121,19 @@ Markdown commands as first-class plugins (cf. leaked
    allow/deny, "trust this folder" prompts, enterprise-managed policy. ✅
    Foundation shipped: `src/permissions.rs` enforces a per-project trust
    store with a path sandbox; `bash`, `edit_file`, `write_file` are gated.
-   Per-tool allow/deny lists and enterprise policy are still open.
+   Per-tool allow/deny lists are now shipped; enterprise policy is still open.
 3. **Memory & compaction** (`services/compact/`, `SessionMemory/`,
    `extractMemories/`, `memdir/`) — automatic in-session compaction plus
    cross-session persistent memory at `~/.ai-chat-cli/memdir/`. ✅ Shipped:
    `src/memdir.rs` + `/memdir*` slash commands; `/compact` summarizes old
    turns to reduce context length. Automatic (model-driven) extraction of
-   memories from conversation history is still open.
+   memories from conversation history is now shipped.
 4. **Proactive completions** (`PromptSuggestion/`, `fileSuggestions.ts`) —
    suggest next prompts and `@file` references while the user types.
 5. **Multi-agent layer** (`utils/swarm/`, `coordinator/`, `assistant/`,
    `tasks/`) — teammates over tmux / iTerm / in-process backends.
 6. **API hardening** (`services/api/`, `claudeAiLimits*`, `tokenEstimation.ts`)
-   — token estimator, rate limiter, retry-with-backoff in `ollama.rs`.
+   — token estimator, rate limiter, retry-with-backoff in `ollama.rs`. ✅ Retry-with-backoff shipped.
 7. **LSP bridge** (`services/lsp/`) — diagnostics after `edit_file`,
    jump-to-definition.
 8. **Notifications + sleep prevention** (`notifier.ts`, `preventSleep.ts`) —
@@ -147,7 +147,7 @@ Markdown commands as first-class plugins (cf. leaked
     markdown / etc., per-session.
 14. **Hooks** — `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`,
     `SessionStart`, `Notification`. ✅ Foundation shipped in `src/hooks.rs`;
-    user-facing `/hooks` management command still open.
+    user-facing `/hooks list|add|rm` management command now shipped.
 15. **Plugin system** (`plugins/`, `services/plugins/`, `reload-plugins`) —
     `~/.ai-chat-cli/plugins/*` discoverable bundles.
 16. **Headless / remote mode** (`server/`, `remote/`, `upstreamproxy/`,
@@ -193,12 +193,12 @@ Markdown commands as first-class plugins (cf. leaked
 7. Subagents (`AgentTool`) + task management tools. ✅ `agent_run` meta-tool
    shipped (fresh-context inner loop; recursion disallowed).
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.
-   ✅ `/diff`, `/commit`, `/review`, `/worktree`, `/branch`, `/tag`, `/files`,
-   `/add-dir` + `worktree` builtin shipped. `/commit-push-pr` still open.
-9. Multi-provider LLM abstraction + token estimator + rate-limit / retry.
+   ✅ `/diff`, `/commit`, `/commit-push-pr`, `/review`, `/worktree`, `/branch`, `/tag`, `/files`,
+   `/add-dir` + `worktree` builtin shipped.
+9. Multi-provider LLM abstraction + token estimator + rate-limit / retry. ✅ Multi-provider + retry shipped.
 10. Web tools (`web_fetch`, `web_search`) + LSP service & tool + REPL tool +
     notebook tool. ✅ All four shipped as built-in tools.
-11. Hooks, plugins, skills, MCP resources / prompts / OAuth, MCP approval UI.
+11. Hooks, plugins, skills, MCP resources / prompts / OAuth, MCP approval UI. ✅ Hooks UI, skills, MCP resources, and approval UI shipped; prompts/OAuth remain open.
 12. TUI (ratatui) rewrite with panes, vim keybindings, output styles, themes,
     statusline.
 13. Headless / remote / server mode, deep-link integration, voice,

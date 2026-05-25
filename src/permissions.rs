@@ -39,6 +39,10 @@ struct TrustFile {
     /// `BTreeSet` so the on-disk file is stable and diff-friendly.
     #[serde(default)]
     trusted_roots: BTreeSet<PathBuf>,
+    #[serde(default)]
+    pub allowed_tools: BTreeSet<String>,
+    #[serde(default)]
+    pub denied_tools: BTreeSet<String>,
 }
 
 /// In-memory permissions snapshot. Cheap to clone; persists changes
@@ -46,6 +50,8 @@ struct TrustFile {
 #[derive(Debug, Default, Clone)]
 pub struct Permissions {
     trusted_roots: BTreeSet<PathBuf>,
+    allowed_tools: BTreeSet<String>,
+    denied_tools: BTreeSet<String>,
 }
 
 impl Permissions {
@@ -60,6 +66,8 @@ impl Permissions {
             Ok(raw) => match serde_json::from_str::<TrustFile>(&raw) {
                 Ok(file) => Self {
                     trusted_roots: file.trusted_roots,
+                    allowed_tools: file.allowed_tools,
+                    denied_tools: file.denied_tools,
                 },
                 Err(_) => {
                     // Don't silently nuke a corrupt file — start empty in
@@ -91,6 +99,8 @@ impl Permissions {
         }
         let file = TrustFile {
             trusted_roots: self.trusted_roots.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            denied_tools: self.denied_tools.clone(),
         };
         let json = serde_json::to_string_pretty(&file)?;
         fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
@@ -186,6 +196,48 @@ impl Permissions {
                 absolute.display()
             )
         }
+    }
+
+    pub fn allow_tool(&mut self, tool: &str) {
+        let name = tool.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.allowed_tools.insert(name.to_string());
+        self.denied_tools.remove(name);
+    }
+
+    pub fn deny_tool(&mut self, tool: &str) {
+        let name = tool.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.denied_tools.insert(name.to_string());
+        self.allowed_tools.remove(name);
+    }
+
+    #[allow(dead_code)]
+    pub fn undeny_tool(&mut self, tool: &str) {
+        self.denied_tools.remove(tool.trim());
+    }
+
+    #[allow(dead_code)]
+    pub fn unallow_tool(&mut self, tool: &str) {
+        self.allowed_tools.remove(tool.trim());
+    }
+
+    pub fn check_tool_allowed(&self, tool: &str) -> bool {
+        let name = tool.trim();
+        !self.denied_tools.contains(name)
+            && (self.allowed_tools.is_empty() || self.allowed_tools.contains(name))
+    }
+
+    pub fn allowed_tools(&self) -> impl Iterator<Item = &String> {
+        self.allowed_tools.iter()
+    }
+
+    pub fn denied_tools(&self) -> impl Iterator<Item = &String> {
+        self.denied_tools.iter()
     }
 
     /// Returns the number of trusted roots — useful for `/status`.
@@ -305,5 +357,77 @@ mod tests {
         // Second revoke is a no-op (returns false).
         assert!(!perms.revoke_dir(&dir).unwrap());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn allow_tool_empty_or_whitespace_is_noop() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("");
+        perms.allow_tool("   ");
+        assert_eq!(perms.allowed_tools().count(), 0);
+    }
+
+    #[test]
+    fn deny_tool_empty_or_whitespace_is_noop() {
+        let mut perms = Permissions::default();
+        perms.deny_tool("");
+        perms.deny_tool("   ");
+        assert_eq!(perms.denied_tools().count(), 0);
+    }
+
+    #[test]
+    fn check_tool_allowed_empty_allow_list_means_allow_all() {
+        let perms = Permissions::default();
+        // No allowed/denied entries: every tool is allowed.
+        assert!(perms.check_tool_allowed("any_tool"));
+        assert!(perms.check_tool_allowed("another_tool"));
+    }
+
+    #[test]
+    fn allow_tool_restricts_to_listed_tools() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("bash");
+        assert!(perms.check_tool_allowed("bash"));
+        assert!(!perms.check_tool_allowed("grep"));
+    }
+
+    #[test]
+    fn deny_tool_blocks_tool_regardless_of_allow_list() {
+        let mut perms = Permissions::default();
+        // deny beats allow
+        perms.allow_tool("bash");
+        perms.deny_tool("bash");
+        assert!(!perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn deny_tool_removes_from_allowed_tools() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("bash");
+        assert!(perms.check_tool_allowed("bash"));
+        perms.deny_tool("bash");
+        // 'bash' must no longer appear in the allowed set.
+        assert!(!perms.allowed_tools().any(|t| t == "bash"));
+        assert!(!perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn allow_tool_removes_from_denied_tools() {
+        let mut perms = Permissions::default();
+        perms.deny_tool("bash");
+        assert!(!perms.check_tool_allowed("bash"));
+        perms.allow_tool("bash");
+        // 'bash' must no longer appear in the denied set.
+        assert!(!perms.denied_tools().any(|t| t == "bash"));
+        assert!(perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn tool_names_are_trimmed() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("  bash  ");
+        assert!(perms.check_tool_allowed("bash"));
+        perms.deny_tool("  bash  ");
+        assert!(!perms.check_tool_allowed("bash"));
     }
 }

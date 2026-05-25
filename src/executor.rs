@@ -1,32 +1,28 @@
-use crate::ollama::{Message, OllamaClient, ToolSpec};
+use crate::llm::{LlmBackend, create_provider};
+use crate::ollama::{Message, ToolSpec};
 use anyhow::Result;
 
 pub struct AIExecutor {
-    ollama: OllamaClient,
+    backend: LlmBackend,
     model: String,
 }
 
 impl AIExecutor {
     pub async fn new(model: String, _cpu_workers: usize) -> Result<Self> {
-        // Note: In a production distributed system, you would initialize
-        // Repartir pool here and use it to distribute AI inference tasks
-        // across multiple workers/machines. For this demo, we're focusing
-        // on the local Ollama integration.
+        Ok(Self::new_from_env(model))
+    }
 
-        let ollama = OllamaClient::new();
-
-        Ok(Self { ollama, model })
+    pub fn new_from_env(model: String) -> Self {
+        Self {
+            backend: create_provider(),
+            model,
+        }
     }
 
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {
-        // Execute AI inference through Ollama
-        let response = self.ollama.chat(&self.model, messages).await?;
-        Ok(response)
+        self.backend.chat(&self.model, messages).await
     }
 
-    /// Streaming chat. `on_token` fires for each text fragment as it
-    /// arrives. Returns the final assembled assistant [`Message`] (which
-    /// may also carry `tool_calls` when tools are in play).
     pub async fn chat_stream<F>(
         &self,
         messages: Vec<Message>,
@@ -36,20 +32,17 @@ impl AIExecutor {
     where
         F: FnMut(&str),
     {
-        self.ollama
+        self.backend
             .chat_stream(&self.model, messages, tools, on_token)
             .await
     }
 
-    /// One-shot non-streaming chat with native tool calling. Returns the
-    /// full message including any `tool_calls`.
-    #[allow(dead_code)] // Wired up by the agent loop in the next commit.
     pub async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<Message> {
-        self.ollama
+        self.backend
             .chat_with_tools(&self.model, messages, tools)
             .await
     }
@@ -58,10 +51,13 @@ impl AIExecutor {
         &self.model
     }
 
+    pub fn provider_name(&self) -> &str {
+        self.backend.provider_name()
+    }
+
     pub async fn switch_model(&mut self, model: String) -> Result<()> {
-        // Verify model exists before switching
-        let models = self.ollama.list_models().await?;
-        if !models.iter().any(|m| m.starts_with(&model)) {
+        let models = self.backend.list_models().await?;
+        if !models.is_empty() && !models.iter().any(|m| m.starts_with(&model) || m == &model) {
             anyhow::bail!("Model '{}' not found. Available: {:?}", model, models);
         }
         self.model = model;

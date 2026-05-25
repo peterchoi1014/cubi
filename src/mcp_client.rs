@@ -16,6 +16,25 @@ pub struct Tool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
@@ -65,6 +84,20 @@ impl McpClient {
         match self {
             McpClient::Stdio(client) => client.call_tool(name, arguments).await,
             McpClient::Http(client) => client.call_tool(name, arguments).await,
+        }
+    }
+
+    pub async fn list_resources(&mut self) -> Result<Vec<McpResource>> {
+        match self {
+            McpClient::Stdio(client) => client.list_resources().await,
+            McpClient::Http(client) => client.list_resources().await,
+        }
+    }
+
+    pub async fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>> {
+        match self {
+            McpClient::Stdio(client) => client.read_resource(uri).await,
+            McpClient::Http(client) => client.read_resource(uri).await,
         }
     }
 
@@ -211,6 +244,34 @@ impl StdioClient {
         Ok(result)
     }
 
+    async fn list_resources(&mut self) -> Result<Vec<McpResource>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": "resources/list",
+            "params": {}
+        });
+        self.request_id += 1;
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(
+            response["result"]["resources"].clone(),
+        )?)
+    }
+
+    async fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": "resources/read",
+            "params": {"uri": uri}
+        });
+        self.request_id += 1;
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(
+            response["result"]["contents"].clone(),
+        )?)
+    }
+
     async fn shutdown(&mut self) -> Result<()> {
         self.process.kill().await?;
         Ok(())
@@ -262,7 +323,15 @@ impl HttpClient {
     }
 
     async fn send_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {
-        let mut req = self.client.post(&self.url).json(&request);
+        self.send_request_to(&self.url, request).await
+    }
+
+    async fn send_request_to(
+        &self,
+        url: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut req = self.client.post(url).json(&request);
 
         for (key, value) in &self.headers {
             req = req.header(key, value);
@@ -313,5 +382,31 @@ impl HttpClient {
 
         let result: ToolCallResult = serde_json::from_value(response["result"].clone())?;
         Ok(result)
+    }
+
+    async fn list_resources(&self) -> Result<Vec<McpResource>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": Uuid::new_v4().to_string(),
+            "method": "resources/list",
+            "params": {}
+        });
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(
+            response["result"]["resources"].clone(),
+        )?)
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<Vec<McpResourceContent>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": Uuid::new_v4().to_string(),
+            "method": "resources/read",
+            "params": {"uri": uri}
+        });
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(
+            response["result"]["contents"].clone(),
+        )?)
     }
 }

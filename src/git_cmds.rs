@@ -92,6 +92,31 @@ pub fn commit(stage_all: bool, message: &str) -> Result<GitOutput> {
     run_git(&args)
 }
 
+/// Runs `git revert --no-edit HEAD`.
+pub fn git_revert_head() -> Result<GitOutput> {
+    run_git(&["revert", "--no-edit", "HEAD"])
+}
+
+/// Runs `git reset --hard HEAD~1`.
+pub fn git_reset_hard_head1() -> Result<GitOutput> {
+    run_git(&["reset", "--hard", "HEAD~1"])
+}
+
+/// Runs `git push`.
+pub fn git_push() -> Result<GitOutput> {
+    run_git(&["push"])
+}
+
+/// Returns the current branch name.
+pub fn current_branch() -> Result<GitOutput> {
+    run_git(&["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
+/// Returns the configured URL for a git remote.
+pub fn remote_get_url(remote: &str) -> Result<GitOutput> {
+    run_git(&["remote", "get-url", remote])
+}
+
 // ----- worktree -----
 
 /// Lists worktrees in porcelain form.

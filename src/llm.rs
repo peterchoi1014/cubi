@@ -6,10 +6,8 @@
 //! any OpenAI-compatible endpoint (OpenAI, Anthropic via proxy, local vLLM,
 //! etc.).
 //!
-//! **Note:** This module is not yet wired into `AIExecutor`. It serves as
-//! the foundation for multi-provider support. To use it, call
-//! [`create_provider()`] and use the returned [`LlmBackend`] directly.
-//! Full integration into the runtime is planned for a future release.
+//! This module is wired into `AIExecutor` so the CLI can select between
+//! Ollama and an OpenAI-compatible endpoint at runtime.
 //!
 //! ## Token estimation
 //!
@@ -21,9 +19,9 @@
 //! ## Provider selection
 //!
 //! The active provider is chosen based on environment variables:
-//! * `AI_CHAT_CLI_PROVIDER=openai` + `AI_CHAT_CLI_API_KEY` → OpenAI mode
-//! * `AI_CHAT_CLI_PROVIDER=ollama` (or unset) → local Ollama (default)
-//! * `AI_CHAT_CLI_BASE_URL` → overrides the API endpoint for either provider
+//! * `OPENAI_API_KEY` → OpenAI-compatible mode
+//! * `OPENAI_BASE_URL` → overrides the OpenAI-compatible endpoint
+//! * otherwise local Ollama is used (optionally overridden by `AI_CHAT_CLI_BASE_URL`)
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -74,14 +72,11 @@ impl LlmBackend {
         on_token: F,
     ) -> Result<Message>
     where
-        F: FnMut(&str) + Send + 'static,
+        F: FnMut(&str),
     {
         match self {
             Self::Ollama(c) => c.chat_stream(model, messages, tools, on_token).await,
-            Self::OpenAi(c) => {
-                c.chat_stream(model, messages, tools, Box::new(on_token))
-                    .await
-            }
+            Self::OpenAi(c) => c.chat_stream(model, messages, tools, on_token).await,
         }
     }
 
@@ -223,10 +218,17 @@ impl OpenAiClient {
 
     /// Creates a client from environment variables.
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("AI_CHAT_CLI_API_KEY").ok()?;
-        let base_url = std::env::var("AI_CHAT_CLI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        Some(Self::new(base_url, api_key))
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("AI_CHAT_CLI_API_KEY").ok())?;
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("AI_CHAT_CLI_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        Some(Self::new(
+            base_url.trim_end_matches('/').to_string(),
+            api_key,
+        ))
     }
 
     fn convert_messages(messages: &[Message]) -> Vec<OaiRequestMessage> {
@@ -346,13 +348,16 @@ impl OpenAiClient {
         Ok(Self::oai_message_to_message(choice.message))
     }
 
-    pub async fn chat_stream(
+    pub async fn chat_stream<F>(
         &self,
         model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-        mut on_token: Box<dyn FnMut(&str) + Send>,
-    ) -> Result<Message> {
+        mut on_token: F,
+    ) -> Result<Message>
+    where
+        F: FnMut(&str),
+    {
         let mut body = serde_json::json!({
             "model": model,
             "messages": Self::convert_messages(&messages),
@@ -492,25 +497,11 @@ impl OpenAiClient {
 // ─── Provider factory ───────────────────────────────────────────────────────
 
 /// Creates the appropriate LLM provider based on environment configuration.
-///
-/// Priority:
-/// 1. `AI_CHAT_CLI_PROVIDER=openai` + `AI_CHAT_CLI_API_KEY` → OpenAI client
-/// 2. Default → Ollama client (optionally using `AI_CHAT_CLI_BASE_URL`)
 pub fn create_provider() -> LlmBackend {
-    let provider = std::env::var("AI_CHAT_CLI_PROVIDER")
-        .unwrap_or_default()
-        .to_lowercase();
-
-    if provider == "openai" {
-        if let Some(client) = OpenAiClient::from_env() {
-            return LlmBackend::OpenAi(client);
-        }
-        eprintln!(
-            "Warning: AI_CHAT_CLI_PROVIDER=openai but AI_CHAT_CLI_API_KEY not set. Falling back to Ollama."
-        );
+    if let Some(client) = OpenAiClient::from_env() {
+        return LlmBackend::OpenAi(client);
     }
 
-    // Use AI_CHAT_CLI_BASE_URL to override Ollama's default endpoint if set.
     let ollama = match std::env::var("AI_CHAT_CLI_BASE_URL") {
         Ok(url) if !url.is_empty() => OllamaClient::with_base_url(url),
         _ => OllamaClient::new(),
