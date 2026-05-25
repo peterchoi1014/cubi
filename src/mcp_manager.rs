@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::builtin_tools::BuiltinToolRegistry;
+use crate::file_rollback::FileJournal;
 use crate::mcp_client::{McpClient, McpResource, McpResourceContent, Tool, ToolCallResult};
 use crate::mcp_config::{McpConfig, McpServerConfig};
 use crate::permissions::Permissions;
@@ -20,11 +21,22 @@ impl McpManager {
         permissions: Arc<Mutex<Permissions>>,
         plan_mode: Arc<AtomicBool>,
     ) -> Result<Self> {
+        Self::new_with_journal(permissions, plan_mode, FileJournal::default()).await
+    }
+
+    /// Variant that wires an explicit [`FileJournal`] through to the
+    /// built-in tool registry. The journal is shared with the CLI so
+    /// `/rewind` can roll back `edit_file`/`write_file` mutations.
+    pub async fn new_with_journal(
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+        journal: FileJournal,
+    ) -> Result<Self> {
         let config = McpConfig::load()?;
         let mut manager = Self {
             clients: HashMap::new(),
             tools: HashMap::new(),
-            builtin_tools: BuiltinToolRegistry::new(permissions, plan_mode),
+            builtin_tools: BuiltinToolRegistry::with_journal(permissions, plan_mode, journal),
         };
 
         // Add built-in tools first
@@ -83,11 +95,22 @@ impl McpManager {
             .get(name)
             .context(format!("Tool '{}' not found", name))?;
 
+        // Time the call so the opt-in telemetry log has useful numbers.
+        let started = std::time::Instant::now();
+        let server_name = server_name.clone();
+
         // Handle built-in tools
         if server_name == "builtin" {
-            let result = self.builtin_tools.execute(name, arguments).await?;
-
-            // Convert BuiltinToolResult to ToolCallResult
+            let result = self.builtin_tools.execute(name, arguments).await;
+            crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+                tool: name,
+                ok: result
+                    .as_ref()
+                    .map(|r| r.is_error != Some(true))
+                    .unwrap_or(false),
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+            let result = result?;
             return Ok(ToolCallResult {
                 content: result
                     .content
@@ -104,10 +127,19 @@ impl McpManager {
         // Handle external MCP server tools
         let client = self
             .clients
-            .get_mut(server_name)
+            .get_mut(&server_name)
             .context(format!("Server '{}' not connected", server_name))?;
 
-        client.call_tool(name, arguments).await
+        let result = client.call_tool(name, arguments).await;
+        crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+            tool: name,
+            ok: result
+                .as_ref()
+                .map(|r| r.is_error != Some(true))
+                .unwrap_or(false),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+        result
     }
 
     async fn connect_server(&mut self, name: &str, config: &McpServerConfig) -> Result<()> {
@@ -194,6 +226,41 @@ impl McpManager {
             .get_mut(server)
             .context(format!("Server '{}' not connected", server))?;
         client.read_resource(uri).await
+    }
+
+    /// Aggregate `prompts/list` over every connected MCP server.
+    /// Per-server failures are logged as warnings but do not abort the
+    /// whole call — partial results are still useful.
+    pub async fn list_prompts(&mut self) -> Result<Vec<(String, String, String)>> {
+        let mut out = Vec::new();
+        for (server_name, client) in &mut self.clients {
+            match client.list_prompts().await {
+                Ok(prompts) => {
+                    for p in prompts {
+                        let desc = p.description.clone().unwrap_or_default();
+                        out.push((server_name.clone(), p.name, desc));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to list prompts from '{}': {}",
+                        "Warning:".bright_yellow(),
+                        server_name,
+                        e
+                    );
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(out)
+    }
+
+    pub async fn get_prompt(&mut self, server: &str, name: &str) -> Result<String> {
+        let client = self
+            .clients
+            .get_mut(server)
+            .context(format!("Server '{}' not connected", server))?;
+        client.get_prompt(name).await
     }
 
     pub async fn shutdown(&mut self) {

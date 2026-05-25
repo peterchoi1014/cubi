@@ -35,6 +35,13 @@ pub struct McpResourceContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
@@ -98,6 +105,21 @@ impl McpClient {
         match self {
             McpClient::Stdio(client) => client.read_resource(uri).await,
             McpClient::Http(client) => client.read_resource(uri).await,
+        }
+    }
+
+    pub async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>> {
+        match self {
+            McpClient::Stdio(client) => client.list_prompts().await,
+            McpClient::Http(client) => client.list_prompts().await,
+        }
+    }
+
+    /// Render a prompt to its concatenated user-message text.
+    pub async fn get_prompt(&mut self, name: &str) -> Result<String> {
+        match self {
+            McpClient::Stdio(client) => client.get_prompt(name).await,
+            McpClient::Http(client) => client.get_prompt(name).await,
         }
     }
 
@@ -272,6 +294,30 @@ impl StdioClient {
         )?)
     }
 
+    async fn list_prompts(&mut self) -> Result<Vec<McpPrompt>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": "prompts/list",
+            "params": {}
+        });
+        self.request_id += 1;
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(response["result"]["prompts"].clone()).unwrap_or_default())
+    }
+
+    async fn get_prompt(&mut self, name: &str) -> Result<String> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": "prompts/get",
+            "params": {"name": name}
+        });
+        self.request_id += 1;
+        let response = self.send_request(request).await?;
+        Ok(render_prompt_messages(&response["result"]))
+    }
+
     async fn shutdown(&mut self) -> Result<()> {
         self.process.kill().await?;
         Ok(())
@@ -409,4 +455,52 @@ impl HttpClient {
             response["result"]["contents"].clone(),
         )?)
     }
+
+    async fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": Uuid::new_v4().to_string(),
+            "method": "prompts/list",
+            "params": {}
+        });
+        let response = self.send_request(request).await?;
+        Ok(serde_json::from_value(response["result"]["prompts"].clone()).unwrap_or_default())
+    }
+
+    async fn get_prompt(&self, name: &str) -> Result<String> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": Uuid::new_v4().to_string(),
+            "method": "prompts/get",
+            "params": {"name": name}
+        });
+        let response = self.send_request(request).await?;
+        Ok(render_prompt_messages(&response["result"]))
+    }
+}
+
+/// Flatten a `prompts/get` response into a single user-visible string.
+/// We deliberately do not try to preserve message role boundaries —
+/// `/mcp-prompts` is for human inspection, not direct injection into
+/// the chat history.
+fn render_prompt_messages(result: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(messages) = result["messages"].as_array() {
+        for m in messages {
+            let role = m["role"].as_str().unwrap_or("user");
+            let text = m["content"]["text"]
+                .as_str()
+                .or_else(|| m["content"].as_str())
+                .unwrap_or("");
+            if !text.is_empty() {
+                out.push_str(&format!("[{role}] {text}\n"));
+            }
+        }
+    }
+    if out.is_empty()
+        && let Some(text) = result["description"].as_str()
+    {
+        out.push_str(text);
+    }
+    out
 }

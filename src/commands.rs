@@ -120,6 +120,11 @@ pub enum Cmd {
     Feedback,
     ReleaseNotes,
     Stickers,
+    // -- Added by the roadmap completion pass --
+    SettingsSync,
+    Policy,
+    Tip,
+    McpPrompts,
     Quit,
 }
 
@@ -700,6 +705,30 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/stickers",
         help: "Print a friendly ASCII sticker sheet",
         cmd: Cmd::Stickers,
+    },
+    SlashCommandSpec {
+        name: "/settings-sync",
+        usage: "/settings-sync [init <remote>|push [msg]|pull|status]",
+        help: "Sync ~/.ai-chat-cli/ via git (cross-machine config + memdir + skills)",
+        cmd: Cmd::SettingsSync,
+    },
+    SlashCommandSpec {
+        name: "/policy",
+        usage: "/policy",
+        help: "Show the active admin-managed policy overlay (read-only)",
+        cmd: Cmd::Policy,
+    },
+    SlashCommandSpec {
+        name: "/tip",
+        usage: "/tip",
+        help: "Show a quick tip about using ai-chat-cli",
+        cmd: Cmd::Tip,
+    },
+    SlashCommandSpec {
+        name: "/mcp-prompts",
+        usage: "/mcp-prompts [server[:prompt]]",
+        help: "List MCP prompts (or fetch a specific one)",
+        cmd: Cmd::McpPrompts,
     },
     SlashCommandSpec {
         name: "/quit",
