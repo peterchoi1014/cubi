@@ -7,6 +7,7 @@ use crate::git_cmds;
 use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
+use crate::oauth;
 use crate::ollama::Message;
 use crate::onboarding::AppConfig;
 use crate::output_styles;
@@ -759,7 +760,7 @@ impl ChatCLI {
             Cmd::Vim => self.handle_vim(args),
             Cmd::Login => self.handle_login(args),
             Cmd::Logout => self.handle_logout(args),
-            Cmd::OauthRefresh => self.show_oauth_refresh(),
+            Cmd::OauthRefresh => self.show_oauth_refresh(args),
             Cmd::PrivacySettings => self.handle_privacy_settings(args),
             Cmd::Mcp => self.show_mcp_status(),
             Cmd::Plugin => self.show_plugins(),
@@ -3823,42 +3824,124 @@ impl ChatCLI {
     }
 
     fn handle_login(&self, args: &str) {
-        let provider = if args.trim().is_empty() {
-            "ollama"
-        } else {
-            args.trim()
+        let parsed = match oauth::parse_login_args(args) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                println!(
+                    "{} Usage: /login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
+                    "Info:".bright_yellow()
+                );
+                return;
+            }
         };
+        let mut store = oauth::OAuthStore::load();
+        store.upsert_login(&parsed);
+        if let Err(e) = store.save() {
+            eprintln!(
+                "{} failed to persist OAuth token: {}",
+                "Error:".bright_red(),
+                e
+            );
+            return;
+        }
+        let env_var = oauth::provider_env_var(&parsed.provider);
+        unsafe { std::env::set_var(&env_var, &parsed.access_token) };
         println!(
-            "\n{} ai-chat-cli is a local-first tool — there is no managed account.\n  \
-             For provider '{}': set the relevant API key in your environment, e.g.\n  \
-             `export AICHAT_{}_API_KEY=...` and restart the CLI.",
-            "ℹ".bright_blue(),
-            provider.bright_cyan(),
-            provider.to_ascii_uppercase()
+            "{} OAuth token saved for '{}' and loaded into {}",
+            "✓".bright_green(),
+            parsed.provider.bright_cyan(),
+            env_var.bright_cyan()
         );
     }
 
     fn handle_logout(&self, args: &str) {
         let provider = if args.trim().is_empty() {
-            "ollama".to_string()
+            "ollama"
         } else {
-            args.trim().to_string()
+            args.trim()
         };
-        let var = format!("AICHAT_{}_API_KEY", provider.to_ascii_uppercase());
+        let mut store = oauth::OAuthStore::load();
+        let removed = store.remove_provider(provider);
+        if let Err(e) = store.save() {
+            eprintln!(
+                "{} failed to persist OAuth store: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+        let var = oauth::provider_env_var(provider);
         unsafe { std::env::remove_var(&var) };
         println!(
-            "{} cleared {} from this process (restart the CLI to refresh on-disk config)",
+            "{} cleared {} from this process{}",
             "✓".bright_green(),
-            var.bright_cyan()
+            var.bright_cyan(),
+            if removed {
+                " and removed persisted OAuth token"
+            } else {
+                ""
+            }
         );
     }
 
-    fn show_oauth_refresh(&self) {
-        println!(
-            "{} OAuth is not configured: ai-chat-cli talks to local Ollama by default. \
-             No tokens to refresh.",
-            "ℹ".bright_blue()
-        );
+    fn show_oauth_refresh(&self, args: &str) {
+        let provider_filter = args.trim().to_ascii_lowercase();
+        let store = oauth::OAuthStore::load();
+        if store.providers.is_empty() {
+            println!(
+                "{} No OAuth tokens are stored yet. Use /login <provider> <access-token> first.",
+                "ℹ".bright_blue()
+            );
+            return;
+        }
+
+        let mut refreshed = 0usize;
+        for (provider, token) in &store.providers {
+            if !provider_filter.is_empty() && provider != &provider_filter {
+                continue;
+            }
+            let env_var = oauth::provider_env_var(provider);
+            if token.is_expired() {
+                println!(
+                    "{} {} token is expired; not loading {}",
+                    "⚠".bright_yellow(),
+                    provider.bright_cyan(),
+                    env_var.bright_cyan()
+                );
+                continue;
+            }
+            unsafe { std::env::set_var(&env_var, &token.access_token) };
+            refreshed += 1;
+            match token.expires_at_unix {
+                Some(ts) => println!(
+                    "{} refreshed {} into {} (expires at unix={})",
+                    "✓".bright_green(),
+                    provider.bright_cyan(),
+                    env_var.bright_cyan(),
+                    ts.to_string().bright_black()
+                ),
+                None => println!(
+                    "{} refreshed {} into {} (no expiry set)",
+                    "✓".bright_green(),
+                    provider.bright_cyan(),
+                    env_var.bright_cyan()
+                ),
+            }
+        }
+        if refreshed == 0 {
+            if !provider_filter.is_empty() {
+                println!(
+                    "{} No non-expired token found for provider '{}'.",
+                    "ℹ".bright_blue(),
+                    provider_filter.bright_cyan()
+                );
+            } else {
+                println!(
+                    "{}",
+                    "ℹ No non-expired OAuth tokens to refresh.".bright_blue()
+                );
+            }
+        }
     }
 
     fn handle_privacy_settings(&self, args: &str) {
@@ -4495,6 +4578,8 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn user(s: &str) -> Message {
         Message::text("user", s)
@@ -4616,5 +4701,67 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ai-chat-cli-missing-{nanos}.txt"));
         let p = path.to_str().unwrap();
         check_overwrite_allowed(p, false, "/export").expect("missing file is fine");
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn new_test_cli() -> ChatCLI {
+        let executor = AIExecutor::new_from_env("test-model".to_string());
+        ChatCLI::new(
+            executor,
+            None,
+            Arc::new(Mutex::new(Permissions::default())),
+            Arc::new(AtomicBool::new(false)),
+            FileJournal::default(),
+        )
+    }
+
+    fn temp_oauth_path(suffix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("ai-chat-cli-{suffix}-{nanos}.json"))
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn login_and_logout_persist_and_remove_provider_tokens() {
+        let _guard = env_lock().lock().expect("lock should not be poisoned");
+        let oauth_path = temp_oauth_path("oauth");
+        unsafe {
+            std::env::set_var("AICHAT_OAUTH_FILE", &oauth_path);
+            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+        }
+
+        let cli = new_test_cli();
+        cli.handle_login("GiTHub token123 --refresh-token refresh123 --expires-in 60");
+
+        let after_login = oauth::OAuthStore::load();
+        let token = after_login
+            .get_provider("github")
+            .expect("provider token should exist after /login");
+        assert_eq!(token.access_token, "token123");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
+        assert_eq!(
+            std::env::var("AICHAT_GITHUB_API_KEY").ok().as_deref(),
+            Some("token123")
+        );
+
+        cli.handle_logout("github");
+        let after_logout = oauth::OAuthStore::load();
+        assert!(after_logout.get_provider("github").is_none());
+        assert!(std::env::var("AICHAT_GITHUB_API_KEY").is_err());
+
+        let _ = std::fs::remove_file(&oauth_path);
+        unsafe {
+            std::env::remove_var("AICHAT_OAUTH_FILE");
+            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+        }
     }
 }

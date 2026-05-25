@@ -200,7 +200,7 @@ pub async fn run_if_needed(
                 println!("  {}. {}", i + 1, label);
             }
             println!(
-                "{} Recommended for tool-calling: {} (or {}/{}).",
+                "{} Recommended for tool-calling: {}. Alternatives: {} or {}.",
                 "ℹ".bright_blue(),
                 "qwen3:4b".bright_cyan(),
                 "qwen2.5:3b".bright_cyan(),
