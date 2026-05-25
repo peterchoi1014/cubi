@@ -229,20 +229,37 @@ impl ChatCLI {
         // Fire Stop hooks.
         self.hooks.fire_stop();
 
-        // Leave the user with a clear hint on how to bring this chat back.
-        // Only print when a checkpoint actually landed on disk — a save
-        // failure (which only logs a warning) would otherwise leave the
-        // user with an id that can't be resumed.
-        if let (Some(session), Some(store)) =
-            (self.current_session.as_ref(), self.session_store.as_ref())
-            && store.exists(&session.id)
-        {
-            println!(
-                "\n{} To pick this chat back up, run {} and then type {}",
-                "↩".bright_cyan(),
-                "cubi".bright_cyan(),
-                format!("/resume {}", session.id).bright_cyan()
-            );
+        // Leave the user with a clear hint on how to pick a chat back up.
+        // Three cases:
+        //   1. We have an on-disk checkpoint for *this* chat → point at it
+        //      directly with /resume <id>.
+        //   2. No current session, but other checkpoints exist in this
+        //      cwd → mention /sessions so they can still find them.
+        //   3. Nothing on disk at all → say nothing; a hint would just
+        //      be noise.
+        let resume_hint = self.session_store.as_ref().and_then(|store| {
+            if let Some(session) = self.current_session.as_ref()
+                && store.exists(&session.id)
+            {
+                Some(format!(
+                    "\n{} To pick this chat back up, run {} and then type {}",
+                    "↩".bright_cyan(),
+                    "cubi".bright_cyan(),
+                    format!("/resume {}", session.id).bright_cyan()
+                ))
+            } else if store.list().map(|l| !l.is_empty()).unwrap_or(false) {
+                Some(format!(
+                    "\n{} Run {} and type {} to see prior chats in this directory.",
+                    "↩".bright_cyan(),
+                    "cubi".bright_cyan(),
+                    "/sessions".bright_cyan()
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some(hint) = resume_hint {
+            println!("{}", hint);
         }
 
         Ok(())
