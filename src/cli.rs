@@ -1,5 +1,6 @@
 use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
 use crate::commands::{self, COMMANDS, Cmd};
+use crate::completer::SlashHelper;
 use crate::executor::AIExecutor;
 use crate::file_mentions::{self, UserCommand};
 use crate::file_rollback::FileJournal;
@@ -22,8 +23,9 @@ use crate::themes;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use colored::*;
-use rustyline::DefaultEditor;
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -159,7 +161,8 @@ impl ChatCLI {
         // Fire SessionStart hooks.
         self.hooks.fire_session_start(self.executor.get_model());
 
-        let mut rl = DefaultEditor::new()?;
+        let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::new()?;
+        rl.set_helper(Some(SlashHelper));
 
         loop {
             let prompt = if self.plan_mode.load(Ordering::SeqCst) {
@@ -229,20 +232,36 @@ impl ChatCLI {
         // Fire Stop hooks.
         self.hooks.fire_stop();
 
-        // Leave the user with a clear hint on how to bring this chat back.
-        // Only print when a checkpoint actually landed on disk — a save
-        // failure (which only logs a warning) would otherwise leave the
-        // user with an id that can't be resumed.
-        if let (Some(session), Some(store)) =
-            (self.current_session.as_ref(), self.session_store.as_ref())
-            && store.exists(&session.id)
-        {
-            println!(
-                "\n{} To pick this chat back up, run {} and then type {}",
-                "↩".bright_cyan(),
-                "cubi".bright_cyan(),
-                format!("/resume {}", session.id).bright_cyan()
-            );
+        // Leave the user with a clear hint on how to pick a chat back up.
+        // Three cases:
+        //   1. We have an on-disk checkpoint for *this* chat → point at it
+        //      directly with /resume <id>.
+        //   2. No current session, but other checkpoints exist in this
+        //      cwd → mention /sessions so they can still find them.
+        //   3. Nothing on disk at all → say nothing; a hint would just
+        //      be noise.
+        let resume_hint = self.session_store.as_ref().and_then(|store| {
+            if let Some(session) = self.current_session.as_ref()
+                && store.exists(&session.id)
+            {
+                Some(format!(
+                    "\n{} To pick this chat back up, run {}",
+                    "↩".bright_cyan(),
+                    format!("cubi --resume {}", session.id).bright_cyan()
+                ))
+            } else if store.list().map(|l| !l.is_empty()).unwrap_or(false) {
+                Some(format!(
+                    "\n{} Run {} to jump back into your most recent chat, or {} for a list.",
+                    "↩".bright_cyan(),
+                    "cubi --resume".bright_cyan(),
+                    "cubi  →  /sessions".bright_cyan()
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some(hint) = resume_hint {
+            println!("{}", hint);
         }
 
         Ok(())
@@ -328,8 +347,24 @@ impl ChatCLI {
 
     async fn handle_command(&mut self, input: &str) -> Result<bool> {
         let Some((cmd, args)) = commands::parse(input) else {
-            println!("{} {}", "Unknown command:".bright_red(), input);
-            println!("Type {} for available commands", "/help".bright_cyan());
+            // Extract the typed `/foo` head so we can show useful
+            // candidates when the user typed an ambiguous prefix.
+            let head = input.split_whitespace().next().unwrap_or(input);
+            let candidates = commands::prefix_matches(head);
+            if candidates.len() > 1 {
+                println!(
+                    "{} {} matches multiple commands:",
+                    "Ambiguous:".bright_yellow(),
+                    head.bright_cyan()
+                );
+                for name in &candidates {
+                    println!("  {}", name.bright_cyan());
+                }
+                println!("Type more characters to disambiguate.");
+            } else {
+                println!("{} {}", "Unknown command:".bright_red(), input);
+                println!("Type {} for available commands", "/help".bright_cyan());
+            }
             return Ok(true);
         };
 
@@ -1031,45 +1066,26 @@ impl ChatCLI {
             r#"  └───────┘  "#,
             r#"   ░░░░░░░   "#,
         ];
+        // Fold the essential commands into the mascot's right-hand
+        // column so first-run output fits on one screen. The full
+        // command list is one `/help` away.
         let tagline = [
-            "",
-            "  hi, i'm Cubi.",
-            "  /help to see commands.",
-            "  ask me anything.",
-            "",
+            "".to_string(),
+            format!("hi, i'm Cubi — {}", "a pocket-sized AI".bright_white()),
+            format!(
+                "{} or {} · {} to exit · Tab to autocomplete",
+                "/help".bright_cyan(),
+                "/version".bright_cyan(),
+                "/quit".bright_cyan()
+            ),
+            format!("ask me anything ({} commands available)", COMMANDS.len()),
+            "".to_string(),
         ];
         println!();
         for (m, t) in mascot.iter().zip(tagline.iter()) {
-            println!("{}  {}", m.bright_cyan(), t.bright_white());
+            println!("{}  {}", m.bright_cyan(), t);
         }
         println!();
-        println!("{}", "=".repeat(60).bright_cyan());
-        println!(
-            "{}",
-            "  Cubi — a pocket-sized AI for your shell"
-                .bright_cyan()
-                .bold()
-        );
-        println!("{}", "=".repeat(60).bright_cyan());
-        let essentials = [
-            ("/help", "show all commands"),
-            ("/quit", "exit the chat"),
-            ("/version", "print version info"),
-        ];
-        println!("\n{}", "Commands:".bright_yellow().bold());
-        for (usage, help) in essentials {
-            println!("  {} - {}", usage.bright_cyan(), help);
-        }
-        println!(
-            "  {} {} for the full list ({} commands available)",
-            "→ type".bright_black(),
-            "/help".bright_cyan(),
-            COMMANDS.len(),
-        );
-        println!(
-            "\n{}\n",
-            "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white()
-        );
     }
 
     fn show_help(&self) {
@@ -1917,7 +1933,7 @@ impl ChatCLI {
     }
 
     /// Resumes the latest session, or a named one if `args` is non-empty.
-    fn resume_session(&mut self, args: &str) {
+    pub fn resume_session(&mut self, args: &str) {
         let Some(store) = &self.session_store else {
             println!(
                 "{} Sessions disabled: could not resolve home directory.",
