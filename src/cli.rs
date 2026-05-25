@@ -18,7 +18,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -682,6 +682,42 @@ impl ChatCLI {
                     }
                 }
             }
+            Cmd::InitVerifiers => self.run_init_verifiers(),
+            Cmd::PrComments => self.run_pr_comments(args),
+            Cmd::SecurityReview => self.run_security_review().await,
+            Cmd::AutofixPr => self.run_autofix_pr(args).await,
+            Cmd::Agents => self.show_agents(),
+            Cmd::Tasks => self.todos.render(),
+            Cmd::Teleport => self.run_teleport(args),
+            Cmd::Passes | Cmd::Effort => self.handle_effort(cmd, args),
+            Cmd::Theme => self.handle_theme(args),
+            Cmd::Color => self.handle_color(args),
+            Cmd::OutputStyle => self.handle_output_style(args),
+            Cmd::Statusline => self.show_statusline(),
+            Cmd::Keybindings => self.show_keybindings(),
+            Cmd::Vim => self.handle_vim(args),
+            Cmd::Login => self.handle_login(args),
+            Cmd::Logout => self.handle_logout(args),
+            Cmd::OauthRefresh => self.show_oauth_refresh(),
+            Cmd::PrivacySettings => self.handle_privacy_settings(args),
+            Cmd::Mcp => self.show_mcp_status(),
+            Cmd::Plugin => self.show_plugins(),
+            Cmd::ReloadPlugins => self.reload_plugins(),
+            Cmd::Cost => self.show_cost(),
+            Cmd::PerfIssue => self.show_perf_issue_url(args),
+            Cmd::Heapdump => self.show_heap_info(),
+            Cmd::DebugToolCall => self.handle_debug_tool_call(args),
+            Cmd::Upgrade => self.show_upgrade(),
+            Cmd::Install => self.show_install(),
+            Cmd::InstallGithubApp => self.show_install_github_app(),
+            Cmd::InstallSlackApp => self.show_install_slack_app(),
+            Cmd::SandboxToggle => self.toggle_plan_mode(),
+            Cmd::ResetLimits => self.reset_limits(),
+            Cmd::Share => self.run_share(args),
+            Cmd::Copy => self.run_copy(),
+            Cmd::Feedback => self.show_feedback_url(args),
+            Cmd::ReleaseNotes => self.show_release_notes(),
+            Cmd::Stickers => self.show_stickers(),
         }
         Ok(true)
     }
@@ -3140,6 +3176,806 @@ impl ChatCLI {
         }
         fs::write(filename, out)?;
         Ok(())
+    }
+
+    // -------- New slash command handlers (v0.2.0) --------
+
+    /// `/init-verifiers` — scan the cwd for well-known build/test/lint
+    /// manifests and print (and save to `.aichat-verifiers.json`) the
+    /// inferred verifier commands.
+    fn run_init_verifiers(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let mut verifiers: Vec<(&str, &str)> = Vec::new();
+        if cwd.join("Cargo.toml").exists() {
+            verifiers.push(("build", "cargo build"));
+            verifiers.push(("test", "cargo test"));
+            verifiers.push(("lint", "cargo clippy --all-targets -- -D warnings"));
+            verifiers.push(("fmt", "cargo fmt --all -- --check"));
+        }
+        if cwd.join("package.json").exists() {
+            verifiers.push(("build", "npm run build"));
+            verifiers.push(("test", "npm test"));
+            verifiers.push(("lint", "npm run lint"));
+        }
+        if cwd.join("pyproject.toml").exists() || cwd.join("setup.py").exists() {
+            verifiers.push(("test", "pytest"));
+            verifiers.push(("lint", "ruff check ."));
+        }
+        if cwd.join("go.mod").exists() {
+            verifiers.push(("build", "go build ./..."));
+            verifiers.push(("test", "go test ./..."));
+            verifiers.push(("lint", "go vet ./..."));
+        }
+        if cwd.join("Makefile").exists() {
+            verifiers.push(("make", "make"));
+        }
+        println!("\n{}", "Detected verifiers:".bright_yellow().bold());
+        if verifiers.is_empty() {
+            println!(
+                "  {} No known build manifest found in {}",
+                "ℹ".bright_blue(),
+                cwd.display()
+            );
+            return;
+        }
+        for (k, v) in &verifiers {
+            println!("  {} {}: {}", "•".bright_cyan(), k.bright_cyan(), v);
+        }
+        let out_path = cwd.join(".aichat-verifiers.json");
+        let payload: Vec<serde_json::Value> = verifiers
+            .iter()
+            .map(|(k, v)| serde_json::json!({ "kind": k, "command": v }))
+            .collect();
+        let serialized = match serde_json::to_string_pretty(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "  {} Could not serialize {}: {}",
+                    "✗".bright_red(),
+                    out_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        match fs::write(&out_path, serialized) {
+            Ok(()) => println!(
+                "\n  {} Saved to {}",
+                "✓".bright_green(),
+                out_path.display().to_string().bright_cyan()
+            ),
+            Err(e) => eprintln!(
+                "  {} Could not write {}: {}",
+                "✗".bright_red(),
+                out_path.display(),
+                e
+            ),
+        }
+        println!();
+    }
+
+    /// `/pr_comments` — shells out to `gh pr view --comments` if installed.
+    fn run_pr_comments(&self, args: &str) {
+        let arg_pr = args.trim();
+        let mut cmd = std::process::Command::new("gh");
+        cmd.arg("pr").arg("view").arg("--comments");
+        if !arg_pr.is_empty() {
+            cmd.arg(arg_pr);
+        }
+        match cmd.output() {
+            Ok(out) => {
+                std::io::Write::write_all(&mut std::io::stdout(), &out.stdout).ok();
+                if !out.status.success() {
+                    eprintln!(
+                        "{} gh pr view exited {} ({})",
+                        "Error:".bright_red(),
+                        out.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "{} `gh` not available ({}). Install GitHub CLI: https://cli.github.com",
+                "Error:".bright_red(),
+                e
+            ),
+        }
+    }
+
+    /// `/security-review` — like `/review`, but prompts the model to focus
+    /// on security-relevant issues in the current `git diff`.
+    async fn run_security_review(&mut self) {
+        let diff = match git_cmds::diff_for_review() {
+            Ok(out) if !out.stdout.trim().is_empty() => out.stdout,
+            Ok(_) => {
+                println!(
+                    "{} Working tree is clean — nothing to review.",
+                    "ℹ".bright_blue()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let prompt = format!(
+            "Please perform a focused security review of the following `git diff`. \
+             Highlight any potential vulnerabilities (injection, path traversal, \
+             auth, secret handling, supply-chain, race conditions, deserialization, \
+             etc.), explain the impact, and suggest a remediation. If the diff is \
+             security-clean, say so explicitly.\n\n```diff\n{diff}\n```"
+        );
+        self.history.push(Message::text("user", prompt));
+        match self.executor.chat(self.history.clone()).await {
+            Ok(reply) => {
+                println!("{} {}", "AI:".bright_cyan().bold(), reply);
+                self.history.push(Message::text("assistant", reply));
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/autofix-pr` — fetch PR comments and ask the model to propose fixes.
+    async fn run_autofix_pr(&mut self, args: &str) {
+        let arg_pr = args.trim();
+        let mut cmd = std::process::Command::new("gh");
+        cmd.arg("pr").arg("view").arg("--comments");
+        if !arg_pr.is_empty() {
+            cmd.arg(arg_pr);
+        }
+        let body = match cmd.output() {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
+            Ok(out) => {
+                eprintln!(
+                    "{} gh pr view failed: {}",
+                    "Error:".bright_red(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} `gh` not available: {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let prompt = format!(
+            "Here are the review comments on the current pull request. Propose \
+             concrete code changes that address each substantive comment. Group \
+             suggestions by file and explain reasoning. If a comment is unclear, \
+             flag it.\n\n```\n{body}\n```"
+        );
+        self.history.push(Message::text("user", prompt));
+        match self.executor.chat(self.history.clone()).await {
+            Ok(reply) => {
+                println!("{} {}", "AI:".bright_cyan().bold(), reply);
+                self.history.push(Message::text("assistant", reply));
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/agents` — list active background agent sessions (from the session
+    /// store). Each session is a candidate "agent" worker.
+    fn show_agents(&self) {
+        println!("\n{}", "Agents / sessions:".bright_yellow().bold());
+        let Some(store) = self.session_store.as_ref() else {
+            println!(
+                "  {} Sessions disabled (no home dir resolved).",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        match store.list() {
+            Ok(list) if list.is_empty() => println!("  {} No sessions yet.", "ℹ".bright_blue()),
+            Ok(list) => {
+                for s in list {
+                    println!(
+                        "  {} {} ({} msgs)",
+                        "•".bright_cyan(),
+                        s.id.bright_cyan(),
+                        s.message_count
+                    );
+                }
+            }
+            Err(e) => eprintln!("  {} {}", "✗".bright_red(), e),
+        }
+        println!();
+    }
+
+    /// `/teleport <path>` — change cwd to a trusted directory.
+    fn run_teleport(&self, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            println!("{} Usage: /teleport <path>", "Info:".bright_yellow());
+            return;
+        }
+        let candidate = PathBuf::from(path);
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&candidate) {
+            eprintln!("{} {}", "Error:".bright_red(), e);
+            return;
+        }
+        match std::env::set_current_dir(path) {
+            Ok(()) => println!("{} cwd is now {}", "✓".bright_green(), path.bright_cyan()),
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/passes` and `/effort` — show or set the agent-loop pass budget. We
+    /// stash it in the `EffortConfig` config field. The agent loop reads
+    /// `AGENT_PASSES_OVERRIDE` env var if set; we set that here so the
+    /// change takes effect mid-session without rebuilding the loop.
+    fn handle_effort(&self, cmd: Cmd, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            let current = std::env::var("AGENT_PASSES_OVERRIDE")
+                .unwrap_or_else(|_| format!("{}", agent_loop::MAX_AGENT_STEPS));
+            println!(
+                "{} max passes: {} (default {})",
+                "ℹ".bright_blue(),
+                current.bright_cyan(),
+                agent_loop::MAX_AGENT_STEPS
+            );
+            return;
+        }
+        let n = if matches!(cmd, Cmd::Effort) {
+            match arg.to_ascii_lowercase().as_str() {
+                "low" => 4,
+                "medium" | "med" => 8,
+                "high" => 12,
+                other => {
+                    if let Ok(n) = other.parse::<u32>() {
+                        n
+                    } else {
+                        eprintln!(
+                            "{} Use low|medium|high or a number 1..=12",
+                            "Error:".bright_red()
+                        );
+                        return;
+                    }
+                }
+            }
+        } else {
+            match arg.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("{} /passes expects a number 1..=12", "Error:".bright_red());
+                    return;
+                }
+            }
+        };
+        if !(1..=12).contains(&n) {
+            eprintln!("{} must be 1..=12", "Error:".bright_red());
+            return;
+        }
+        unsafe { std::env::set_var("AGENT_PASSES_OVERRIDE", n.to_string()) };
+        println!("{} max passes set to {}", "✓".bright_green(), n);
+    }
+
+    fn handle_theme(&self, args: &str) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => println!(
+                "{} theme: {} (set with /theme [auto|light|dark])",
+                "ℹ".bright_blue(),
+                std::env::var("AICHAT_THEME")
+                    .unwrap_or_else(|_| "auto".to_string())
+                    .bright_cyan()
+            ),
+            "auto" | "light" | "dark" => {
+                unsafe { std::env::set_var("AICHAT_THEME", &arg) };
+                println!("{} theme set to {}", "✓".bright_green(), arg);
+            }
+            other => eprintln!(
+                "{} Unknown theme '{}'. Expected auto|light|dark.",
+                "Error:".bright_red(),
+                other
+            ),
+        }
+    }
+
+    fn handle_color(&self, args: &str) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => println!(
+                "{} colored output is {} (toggle with /color on|off)",
+                "ℹ".bright_blue(),
+                if colored::control::SHOULD_COLORIZE.should_colorize() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            "on" => {
+                colored::control::set_override(true);
+                println!("{} colored output ON", "✓".bright_green());
+            }
+            "off" => {
+                colored::control::set_override(false);
+                println!("colored output OFF");
+            }
+            other => eprintln!(
+                "{} Unknown value '{}'. Expected on|off.",
+                "Error:".bright_red(),
+                other
+            ),
+        }
+    }
+
+    fn handle_output_style(&self, args: &str) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => println!(
+                "{} output style: {} (set with /output-style [concise|markdown|explanatory])",
+                "ℹ".bright_blue(),
+                std::env::var("AICHAT_OUTPUT_STYLE")
+                    .unwrap_or_else(|_| "markdown".to_string())
+                    .bright_cyan()
+            ),
+            "concise" | "markdown" | "explanatory" => {
+                unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", &arg) };
+                println!("{} output style set to {}", "✓".bright_green(), arg);
+            }
+            other => eprintln!(
+                "{} Unknown style '{}'. Expected concise|markdown|explanatory.",
+                "Error:".bright_red(),
+                other
+            ),
+        }
+    }
+
+    fn show_statusline(&self) {
+        let plan = if self.plan_mode.load(Ordering::SeqCst) {
+            "plan"
+        } else {
+            "live"
+        };
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        println!(
+            "{} [{}] [{}] {} msgs | todos {}/{} | memdir {} | model {}",
+            "statusline:".bright_yellow().bold(),
+            plan.bright_cyan(),
+            cwd.bright_cyan(),
+            self.history.len(),
+            self.todos.pending(),
+            self.todos.len(),
+            self.memdir.len(),
+            self.executor.get_model().bright_cyan(),
+        );
+    }
+
+    fn show_keybindings(&self) {
+        println!("\n{}", "Keybindings:".bright_yellow().bold());
+        let pairs: &[(&str, &str)] = &[
+            ("Up / Down", "history navigation"),
+            ("Ctrl-A / Ctrl-E", "beginning / end of line (emacs)"),
+            ("Ctrl-W", "delete previous word"),
+            ("Ctrl-U", "kill to start of line"),
+            ("Ctrl-K", "kill to end of line"),
+            ("Ctrl-R", "reverse-i-search through history"),
+            ("Ctrl-C", "cancel current input"),
+            ("Ctrl-D", "exit on empty line"),
+            ("Tab", "rustyline autocomplete (where available)"),
+        ];
+        for (k, v) in pairs {
+            println!("  {} {}", k.bright_cyan(), v);
+        }
+        println!();
+    }
+
+    fn handle_vim(&self, args: &str) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => println!(
+                "{} vim mode: {} (toggle with /vim on|off; takes effect next session)",
+                "ℹ".bright_blue(),
+                std::env::var("AICHAT_VIM_MODE")
+                    .unwrap_or_else(|_| "off".to_string())
+                    .bright_cyan()
+            ),
+            "on" | "off" => {
+                unsafe { std::env::set_var("AICHAT_VIM_MODE", &arg) };
+                println!(
+                    "{} vim mode {} (restart the CLI to apply)",
+                    "✓".bright_green(),
+                    arg
+                );
+            }
+            other => eprintln!(
+                "{} Unknown value '{}'. Expected on|off.",
+                "Error:".bright_red(),
+                other
+            ),
+        }
+    }
+
+    fn handle_login(&self, args: &str) {
+        let provider = if args.trim().is_empty() {
+            "ollama"
+        } else {
+            args.trim()
+        };
+        println!(
+            "\n{} ai-chat-cli is a local-first tool — there is no managed account.\n  \
+             For provider '{}': set the relevant API key in your environment, e.g.\n  \
+             `export AICHAT_{}_API_KEY=...` and restart the CLI.",
+            "ℹ".bright_blue(),
+            provider.bright_cyan(),
+            provider.to_ascii_uppercase()
+        );
+    }
+
+    fn handle_logout(&self, args: &str) {
+        let provider = if args.trim().is_empty() {
+            "ollama".to_string()
+        } else {
+            args.trim().to_string()
+        };
+        let var = format!("AICHAT_{}_API_KEY", provider.to_ascii_uppercase());
+        unsafe { std::env::remove_var(&var) };
+        println!(
+            "{} cleared {} from this process (restart the CLI to refresh on-disk config)",
+            "✓".bright_green(),
+            var.bright_cyan()
+        );
+    }
+
+    fn show_oauth_refresh(&self) {
+        println!(
+            "{} OAuth is not configured: ai-chat-cli talks to local Ollama by default. \
+             No tokens to refresh.",
+            "ℹ".bright_blue()
+        );
+    }
+
+    fn handle_privacy_settings(&self, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            let telemetry = std::env::var("AICHAT_TELEMETRY").unwrap_or_else(|_| "off".to_string());
+            println!(
+                "\n{}\n  telemetry: {} (no remote analytics implemented yet)\n  \
+                 local data: ~/.ai-chat-cli/ (sessions, memdir, schedule, messages, triggers)\n  \
+                 set with: /privacy-settings telemetry on|off\n",
+                "Privacy:".bright_yellow().bold(),
+                telemetry.bright_cyan()
+            );
+            return;
+        }
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            ["telemetry", v] if matches!(*v, "on" | "off") => {
+                unsafe { std::env::set_var("AICHAT_TELEMETRY", *v) };
+                println!("{} telemetry set to {}", "✓".bright_green(), v);
+            }
+            _ => eprintln!(
+                "{} Usage: /privacy-settings telemetry on|off",
+                "Error:".bright_red()
+            ),
+        }
+    }
+
+    fn show_mcp_status(&self) {
+        println!("\n{}", "MCP status:".bright_yellow().bold());
+        match &self.mcp_manager {
+            Some(m) => {
+                let tools = m.list_tools();
+                println!("  {} {} tool(s) available", "•".bright_cyan(), tools.len());
+                for t in tools.iter().take(20) {
+                    println!("    - {}", t.name.bright_cyan());
+                }
+                if tools.len() > 20 {
+                    println!("    … {} more (see /mcp-tools)", tools.len() - 20);
+                }
+            }
+            None => println!("  {} No MCP manager loaded.", "ℹ".bright_blue()),
+        }
+        println!();
+    }
+
+    fn show_plugins(&self) {
+        let path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("plugins"));
+        println!("\n{}", "Plugins:".bright_yellow().bold());
+        let Some(p) = path else {
+            println!("  {} No home directory.", "ℹ".bright_blue());
+            return;
+        };
+        match fs::read_dir(&p) {
+            Ok(rd) => {
+                let mut any = false;
+                for entry in rd.flatten() {
+                    any = true;
+                    println!("  {} {}", "•".bright_cyan(), entry.path().display());
+                }
+                if !any {
+                    println!("  {} No plugins in {}", "ℹ".bright_blue(), p.display());
+                }
+            }
+            Err(_) => println!(
+                "  {} Directory {} does not exist yet.",
+                "ℹ".bright_blue(),
+                p.display()
+            ),
+        }
+        println!();
+    }
+
+    fn reload_plugins(&mut self) {
+        self.skills = skills::load_skills();
+        println!(
+            "{} Reloaded plugins/skills ({} skills)",
+            "✓".bright_green(),
+            self.skills.len()
+        );
+    }
+
+    fn show_cost(&self) {
+        let tokens = self.history.iter().map(|m| m.content.len()).sum::<usize>() / 4;
+        println!(
+            "\n{}\n  estimated tokens: ~{}\n  estimated cost:   $0.00 (local Ollama)\n",
+            "Cost:".bright_yellow().bold(),
+            tokens
+        );
+    }
+
+    fn show_perf_issue_url(&self, args: &str) {
+        let title = if args.trim().is_empty() {
+            "Performance issue".to_string()
+        } else {
+            args.trim().to_string()
+        };
+        let body = format!(
+            "## Symptom\n<!-- What was slow? -->\n\n## Environment\n- ai-chat-cli: v{}\n- os: {} ({})\n- model: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            self.executor.get_model(),
+        );
+        let url = format!(
+            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=performance&title={}&body={}",
+            url_encode(&title),
+            url_encode(&body),
+        );
+        println!(
+            "\n{} {}\n",
+            "Perf issue URL:".bright_yellow().bold(),
+            url.bright_cyan()
+        );
+    }
+
+    fn show_heap_info(&self) {
+        println!("\n{}", "Process info:".bright_yellow().bold());
+        #[cfg(target_os = "linux")]
+        {
+            match fs::read_to_string("/proc/self/status") {
+                Ok(s) => {
+                    for line in s.lines() {
+                        if line.starts_with("VmPeak")
+                            || line.starts_with("VmRSS")
+                            || line.starts_with("VmSize")
+                            || line.starts_with("VmData")
+                            || line.starts_with("Threads")
+                        {
+                            println!("  {}", line);
+                        }
+                    }
+                }
+                Err(e) => println!(
+                    "  {} /proc/self/status unavailable: {}",
+                    "ℹ".bright_blue(),
+                    e
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!(
+                "  {} No portable heap-info backend; use an external profiler.",
+                "ℹ".bright_blue()
+            );
+        }
+        println!();
+    }
+
+    fn handle_debug_tool_call(&self, args: &str) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" => println!(
+                "{} debug-tool-call: {} (toggle with /debug-tool-call on|off)",
+                "ℹ".bright_blue(),
+                std::env::var("AICHAT_DEBUG_TOOL_CALL")
+                    .unwrap_or_else(|_| "off".to_string())
+                    .bright_cyan()
+            ),
+            "on" => {
+                unsafe { std::env::set_var("AICHAT_DEBUG_TOOL_CALL", "on") };
+                println!("{} debug-tool-call ON", "✓".bright_green());
+            }
+            "off" => {
+                unsafe { std::env::remove_var("AICHAT_DEBUG_TOOL_CALL") };
+                println!("debug-tool-call OFF");
+            }
+            other => eprintln!(
+                "{} Unknown value '{}'. Expected on|off.",
+                "Error:".bright_red(),
+                other
+            ),
+        }
+    }
+
+    fn show_upgrade(&self) {
+        println!(
+            "\n{}\n  cd ~/code/ai-chat-cli && git pull && cargo install --path . --locked\n  \
+             or download a release binary from\n  \
+             https://github.com/peterchoi1014/ai-chat-cli/releases\n",
+            "Upgrade ai-chat-cli:".bright_yellow().bold()
+        );
+    }
+
+    fn show_install(&self) {
+        println!(
+            "\n{}\n  1. install Rust: https://rustup.rs/\n  \
+             2. install Ollama: https://ollama.ai/\n  \
+             3. `ollama pull llama3.2:1b`\n  \
+             4. `cargo install --path .` from a clone of\n     https://github.com/peterchoi1014/ai-chat-cli\n",
+            "Install ai-chat-cli:".bright_yellow().bold()
+        );
+    }
+
+    fn show_install_github_app(&self) {
+        println!(
+            "{} ai-chat-cli does not ship a GitHub App. Use the GitHub CLI (`gh`) \
+             instead for PRs/issues; see /commit-push-pr and /pr_comments.",
+            "ℹ".bright_blue()
+        );
+    }
+
+    fn show_install_slack_app(&self) {
+        println!(
+            "{} No Slack integration is bundled. You can drive ai-chat-cli from \
+             a Slack bot by piping prompts through `--batch` mode.",
+            "ℹ".bright_blue()
+        );
+    }
+
+    fn reset_limits(&self) {
+        // The Ollama client tracks retries per-call (no persistent state), so
+        // "resetting" is informational. Clear the env-var override if set so
+        // backoff returns to defaults.
+        unsafe { std::env::remove_var("AICHAT_RATE_LIMIT_BACKOFF_MS") };
+        println!(
+            "{} Rate-limit / retry state cleared (Ollama retries are per-call).",
+            "✓".bright_green()
+        );
+    }
+
+    fn run_share(&self, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            println!("{} Usage: /share <file.md>", "Info:".bright_yellow());
+            return;
+        }
+        match self.export_markdown(path, true) {
+            Ok(()) => {
+                let abs = std::fs::canonicalize(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| path.to_string());
+                println!(
+                    "{} Conversation written to {}\n  share it as a gist:\n  \
+                     gh gist create {}",
+                    "✓".bright_green(),
+                    abs.bright_cyan(),
+                    abs
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/copy` — copy the last assistant message to the clipboard via
+    /// `pbcopy` (macOS), `wl-copy` / `xclip` (Linux), or `clip` (Windows).
+    fn run_copy(&self) {
+        let Some(last) = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone())
+        else {
+            println!("{} No assistant message in history yet.", "ℹ".bright_blue());
+            return;
+        };
+
+        let (program, extra): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("pbcopy", &[])
+        } else if cfg!(target_os = "windows") {
+            ("clip", &[])
+        } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            ("wl-copy", &[])
+        } else {
+            ("xclip", &["-selection", "clipboard"])
+        };
+
+        let mut child = match std::process::Command::new(program)
+            .args(extra)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "{} `{}` not available ({}). Install a clipboard tool or paste manually.",
+                    "Error:".bright_red(),
+                    program,
+                    e
+                );
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(last.as_bytes());
+        }
+        match child.wait() {
+            Ok(s) if s.success() => println!(
+                "{} Copied last assistant message ({} chars) via {}",
+                "✓".bright_green(),
+                last.len(),
+                program
+            ),
+            Ok(s) => eprintln!(
+                "{} {} exited {}",
+                "Error:".bright_red(),
+                program,
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn show_feedback_url(&self, args: &str) {
+        let title = if args.trim().is_empty() {
+            "Feedback".to_string()
+        } else {
+            args.trim().to_string()
+        };
+        let url = format!(
+            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=feedback&title={}",
+            url_encode(&title),
+        );
+        println!(
+            "\n{} {}\n",
+            "Feedback URL:".bright_yellow().bold(),
+            url.bright_cyan()
+        );
+    }
+
+    fn show_release_notes(&self) {
+        println!(
+            "\n{} v{}\n\n\
+             - Cross-platform `shell` tool (POSIX sh / PowerShell)\n\
+             - Time tools: `sleep`, `schedule` (cron-style)\n\
+             - Structured output helpers: `brief`, `synthetic_output`\n\
+             - Inter-agent messaging: `send_message`, `recv_messages`, `remote_trigger`\n\
+             - OS notification: `notify` (osascript / notify-send / PowerShell)\n\
+             - 36 new slash commands wired into the registry (see /help)\n",
+            "Release notes:".bright_yellow().bold(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    fn show_stickers(&self) {
+        println!(
+            "\n{}\n  ┌────────────┐    (\\(\\\n  │ ai-chat 🚀 │    ( -.-)\n  └────────────┘    o_(\")(\")\n",
+            "Stickers:".bright_yellow().bold()
+        );
     }
 }
 
