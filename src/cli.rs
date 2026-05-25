@@ -229,6 +229,22 @@ impl ChatCLI {
         // Fire Stop hooks.
         self.hooks.fire_stop();
 
+        // Leave the user with a clear hint on how to bring this chat back.
+        // Only print when a checkpoint actually landed on disk — a save
+        // failure (which only logs a warning) would otherwise leave the
+        // user with an id that can't be resumed.
+        if let (Some(session), Some(store)) =
+            (self.current_session.as_ref(), self.session_store.as_ref())
+            && store.exists(&session.id)
+        {
+            println!(
+                "\n{} To pick this chat back up, run {} and then type {}",
+                "↩".bright_cyan(),
+                "cubi".bright_cyan(),
+                format!("/resume {}", session.id).bright_cyan()
+            );
+        }
+
         Ok(())
     }
 
