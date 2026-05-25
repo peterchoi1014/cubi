@@ -129,9 +129,6 @@ impl Permissions {
     }
 
     /// Snapshot of the trusted roots in stable order. Cheap to iterate.
-    /// Kept for upcoming `/permissions` UI; allow dead code in the
-    /// meantime so the warning-free build stays clean.
-    #[allow(dead_code)]
     pub fn trusted_roots(&self) -> impl Iterator<Item = &PathBuf> {
         self.trusted_roots.iter()
     }
