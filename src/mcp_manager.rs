@@ -8,6 +8,7 @@ use crate::builtin_tools::BuiltinToolRegistry;
 use crate::file_rollback::FileJournal;
 use crate::mcp_client::{McpClient, McpResource, McpResourceContent, Tool, ToolCallResult};
 use crate::mcp_config::{McpConfig, McpServerConfig};
+use crate::oauth;
 use crate::permissions::Permissions;
 
 pub struct McpManager {
@@ -151,7 +152,25 @@ impl McpManager {
             McpClient::connect_stdio(command, args, env).await?
         } else if config.is_http() {
             let url = config.http_url.clone().unwrap();
-            let headers = config.headers.clone().unwrap_or_default();
+            let mut headers = config.headers.clone().unwrap_or_default();
+            if let Some(provider) = config.oauth_provider.as_deref()
+                && !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("authorization"))
+            {
+                match oauth::bearer_header_for_provider(provider)? {
+                    Some(header) => {
+                        headers.insert("Authorization".to_string(), header);
+                    }
+                    None => {
+                        eprintln!(
+                            "{} No usable OAuth token for MCP provider '{}'; continuing without Authorization header.",
+                            "Warning:".bright_yellow(),
+                            provider
+                        );
+                    }
+                }
+            }
 
             McpClient::connect_http(url, headers).await?
         } else {
