@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use colored::*;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::builtin_tools::BuiltinToolRegistry;
 use crate::mcp_client::{McpClient, Tool, ToolCallResult};
 use crate::mcp_config::{McpConfig, McpServerConfig};
+use crate::permissions::Permissions;
 
 pub struct McpManager {
     clients: HashMap<String, McpClient>,
@@ -13,12 +15,12 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(permissions: Arc<Mutex<Permissions>>) -> Result<Self> {
         let config = McpConfig::load()?;
         let mut manager = Self {
             clients: HashMap::new(),
             tools: HashMap::new(),
-            builtin_tools: BuiltinToolRegistry::new(),
+            builtin_tools: BuiltinToolRegistry::new(permissions),
         };
 
         // Add built-in tools first

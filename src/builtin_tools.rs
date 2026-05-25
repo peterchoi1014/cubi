@@ -4,8 +4,11 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
+
+use crate::permissions::Permissions;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinTool {
@@ -52,10 +55,13 @@ impl ToolResult {
 
 pub struct BuiltinToolRegistry {
     tools: Vec<BuiltinTool>,
+    /// Shared trust + sandbox state. Consulted by the write/exec tools
+    /// (`bash`, `edit_file`, `write_file`) before they touch the disk.
+    permissions: Arc<Mutex<Permissions>>,
 }
 
 impl BuiltinToolRegistry {
-    pub fn new() -> Self {
+    pub fn new(permissions: Arc<Mutex<Permissions>>) -> Self {
         let tools = vec![
             Self::bash_tool(),
             Self::read_file_tool(),
@@ -67,7 +73,7 @@ impl BuiltinToolRegistry {
             Self::think_tool(),
         ];
 
-        Self { tools }
+        Self { tools, permissions }
     }
 
     pub fn list_tools(&self) -> &[BuiltinTool] {
@@ -288,7 +294,15 @@ impl BuiltinToolRegistry {
 
         let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
 
-        // Security: Basic command validation
+        // Permissions: the cwd must be a trusted project.
+        let cwd = std::env::current_dir().context("Could not read cwd")?;
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            return Ok(ToolResult::error(format!("{}", e)));
+        }
+
+        // Security: Basic command validation (defence in depth — the
+        // permissions check above is the primary gate, this just catches a
+        // few well-known footguns even inside trusted projects).
         let dangerous_patterns = ["rm -rf /", "dd if=", "mkfs", "format", "> /dev/"];
         for pattern in &dangerous_patterns {
             if command.contains(pattern) {
@@ -491,6 +505,15 @@ impl BuiltinToolRegistry {
             .as_str()
             .context("Missing 'new_text' parameter")?;
 
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap()
+            .check_write(Path::new(path))
+        {
+            return Ok(ToolResult::error(format!("{}", e)));
+        }
+
         let content = fs::read_to_string(path).context(format!("Failed to read file: {}", path))?;
 
         if !content.contains(old_text) {
@@ -514,6 +537,15 @@ impl BuiltinToolRegistry {
         let content = args["content"]
             .as_str()
             .context("Missing 'content' parameter")?;
+
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap()
+            .check_write(Path::new(path))
+        {
+            return Ok(ToolResult::error(format!("{}", e)));
+        }
 
         // Create parent directories if needed
         if let Some(parent) = Path::new(path).parent() {

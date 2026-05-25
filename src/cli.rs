@@ -2,6 +2,7 @@ use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
+use crate::permissions::Permissions;
 use crate::project_memory;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Sentinel prefix used to tag system messages that should only influence the
 /// next assistant turn (e.g. `/ask`). After the model responds once, any
@@ -27,16 +29,22 @@ pub struct ChatCLI {
     mcp_manager: Option<McpManager>,
     todos: TodoList,
     plan_mode: bool,
+    permissions: Arc<Mutex<Permissions>>,
 }
 
 impl ChatCLI {
-    pub fn new(executor: AIExecutor, mcp_manager: Option<McpManager>) -> Self {
+    pub fn new(
+        executor: AIExecutor,
+        mcp_manager: Option<McpManager>,
+        permissions: Arc<Mutex<Permissions>>,
+    ) -> Self {
         let mut cli = Self {
             executor,
             history: Vec::new(),
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
             plan_mode: false,
+            permissions,
         };
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
@@ -428,6 +436,9 @@ impl ChatCLI {
                     self.ask_user(args);
                 }
             }
+            Cmd::Trust => {
+                self.handle_trust(args);
+            }
             Cmd::Export => {
                 if args.is_empty() {
                     println!(
@@ -584,7 +595,7 @@ impl ChatCLI {
         }
 
         // Reload configuration and reconnect
-        self.mcp_manager = match McpManager::new().await {
+        self.mcp_manager = match McpManager::new(Arc::clone(&self.permissions)).await {
             Ok(manager) => Some(manager),
             Err(e) => {
                 eprintln!("{} {}", "Warning:".bright_yellow(), e);
@@ -647,6 +658,12 @@ impl ChatCLI {
             .as_ref()
             .map(|m| m.list_tools().len())
             .unwrap_or(0);
+        let cwd = std::env::current_dir().ok();
+        let perms = self.permissions.lock().unwrap();
+        let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
+        let trusted_count = perms.trusted_count();
+        drop(perms);
+
         println!("\n{}", "Status:".bright_yellow().bold());
         println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
         println!("  {}: {}", "messages".bright_cyan(), self.history.len());
@@ -666,7 +683,76 @@ impl ChatCLI {
             self.todos.pending()
         );
         println!("  {}: {}", "mcp tools".bright_cyan(), mcp_tool_count);
+        println!(
+            "  {}: {} ({} trusted root{} total)",
+            "cwd trust".bright_cyan(),
+            if trusted_here {
+                "trusted".bright_green()
+            } else {
+                "not trusted".bright_red()
+            },
+            trusted_count,
+            if trusted_count == 1 { "" } else { "s" }
+        );
         println!();
+    }
+
+    /// Handles `/trust` and `/trust revoke`. Both forms operate on the
+    /// current working directory.
+    fn handle_trust(&self, args: &str) {
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let mut perms = self.permissions.lock().unwrap();
+        let result = match args.trim() {
+            "" | "add" => perms.trust_dir(&cwd).map(|added| (added, true)),
+            "revoke" | "remove" | "rm" => perms.revoke_dir(&cwd).map(|removed| (removed, false)),
+            other => {
+                eprintln!(
+                    "{} Unknown argument '{}'. Usage: /trust [revoke]",
+                    "Error:".bright_red(),
+                    other
+                );
+                return;
+            }
+        };
+        match result {
+            Ok((changed, added)) => {
+                if let Err(e) = perms.save() {
+                    eprintln!(
+                        "{} Failed to persist trust store: {}",
+                        "Warn:".bright_yellow(),
+                        e
+                    );
+                }
+                let verb = if added { "trusted" } else { "revoked" };
+                if changed {
+                    println!(
+                        "{} {} {}",
+                        "✓".bright_green(),
+                        verb.bright_green(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                } else if added {
+                    println!(
+                        "{} {} was already trusted",
+                        "ℹ".bright_blue(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "{} {} was not in the trust list",
+                        "ℹ".bright_blue(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
     }
 
     fn toggle_plan_mode(&mut self) {

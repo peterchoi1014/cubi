@@ -1,0 +1,312 @@
+//! Project trust + path sandboxing for built-in tools.
+//!
+//! Built-in tools like `bash`, `write_file`, and `edit_file` execute
+//! immediately against the user's machine. Before this module existed the
+//! only guard was a hard-coded denylist of well-known footguns in
+//! `execute_bash` (`rm -rf /`, `dd if=`, ...). That's both too strict (it
+//! flags benign commands containing the substring) and far too lax (any
+//! `bash` invocation outside that list is unconditionally allowed, even in
+//! a directory the user has never approved this CLI to touch).
+//!
+//! The model here is intentionally simple:
+//!
+//! * A **trust store** at `~/.ai-chat-cli/trusted_dirs.json` records the
+//!   set of directory roots the user has explicitly approved. Approval is a
+//!   conscious one-time act per project (`/trust` slash command, or the
+//!   prompt shown by the first-run wizard).
+//! * A path is **writable** iff it canonicalizes to a location inside one
+//!   of those trusted roots. Edits and writes outside any trusted root are
+//!   refused before they hit the disk.
+//! * Shell execution is allowed iff the **current working directory** is
+//!   inside a trusted root. This deliberately keeps the surface narrow:
+//!   running `bash` from an untrusted cwd is the high-risk case.
+//!
+//! Plan mode (gated separately in commit 3) layers on top: even in a
+//! trusted directory, write/exec tools refuse while plan mode is on.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// On-disk representation of [`Permissions`]. Kept as a separate struct so
+/// the file format can grow (per-tool allow/deny lists, expiry timestamps,
+/// ...) without churn in the in-memory API.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TrustFile {
+    /// Canonical absolute paths of directories the user has trusted.
+    /// `BTreeSet` so the on-disk file is stable and diff-friendly.
+    #[serde(default)]
+    trusted_roots: BTreeSet<PathBuf>,
+}
+
+/// In-memory permissions snapshot. Cheap to clone; persists changes
+/// eagerly so a crash never loses an approval the user just granted.
+#[derive(Debug, Default, Clone)]
+pub struct Permissions {
+    trusted_roots: BTreeSet<PathBuf>,
+}
+
+impl Permissions {
+    /// Loads `~/.ai-chat-cli/trusted_dirs.json`. Missing or unreadable
+    /// files yield an empty permissions set rather than an error: a
+    /// well-formed absence simply means "no projects trusted yet".
+    pub fn load() -> Self {
+        let Some(path) = Self::storage_path() else {
+            return Self::default();
+        };
+        match fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<TrustFile>(&raw) {
+                Ok(file) => Self {
+                    trusted_roots: file.trusted_roots,
+                },
+                Err(_) => {
+                    // Don't silently nuke a corrupt file — start empty in
+                    // memory but leave the file in place so the user can
+                    // inspect it. Saving will overwrite once they make a
+                    // change.
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn storage_path() -> Option<PathBuf> {
+        Some(
+            dirs::home_dir()?
+                .join(".ai-chat-cli")
+                .join("trusted_dirs.json"),
+        )
+    }
+
+    /// Persists the current trust set. Errors are surfaced so callers can
+    /// decide whether to nag or swallow them.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::storage_path().context("Could not resolve home directory")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        let file = TrustFile {
+            trusted_roots: self.trusted_roots.clone(),
+        };
+        let json = serde_json::to_string_pretty(&file)?;
+        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Adds `dir` to the trust set after canonicalization. The canonical
+    /// form is stored so symlink games can't be used to fool
+    /// [`Self::contains`]. Returns `true` if the directory was newly added.
+    pub fn trust_dir(&mut self, dir: &Path) -> Result<bool> {
+        let canonical = fs::canonicalize(dir)
+            .with_context(|| format!("Failed to canonicalize {}", dir.display()))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("Not a directory: {}", canonical.display());
+        }
+        Ok(self.trusted_roots.insert(canonical))
+    }
+
+    /// Removes `dir` from the trust set. Returns `true` if a matching
+    /// entry was found.
+    pub fn revoke_dir(&mut self, dir: &Path) -> Result<bool> {
+        let canonical = fs::canonicalize(dir)
+            .with_context(|| format!("Failed to canonicalize {}", dir.display()))?;
+        Ok(self.trusted_roots.remove(&canonical))
+    }
+
+    /// Returns true when `path` (or any of its ancestors, after
+    /// canonicalization) is in the trust set.
+    pub fn contains(&self, path: &Path) -> bool {
+        let Ok(canonical) = fs::canonicalize(path) else {
+            return false;
+        };
+        canonical
+            .ancestors()
+            .any(|a| self.trusted_roots.contains(a))
+    }
+
+    /// Snapshot of the trusted roots in stable order. Cheap to iterate.
+    /// Kept for upcoming `/permissions` UI; allow dead code in the
+    /// meantime so the warning-free build stays clean.
+    #[allow(dead_code)]
+    pub fn trusted_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.trusted_roots.iter()
+    }
+
+    /// Verifies a write target. The path itself need not exist (we're
+    /// about to create it), but its nearest existing ancestor must
+    /// canonicalize to somewhere inside a trusted root. This catches both
+    /// "write to untrusted dir" and `..`-escape attempts.
+    pub fn check_write(&self, path: &Path) -> Result<()> {
+        let absolute = absolutize(path)?;
+        // Walk up until we find a real, existing directory we can
+        // canonicalize. The nearest-existing-ancestor rule means a
+        // brand-new file under a trusted dir is fine, but constructing
+        // a path that would escape via `..` still gets caught because
+        // canonicalize resolves the `..` components before we check.
+        let mut cursor: &Path = &absolute;
+        let canonical_root = loop {
+            if let Ok(real) = fs::canonicalize(cursor) {
+                break real;
+            }
+            match cursor.parent() {
+                Some(parent) if parent != cursor => cursor = parent,
+                _ => {
+                    anyhow::bail!(
+                        "Refusing write to '{}': no real ancestor could be canonicalized",
+                        path.display()
+                    );
+                }
+            }
+        };
+
+        if canonical_root
+            .ancestors()
+            .any(|a| self.trusted_roots.contains(a))
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Refusing write to '{}': path is outside any trusted root. \
+                 Run `/trust` in the project directory to approve it.",
+                path.display()
+            )
+        }
+    }
+
+    /// Verifies that shell execution is permitted in `cwd`.
+    pub fn check_exec(&self, cwd: &Path) -> Result<()> {
+        let absolute = absolutize(cwd)?;
+        if self.contains(&absolute) {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Refusing to execute shell command: '{}' is not a trusted directory. \
+                 Run `/trust` in the project directory to approve it.",
+                absolute.display()
+            )
+        }
+    }
+
+    /// Returns the number of trusted roots — useful for `/status`.
+    pub fn trusted_count(&self) -> usize {
+        self.trusted_roots.len()
+    }
+}
+
+/// Returns an absolute, lexically-normalized path. Used as a fallback when
+/// `canonicalize` can't run because the leaf doesn't exist yet.
+fn absolutize(p: &Path) -> Result<PathBuf> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        let cwd = std::env::current_dir().context("Could not read current working directory")?;
+        Ok(cwd.join(p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("ai-chat-cli-perm-{label}-{nanos}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn trust_dir_inserts_canonical_path() {
+        let dir = unique_dir("trust");
+        let mut perms = Permissions::default();
+        assert!(perms.trust_dir(&dir).unwrap());
+        // Second call is a no-op.
+        assert!(!perms.trust_dir(&dir).unwrap());
+        assert!(perms.contains(&dir));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn contains_walks_ancestors() {
+        let root = unique_dir("anc");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        let mut perms = Permissions::default();
+        perms.trust_dir(&root).unwrap();
+
+        assert!(perms.contains(&nested));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn check_write_rejects_outside_trusted_root() {
+        let trusted = unique_dir("write-trusted");
+        let untrusted = unique_dir("write-untrusted");
+
+        let mut perms = Permissions::default();
+        perms.trust_dir(&trusted).unwrap();
+
+        // Existing trusted file: allowed.
+        let inside = trusted.join("new.txt");
+        perms.check_write(&inside).expect("inside trusted root");
+
+        // Outside trusted root: refused.
+        let outside = untrusted.join("nope.txt");
+        let err = perms.check_write(&outside).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("outside any trusted root"), "got: {msg}");
+
+        fs::remove_dir_all(&trusted).ok();
+        fs::remove_dir_all(&untrusted).ok();
+    }
+
+    #[test]
+    fn check_write_blocks_dotdot_escape() {
+        let trusted = unique_dir("escape-trusted");
+        let mut perms = Permissions::default();
+        perms.trust_dir(&trusted).unwrap();
+
+        // `<trusted>/../../etc/passwd` canonicalizes away from the trusted
+        // root and must be refused.
+        let escape = trusted.join("..").join("..").join("etc").join("passwd");
+        assert!(perms.check_write(&escape).is_err());
+
+        fs::remove_dir_all(&trusted).ok();
+    }
+
+    #[test]
+    fn check_exec_requires_trusted_cwd() {
+        let trusted = unique_dir("exec-trusted");
+        let untrusted = unique_dir("exec-untrusted");
+        let mut perms = Permissions::default();
+        perms.trust_dir(&trusted).unwrap();
+
+        perms.check_exec(&trusted).expect("trusted cwd ok");
+        assert!(perms.check_exec(&untrusted).is_err());
+
+        fs::remove_dir_all(&trusted).ok();
+        fs::remove_dir_all(&untrusted).ok();
+    }
+
+    #[test]
+    fn revoke_removes_entry() {
+        let dir = unique_dir("revoke");
+        let mut perms = Permissions::default();
+        perms.trust_dir(&dir).unwrap();
+        assert!(perms.contains(&dir));
+        assert!(perms.revoke_dir(&dir).unwrap());
+        assert!(!perms.contains(&dir));
+        // Second revoke is a no-op (returns false).
+        assert!(!perms.revoke_dir(&dir).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+}

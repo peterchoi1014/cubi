@@ -6,6 +6,7 @@ mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
 mod ollama;
+mod permissions;
 mod project_memory;
 mod todos;
 
@@ -14,6 +15,8 @@ use cli::ChatCLI;
 use colored::*;
 use executor::AIExecutor;
 use mcp_manager::McpManager;
+use permissions::Permissions;
+use std::sync::{Arc, Mutex};
 
 /// Default model used when the user has not configured one. Can be overridden
 /// at runtime by setting the `AI_CHAT_CLI_MODEL` environment variable.
@@ -69,8 +72,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Initialize permissions (project trust store).
+    let permissions = Arc::new(Mutex::new(Permissions::load()));
+
     // Initialize MCP
-    let mcp_manager = match McpManager::new().await {
+    let mcp_manager = match McpManager::new(Arc::clone(&permissions)).await {
         Ok(manager) => {
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
@@ -102,7 +108,7 @@ async fn main() -> Result<()> {
     println!("{} AI executor ready", "✓".bright_green());
 
     // Create and run CLI
-    let mut cli = ChatCLI::new(executor, mcp_manager);
+    let mut cli = ChatCLI::new(executor, mcp_manager, permissions);
     let run_result = cli.run().await;
 
     // Shut down MCP cleanly while we still have an async context. The Drop
