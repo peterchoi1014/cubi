@@ -4522,6 +4522,8 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn user(s: &str) -> Message {
         Message::text("user", s)
@@ -4643,5 +4645,67 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ai-chat-cli-missing-{nanos}.txt"));
         let p = path.to_str().unwrap();
         check_overwrite_allowed(p, false, "/export").expect("missing file is fine");
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn new_test_cli() -> ChatCLI {
+        let executor = AIExecutor::new_from_env("test-model".to_string());
+        ChatCLI::new(
+            executor,
+            None,
+            Arc::new(Mutex::new(Permissions::default())),
+            Arc::new(AtomicBool::new(false)),
+            FileJournal::default(),
+        )
+    }
+
+    fn temp_oauth_path(suffix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("ai-chat-cli-{suffix}-{nanos}.json"))
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn login_and_logout_persist_and_remove_provider_tokens() {
+        let _guard = env_lock().lock().expect("lock should not be poisoned");
+        let oauth_path = temp_oauth_path("oauth");
+        unsafe {
+            std::env::set_var("AICHAT_OAUTH_FILE", &oauth_path);
+            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+        }
+
+        let cli = new_test_cli();
+        cli.handle_login("GiTHub token123 --refresh-token refresh123 --expires-in 60");
+
+        let after_login = oauth::OAuthStore::load();
+        let token = after_login
+            .get_provider("github")
+            .expect("provider token should exist after /login");
+        assert_eq!(token.access_token, "token123");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
+        assert_eq!(
+            std::env::var("AICHAT_GITHUB_API_KEY").ok().as_deref(),
+            Some("token123")
+        );
+
+        cli.handle_logout("github");
+        let after_logout = oauth::OAuthStore::load();
+        assert!(after_logout.get_provider("github").is_none());
+        assert!(std::env::var("AICHAT_GITHUB_API_KEY").is_err());
+
+        let _ = std::fs::remove_file(&oauth_path);
+        unsafe {
+            std::env::remove_var("AICHAT_OAUTH_FILE");
+            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+        }
     }
 }
