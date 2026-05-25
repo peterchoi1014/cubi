@@ -866,8 +866,8 @@ mod tests {
 
     #[test]
     fn parse_ambiguous_prefix_returns_none() {
-        // `/re` matches /release, /reload, /reset, /resume, /review,
-        // /rewind — refuse to guess.
+        // `/re` matches /release-notes, /reload-plugins, /reset-limits,
+        // /resume, /review, /rewind — refuse to guess.
         assert!(parse("/re").is_none());
     }
 

@@ -145,6 +145,13 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Returns `true` if a checkpoint file for this id is on disk.
+    /// Cheap stat — used to confirm a session is actually resumable
+    /// before pointing the user at it.
+    pub fn exists(&self, id: &str) -> bool {
+        self.dir.join(format!("{}.json", id)).exists()
+    }
+
     /// Loads a session by id (filename stem). Returns `None` if no file
     /// matches; surfaces parse errors so the user can see corrupted
     /// session files instead of silently losing them.
