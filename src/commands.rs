@@ -49,6 +49,7 @@ pub enum Cmd {
     McpReload,
     Model,
     Version,
+    Trust,
     Quit,
 }
 
@@ -178,6 +179,12 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/batch <f>",
         help: "Process batch file",
         cmd: Cmd::Batch,
+    },
+    SlashCommandSpec {
+        name: "/trust",
+        usage: "/trust [revoke]",
+        help: "Trust this project (or pass `revoke` to undo)",
+        cmd: Cmd::Trust,
     },
     SlashCommandSpec {
         name: "/mcp-tools",
