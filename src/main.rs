@@ -18,6 +18,7 @@ mod onboarding;
 mod permissions;
 mod project_memory;
 mod sessions;
+pub mod skills;
 mod todos;
 
 use anyhow::{Context, Result};
@@ -62,45 +63,66 @@ async fn main() -> Result<()> {
 
     println!("{}", "Initializing AI Chat CLI...".bright_cyan());
 
-    // Check if Ollama is running
-    match ollama_client.list_models().await {
-        Ok(models) => {
-            println!(
-                "{} {}",
-                "✓".bright_green(),
-                "Connected to Ollama".bright_white()
-            );
-
-            if !models.iter().any(|m| m.starts_with(model)) {
-                eprintln!(
-                    "{} Model '{}' not found. Available models: {:?}",
-                    "Warning:".bright_yellow(),
-                    model,
-                    models
-                );
-                eprintln!(
-                    "\nInstall the model with: {}",
-                    format!("ollama pull {}", model).bright_cyan()
-                );
-                std::process::exit(1);
-            }
-
-            println!(
-                "{} Using model: {}",
-                "✓".bright_green(),
-                model.bright_cyan()
-            );
-        }
-        Err(e) => {
-            eprintln!("{} {}", "Error:".bright_red().bold(), e);
-            eprintln!("\n{}", "Make sure Ollama is running:".bright_yellow());
-            eprintln!("  {}", "ollama serve".bright_cyan());
-            std::process::exit(1);
-        }
-    }
-
     // Shared plan-mode flag, observed by built-in write/exec tools.
     let plan_mode = Arc::new(AtomicBool::new(false));
+
+    // Create executor before provider-specific startup checks.
+    let executor = AIExecutor::new(model.to_string(), cpu_workers)
+        .await
+        .context("Failed to create AI executor")?;
+
+    if executor.provider_name() == "openai" {
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("AI_CHAT_CLI_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        println!(
+            "{} Using OpenAI-compatible provider at {}",
+            "✓".bright_green(),
+            base_url.bright_cyan()
+        );
+        println!(
+            "{} Using model: {}",
+            "✓".bright_green(),
+            model.bright_cyan()
+        );
+    } else {
+        match ollama_client.list_models().await {
+            Ok(models) => {
+                println!(
+                    "{} {}",
+                    "✓".bright_green(),
+                    "Connected to Ollama".bright_white()
+                );
+
+                if !models.iter().any(|m| m.starts_with(model)) {
+                    eprintln!(
+                        "{} Model '{}' not found. Available models: {:?}",
+                        "Warning:".bright_yellow(),
+                        model,
+                        models
+                    );
+                    eprintln!(
+                        "\nInstall the model with: {}",
+                        format!("ollama pull {}", model).bright_cyan()
+                    );
+                    std::process::exit(1);
+                }
+
+                println!(
+                    "{} Using model: {}",
+                    "✓".bright_green(),
+                    model.bright_cyan()
+                );
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red().bold(), e);
+                eprintln!("\n{}", "Make sure Ollama is running:".bright_yellow());
+                eprintln!("  {}", "ollama serve".bright_cyan());
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Initialize MCP
     let mcp_manager = match McpManager::new(Arc::clone(&permissions), Arc::clone(&plan_mode)).await
@@ -127,11 +149,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    // Create executor
-    let executor = AIExecutor::new(model.to_string(), cpu_workers)
-        .await
-        .context("Failed to create AI executor")?;
 
     println!("{} AI executor ready", "✓".bright_green());
 

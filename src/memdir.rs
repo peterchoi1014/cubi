@@ -259,6 +259,21 @@ mod tests {
     }
 
     #[test]
+    fn clear_and_context_string_track_len() {
+        let mut m = Memdir::with_path(tmp_path("ctx"));
+        m.add("remember alpha", None);
+        m.add("remember beta", Some("src"));
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m.as_context_string().as_deref(),
+            Some("- remember alpha\n- remember beta\n")
+        );
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert!(m.as_context_string().is_none());
+    }
+
+    #[test]
     fn clear_empties_list() {
         let mut m = Memdir::with_path(tmp_path("clear"));
         m.add("x", None);

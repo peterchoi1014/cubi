@@ -76,12 +76,22 @@ pub enum HookEvent {
 
 impl HookEvent {
     #[allow(dead_code)]
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::SessionStart => "SessionStart",
             Self::Stop => "Stop",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pretooluse" | "pre-tool-use" | "pre_tool_use" => Some(Self::PreToolUse),
+            "posttooluse" | "post-tool-use" | "post_tool_use" => Some(Self::PostToolUse),
+            "sessionstart" | "session-start" | "session_start" => Some(Self::SessionStart),
+            "stop" => Some(Self::Stop),
+            _ => None,
         }
     }
 }
@@ -171,6 +181,11 @@ impl HookRegistry {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.hooks.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn hooks(&self) -> &[HookDef] {
+        &self.hooks
     }
 
     /// Fires PreToolUse hooks for the given tool. Returns `Allow` if all
@@ -307,6 +322,26 @@ impl HookRegistry {
             .output()?;
         Ok(output.status.code().unwrap_or(2))
     }
+}
+
+/// Writes the global hooks config at `~/.ai-chat-cli/hooks.json`.
+pub fn save_global(hooks: &[HookDef]) -> Result<()> {
+    let path =
+        global_hooks_path().ok_or_else(|| anyhow::anyhow!("Could not resolve home directory"))?;
+    let mut cfg = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<HooksConfig>(&raw).ok())
+            .unwrap_or_default()
+    } else {
+        HooksConfig::default()
+    };
+    cfg.hooks = hooks.to_vec();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+    Ok(())
 }
 
 /// Path to the global hooks config.

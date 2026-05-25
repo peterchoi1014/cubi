@@ -39,6 +39,10 @@ struct TrustFile {
     /// `BTreeSet` so the on-disk file is stable and diff-friendly.
     #[serde(default)]
     trusted_roots: BTreeSet<PathBuf>,
+    #[serde(default)]
+    pub allowed_tools: BTreeSet<String>,
+    #[serde(default)]
+    pub denied_tools: BTreeSet<String>,
 }
 
 /// In-memory permissions snapshot. Cheap to clone; persists changes
@@ -46,6 +50,8 @@ struct TrustFile {
 #[derive(Debug, Default, Clone)]
 pub struct Permissions {
     trusted_roots: BTreeSet<PathBuf>,
+    allowed_tools: BTreeSet<String>,
+    denied_tools: BTreeSet<String>,
 }
 
 impl Permissions {
@@ -60,6 +66,8 @@ impl Permissions {
             Ok(raw) => match serde_json::from_str::<TrustFile>(&raw) {
                 Ok(file) => Self {
                     trusted_roots: file.trusted_roots,
+                    allowed_tools: file.allowed_tools,
+                    denied_tools: file.denied_tools,
                 },
                 Err(_) => {
                     // Don't silently nuke a corrupt file — start empty in
@@ -91,6 +99,8 @@ impl Permissions {
         }
         let file = TrustFile {
             trusted_roots: self.trusted_roots.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            denied_tools: self.denied_tools.clone(),
         };
         let json = serde_json::to_string_pretty(&file)?;
         fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
@@ -186,6 +196,47 @@ impl Permissions {
                 absolute.display()
             )
         }
+    }
+
+    pub fn allow_tool(&mut self, tool: &str) {
+        let name = tool.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.allowed_tools.insert(name.to_string());
+        self.denied_tools.remove(name);
+    }
+
+    pub fn deny_tool(&mut self, tool: &str) {
+        let name = tool.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.denied_tools.insert(name.to_string());
+    }
+
+    #[allow(dead_code)]
+    pub fn undeny_tool(&mut self, tool: &str) {
+        self.denied_tools.remove(tool.trim());
+    }
+
+    #[allow(dead_code)]
+    pub fn unallow_tool(&mut self, tool: &str) {
+        self.allowed_tools.remove(tool.trim());
+    }
+
+    pub fn check_tool_allowed(&self, tool: &str) -> bool {
+        let name = tool.trim();
+        !self.denied_tools.contains(name)
+            && (self.allowed_tools.is_empty() || self.allowed_tools.contains(name))
+    }
+
+    pub fn allowed_tools(&self) -> impl Iterator<Item = &String> {
+        self.allowed_tools.iter()
+    }
+
+    pub fn denied_tools(&self) -> impl Iterator<Item = &String> {
+        self.denied_tools.iter()
     }
 
     /// Returns the number of trusted roots — useful for `/status`.

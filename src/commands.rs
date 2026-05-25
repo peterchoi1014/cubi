@@ -54,6 +54,8 @@ pub enum Cmd {
     Trust,
     Diff,
     Commit,
+    CommitPushPr,
+    Undo,
     Review,
     Worktree,
     Branch,
@@ -70,7 +72,16 @@ pub enum Cmd {
     Env,
     Config,
     Permissions,
+    ToolAllow,
+    ToolDeny,
+    Hooks,
+    Skills,
+    Stats,
+    Usage,
+    McpResources,
+    McpRead,
     Bug,
+    Issue,
     Quit,
 }
 
@@ -104,6 +115,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/status",
         help: "Show session status",
         cmd: Cmd::Status,
+    },
+    SlashCommandSpec {
+        name: "/stats",
+        usage: "/stats",
+        help: "Show session statistics",
+        cmd: Cmd::Stats,
+    },
+    SlashCommandSpec {
+        name: "/usage",
+        usage: "/usage",
+        help: "Show session usage statistics",
+        cmd: Cmd::Usage,
     },
     SlashCommandSpec {
         name: "/plan",
@@ -232,6 +255,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         cmd: Cmd::Commit,
     },
     SlashCommandSpec {
+        name: "/commit-push-pr",
+        usage: "/commit-push-pr [-a] <msg>",
+        help: "Commit, push, and print a GitHub PR URL",
+        cmd: Cmd::CommitPushPr,
+    },
+    SlashCommandSpec {
+        name: "/undo",
+        usage: "/undo [hard]",
+        help: "Undo the latest commit (or hard reset HEAD~1)",
+        cmd: Cmd::Undo,
+    },
+    SlashCommandSpec {
         name: "/review",
         usage: "/review",
         help: "Ask the model to review the current `git diff`",
@@ -304,6 +339,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         cmd: Cmd::Compact,
     },
     SlashCommandSpec {
+        name: "/skills",
+        usage: "/skills [list|run <name>]",
+        help: "List or run reusable Markdown skills",
+        cmd: Cmd::Skills,
+    },
+    SlashCommandSpec {
+        name: "/hooks",
+        usage: "/hooks [list | add <event> <cmd> | rm <n>]",
+        help: "List, add, or remove lifecycle hooks",
+        cmd: Cmd::Hooks,
+    },
+    SlashCommandSpec {
         name: "/mcp-tools",
         usage: "/mcp-tools",
         help: "List available MCP tools",
@@ -320,6 +367,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/mcp-reload",
         help: "Reload MCP configuration",
         cmd: Cmd::McpReload,
+    },
+    SlashCommandSpec {
+        name: "/mcp-resources",
+        usage: "/mcp-resources [server]",
+        help: "List MCP resources",
+        cmd: Cmd::McpResources,
+    },
+    SlashCommandSpec {
+        name: "/mcp-read",
+        usage: "/mcp-read <uri>",
+        help: "Read an MCP resource by URI",
+        cmd: Cmd::McpRead,
     },
     SlashCommandSpec {
         name: "/model",
@@ -358,10 +417,28 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         cmd: Cmd::Permissions,
     },
     SlashCommandSpec {
+        name: "/tool-allow",
+        usage: "/tool-allow <name>",
+        help: "Allow a specific tool in this trust store",
+        cmd: Cmd::ToolAllow,
+    },
+    SlashCommandSpec {
+        name: "/tool-deny",
+        usage: "/tool-deny <name>",
+        help: "Deny a specific tool in this trust store",
+        cmd: Cmd::ToolDeny,
+    },
+    SlashCommandSpec {
         name: "/bug",
         usage: "/bug [summary]",
-        help: "Print a pre-filled GitHub Issues URL with runtime info",
+        help: "Print a pre-filled GitHub bug URL with runtime info",
         cmd: Cmd::Bug,
+    },
+    SlashCommandSpec {
+        name: "/issue",
+        usage: "/issue [title]",
+        help: "Print a pre-filled GitHub feature request URL",
+        cmd: Cmd::Issue,
     },
     SlashCommandSpec {
         name: "/quit",
