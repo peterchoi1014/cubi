@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod executor;
 mod file_mentions;
+mod file_rollback;
 mod git_cmds;
 mod hooks;
 #[allow(dead_code)]
@@ -13,12 +14,21 @@ mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
 mod memdir;
+mod migrations;
 mod ollama;
 mod onboarding;
+mod output_styles;
 mod permissions;
+pub mod plugins;
+mod policy;
 mod project_memory;
+mod schemas;
 mod sessions;
+mod settings_sync;
 pub mod skills;
+mod telemetry;
+mod themes;
+mod tips;
 mod todos;
 
 use anyhow::{Context, Result};
@@ -43,6 +53,42 @@ async fn main() -> Result<()> {
 
     // Persistent user config (model preference, onboarding flag, ...).
     let mut config = AppConfig::load();
+
+    // Apply forward-only config migrations and persist if anything
+    // changed (e.g. first time this binary saw the file).
+    if migrations::migrate_config(&mut config)
+        && let Err(e) = config.save()
+    {
+        eprintln!(
+            "{} could not persist migrated config: {}",
+            "Warn:".bright_yellow(),
+            e
+        );
+    }
+
+    // Initialise telemetry early so onboarding events can be recorded.
+    telemetry::init(config.telemetry);
+
+    // Apply persisted UI prefs from config (theme/output-style/color/vim)
+    // into the env-var slots that the rest of the CLI already reads.
+    if let Some(t) = &config.theme {
+        // SAFETY: single-threaded during startup.
+        unsafe { std::env::set_var("AICHAT_THEME", t) };
+    }
+    if let Some(s) = &config.output_style {
+        unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", s) };
+    }
+    if let Some(c) = &config.color {
+        unsafe { std::env::set_var("AICHAT_COLOR", c) };
+        match c.as_str() {
+            "off" => colored::control::set_override(false),
+            "on" => colored::control::set_override(true),
+            _ => {}
+        }
+    }
+    if let Some(v) = &config.vim_mode {
+        unsafe { std::env::set_var("AICHAT_VIM_MODE", v) };
+    }
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
     // shells, or when `AI_CHAT_CLI_NO_ONBOARD=1` is set.
@@ -124,8 +170,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize MCP
-    let mcp_manager = match McpManager::new(Arc::clone(&permissions), Arc::clone(&plan_mode)).await
+    // Initialize MCP. We hand it a shared FileJournal so the CLI's
+    // `/rewind` can roll back any `edit_file`/`write_file` mutations
+    // recorded by the built-in tool registry.
+    let journal = file_rollback::FileJournal::default();
+    let mcp_manager = match McpManager::new_with_journal(
+        Arc::clone(&permissions),
+        Arc::clone(&plan_mode),
+        journal.clone(),
+    )
+    .await
     {
         Ok(manager) => {
             if manager.has_tools() {
@@ -152,8 +206,16 @@ async fn main() -> Result<()> {
 
     println!("{} AI executor ready", "✓".bright_green());
 
+    // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
+    // stay quiet under CI.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && let Some(tip) = tips::tip_of_the_day()
+    {
+        println!("{} {}", "💡 tip:".bright_yellow(), tip);
+    }
+
     // Create and run CLI
-    let mut cli = ChatCLI::new(executor, mcp_manager, permissions, plan_mode);
+    let mut cli = ChatCLI::new(executor, mcp_manager, permissions, plan_mode, journal);
     let run_result = cli.run().await;
 
     // Shut down MCP cleanly while we still have an async context. The Drop

@@ -15,6 +15,7 @@ use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
+use crate::file_rollback::FileJournal;
 use crate::permissions::Permissions;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,10 @@ pub struct BuiltinToolRegistry {
     /// response to `/plan`; the atomic + `Arc` lets the registry observe
     /// changes without taking a lock on every tool call.
     plan_mode: Arc<AtomicBool>,
+    /// Pre-image journal for `/rewind` — see `file_rollback.rs`. Cloned
+    /// (cheap `Arc`) into every tool call so `edit_file`/`write_file`
+    /// can capture the original bytes before mutating the disk.
+    journal: FileJournal,
     /// Long-lived shell sessions owned by the REPL tool. Keyed by
     /// caller-supplied session id (the model picks a stable string and
     /// reuses it across `repl_eval` calls). Wrapped in a tokio
@@ -98,7 +103,23 @@ struct ReplSession {
 }
 
 impl BuiltinToolRegistry {
+    /// Convenience constructor that wires up a default (no-op) journal.
+    /// Kept for any callers that don't care about `/rewind` integration.
+    #[allow(dead_code)]
     pub fn new(permissions: Arc<Mutex<Permissions>>, plan_mode: Arc<AtomicBool>) -> Self {
+        Self::with_journal(permissions, plan_mode, FileJournal::default())
+    }
+
+    /// Same as [`Self::new`] but lets the caller supply a journal so the
+    /// CLI's `/rewind` can roll back any mutations recorded by
+    /// `edit_file` and `write_file`. The two-constructor split keeps
+    /// existing callers (and tests) working without forcing them to
+    /// invent a journal they don't care about.
+    pub fn with_journal(
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+        journal: FileJournal,
+    ) -> Self {
         let tools = vec![
             Self::bash_tool(),
             Self::read_file_tool(),
@@ -126,12 +147,14 @@ impl BuiltinToolRegistry {
             Self::recv_messages_tool(),
             Self::remote_trigger_tool(),
             Self::notify_tool(),
+            Self::prevent_sleep_tool(),
         ];
 
         Self {
             tools,
             permissions,
             plan_mode,
+            journal,
             repls: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
@@ -176,6 +199,7 @@ impl BuiltinToolRegistry {
             "recv_messages" => self.execute_recv_messages(args),
             "remote_trigger" => self.execute_remote_trigger(args),
             "notify" => self.execute_notify(args),
+            "prevent_sleep" => self.execute_prevent_sleep(args).await,
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -655,6 +679,10 @@ impl BuiltinToolRegistry {
         let new_content = content.replace(old_text, new_text);
 
         fs::write(path, new_content).context(format!("Failed to write file: {}", path))?;
+        // Capture the pre-image only after a successful mutation so failed
+        // writes don't create phantom rollback entries.
+        self.journal
+            .record(PathBuf::from(path), Some(content.into_bytes()));
 
         Ok(ToolResult::success(format!(
             "File edited successfully: {}",
@@ -686,7 +714,19 @@ impl BuiltinToolRegistry {
             fs::create_dir_all(parent).context("Failed to create parent directories")?;
         }
 
+        // Capture the pre-image before writing. Distinguish true "missing"
+        // from other read failures so we don't mis-journal unreadable files
+        // as if they never existed.
+        let previous = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).context(format!("Failed to read file: {}", path)),
+        };
+
         fs::write(path, content).context(format!("Failed to write file: {}", path))?;
+        // Record only after a successful write so rewind tracks real
+        // mutations.
+        self.journal.record(PathBuf::from(path), previous);
 
         Ok(ToolResult::success(format!(
             "File written successfully: {} ({} bytes)",
@@ -1961,6 +2001,109 @@ impl BuiltinToolRegistry {
         match send_os_notification(&title, &message) {
             Ok(s) => Ok(ToolResult::success(s)),
             Err(e) => Ok(ToolResult::error(format!("notify failed: {e}"))),
+        }
+    }
+
+    // ---- prevent_sleep ----
+    //
+    // Roadmap C#8 (sleep prevention): spawns the platform's
+    // sleep-inhibiting helper for the requested duration (default 5
+    // minutes, hard-capped at 4 hours so a misbehaving agent can't
+    // pin a laptop awake forever). The helper is detached and the
+    // tool returns immediately — the model only needs to know "the
+    // request was accepted" before kicking off a long-running task.
+
+    fn prevent_sleep_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "prevent_sleep".to_string(),
+            description: "Prevent the host from sleeping for the given number of seconds. \
+                 Uses `caffeinate -dimsu` on macOS, `systemd-inhibit` on Linux, and a \
+                 SetThreadExecutionState-equivalent PowerShell loop on Windows. \
+                 Capped at 4 hours; the inhibitor is detached and will exit on its own."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "How long to keep the host awake. Defaults to 300 (5 minutes), hard-capped at 14400 (4 hours)."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute_prevent_sleep(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let seconds = args["seconds"]
+            .as_f64()
+            .or_else(|| args["seconds"].as_u64().map(|n| n as f64))
+            .unwrap_or(300.0);
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Ok(ToolResult::error(
+                "'seconds' must be a non-negative number".to_string(),
+            ));
+        }
+        // Hard-cap at 4 hours.
+        let capped = seconds.min(14_400.0) as u64;
+        if capped == 0 {
+            return Ok(ToolResult::success(
+                "prevent_sleep: nothing to do (seconds=0)".to_string(),
+            ));
+        }
+
+        // Pick the right inhibitor for this host. All branches return a
+        // ready-to-spawn `Command` so the spawn-and-detach logic stays
+        // unified below.
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let mut c = Command::new("caffeinate");
+            // -d display, -i system idle, -m disk, -s system sleep, -u user
+            c.args(["-dimsu", "-t", &capped.to_string()]);
+            c
+        };
+        #[cfg(target_os = "linux")]
+        let mut cmd = {
+            // systemd-inhibit holds the lock for the lifetime of its
+            // child command. We use `sleep` as the held command.
+            let mut c = Command::new("systemd-inhibit");
+            c.args([
+                "--what=idle:sleep",
+                "--who=ai-chat-cli",
+                "--why=ai-chat-cli prevent_sleep",
+                "--mode=block",
+                "sleep",
+                &capped.to_string(),
+            ]);
+            c
+        };
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            // A tiny PowerShell loop sets ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            // periodically. Exits on its own after `capped` seconds.
+            let script = format!(
+                "$sig='[DllImport(\\\"kernel32.dll\\\")] public static extern uint SetThreadExecutionState(uint esFlags);'; \
+                 Add-Type -MemberDefinition $sig -Name PWR -Namespace W; \
+                 $end = (Get-Date).AddSeconds({secs}); \
+                 while ((Get-Date) -lt $end) {{ [W.PWR]::SetThreadExecutionState(0x80000003) | Out-Null; Start-Sleep -Seconds 30 }}; \
+                 [W.PWR]::SetThreadExecutionState(0x80000000) | Out-Null",
+                secs = capped
+            );
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-Command", &script]);
+            c
+        };
+
+        // Detach: ignore stdio + spawn so we return immediately.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(_child) => Ok(ToolResult::success(format!(
+                "prevent_sleep: host inhibitor started for {capped}s"
+            ))),
+            Err(e) => Ok(ToolResult::error(format!(
+                "prevent_sleep failed to start inhibitor: {e}"
+            ))),
         }
     }
 }

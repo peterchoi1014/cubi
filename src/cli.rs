@@ -2,15 +2,22 @@ use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::file_mentions::{self, UserCommand};
+use crate::file_rollback::FileJournal;
 use crate::git_cmds;
 use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
 use crate::ollama::Message;
+use crate::onboarding::AppConfig;
+use crate::output_styles;
 use crate::permissions::Permissions;
+use crate::plugins::{self, Plugin};
+use crate::policy::Policy;
 use crate::project_memory;
 use crate::sessions::{SessionFile, SessionStore};
+use crate::settings_sync;
 use crate::skills::{self, Skill};
+use crate::themes;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use colored::*;
@@ -57,6 +64,15 @@ pub struct ChatCLI {
     /// The session currently being appended to. Lazily initialized so
     /// the file isn't created until the user actually sends a message.
     current_session: Option<SessionFile>,
+    /// Shared with `BuiltinToolRegistry` — receives one pre-image
+    /// snapshot per `edit_file`/`write_file` so `/rewind` can restore.
+    journal: FileJournal,
+    /// Discovered plugin bundles (see `plugins.rs`). Refreshed by
+    /// `/reload-plugins`.
+    plugins: Vec<Plugin>,
+    /// Read-only admin policy overlay (see `policy.rs`). Loaded once at
+    /// startup; surfaced by `/permissions`.
+    policy: Policy,
 }
 
 impl ChatCLI {
@@ -65,6 +81,7 @@ impl ChatCLI {
         mcp_manager: Option<McpManager>,
         permissions: Arc<Mutex<Permissions>>,
         plan_mode: Arc<AtomicBool>,
+        journal: FileJournal,
     ) -> Self {
         let mut cli = Self {
             executor,
@@ -80,6 +97,9 @@ impl ChatCLI {
             permissions,
             session_store: SessionStore::for_current_dir(),
             current_session: None,
+            journal,
+            plugins: plugins::load_plugins(),
+            policy: Policy::load(),
         };
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
@@ -87,6 +107,16 @@ impl ChatCLI {
 
         // Auto-inject cross-session memdir into context, if non-empty.
         cli.inject_memdir();
+
+        // Steer reply formatting via the configured output style. We push
+        // a system message rather than mutating per-prompt so the
+        // preset rides along with every assistant turn for the session.
+        let style = std::env::var("AICHAT_OUTPUT_STYLE")
+            .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string());
+        cli.history.push(Message::text(
+            "system",
+            format!("SYSTEM: {}", output_styles::system_prompt_for(&style)),
+        ));
 
         // Auto-inject MCP tools into context
         if let Some(mcp) = &cli.mcp_manager
@@ -179,6 +209,10 @@ impl ChatCLI {
                     // Add user message to history
                     self.history.push(Message::text("user", &expanded));
 
+                    // Open a fresh journal bucket so any file edits in
+                    // this turn can be rolled back atomically by /rewind.
+                    self.journal.start_turn();
+
                     // Run the agent: stream model output, execute any
                     // requested tools, loop until the model returns plain
                     // content (or we hit the safety cap).
@@ -206,8 +240,8 @@ impl ChatCLI {
         Ok(())
     }
 
-    /// Tries to match a `/command` against user-defined Markdown commands.
-    /// Returns `true` if a user command was matched and handled.
+    /// Tries to match a `/command` against user-defined and plugin Markdown
+    /// commands. Returns `true` if a command was matched and handled.
     fn try_user_command(&mut self, input: &str) -> bool {
         let input = input.trim();
         let (head, args) = match input.find(char::is_whitespace) {
@@ -217,37 +251,69 @@ impl ChatCLI {
         // Strip the leading `/` to get the command name.
         let cmd_name = head.strip_prefix('/').unwrap_or(head).to_lowercase();
 
-        let matched = self
+        let matched_user = self
             .user_commands
             .iter()
             .find(|c| c.name == cmd_name)
             .cloned();
 
-        let Some(user_cmd) = matched else {
+        if let Some(user_cmd) = matched_user {
+            // Inject the Markdown body as a single-turn system message.
+            let body = if args.is_empty() {
+                user_cmd.body.clone()
+            } else {
+                format!("{}\n\nUser argument: {}", user_cmd.body, args)
+            };
+
+            self.history.push(Message::text(
+                "system",
+                format!(
+                    "{} User command /{} (from {}):\n\n{}",
+                    SINGLE_TURN_SYSTEM_TAG,
+                    user_cmd.name,
+                    user_cmd.path.display(),
+                    body
+                ),
+            ));
+            println!(
+                "{} Applied user command /{}",
+                "✓".bright_green(),
+                user_cmd.name.bright_cyan()
+            );
+            return true;
+        }
+
+        let Some(plugin_cmd) = plugins::resolve(&self.plugins, head).cloned() else {
             return false;
         };
+        let plugin_name = head
+            .strip_prefix('/')
+            .unwrap_or(head)
+            .split_once(':')
+            .map(|(ns, _)| ns)
+            .unwrap_or_default()
+            .to_string();
 
-        // Inject the Markdown body as a single-turn system message.
         let body = if args.is_empty() {
-            user_cmd.body.clone()
+            plugin_cmd.body.clone()
         } else {
-            format!("{}\n\nUser argument: {}", user_cmd.body, args)
+            format!("{}\n\nUser argument: {}", plugin_cmd.body, args)
         };
 
         self.history.push(Message::text(
             "system",
             format!(
-                "{} User command /{} (from {}):\n\n{}",
+                "{} Plugin command {} (from {}):\n\n{}",
                 SINGLE_TURN_SYSTEM_TAG,
-                user_cmd.name,
-                user_cmd.path.display(),
+                plugin_cmd.trigger(&plugin_name),
+                plugin_cmd.path.display(),
                 body
             ),
         ));
         println!(
-            "{} Applied user command /{}",
+            "{} Applied plugin command {}",
             "✓".bright_green(),
-            user_cmd.name.bright_cyan()
+            plugin_cmd.trigger(&plugin_name).bright_cyan()
         );
         true
     }
@@ -273,6 +339,10 @@ impl ChatCLI {
                 // `current_session` is allocated lazily on the next
                 // `checkpoint_session` call.
                 self.current_session = None;
+                // Also drop the file-rollback journal — `/clear` is a
+                // hard reset, so further `/rewind`s should not reach
+                // back into the now-discarded conversation.
+                self.journal.reset();
                 println!("{}", "Conversation history cleared.".yellow());
             }
             Cmd::History => {
@@ -718,6 +788,10 @@ impl ChatCLI {
             Cmd::Feedback => self.show_feedback_url(args),
             Cmd::ReleaseNotes => self.show_release_notes(),
             Cmd::Stickers => self.show_stickers(),
+            Cmd::SettingsSync => self.handle_settings_sync(args),
+            Cmd::Policy => self.show_policy(),
+            Cmd::Tip => self.show_tip(),
+            Cmd::McpPrompts => self.show_mcp_prompts(args).await,
         }
         Ok(true)
     }
@@ -1398,6 +1472,29 @@ impl ChatCLI {
                 denied.join(", ")
             }
         );
+        if !self.policy.denied_tools.is_empty() || self.policy.note.is_some() {
+            let policy_path = Policy::active_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            println!(
+                "  {}: {} (from {})",
+                "admin policy denies".bright_red(),
+                if self.policy.denied_tools.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.policy
+                        .denied_tools
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                policy_path.bright_black()
+            );
+            if let Some(note) = &self.policy.note {
+                println!("    {} {}", "note:".bright_black(), note);
+            }
+        }
         println!(
             "  {} Plan mode also blocks write/exec tools regardless of trust.",
             "ℹ".bright_blue()
@@ -1672,6 +1769,7 @@ impl ChatCLI {
             "✓".bright_green(),
             skill.name.bright_cyan()
         );
+        self.journal.start_turn();
         if let Err(e) = self.agent_turn().await {
             eprintln!("{} {}", "Error:".bright_red(), e);
         }
@@ -2612,6 +2710,11 @@ impl ChatCLI {
             .map(|(_, m)| m.clone())
             .collect();
         let removed = prev_len - self.history.len();
+        // Roll back any file edits/writes recorded by the built-in
+        // tools during the rewound turns. We treat each removed
+        // exchange (assumed n) as one journal turn — matches how the
+        // CLI opens one journal turn for each agent entry point.
+        let outcome = self.journal.rewind(n);
         println!(
             "{} Rewound {} message{} ({} exchange{})",
             "✓".bright_green(),
@@ -2620,6 +2723,25 @@ impl ChatCLI {
             n.min(non_system.len() / 2),
             if n == 1 { "" } else { "s" }
         );
+        if !outcome.restored.is_empty() {
+            println!(
+                "  {} Restored {} file{}:",
+                "↺".bright_yellow(),
+                outcome.restored.len(),
+                if outcome.restored.len() == 1 { "" } else { "s" }
+            );
+            for p in &outcome.restored {
+                println!("    {} {}", "•".bright_cyan(), p.display());
+            }
+        }
+        for (path, err) in &outcome.errors {
+            eprintln!(
+                "  {} could not roll back {}: {}",
+                "Warn:".bright_yellow(),
+                path.display(),
+                err
+            );
+        }
         self.checkpoint_session();
     }
 
@@ -3029,6 +3151,11 @@ impl ChatCLI {
                         "denied by PreToolUse hook".bright_red()
                     );
                     format!("[tool denied] {reason}")
+                } else if self.policy.is_denied(&call.function.name) {
+                    format!(
+                        "[tool denied] `{}` is blocked by admin policy",
+                        call.function.name
+                    )
                 } else if !self
                     .permissions
                     .lock()
@@ -3458,26 +3585,48 @@ impl ChatCLI {
         println!("{} max passes set to {}", "✓".bright_green(), n);
     }
 
+    /// Loads the on-disk AppConfig, applies `mutate`, persists. Errors
+    /// are surfaced but never fatal — handlers fall back to "in-memory
+    /// only" (still affects the env vars for the current process) so a
+    /// read-only $HOME doesn't break the slash commands.
+    fn update_config(&self, mutate: impl FnOnce(&mut AppConfig)) -> Result<()> {
+        let mut cfg = AppConfig::load();
+        mutate(&mut cfg);
+        cfg.save()
+    }
+
     fn handle_theme(&self, args: &str) {
         let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} theme: {} (set with /theme [auto|light|dark])",
+        if arg.is_empty() {
+            println!(
+                "{} theme: {} (set with /theme [{}])",
                 "ℹ".bright_blue(),
                 std::env::var("AICHAT_THEME")
                     .unwrap_or_else(|_| "auto".to_string())
-                    .bright_cyan()
-            ),
-            "auto" | "light" | "dark" => {
-                unsafe { std::env::set_var("AICHAT_THEME", &arg) };
-                println!("{} theme set to {}", "✓".bright_green(), arg);
-            }
-            other => eprintln!(
-                "{} Unknown theme '{}'. Expected auto|light|dark.",
-                "Error:".bright_red(),
-                other
-            ),
+                    .bright_cyan(),
+                themes::VALID_THEMES.join("|")
+            );
+            return;
         }
+        if !themes::is_valid_theme(&arg) {
+            eprintln!(
+                "{} Unknown theme '{}'. Expected {}.",
+                "Error:".bright_red(),
+                arg,
+                themes::VALID_THEMES.join("|")
+            );
+            return;
+        }
+        // SAFETY: handled on the readline thread, no race.
+        unsafe { std::env::set_var("AICHAT_THEME", &arg) };
+        if let Err(e) = self.update_config(|c| c.theme = Some(arg.clone())) {
+            eprintln!(
+                "{} theme set in this session but not persisted: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+        println!("{} theme set to {}", "✓".bright_green(), arg);
     }
 
     fn handle_color(&self, args: &str) {
@@ -3494,10 +3643,16 @@ impl ChatCLI {
             ),
             "on" => {
                 colored::control::set_override(true);
+                if let Err(e) = self.update_config(|c| c.color = Some("on".to_string())) {
+                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
+                }
                 println!("{} colored output ON", "✓".bright_green());
             }
             "off" => {
                 colored::control::set_override(false);
+                if let Err(e) = self.update_config(|c| c.color = Some("off".to_string())) {
+                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
+                }
                 println!("colored output OFF");
             }
             other => eprintln!(
@@ -3510,24 +3665,35 @@ impl ChatCLI {
 
     fn handle_output_style(&self, args: &str) {
         let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} output style: {} (set with /output-style [concise|markdown|explanatory])",
+        if arg.is_empty() {
+            println!(
+                "{} output style: {} (set with /output-style [{}])",
                 "ℹ".bright_blue(),
                 std::env::var("AICHAT_OUTPUT_STYLE")
-                    .unwrap_or_else(|_| "markdown".to_string())
-                    .bright_cyan()
-            ),
-            "concise" | "markdown" | "explanatory" => {
-                unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", &arg) };
-                println!("{} output style set to {}", "✓".bright_green(), arg);
-            }
-            other => eprintln!(
-                "{} Unknown style '{}'. Expected concise|markdown|explanatory.",
-                "Error:".bright_red(),
-                other
-            ),
+                    .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string())
+                    .bright_cyan(),
+                output_styles::VALID_STYLES.join("|")
+            );
+            return;
         }
+        if !output_styles::is_valid_style(&arg) {
+            eprintln!(
+                "{} Unknown style '{}'. Expected {}.",
+                "Error:".bright_red(),
+                arg,
+                output_styles::VALID_STYLES.join("|")
+            );
+            return;
+        }
+        unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", &arg) };
+        if let Err(e) = self.update_config(|c| c.output_style = Some(arg.clone())) {
+            eprintln!(
+                "{} style set in this session but not persisted: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+        println!("{} output style set to {}", "✓".bright_green(), arg);
     }
 
     fn show_statusline(&self) {
@@ -3583,6 +3749,9 @@ impl ChatCLI {
             ),
             "on" | "off" => {
                 unsafe { std::env::set_var("AICHAT_VIM_MODE", &arg) };
+                if let Err(e) = self.update_config(|c| c.vim_mode = Some(arg.clone())) {
+                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
+                }
                 println!(
                     "{} vim mode {} (restart the CLI to apply)",
                     "✓".bright_green(),
@@ -3681,38 +3850,54 @@ impl ChatCLI {
     }
 
     fn show_plugins(&self) {
-        let path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("plugins"));
         println!("\n{}", "Plugins:".bright_yellow().bold());
-        let Some(p) = path else {
+        let Some(dir) = plugins::plugins_dir() else {
             println!("  {} No home directory.", "ℹ".bright_blue());
             return;
         };
-        match fs::read_dir(&p) {
-            Ok(rd) => {
-                let mut any = false;
-                for entry in rd.flatten() {
-                    any = true;
-                    println!("  {} {}", "•".bright_cyan(), entry.path().display());
-                }
-                if !any {
-                    println!("  {} No plugins in {}", "ℹ".bright_blue(), p.display());
-                }
-            }
-            Err(_) => println!(
-                "  {} Directory {} does not exist yet.",
+        if self.plugins.is_empty() {
+            println!(
+                "  {} No plugins discovered in {}. Drop a Markdown file at \n     {}/<plugin>/commands/<name>.md to register one.",
                 "ℹ".bright_blue(),
-                p.display()
-            ),
+                dir.display(),
+                dir.display()
+            );
+            println!();
+            return;
+        }
+        for p in &self.plugins {
+            println!(
+                "  {} {} ({})",
+                "•".bright_cyan(),
+                p.name.bright_cyan(),
+                p.root.display().to_string().bright_black()
+            );
+            if p.commands.is_empty() {
+                println!("      {} (no commands)", "ℹ".bright_blue());
+                continue;
+            }
+            for c in &p.commands {
+                println!(
+                    "      {} {} — {}",
+                    "›".bright_green(),
+                    c.trigger(&p.name).bright_white(),
+                    c.description
+                );
+            }
         }
         println!();
     }
 
     fn reload_plugins(&mut self) {
         self.skills = skills::load_skills();
+        self.plugins = plugins::load_plugins();
+        let cmd_count: usize = self.plugins.iter().map(|p| p.commands.len()).sum();
         println!(
-            "{} Reloaded plugins/skills ({} skills)",
+            "{} Reloaded {} skill(s) + {} plugin(s) ({} command(s))",
             "✓".bright_green(),
-            self.skills.len()
+            self.skills.len(),
+            self.plugins.len(),
+            cmd_count
         );
     }
 
@@ -3960,12 +4145,20 @@ impl ChatCLI {
     fn show_release_notes(&self) {
         println!(
             "\n{} v{}\n\n\
-             - Cross-platform `shell` tool (POSIX sh / PowerShell)\n\
-             - Time tools: `sleep`, `schedule` (cron-style)\n\
-             - Structured output helpers: `brief`, `synthetic_output`\n\
-             - Inter-agent messaging: `send_message`, `recv_messages`, `remote_trigger`\n\
-             - OS notification: `notify` (osascript / notify-send / PowerShell)\n\
-             - 36 new slash commands wired into the registry (see /help)\n",
+             - Plugin system: namespaced `/<plugin>:<command>` triggers\n   \
+               loaded from ~/.ai-chat-cli/plugins/<name>/commands/*.md\n\
+             - Themable output styles: `/theme`, `/output-style`, `/color`,\n   \
+               and `/vim` now persist to ~/.ai-chat-cli/config.json\n\
+             - `prevent_sleep` built-in tool (caffeinate / systemd-inhibit /\n   \
+               SetThreadExecutionState)\n\
+             - Opt-in telemetry: tool calls log to ~/.ai-chat-cli/telemetry.log\n\
+             - Tip-of-the-day at startup + on-demand via `/tip`\n\
+             - Admin policy overlay (~/.ai-chat-cli/policy.json,\n   \
+               /etc/ai-chat-cli/policy.json, $AICHAT_POLICY_FILE); inspect via `/policy`\n\
+             - Git-backed cross-machine sync via `/settings-sync`\n\
+             - File-mutation rollback on `/rewind` (edit_file / write_file)\n\
+             - MCP prompts (`prompts/list` + `prompts/get`) via `/mcp-prompts`\n\
+             - Versioned config migrations framework\n",
             "Release notes:".bright_yellow().bold(),
             env!("CARGO_PKG_VERSION")
         );
@@ -3976,6 +4169,148 @@ impl ChatCLI {
             "\n{}\n  ┌────────────┐    (\\(\\\n  │ ai-chat 🚀 │    ( -.-)\n  └────────────┘    o_(\")(\")\n",
             "Stickers:".bright_yellow().bold()
         );
+    }
+
+    /// `/settings-sync` — drive `settings_sync.rs` for cross-machine
+    /// config + memdir + skills sync via git. Verbs: `init <remote>`,
+    /// `push [msg]`, `pull`, `status`.
+    fn handle_settings_sync(&self, args: &str) {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let verb = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
+
+        let result: Result<String> = match verb {
+            "" | "status" => settings_sync::status(),
+            "init" => {
+                if rest.is_empty() {
+                    eprintln!(
+                        "{} Usage: /settings-sync init <remote-url>",
+                        "Error:".bright_red()
+                    );
+                    return;
+                }
+                settings_sync::init(rest)
+            }
+            "push" => {
+                let msg = if rest.is_empty() {
+                    "ai-chat-cli: sync"
+                } else {
+                    rest
+                };
+                settings_sync::push(msg)
+            }
+            "pull" => settings_sync::pull(),
+            other => {
+                eprintln!(
+                    "{} Unknown verb '{}'. Expected init|push|pull|status.",
+                    "Error:".bright_red(),
+                    other
+                );
+                return;
+            }
+        };
+        match result {
+            Ok(msg) => println!("{} {}", "✓".bright_green(), msg),
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn show_policy(&self) {
+        println!("\n{}", "Admin policy:".bright_yellow().bold());
+        match Policy::active_path() {
+            Some(p) => println!(
+                "  {}: {}",
+                "file".bright_cyan(),
+                p.display().to_string().bright_cyan()
+            ),
+            None => {
+                println!(
+                    "  {} No policy file. Drop JSON at /etc/ai-chat-cli/policy.json or \n     ~/.ai-chat-cli/policy.json to enforce one.",
+                    "ℹ".bright_blue()
+                );
+                println!();
+                return;
+            }
+        }
+        if self.policy.denied_tools.is_empty() {
+            println!("  {} denied tools: (none)", "•".bright_cyan());
+        } else {
+            println!(
+                "  {} denied tools: {}",
+                "•".bright_red(),
+                self.policy
+                    .denied_tools
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if let Some(note) = &self.policy.note {
+            println!("  {} note: {}", "•".bright_cyan(), note);
+        }
+        println!();
+    }
+
+    fn show_tip(&self) {
+        match crate::tips::tip_of_the_day() {
+            Some(tip) => println!("\n{} {}\n", "💡 tip:".bright_yellow(), tip),
+            None => println!("\n{} no tips available\n", "ℹ".bright_blue()),
+        }
+    }
+
+    /// `/mcp-prompts` — list prompts exposed by configured MCP servers,
+    /// or render a specific one when called as
+    /// `/mcp-prompts <server>:<prompt>`.
+    async fn show_mcp_prompts(&mut self, args: &str) {
+        let Some(mcp) = self.mcp_manager.as_mut() else {
+            println!(
+                "{} No MCP servers loaded (configure ~/.ai-chat-cli/mcp.json).",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        let arg = args.trim();
+        if let Some((server, prompt)) = arg.split_once(':') {
+            match mcp.get_prompt(server, prompt).await {
+                Ok(body) => {
+                    println!(
+                        "\n{}",
+                        format!("Prompt {server}:{prompt}").bright_yellow().bold()
+                    );
+                    println!("{}\n", body);
+                }
+                Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+            }
+            return;
+        }
+        match mcp.list_prompts().await {
+            Ok(prompts) => {
+                println!("\n{}", "MCP prompts:".bright_yellow().bold());
+                if prompts.is_empty() {
+                    println!(
+                        "  {} No prompts exposed by any configured server.",
+                        "ℹ".bright_blue()
+                    );
+                } else {
+                    for (server, name, description) in &prompts {
+                        println!(
+                            "  {} {}:{} — {}",
+                            "•".bright_cyan(),
+                            server.bright_cyan(),
+                            name.bright_white(),
+                            description
+                        );
+                    }
+                    println!(
+                        "\n  {} /mcp-prompts <server>:<name> renders the prompt body.",
+                        "ℹ".bright_blue()
+                    );
+                }
+                println!();
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
     }
 }
 
