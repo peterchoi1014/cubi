@@ -1,5 +1,6 @@
 mod builtin_tools;
 mod cli;
+mod commands;
 mod executor;
 mod mcp_client;
 mod mcp_config;

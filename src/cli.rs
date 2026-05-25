@@ -1,3 +1,4 @@
+use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
@@ -168,29 +169,51 @@ impl ChatCLI {
         Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: &str) -> Result<bool> {
+    async fn handle_command(&mut self, input: &str) -> Result<bool> {
+        let Some((cmd, args)) = commands::parse(input) else {
+            println!("{} {}", "Unknown command:".bright_red(), input);
+            println!("Type {} for available commands", "/help".bright_cyan());
+            return Ok(true);
+        };
+
         match cmd {
-            "/quit" | "/exit" => {
+            Cmd::Quit => {
                 println!("{}", "Goodbye!".bright_cyan());
                 return Ok(false);
             }
-            "/clear" => {
+            Cmd::Clear => {
                 self.history.clear();
                 println!("{}", "Conversation history cleared.".yellow());
             }
-            "/history" => {
+            Cmd::History => {
                 self.show_history();
             }
-            "/help" => {
+            Cmd::Help => {
                 self.show_help();
             }
-            "/model" => {
-                println!("Current model: {}", self.executor.get_model().bright_cyan());
+            Cmd::Model => {
+                if args.is_empty() {
+                    println!("Current model: {}", self.executor.get_model().bright_cyan());
+                } else {
+                    match self.executor.switch_model(args.to_string()).await {
+                        Ok(_) => {
+                            println!(
+                                "{} Switched to model: {}",
+                                "✓".bright_green(),
+                                args.bright_cyan()
+                            );
+                            self.history.clear();
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "Error:".bright_red(), e);
+                        }
+                    }
+                }
             }
-            "/mcp-tools" => {
+            Cmd::McpTools => {
                 self.show_mcp_tools();
             }
-            cmd if cmd.starts_with("/mcp-call ") => {
+            Cmd::McpCall => {
                 if self.plan_mode {
                     println!(
                         "{} Plan mode is on — refusing /mcp-call. Toggle off with /plan first.",
@@ -198,10 +221,8 @@ impl ChatCLI {
                     );
                     return Ok(true);
                 }
-                let rest = cmd.strip_prefix("/mcp-call ").unwrap().trim();
-                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-
-                if parts.len() < 2 {
+                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if args.is_empty() || parts.len() < 2 {
                     println!(
                         "{} Usage: /mcp-call <tool_name> <json_args>",
                         "Info:".bright_yellow()
@@ -212,8 +233,8 @@ impl ChatCLI {
                     let args_str = parts[1];
 
                     match serde_json::from_str(args_str) {
-                        Ok(args) => {
-                            if let Err(e) = self.call_mcp_tool(tool_name, args).await {
+                        Ok(json_args) => {
+                            if let Err(e) = self.call_mcp_tool(tool_name, json_args).await {
                                 eprintln!("{} {}", "Error:".bright_red(), e);
                             }
                         }
@@ -223,56 +244,40 @@ impl ChatCLI {
                     }
                 }
             }
-            "/mcp-reload" => {
+            Cmd::McpReload => {
                 if let Err(e) = self.reload_mcp().await {
                     eprintln!("{} Failed to reload MCP: {}", "Error:".bright_red(), e);
                 } else {
                     println!("{} MCP configuration reloaded", "✓".bright_green());
                 }
             }
-            cmd if cmd.starts_with("/model ") => {
-                let model = cmd.strip_prefix("/model ").unwrap().trim();
-                match self.executor.switch_model(model.to_string()).await {
-                    Ok(_) => {
-                        println!(
-                            "{} Switched to model: {}",
-                            "✓".bright_green(),
-                            model.bright_cyan()
-                        );
-                        self.history.clear();
-                    }
-                    Err(e) => {
-                        eprintln!("{} {}", "Error:".bright_red(), e);
-                    }
-                }
-            }
-            cmd if cmd.starts_with("/save ") => {
-                let rest = cmd.strip_prefix("/save ").unwrap().trim();
-                match parse_force_and_filename(rest) {
-                    Some((force, filename)) => match self.save_conversation(filename, force) {
-                        Ok(()) => println!(
-                            "{} Conversation saved to {}",
-                            "✓".bright_green(),
-                            filename.bright_cyan()
-                        ),
-                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
-                    },
-                    None => {
-                        println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
-                        println!("       Pass -f to overwrite an existing file.");
+            Cmd::Save => {
+                if args.is_empty() {
+                    println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                    println!("       Pass -f to overwrite an existing file.");
+                    println!("Example: /save my_chat.json");
+                } else {
+                    match parse_force_and_filename(args) {
+                        Some((force, filename)) => match self.save_conversation(filename, force) {
+                            Ok(()) => println!(
+                                "{} Conversation saved to {}",
+                                "✓".bright_green(),
+                                filename.bright_cyan()
+                            ),
+                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                        },
+                        None => {
+                            println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                            println!("       Pass -f to overwrite an existing file.");
+                        }
                     }
                 }
             }
-            "/save" => {
-                println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
-                println!("       Pass -f to overwrite an existing file.");
-                println!("Example: /save my_chat.json");
-            }
-            cmd if cmd.starts_with("/load ") => {
-                let filename = cmd.strip_prefix("/load ").unwrap().trim();
-                if filename.is_empty() {
+            Cmd::Load => {
+                if args.is_empty() {
                     println!("{} Usage: /load <filename>", "Info:".bright_yellow());
-                } else if let Err(e) = self.load_conversation(filename) {
+                    println!("Example: /load my_chat.json");
+                } else if let Err(e) = self.load_conversation(args) {
                     // History intentionally preserved; surface the error
                     // chain so the user can tell read vs. parse failures
                     // apart.
@@ -285,20 +290,23 @@ impl ChatCLI {
                     println!(
                         "{} Conversation loaded from {}",
                         "✓".bright_green(),
-                        filename.bright_cyan()
+                        args.bright_cyan()
                     );
                 }
             }
-            "/load" => {
-                println!("{} Usage: /load <filename>", "Info:".bright_yellow());
-                println!("Example: /load my_chat.json");
-            }
-            cmd if cmd.starts_with("/batch ") => {
-                let filename = cmd.strip_prefix("/batch ").unwrap().trim();
-                if filename.is_empty() {
+            Cmd::Batch => {
+                if args.is_empty() {
                     println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
+                    println!("Example: /batch prompts.txt");
+                    println!(
+                        "\nBatch file format (one prompt per line, blank lines and #-comments are skipped):"
+                    );
+                    println!("  # warm-up");
+                    println!("  What is Rust?");
+                    println!("  Write hello world in Python");
+                    println!("  Explain recursion");
                 } else {
-                    match self.process_batch_file(filename).await {
+                    match self.process_batch_file(args).await {
                         Ok(BatchSummary { ok, failed }) => {
                             if failed == 0 {
                                 println!(
@@ -322,37 +330,26 @@ impl ChatCLI {
                     }
                 }
             }
-            "/batch" => {
-                println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
-                println!("Example: /batch prompts.txt");
-                println!(
-                    "\nBatch file format (one prompt per line, blank lines and #-comments are skipped):"
-                );
-                println!("  # warm-up");
-                println!("  What is Rust?");
-                println!("  Write hello world in Python");
-                println!("  Explain recursion");
-            }
-            "/version" => {
+            Cmd::Version => {
                 println!(
                     "{} {}",
                     "ai-chat-cli".bright_cyan(),
                     env!("CARGO_PKG_VERSION")
                 );
             }
-            "/status" => {
+            Cmd::Status => {
                 self.show_status();
             }
-            "/plan" => {
+            Cmd::Plan => {
                 self.toggle_plan_mode();
             }
-            "/init" => {
+            Cmd::Init => {
                 self.run_init();
             }
-            "/memory" => {
+            Cmd::Memory => {
                 self.show_memory();
             }
-            "/memory-reload" => {
+            Cmd::MemoryReload => {
                 self.inject_project_memory();
                 match project_memory::read_memory_with_path() {
                     Ok(Some((p, _))) => println!(
@@ -368,107 +365,95 @@ impl ChatCLI {
                     Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
                 }
             }
-            "/todos" => {
+            Cmd::Todos => {
                 self.todos.render();
             }
-            cmd if cmd.starts_with("/todo-add ") => {
-                let text = cmd.strip_prefix("/todo-add ").unwrap().trim();
-                if text.is_empty() {
+            Cmd::TodoAdd => {
+                if args.is_empty() {
                     println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
                 } else {
-                    self.todos.add(text);
+                    self.todos.add(args);
                     self.persist_todos();
                     println!("{} Added todo", "✓".bright_green());
                 }
             }
-            "/todo-add" => {
-                println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
-            }
-            cmd if cmd.starts_with("/todo-done ") => {
-                let arg = cmd.strip_prefix("/todo-done ").unwrap().trim();
-                match arg.parse::<usize>() {
-                    Ok(n) => {
-                        if self.todos.mark_done(n) {
-                            self.persist_todos();
-                            println!("{} Marked todo {} as done", "✓".bright_green(), n);
-                        } else {
-                            eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+            Cmd::TodoDone => {
+                if args.is_empty() {
+                    println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.todos.mark_done(n) {
+                                self.persist_todos();
+                                println!("{} Marked todo {} as done", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+                            }
                         }
-                    }
-                    Err(_) => {
-                        eprintln!("{} Usage: /todo-done <index>", "Error:".bright_red());
+                        Err(_) => {
+                            eprintln!("{} Usage: /todo-done <index>", "Error:".bright_red());
+                        }
                     }
                 }
             }
-            "/todo-done" => {
-                println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
-            }
-            cmd if cmd.starts_with("/todo-rm ") => {
-                let arg = cmd.strip_prefix("/todo-rm ").unwrap().trim();
-                match arg.parse::<usize>() {
-                    Ok(n) => {
-                        if self.todos.remove(n) {
-                            self.persist_todos();
-                            println!("{} Removed todo {}", "✓".bright_green(), n);
-                        } else {
-                            eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+            Cmd::TodoRm => {
+                if args.is_empty() {
+                    println!("{} Usage: /todo-rm <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.todos.remove(n) {
+                                self.persist_todos();
+                                println!("{} Removed todo {}", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+                            }
                         }
-                    }
-                    Err(_) => {
-                        eprintln!("{} Usage: /todo-rm <index>", "Error:".bright_red());
+                        Err(_) => {
+                            eprintln!("{} Usage: /todo-rm <index>", "Error:".bright_red());
+                        }
                     }
                 }
             }
-            "/todo-rm" => {
-                println!("{} Usage: /todo-rm <index>", "Info:".bright_yellow());
-            }
-            "/todo-clear" => {
+            Cmd::TodoClear => {
                 self.todos.clear();
                 self.persist_todos();
                 println!("{} Cleared todos", "✓".bright_green());
             }
-            cmd if cmd.starts_with("/ask ") => {
-                let question = cmd.strip_prefix("/ask ").unwrap().trim();
-                if question.is_empty() {
+            Cmd::Ask => {
+                if args.is_empty() {
                     println!("{} Usage: /ask <question>", "Info:".bright_yellow());
+                    println!("Records a clarifying question to be answered on the next turn.");
                 } else {
-                    self.ask_user(question);
+                    self.ask_user(args);
                 }
             }
-            "/ask" => {
-                println!("{} Usage: /ask <question>", "Info:".bright_yellow());
-                println!("Records a clarifying question to be answered on the next turn.");
-            }
-            cmd if cmd.starts_with("/export ") => {
-                let rest = cmd.strip_prefix("/export ").unwrap().trim();
-                match parse_force_and_filename(rest) {
-                    Some((force, filename)) => match self.export_markdown(filename, force) {
-                        Ok(()) => println!(
-                            "{} Conversation exported to {}",
-                            "✓".bright_green(),
-                            filename.bright_cyan()
-                        ),
-                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
-                    },
-                    None => {
-                        println!(
-                            "{} Usage: /export [-f] <filename.md>",
-                            "Info:".bright_yellow()
-                        );
-                        println!("       Pass -f to overwrite an existing file.");
+            Cmd::Export => {
+                if args.is_empty() {
+                    println!(
+                        "{} Usage: /export [-f] <filename.md>",
+                        "Info:".bright_yellow()
+                    );
+                    println!("       Pass -f to overwrite an existing file.");
+                } else {
+                    match parse_force_and_filename(args) {
+                        Some((force, filename)) => match self.export_markdown(filename, force) {
+                            Ok(()) => println!(
+                                "{} Conversation exported to {}",
+                                "✓".bright_green(),
+                                filename.bright_cyan()
+                            ),
+                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                        },
+                        None => {
+                            println!(
+                                "{} Usage: /export [-f] <filename.md>",
+                                "Info:".bright_yellow()
+                            );
+                            println!("       Pass -f to overwrite an existing file.");
+                        }
                     }
                 }
-            }
-            "/export" => {
-                println!(
-                    "{} Usage: /export [-f] <filename.md>",
-                    "Info:".bright_yellow()
-                );
-                println!("       Pass -f to overwrite an existing file.");
-            }
-            _ => {
-                println!("{} {}", "Unknown command:".bright_red(), cmd);
-                println!("Type {} for available commands", "/help".bright_cyan());
             }
         }
         Ok(true)
@@ -610,38 +595,6 @@ impl ChatCLI {
         Ok(())
     }
 
-    /// Single source of truth for slash commands shown in `/help` and the
-    /// startup banner. `(command, description)` pairs.
-    fn command_help() -> &'static [(&'static str, &'static str)] {
-        &[
-            ("/help", "Show this help message"),
-            ("/status", "Show session status"),
-            ("/plan", "Toggle plan mode (read-only)"),
-            ("/init", "Create starter AICHAT.md"),
-            ("/memory", "Show project memory (AICHAT.md)"),
-            ("/memory-reload", "Re-read AICHAT.md from disk"),
-            ("/todos", "List todos"),
-            ("/todo-add <text>", "Add a todo"),
-            ("/todo-done <n>", "Mark todo n as done"),
-            ("/todo-rm <n>", "Remove todo n"),
-            ("/todo-clear", "Clear all todos"),
-            ("/ask <q>", "Record a clarifying question (single-turn)"),
-            ("/clear", "Clear conversation history"),
-            ("/history", "Show conversation history"),
-            ("/export [-f] <f.md>", "Export conversation as Markdown"),
-            ("/save [-f] <f.json>", "Save conversation (-f overwrites)"),
-            ("/load <f.json>", "Load conversation"),
-            ("/batch <f>", "Process batch file"),
-            ("/mcp-tools", "List available MCP tools"),
-            ("/mcp-call <t> <a>", "Call MCP tool"),
-            ("/mcp-reload", "Reload MCP configuration"),
-            ("/model", "Show current model"),
-            ("/model <name>", "Switch to a different model"),
-            ("/version", "Show version"),
-            ("/quit", "Exit the chat"),
-        ]
-    }
-
     fn print_welcome(&self) {
         println!("\n{}", "=".repeat(60).bright_cyan());
         println!(
@@ -650,8 +603,8 @@ impl ChatCLI {
         );
         println!("{}", "=".repeat(60).bright_cyan());
         println!("\n{}", "Commands:".bright_yellow().bold());
-        for (cmd, desc) in Self::command_help() {
-            println!("  {} - {}", cmd.bright_cyan(), desc);
+        for spec in COMMANDS {
+            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
         }
         println!(
             "\n{}\n",
@@ -661,8 +614,8 @@ impl ChatCLI {
 
     fn show_help(&self) {
         println!("\n{}", "Available Commands:".bright_yellow().bold());
-        for (cmd, desc) in Self::command_help() {
-            println!("  {} - {}", cmd.bright_cyan(), desc);
+        for spec in COMMANDS {
+            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
         }
         println!();
     }
@@ -1056,52 +1009,6 @@ mod tests {
         assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
         assert_eq!(cli_history[1].role, "user");
         assert_eq!(cli_history[2].role, "assistant");
-    }
-
-    // ---- command_help / handle_command parity ----
-    //
-    // Guards against the drift that bit us before this PR: a command added
-    // to `handle_command` but not to `command_help()` (or vice versa). We
-    // assert every command listed in the help table is mentioned by name in
-    // the handler source, and that a handful of must-have commands are in
-    // the help table.
-
-    #[test]
-    fn command_help_lists_match_handler() {
-        let source = include_str!("cli.rs");
-        for (cmd, _desc) in ChatCLI::command_help() {
-            // Strip any argument placeholder after the first space so we look
-            // up just the `/foo` part — that's what appears in `handle_command`.
-            let bare = cmd.split_whitespace().next().unwrap();
-            assert!(
-                source.contains(&format!("\"{}\"", bare))
-                    || source.contains(&format!("starts_with(\"{} \")", bare)),
-                "command `{}` listed in help but not handled in cli.rs",
-                bare
-            );
-        }
-    }
-
-    #[test]
-    fn command_help_covers_core_commands() {
-        let cmds: Vec<&str> = ChatCLI::command_help()
-            .iter()
-            .map(|(c, _)| c.split_whitespace().next().unwrap())
-            .collect();
-        for must in [
-            "/help",
-            "/quit",
-            "/save",
-            "/load",
-            "/batch",
-            "/export",
-            "/memory",
-            "/memory-reload",
-            "/todo-add",
-            "/todo-rm",
-        ] {
-            assert!(cmds.contains(&must), "missing core command in help: {must}");
-        }
     }
 
     // ---- overwrite guard ----
