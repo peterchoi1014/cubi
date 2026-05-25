@@ -518,6 +518,7 @@ impl ChatCLI {
                         .map(|p| p.display().to_string());
                     self.memdir.add(args, source.as_deref());
                     self.persist_memdir();
+                    self.inject_memdir();
                     println!("{} Memory added", "✓".bright_green());
                 }
             }
@@ -529,6 +530,7 @@ impl ChatCLI {
                         Ok(n) => {
                             if self.memdir.remove(n) {
                                 self.persist_memdir();
+                                self.inject_memdir();
                                 println!("{} Removed memory {}", "✓".bright_green(), n);
                             } else {
                                 eprintln!("{} No memory with index {}", "Error:".bright_red(), n);
@@ -543,6 +545,7 @@ impl ChatCLI {
             Cmd::MemdirClear => {
                 self.memdir.clear();
                 self.persist_memdir();
+                self.inject_memdir();
                 println!("{} Cleared all memories", "✓".bright_green());
             }
             Cmd::Rewind => {
@@ -1321,9 +1324,10 @@ impl ChatCLI {
                 "tool" => "Tool",
                 _ => &msg.role,
             };
-            // Truncate very long messages for the summarizer.
-            let content = if msg.content.len() > 500 {
-                format!("{}…", &msg.content[..500])
+            // Truncate very long messages for the summarizer (char-safe).
+            let content = if msg.content.chars().count() > 500 {
+                let truncated: String = msg.content.chars().take(500).collect();
+                format!("{}…", truncated)
             } else {
                 msg.content.clone()
             };
@@ -1348,25 +1352,31 @@ impl ChatCLI {
 
         match self.executor.chat(summary_prompt).await {
             Ok(summary) => {
-                // Remove old non-system messages before cutoff.
-                let system_msgs: Vec<Message> = self
-                    .history
-                    .iter()
-                    .filter(|m| m.role == "system")
-                    .cloned()
-                    .collect();
-                let kept_recent: Vec<Message> = self.history[cutoff_idx..].to_vec();
+                // Rebuild history: keep all messages at their original positions,
+                // but replace old non-system messages before cutoff with a single
+                // summary. Messages at/after cutoff are preserved as-is.
+                let mut new_history: Vec<Message> = Vec::new();
 
-                // Rebuild: system messages + summary + recent messages.
-                self.history = system_msgs;
-                self.history.push(Message::text(
+                // Keep system messages that appeared before the cutoff.
+                for msg in &self.history[..cutoff_idx] {
+                    if msg.role == "system" {
+                        new_history.push(msg.clone());
+                    }
+                }
+
+                // Insert the compacted summary.
+                new_history.push(Message::text(
                     "system",
                     format!(
                         "SYSTEM: Compacted summary of earlier conversation:\n\n{}",
                         summary
                     ),
                 ));
-                self.history.extend(kept_recent);
+
+                // Append all messages from cutoff onward (recent messages kept intact).
+                new_history.extend(self.history[cutoff_idx..].iter().cloned());
+
+                self.history = new_history;
 
                 println!(
                     "{} Compacted. History now has {} messages.",
@@ -1501,7 +1511,16 @@ impl ChatCLI {
             return;
         };
 
-        let msg = Message::text("system", format!("{} {}", Self::MEMDIR_PREFIX, ctx));
+        // `as_context_string()` already includes the header, so use the prefix
+        // only as a tag for future removal — the actual content comes from ctx.
+        let msg = Message::text(
+            "system",
+            format!(
+                "{} (from ~/.ai-chat-cli/memdir/):\n{}",
+                Self::MEMDIR_PREFIX,
+                ctx
+            ),
+        );
 
         let insert_at = self
             .history

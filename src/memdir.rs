@@ -173,12 +173,13 @@ impl Memdir {
     }
 
     /// Returns the combined text of all memories, suitable for injection
-    /// into the model's system context.
+    /// into the model's system context. Returns just the bullet list (the
+    /// caller provides the header/prefix).
     pub fn as_context_string(&self) -> Option<String> {
         if self.memories.is_empty() {
             return None;
         }
-        let mut out = String::from("Cross-session memories (from ~/.ai-chat-cli/memdir/):\n");
+        let mut out = String::new();
         for mem in &self.memories {
             out.push_str(&format!("- {}\n", mem.text));
         }
