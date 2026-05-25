@@ -3,6 +3,7 @@ use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::git_cmds;
 use crate::mcp_manager::McpManager;
+use crate::memdir::Memdir;
 use crate::ollama::Message;
 use crate::permissions::Permissions;
 use crate::project_memory;
@@ -32,6 +33,8 @@ pub struct ChatCLI {
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
     todos: TodoList,
+    /// Cross-session persistent memory store (`~/.ai-chat-cli/memdir/`).
+    memdir: Memdir,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -56,6 +59,7 @@ impl ChatCLI {
             history: Vec::new(),
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
+            memdir: Memdir::load(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -64,6 +68,9 @@ impl ChatCLI {
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
         cli.inject_project_memory();
+
+        // Auto-inject cross-session memdir into context, if non-empty.
+        cli.inject_memdir();
 
         // Auto-inject MCP tools into context
         if let Some(mcp) = &cli.mcp_manager
@@ -431,6 +438,45 @@ impl ChatCLI {
                 self.todos.clear();
                 self.persist_todos();
                 println!("{} Cleared todos", "✓".bright_green());
+            }
+            Cmd::Memdir => {
+                self.memdir.render();
+            }
+            Cmd::MemdirAdd => {
+                if args.is_empty() {
+                    println!("{} Usage: /memdir-add <text>", "Info:".bright_yellow());
+                } else {
+                    let source = std::env::current_dir()
+                        .ok()
+                        .map(|p| p.display().to_string());
+                    self.memdir.add(args, source.as_deref());
+                    self.persist_memdir();
+                    println!("{} Memory added", "✓".bright_green());
+                }
+            }
+            Cmd::MemdirRm => {
+                if args.is_empty() {
+                    println!("{} Usage: /memdir-rm <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.memdir.remove(n) {
+                                self.persist_memdir();
+                                println!("{} Removed memory {}", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No memory with index {}", "Error:".bright_red(), n);
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("{} Usage: /memdir-rm <index>", "Error:".bright_red());
+                        }
+                    }
+                }
+            }
+            Cmd::MemdirClear => {
+                self.memdir.clear();
+                self.persist_memdir();
+                println!("{} Cleared all memories", "✓".bright_green());
             }
             Cmd::Ask => {
                 if args.is_empty() {
@@ -1082,6 +1128,16 @@ impl ChatCLI {
         }
     }
 
+    fn persist_memdir(&self) {
+        if let Err(e) = self.memdir.save() {
+            eprintln!(
+                "{} Failed to persist memdir: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+    }
+
     /// Records a clarifying question from the user. Until the model can
     /// invoke `ask_user` itself, this command lets the user front-load a
     /// pointed question that the next turn's system context highlights.
@@ -1180,6 +1236,30 @@ impl ChatCLI {
         // Find the boundary: the first non-system message. We want the
         // project-memory entry to sit with the other system messages,
         // ahead of any user/assistant turns.
+        let insert_at = self
+            .history
+            .iter()
+            .position(|m| m.role != "system")
+            .unwrap_or(self.history.len());
+        self.history.insert(insert_at, msg);
+    }
+
+    /// Prefix used to locate previously injected memdir system messages.
+    const MEMDIR_PREFIX: &'static str = "SYSTEM: Cross-session memories";
+
+    /// Injects memdir context into the system messages (or removes it if
+    /// the memdir is now empty). Safe to call multiple times.
+    fn inject_memdir(&mut self) {
+        // Drop any prior memdir entries.
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(Self::MEMDIR_PREFIX)));
+
+        let Some(ctx) = self.memdir.as_context_string() else {
+            return;
+        };
+
+        let msg = Message::text("system", format!("{} {}", Self::MEMDIR_PREFIX, ctx));
+
         let insert_at = self
             .history
             .iter()
