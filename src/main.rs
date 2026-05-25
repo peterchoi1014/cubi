@@ -96,9 +96,13 @@ async fn main() -> Result<()> {
                  cubi --version          Print version and exit\n  \
                  cubi --help             Print this help and exit\n\n\
                  OUTPUT FLAGS (can be combined with any command):\n  \
-                 --no-stream             Wait for the full reply instead of streaming\n  \
-                 --no-markdown           Disable markdown rendering (buffered mode only)\n  \
-                 --show-stats-footer     Print a token/timing footer after each reply\n\n\
+                 --stream / --no-stream         Stream tokens live (default) or wait\n  \
+                                                for the full reply\n  \
+                 --markdown / --no-markdown     Enable / disable markdown rendering\n  \
+                                                (markdown only applies in --no-stream\n  \
+                                                mode; auto-disabled for non-TTY stdout)\n  \
+                 --show-stats-footer            Print a token/timing footer after\n  \
+                                                each reply\n\n\
                  Once inside the REPL, type /help to list slash commands.",
                 env!("CARGO_PKG_VERSION")
             );
