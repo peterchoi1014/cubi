@@ -576,20 +576,20 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/login",
-        usage: "/login [provider]",
-        help: "Record an API key for a remote LLM provider (stub for OAuth)",
+        usage: "/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
+        help: "Store an OAuth token for a provider (persisted in ~/.ai-chat-cli/oauth.json)",
         cmd: Cmd::Login,
     },
     SlashCommandSpec {
         name: "/logout",
         usage: "/logout [provider]",
-        help: "Forget the stored API key for a provider",
+        help: "Forget a provider API key for this process and remove its persisted OAuth token",
         cmd: Cmd::Logout,
     },
     SlashCommandSpec {
         name: "/oauth-refresh",
-        usage: "/oauth-refresh",
-        help: "Show OAuth-refresh status (no OAuth backend yet)",
+        usage: "/oauth-refresh [provider]",
+        help: "Load stored OAuth tokens into this process and show token status",
         cmd: Cmd::OauthRefresh,
     },
     SlashCommandSpec {

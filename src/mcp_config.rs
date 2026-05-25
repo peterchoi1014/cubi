@@ -32,6 +32,12 @@ pub struct McpServerConfig {
     /// HTTP headers (for authentication)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+
+    /// Optional OAuth provider key used to inject an Authorization header
+    /// from ~/.ai-chat-cli/oauth.json for HTTP MCP servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "oauthProvider")]
+    pub oauth_provider: Option<String>,
 }
 
 impl McpServerConfig {
