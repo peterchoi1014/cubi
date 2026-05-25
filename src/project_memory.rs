@@ -39,14 +39,18 @@ pub fn find_memory_path() -> Option<PathBuf> {
     find_memory_path_from(&cwd)
 }
 
-/// Returns the contents of the nearest `AICHAT.md` (walking parents) if any.
-pub fn read_memory() -> Result<Option<String>> {
+/// Returns both the path and contents of the nearest `AICHAT.md` in a single
+/// directory walk. Prefer this over calling [`find_memory_path`] and then
+/// reading the file separately: doing two walks opens a small TOCTOU window
+/// where the path can be reported as one location while the contents are read
+/// from another (or worse, the file vanishes between calls).
+pub fn read_memory_with_path() -> Result<Option<(PathBuf, String)>> {
     let Some(path) = find_memory_path() else {
         return Ok(None);
     };
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    Ok(Some(contents))
+    Ok(Some((path, contents)))
 }
 
 /// Writes a starter `AICHAT.md` if one does not already exist.
@@ -124,8 +128,9 @@ mod tests {
         assert!(!wrote_again, "expected second call to be a no-op");
 
         // Read it back through the public API.
-        let contents = read_memory().unwrap().expect("memory should exist");
+        let (path, contents) = read_memory_with_path().unwrap().expect("memory should exist");
         assert!(contents.contains("# Project memory for ai-chat-cli"));
+        assert!(path.ends_with(MEMORY_FILENAME));
 
         // Restore cwd before cleanup so other tests aren't stranded.
         std::env::set_current_dir(&prev).unwrap();
@@ -147,7 +152,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
-        let result = read_memory().unwrap();
+        let result = read_memory_with_path().unwrap();
         assert!(result.is_none(), "expected None when AICHAT.md is absent");
 
         std::env::set_current_dir(&prev).unwrap();

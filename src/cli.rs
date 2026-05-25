@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::*;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -61,17 +61,27 @@ impl ChatCLI {
         cli
     }
 
-    pub fn save_conversation(&self, filename: &str) -> Result<()> {
+    pub fn save_conversation(&self, filename: &str, force: bool) -> Result<()> {
+        check_overwrite_allowed(filename, force, "/save")?;
         let json = serde_json::to_string_pretty(&self.history)?;
         fs::write(filename, json)?;
-        println!("Conversation saved to {}", filename);
         Ok(())
     }
 
+    /// Loads a conversation from `filename`, leaving the existing `history`
+    /// untouched if the file is missing or fails to parse. This avoids the
+    /// previous footgun where a typo'd path or a corrupt JSON file silently
+    /// wiped the current conversation.
     pub fn load_conversation(&mut self, filename: &str) -> Result<()> {
-        let json = fs::read_to_string(filename)?;
-        self.history = serde_json::from_str(&json)?;
-        println!("Conversation loaded from {}", filename);
+        let json = fs::read_to_string(filename)
+            .with_context(|| format!("Failed to read '{}'", filename))?;
+        let parsed: Vec<Message> = serde_json::from_str(&json).with_context(|| {
+            format!(
+                "Failed to parse '{}' as a saved conversation (expected JSON array of messages)",
+                filename
+            )
+        })?;
+        self.history = parsed;
         Ok(())
     }
 
@@ -229,23 +239,46 @@ impl ChatCLI {
                 }
             }
             cmd if cmd.starts_with("/save ") => {
-                let filename = cmd.strip_prefix("/save ").unwrap().trim();
-                if let Err(e) = self.save_conversation(filename) {
-                    eprintln!("{} Failed to save: {}", "Error:".bright_red(), e);
-                } else {
-                    println!("{} Conversation saved to {}", "✓".bright_green(), filename.bright_cyan());
+                let rest = cmd.strip_prefix("/save ").unwrap().trim();
+                match parse_force_and_filename(rest) {
+                    Some((force, filename)) => match self.save_conversation(filename, force) {
+                        Ok(()) => println!(
+                            "{} Conversation saved to {}",
+                            "✓".bright_green(),
+                            filename.bright_cyan()
+                        ),
+                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                    },
+                    None => {
+                        println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                        println!("       Pass -f to overwrite an existing file.");
+                    }
                 }
             }
             "/save" => {
-                println!("{} Usage: /save <filename>", "Info:".bright_yellow());
+                println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                println!("       Pass -f to overwrite an existing file.");
                 println!("Example: /save my_chat.json");
             }
             cmd if cmd.starts_with("/load ") => {
                 let filename = cmd.strip_prefix("/load ").unwrap().trim();
-                if let Err(e) = self.load_conversation(filename) {
-                    eprintln!("{} Failed to load: {}", "Error:".bright_red(), e);
+                if filename.is_empty() {
+                    println!("{} Usage: /load <filename>", "Info:".bright_yellow());
+                } else if let Err(e) = self.load_conversation(filename) {
+                    // History intentionally preserved; surface the error
+                    // chain so the user can tell read vs. parse failures
+                    // apart.
+                    eprintln!(
+                        "{} Failed to load (existing conversation kept): {:#}",
+                        "Error:".bright_red(),
+                        e
+                    );
                 } else {
-                    println!("{} Conversation loaded from {}", "✓".bright_green(), filename.bright_cyan());
+                    println!(
+                        "{} Conversation loaded from {}",
+                        "✓".bright_green(),
+                        filename.bright_cyan()
+                    );
                 }
             }
             "/load" => {
@@ -254,16 +287,38 @@ impl ChatCLI {
             }
             cmd if cmd.starts_with("/batch ") => {
                 let filename = cmd.strip_prefix("/batch ").unwrap().trim();
-                if let Err(e) = self.process_batch_file(filename).await {
-                    eprintln!("{} Batch processing failed: {}", "Error:".bright_red(), e);
+                if filename.is_empty() {
+                    println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
                 } else {
-                    println!("{} Batch processing complete", "✓".bright_green());
+                    match self.process_batch_file(filename).await {
+                        Ok(BatchSummary { ok, failed }) => {
+                            if failed == 0 {
+                                println!(
+                                    "{} Batch complete — {}/{} prompts succeeded",
+                                    "✓".bright_green(),
+                                    ok,
+                                    ok + failed
+                                );
+                            } else {
+                                println!(
+                                    "{} Batch finished with errors — {} ok, {} failed",
+                                    "!".bright_yellow(),
+                                    ok,
+                                    failed
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} Batch processing failed: {}", "Error:".bright_red(), e);
+                        }
+                    }
                 }
             }
             "/batch" => {
                 println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
                 println!("Example: /batch prompts.txt");
-                println!("\nBatch file format (one prompt per line):");
+                println!("\nBatch file format (one prompt per line, blank lines and #-comments are skipped):");
+                println!("  # warm-up");
                 println!("  What is Rust?");
                 println!("  Write hello world in Python");
                 println!("  Explain recursion");
@@ -285,17 +340,18 @@ impl ChatCLI {
             }
             "/memory-reload" => {
                 self.inject_project_memory();
-                match project_memory::find_memory_path() {
-                    Some(p) => println!(
+                match project_memory::read_memory_with_path() {
+                    Ok(Some((p, _))) => println!(
                         "{} Reloaded project memory from {}",
                         "✓".bright_green(),
                         p.display().to_string().bright_cyan()
                     ),
-                    None => println!(
+                    Ok(None) => println!(
                         "{} No {} found in cwd or any ancestor",
                         "ℹ".bright_blue(),
                         project_memory::MEMORY_FILENAME.bright_cyan()
                     ),
+                    Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
                 }
             }
             "/todos" => {
@@ -382,24 +438,18 @@ impl ChatCLI {
             }
             cmd if cmd.starts_with("/export ") => {
                 let rest = cmd.strip_prefix("/export ").unwrap().trim();
-                if rest.is_empty() {
-                    println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
-                } else {
-                    let (force, filename) = match rest.strip_prefix("-f ") {
-                        Some(after) => (true, after.trim()),
-                        None => (false, rest),
-                    };
-                    if filename.is_empty() {
+                match parse_force_and_filename(rest) {
+                    Some((force, filename)) => match self.export_markdown(filename, force) {
+                        Ok(()) => println!(
+                            "{} Conversation exported to {}",
+                            "✓".bright_green(),
+                            filename.bright_cyan()
+                        ),
+                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                    },
+                    None => {
                         println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
-                    } else {
-                        match self.export_markdown(filename, force) {
-                            Ok(()) => println!(
-                                "{} Conversation exported to {}",
-                                "✓".bright_green(),
-                                filename.bright_cyan()
-                            ),
-                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
-                        }
+                        println!("       Pass -f to overwrite an existing file.");
                     }
                 }
             }
@@ -415,24 +465,55 @@ impl ChatCLI {
         Ok(true)
     }
     
-    async fn process_batch_file(&self, filename: &str) -> Result<()> {
-        let content = fs::read_to_string(filename)?;
-        let prompts: Vec<String> = content.lines()
-            .map(|s: &str| s.to_string())
+    async fn process_batch_file(&self, filename: &str) -> Result<BatchSummary> {
+        let content = fs::read_to_string(filename)
+            .with_context(|| format!("Failed to read batch file '{}'", filename))?;
+
+        // Strip blank lines and `#`-prefixed comment lines so users can
+        // annotate their batch files without those getting sent to the model.
+        let prompts: Vec<String> = content
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .map(|s| s.to_string())
             .collect();
-    
+
+        if prompts.is_empty() {
+            println!(
+                "{} Batch file contained no prompts (after stripping blanks/comments).",
+                "ℹ".bright_blue()
+            );
+            return Ok(BatchSummary { ok: 0, failed: 0 });
+        }
+
         println!("Processing {} prompts...", prompts.len());
-    
+
+        let mut summary = BatchSummary { ok: 0, failed: 0 };
         for (i, prompt) in prompts.iter().enumerate() {
             println!("\n[{}/{}] {}", i + 1, prompts.len(), prompt);
-            let response = self.executor.chat(vec![Message {
-                role: "user".to_string(),
-                content: prompt.clone(),
-            }]).await?;
-            println!("Response: {}", response);
+            match self
+                .executor
+                .chat(vec![Message {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                }])
+                .await
+            {
+                Ok(response) => {
+                    println!("Response: {}", response);
+                    summary.ok += 1;
+                }
+                Err(e) => {
+                    // Don't abort the rest of the batch — surface the error
+                    // and keep going so a single bad prompt doesn't sink the
+                    // whole run.
+                    eprintln!("{} prompt {} failed: {}", "Error:".bright_red(), i + 1, e);
+                    summary.failed += 1;
+                }
+            }
         }
-    
-        Ok(())
+
+        Ok(summary)
     }
 
     fn show_mcp_tools(&self) {
@@ -538,7 +619,7 @@ impl ChatCLI {
             ("/clear", "Clear conversation history"),
             ("/history", "Show conversation history"),
             ("/export [-f] <f.md>", "Export conversation as Markdown"),
-            ("/save <f.json>", "Save conversation"),
+            ("/save [-f] <f.json>", "Save conversation (-f overwrites)"),
             ("/load <f.json>", "Load conversation"),
             ("/batch <f>", "Process batch file"),
             ("/mcp-tools", "List available MCP tools"),
@@ -702,15 +783,12 @@ impl ChatCLI {
     }
 
     fn show_memory(&self) {
-        match project_memory::read_memory() {
-            Ok(Some(contents)) => {
-                let location = project_memory::find_memory_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| project_memory::MEMORY_FILENAME.to_string());
+        match project_memory::read_memory_with_path() {
+            Ok(Some((path, contents))) => {
                 println!(
                     "\n{} ({}):",
                     "Project memory".bright_yellow().bold(),
-                    location.bright_cyan()
+                    path.display().to_string().bright_cyan()
                 );
                 println!("{}", "-".repeat(60).bright_black());
                 println!("{}", contents);
@@ -727,6 +805,13 @@ impl ChatCLI {
 
     /// Removes any previously injected project-memory system message and
     /// re-reads `AICHAT.md` (walking up the directory tree) into history.
+    ///
+    /// The reloaded memory is inserted **at the front** of `history` (after
+    /// any earlier system messages, but before user/assistant turns) so that
+    /// `/memory-reload` produces the same model-weighting as the initial
+    /// `ChatCLI::new` injection. Appending at the tail meant the refreshed
+    /// context got the most recency weight, which is usually the opposite of
+    /// what the user wants from "long-lived project context".
     fn inject_project_memory(&mut self) {
         // Drop any prior project-memory entries so callers can use this as
         // both an initial inject and a reload.
@@ -734,20 +819,29 @@ impl ChatCLI {
             !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX))
         });
 
-        if let Ok(Some(memory)) = project_memory::read_memory() {
-            let location = project_memory::find_memory_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| project_memory::MEMORY_FILENAME.to_string());
-            self.history.push(Message {
-                role: "system".to_string(),
-                content: format!(
-                    "{} {}:\n\n{}",
-                    PROJECT_MEMORY_PREFIX,
-                    location,
-                    memory.trim()
-                ),
-            });
-        }
+        let Ok(Some((path, memory))) = project_memory::read_memory_with_path() else {
+            return;
+        };
+
+        let msg = Message {
+            role: "system".to_string(),
+            content: format!(
+                "{} {}:\n\n{}",
+                PROJECT_MEMORY_PREFIX,
+                path.display(),
+                memory.trim()
+            ),
+        };
+
+        // Find the boundary: the first non-system message. We want the
+        // project-memory entry to sit with the other system messages,
+        // ahead of any user/assistant turns.
+        let insert_at = self
+            .history
+            .iter()
+            .position(|m| m.role != "system")
+            .unwrap_or(self.history.len());
+        self.history.insert(insert_at, msg);
     }
 
     /// Cleanly shuts down any owned MCP connections. Call this from an
@@ -760,12 +854,7 @@ impl ChatCLI {
     }
 
     fn export_markdown(&self, filename: &str, force: bool) -> Result<()> {
-        if !force && Path::new(filename).exists() {
-            anyhow::bail!(
-                "Refusing to overwrite existing file '{}'. Re-run with /export -f <file> to force.",
-                filename
-            );
-        }
+        check_overwrite_allowed(filename, force, "/export")?;
         let mut out = String::new();
         out.push_str("# ai-chat-cli conversation\n\n");
         out.push_str(&format!("- model: `{}`\n", self.executor.get_model()));
@@ -819,5 +908,227 @@ impl Drop for ChatCLI {
                 );
             }
         }
+    }
+}
+
+/// Tally returned by [`ChatCLI::process_batch_file`]. Tracked separately so
+/// the caller can render a final "N ok, M failed" summary line and emit a
+/// distinct color / severity when any prompts failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchSummary {
+    ok: usize,
+    failed: usize,
+}
+
+/// Refuses to overwrite `filename` unless `force` is true. Shared between
+/// `/export` and `/save` so the error wording stays in sync and there's only
+/// one place to audit the file-clobber footgun.
+fn check_overwrite_allowed(filename: &str, force: bool, cmd: &str) -> Result<()> {
+    if !force && Path::new(filename).exists() {
+        anyhow::bail!(
+            "Refusing to overwrite existing file '{}'. Re-run with {} -f <file> to force.",
+            filename,
+            cmd
+        );
+    }
+    Ok(())
+}
+
+/// Parses the argument list of `/export` and `/save` into a `(force, filename)`
+/// pair. Accepts the `-f` flag in either position:
+///
+/// * `-f foo.md`
+/// * `foo.md -f`
+/// * `foo.md` (no force)
+///
+/// Returns `None` if the argument list is empty or contains only the flag,
+/// which the caller should treat as a usage error.
+fn parse_force_and_filename(rest: &str) -> Option<(bool, &str)> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(after) = trimmed.strip_prefix("-f ") {
+        let name = after.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some((true, name));
+    }
+    if let Some(before) = trimmed.strip_suffix(" -f") {
+        let name = before.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some((true, name));
+    }
+    if trimmed == "-f" {
+        return None;
+    }
+    Some((false, trimmed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(s: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: s.to_string(),
+        }
+    }
+
+    fn assistant(s: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: s.to_string(),
+        }
+    }
+
+    fn system(s: &str) -> Message {
+        Message {
+            role: "system".to_string(),
+            content: s.to_string(),
+        }
+    }
+
+    // ---- parse_force_and_filename ----
+
+    #[test]
+    fn parse_force_empty_is_none() {
+        assert_eq!(parse_force_and_filename(""), None);
+        assert_eq!(parse_force_and_filename("   "), None);
+        assert_eq!(parse_force_and_filename("-f"), None);
+        assert_eq!(parse_force_and_filename("-f "), None);
+        assert_eq!(parse_force_and_filename(" -f"), None);
+    }
+
+    #[test]
+    fn parse_force_plain_filename() {
+        assert_eq!(
+            parse_force_and_filename("conv.json"),
+            Some((false, "conv.json"))
+        );
+    }
+
+    #[test]
+    fn parse_force_prefix() {
+        assert_eq!(
+            parse_force_and_filename("-f conv.json"),
+            Some((true, "conv.json"))
+        );
+    }
+
+    #[test]
+    fn parse_force_suffix() {
+        assert_eq!(
+            parse_force_and_filename("conv.json -f"),
+            Some((true, "conv.json"))
+        );
+    }
+
+    // ---- strip_single_turn_system_messages ----
+
+    #[test]
+    fn strip_single_turn_removes_only_tagged_system_messages() {
+        let mut cli_history = vec![
+            system("SYSTEM: persistent context"),
+            system(&format!(
+                "{} ephemeral question",
+                SINGLE_TURN_SYSTEM_TAG
+            )),
+            user("hi"),
+            assistant("hello"),
+        ];
+        cli_history.retain(|m| {
+            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
+        });
+        assert_eq!(cli_history.len(), 3);
+        assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
+        assert_eq!(cli_history[1].role, "user");
+        assert_eq!(cli_history[2].role, "assistant");
+    }
+
+    // ---- command_help / handle_command parity ----
+    //
+    // Guards against the drift that bit us before this PR: a command added
+    // to `handle_command` but not to `command_help()` (or vice versa). We
+    // assert every command listed in the help table is mentioned by name in
+    // the handler source, and that a handful of must-have commands are in
+    // the help table.
+
+    #[test]
+    fn command_help_lists_match_handler() {
+        let source = include_str!("cli.rs");
+        for (cmd, _desc) in ChatCLI::command_help() {
+            // Strip any argument placeholder after the first space so we look
+            // up just the `/foo` part — that's what appears in `handle_command`.
+            let bare = cmd.split_whitespace().next().unwrap();
+            assert!(
+                source.contains(&format!("\"{}\"", bare))
+                    || source.contains(&format!("starts_with(\"{} \")", bare)),
+                "command `{}` listed in help but not handled in cli.rs",
+                bare
+            );
+        }
+    }
+
+    #[test]
+    fn command_help_covers_core_commands() {
+        let cmds: Vec<&str> = ChatCLI::command_help()
+            .iter()
+            .map(|(c, _)| c.split_whitespace().next().unwrap())
+            .collect();
+        for must in [
+            "/help",
+            "/quit",
+            "/save",
+            "/load",
+            "/batch",
+            "/export",
+            "/memory",
+            "/memory-reload",
+            "/todo-add",
+            "/todo-rm",
+        ] {
+            assert!(cmds.contains(&must), "missing core command in help: {must}");
+        }
+    }
+
+    // ---- overwrite guard ----
+
+    #[test]
+    fn overwrite_guard_blocks_existing_file_without_force() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ai-chat-cli-overwrite-{nanos}.txt"));
+        std::fs::write(&path, "existing").unwrap();
+
+        let p = path.to_str().unwrap();
+        let err = check_overwrite_allowed(p, false, "/save").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("Refusing to overwrite"), "got: {msg}");
+        assert!(msg.contains("/save -f"), "expected hint for /save -f, got: {msg}");
+
+        // With force=true the guard must pass even though the file exists.
+        check_overwrite_allowed(p, true, "/save").expect("force should bypass");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn overwrite_guard_allows_missing_file() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ai-chat-cli-missing-{nanos}.txt"));
+        let p = path.to_str().unwrap();
+        check_overwrite_allowed(p, false, "/export").expect("missing file is fine");
     }
 }
