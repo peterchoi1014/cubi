@@ -201,6 +201,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_login_args_requires_provider_and_token() {
+        let err = parse_login_args("github").unwrap_err();
+        assert!(err.to_string().contains("Usage: /login"));
+    }
+
+    #[test]
+    fn parse_login_args_requires_flag_values() {
+        let refresh_err = parse_login_args("github tok123 --refresh-token").unwrap_err();
+        assert!(
+            refresh_err
+                .to_string()
+                .contains("--refresh-token requires a value")
+        );
+
+        let expires_err = parse_login_args("github tok123 --expires-in").unwrap_err();
+        assert!(
+            expires_err
+                .to_string()
+                .contains("--expires-in requires a value")
+        );
+    }
+
+    #[test]
+    fn parse_login_args_rejects_invalid_expires_in() {
+        let err = parse_login_args("github tok123 --expires-in not-a-number").unwrap_err();
+        assert!(err.to_string().contains("Invalid --expires-in seconds"));
+    }
+
+    #[test]
+    fn provider_normalization_and_env_mapping() {
+        assert_eq!(normalize_provider("  GitHub  "), "github");
+        assert_eq!(provider_env_var("  GitHub  "), "AICHAT_GITHUB_API_KEY");
+    }
+
+    #[test]
+    fn store_upsert_and_remove_provider_normalizes_key() {
+        let mut store = OAuthStore::default();
+        let args = LoginArgs {
+            provider: "  GiTHub  ".to_string(),
+            access_token: "token123".to_string(),
+            refresh_token: Some("refresh123".to_string()),
+            expires_in_seconds: Some(60),
+        };
+
+        store.upsert_login(&args);
+        let token = store
+            .get_provider("github")
+            .expect("provider token should exist");
+        assert_eq!(token.access_token, "token123");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
+        assert!(token.expires_at_unix.is_some());
+
+        assert!(store.remove_provider(" GITHUB "));
+        assert!(store.get_provider("github").is_none());
+    }
+
+    #[test]
     fn token_expiry_works() {
         let expired = OAuthToken {
             access_token: "a".to_string(),
