@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/cubi-banner.png" alt="Cubi — a pocket-sized AI for your shell" width="100%">
+</p>
+
 # Cubi
 
 A pocket-sized AI for your shell. Cubi is a Rust-based command-line AI chat application with local model inference through Ollama, a streaming native-tool-calling agent loop, and MCP support.
