@@ -65,7 +65,23 @@ async fn main() -> Result<()> {
     // so non-UTF-8 argv can't panic the binary.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mut resume_request: Option<String> = None;
-    match argv.first().and_then(|a| a.to_str()) {
+    let mut cli_flags = cli::CliFlags::default();
+
+    // Pre-scan for flags that may appear in any position alongside the
+    // primary command. Strip them out and operate on the residual argv.
+    let mut residual: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
+    for a in &argv {
+        match a.to_str() {
+            Some("--no-stream") => cli_flags.stream = false,
+            Some("--stream") => cli_flags.stream = true,
+            Some("--no-markdown") => cli_flags.markdown = false,
+            Some("--markdown") => cli_flags.markdown = true,
+            Some("--show-stats-footer") => cli_flags.stats_footer = true,
+            _ => residual.push(a.clone()),
+        }
+    }
+
+    match residual.first().and_then(|a| a.to_str()) {
         None => {}
         Some("--version") | Some("-V") | Some("-v") | Some("version") => {
             println!("cubi {}", env!("CARGO_PKG_VERSION"));
@@ -79,6 +95,14 @@ async fn main() -> Result<()> {
                                          directory if no id is given)\n  \
                  cubi --version          Print version and exit\n  \
                  cubi --help             Print this help and exit\n\n\
+                 OUTPUT FLAGS (can be combined with any command):\n  \
+                 --stream / --no-stream         Stream tokens live (default) or wait\n  \
+                                                for the full reply\n  \
+                 --markdown / --no-markdown     Enable / disable markdown rendering\n  \
+                                                (markdown only applies in --no-stream\n  \
+                                                mode; auto-disabled for non-TTY stdout)\n  \
+                 --show-stats-footer            Print a token/timing footer after\n  \
+                                                each reply\n\n\
                  Once inside the REPL, type /help to list slash commands.",
                 env!("CARGO_PKG_VERSION")
             );
@@ -87,12 +111,13 @@ async fn main() -> Result<()> {
         Some("--resume") | Some("-r") | Some("resume") => {
             // Empty string means "latest"; an explicit id selects it.
             resume_request = Some(
-                argv.get(1)
+                residual
+                    .get(1)
                     .and_then(|a| a.to_str())
                     .unwrap_or("")
                     .to_string(),
             );
-            if argv.len() > 2 {
+            if residual.len() > 2 {
                 eprintln!(
                     "cubi: --resume takes at most one argument. Run `cubi --help` for usage."
                 );
@@ -102,7 +127,7 @@ async fn main() -> Result<()> {
         Some(_) => {
             eprintln!(
                 "cubi: unrecognized argument {:?}. Run `cubi --help` for usage.",
-                argv[0]
+                residual[0]
             );
             std::process::exit(2);
         }
@@ -299,7 +324,14 @@ async fn main() -> Result<()> {
     }
 
     // Create and run CLI
-    let mut cli = ChatCLI::new(executor, mcp_manager, permissions, plan_mode, journal);
+    let mut cli = ChatCLI::new_with_flags(
+        executor,
+        mcp_manager,
+        permissions,
+        plan_mode,
+        journal,
+        cli_flags,
+    );
     if let Some(target) = resume_request {
         cli.resume_session(&target);
     }

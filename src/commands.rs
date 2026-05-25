@@ -125,6 +125,10 @@ pub enum Cmd {
     Policy,
     Tip,
     McpPrompts,
+    // -- Phase 1: streaming/markdown/stats UX --
+    Stream,
+    Markdown,
+    StatsFooter,
     Quit,
 }
 
@@ -729,6 +733,24 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/mcp-prompts [server[:prompt]]",
         help: "List MCP prompts (or fetch a specific one)",
         cmd: Cmd::McpPrompts,
+    },
+    SlashCommandSpec {
+        name: "/stream",
+        usage: "/stream [on|off]",
+        help: "Toggle live token streaming (default: on)",
+        cmd: Cmd::Stream,
+    },
+    SlashCommandSpec {
+        name: "/markdown",
+        usage: "/markdown [on|off]",
+        help: "Toggle markdown rendering (applies when streaming is off)",
+        cmd: Cmd::Markdown,
+    },
+    SlashCommandSpec {
+        name: "/stats-footer",
+        usage: "/stats-footer [on|off]",
+        help: "Toggle per-turn usage footer (default: off)",
+        cmd: Cmd::StatsFooter,
     },
     SlashCommandSpec {
         name: "/quit",

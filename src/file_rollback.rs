@@ -125,6 +125,16 @@ impl FileJournal {
         outcome
     }
 
+    /// Drops the top journal bucket if it has no recorded snapshots. Used
+    /// when a turn is cancelled before any tools ran so `/rewind 1` still
+    /// targets the *previous* completed turn instead of an empty bucket.
+    pub fn discard_last_turn_if_empty(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.turns.last().is_some_and(|t| t.order.is_empty()) {
+            g.turns.pop();
+        }
+    }
+
     /// Drops the journal completely. Called after `/clear`.
     pub fn reset(&self) {
         let mut g = self.inner.lock().unwrap();
