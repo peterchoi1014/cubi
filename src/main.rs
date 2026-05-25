@@ -59,10 +59,6 @@ const DEFAULT_MODEL: &str = "qwen3:4b";
 #[tokio::main]
 async fn main() -> Result<()> {
     // Lightweight argv handling. We don't pull in clap because the chat
-    // loop has no flags of its own; this just makes `cubi --version` and
-    // `cubi --help` Do What People Expect instead of dropping them into
-    // the REPL. Use `args_os()` so non-UTF-8 argv can't panic the binary.
-    // Lightweight argv handling. We don't pull in clap because the chat
     // loop has no flags of its own; this just makes `cubi --version`,
     // `cubi --help`, and `cubi --resume [id]` Do What People Expect
     // instead of dropping them straight into the REPL. Use `args_os()`

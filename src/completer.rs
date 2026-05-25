@@ -4,7 +4,7 @@
 //! the current line starts with `/` so it can't get in the way of
 //! normal prose input.
 
-use crate::commands::COMMANDS;
+use crate::commands;
 use rustyline::Helper;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -39,25 +39,20 @@ impl Completer for SlashHelper {
             return Ok((pos, Vec::new()));
         }
         let head = &line[..head_end];
-        let Some(typed) = head.strip_prefix('/') else {
+        if !head.starts_with('/') {
             return Ok((pos, Vec::new()));
-        };
+        }
 
-        let candidates: Vec<Pair> = COMMANDS
-            .iter()
-            .filter_map(|spec| {
-                let name = spec.name.strip_prefix('/')?;
-                if name.starts_with(typed) {
-                    Some(Pair {
-                        // The replacement keeps the leading `/` and adds
-                        // a trailing space so the user can immediately
-                        // start typing args after Tab-completing.
-                        display: spec.name.to_string(),
-                        replacement: format!("{} ", spec.name),
-                    })
-                } else {
-                    None
-                }
+        // Reuse the single source of truth for prefix → command name
+        // matching so completion can never drift from the
+        // "did-you-mean?" hint surfaced by the REPL on unknown input.
+        let candidates: Vec<Pair> = commands::prefix_matches(head)
+            .into_iter()
+            .map(|name| Pair {
+                display: name.to_string(),
+                // Keep the leading `/` and add a trailing space so the
+                // user can immediately start typing args after Tab.
+                replacement: format!("{} ", name),
             })
             .collect();
 
