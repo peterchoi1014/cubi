@@ -8,6 +8,7 @@ mod lsp_client;
 mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
+mod memdir;
 mod ollama;
 mod onboarding;
 mod permissions;
