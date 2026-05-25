@@ -59,8 +59,9 @@ for future PRs. Current crate version: **0.3.0**.
       `remote_trigger` drops payload+ts files in `~/.ai-chat-cli/triggers/`)*
 - [x] **MCP resources & prompts** — `resources/list`, `resources/read`,
       `prompts/list`, `prompts/get`; per-server OAuth and interactive approval
-      ✅ resources + interactive approval + prompts all shipped; per-server
-      OAuth still open (no backend exists for this CLI yet)
+      ✅ resources + interactive approval + prompts all shipped; OAuth Phase 1
+      backend shipped (persisted tokens + MCP HTTP auth injection), with full
+      provider-device/code flows still open
 - [x] **Sleep prevention** — `prevent_sleep` builtin tool wraps `caffeinate`
       (macOS), `systemd-inhibit` (Linux), and `SetThreadExecutionState` via
       PowerShell (Windows). Hard-capped at 4 hours.
@@ -107,8 +108,8 @@ Shipped previously:
       `/statusline` ✅, `/keybindings` ✅, `/vim` ✅ (config flag now
       persists to `AppConfig.vim_mode`; full vim-mode TUI still needs a
       ratatui port — see Section C #12)
-- [x] `/login` ✅, `/logout` ✅, `/oauth-refresh` ✅ *(informational —
-      no OAuth backend yet)*, `/privacy-settings` ✅
+- [x] `/login` ✅, `/logout` ✅, `/oauth-refresh` ✅ *(OAuth Phase 1 backend:
+      persisted token store + in-process token reload)*, `/privacy-settings` ✅
 - [x] `/mcp` ✅, `/plugin` ✅ (now backed by `plugins.rs`, lists discovered
       `~/.ai-chat-cli/plugins/<name>/commands/*.md`), `/reload-plugins` ✅
       (now reloads both skills and plugin bundles), `/skills` ✅, `/hooks` ✅
@@ -278,7 +279,8 @@ Foundation work:
     notebook tool. ✅ All four shipped.
 11. Hooks, plugins, skills, MCP resources / prompts / OAuth, MCP approval UI.
     ✅ Hooks UI, skills, plugins, MCP resources, MCP prompts, and approval
-    UI all shipped. OAuth backend remains open.
+    UI all shipped. OAuth Phase 1 backend shipped; full hosted-provider OAuth
+    flows remain open.
 12. TUI (ratatui) rewrite with panes, vim keybindings, output styles, themes,
     statusline. ⏳ **Deferred** (themes/output-style preset plumbing is in
     place so this can begin cleanly).
@@ -298,17 +300,18 @@ These items are tracked above but cannot realistically be completed in a
 single automated pass. They are listed here so the next contributor has a
 clear starting point:
 
+- **OAuth backend (Phase 2+)** (Section A MCP OAuth; touches /login flows).
+  Phase 1 shipped (persisted token backend + MCP HTTP auth injection); full
+  provider/device authorization flows and refresh endpoints remain open.
+- **Headless / remote / server / daemon mode** (Section C #16).
 - **Full TUI rewrite to ratatui** (Section C #18 / Section D #12). Plumbing
   for themes, output-style presets, and palettes is in place; the port
   itself remains future work.
+- **Proactive prompt suggestions** (Section C #4). Needs TUI integration.
 - **Vim-mode TUI** (Section C #12). Config flag persists; full keybinding
   layer waits on the ratatui port.
 - **Voice input** (Section C #11). Needs an audio pipeline.
 - **Multi-agent layer over tmux / iTerm** (Section C #5). In-process
   subagents are shipped via `agent_run`.
-- **Headless / remote / server / daemon mode** (Section C #16).
 - **Deep-link / Chrome native-messaging bridge** (Section C #19). Needs a
   separate native-messaging host binary.
-- **OAuth backend** (Section A MCP OAuth; touches /login flows). No OAuth
-  provider is wired up yet.
-- **Proactive prompt suggestions** (Section C #4). Needs TUI integration.

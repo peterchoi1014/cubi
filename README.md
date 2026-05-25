@@ -319,9 +319,9 @@ groups below mirror that registry.
 
 | Command | Description |
 | --- | --- |
-| `/login [provider]` | Print how to record an API key (env-var based) |
-| `/logout [provider]` | Forget the in-process API key for a provider |
-| `/oauth-refresh` | Show OAuth status (no OAuth backend yet) |
+| `/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]` | Store OAuth credentials in `~/.ai-chat-cli/oauth.json` and load token into this process |
+| `/logout [provider]` | Forget in-process API key and remove persisted OAuth token for a provider |
+| `/oauth-refresh [provider]` | Reload non-expired stored OAuth tokens into this process and show status |
 | `/privacy-settings [telemetry on \| off]` | Show or set local privacy preferences |
 | `/sandbox-toggle` | Alias for `/plan` (strict-sandbox mode) |
 | `/reset-limits` | Clear in-process rate-limit / retry backoff state |

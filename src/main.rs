@@ -15,6 +15,7 @@ mod mcp_config;
 mod mcp_manager;
 mod memdir;
 mod migrations;
+mod oauth;
 mod ollama;
 mod onboarding;
 mod output_styles;
