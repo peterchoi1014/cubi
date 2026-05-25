@@ -44,6 +44,30 @@ pub struct AppConfig {
     /// only runs while this is `false`, so users never get pestered twice.
     #[serde(default)]
     pub onboarded: bool,
+    /// UI theme: "auto" | "light" | "dark". Drives the bundled colour
+    /// palette in `themes.rs`.
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Output-style preset: "concise" | "markdown" | "explanatory".
+    /// Surfaces as a system prompt prefix injected by `cli.rs`.
+    #[serde(default)]
+    pub output_style: Option<String>,
+    /// Coloured output toggle: "on" | "off". `None` means follow the
+    /// `colored` crate's default (TTY detection).
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Vim-mode toggle for the readline editor: "on" | "off".
+    #[serde(default)]
+    pub vim_mode: Option<String>,
+    /// Opt-in telemetry / debug logging to
+    /// `~/.ai-chat-cli/telemetry.log`. Off by default.
+    #[serde(default)]
+    pub telemetry: bool,
+    /// Schema version for the on-disk config. Bumped by `migrations.rs`
+    /// when a breaking change to this struct is introduced; older configs
+    /// are migrated forward on load.
+    #[serde(default)]
+    pub config_version: u32,
 }
 
 impl AppConfig {
@@ -301,6 +325,7 @@ mod tests {
         let cfg = AppConfig {
             default_model: Some("config-model".into()),
             onboarded: true,
+            ..AppConfig::default()
         };
         assert_eq!(resolve_model(&cfg, "fallback"), "env-model");
         unsafe {
@@ -323,6 +348,7 @@ mod tests {
         let cfg2 = AppConfig {
             default_model: Some("foo".into()),
             onboarded: true,
+            ..AppConfig::default()
         };
         assert_eq!(resolve_model(&cfg2, "fallback"), "foo");
         if let Some(v) = prev {
