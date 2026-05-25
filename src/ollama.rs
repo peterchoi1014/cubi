@@ -120,6 +120,14 @@ impl OllamaClient {
         }
     }
 
+    /// Creates an OllamaClient with a custom base URL.
+    pub fn with_base_url(base_url: String) -> Self {
+        Self {
+            base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+
     pub async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
         let msg = self.chat_with_tools(model, messages, None).await?;
         Ok(msg.content)
