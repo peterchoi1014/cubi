@@ -1,4 +1,4 @@
-# ai-chat-cli — Roadmap
+# cubi — Roadmap
 
 This roadmap captures the implementation plan derived from a prior architectural
 review and a feature inventory of the recovered
@@ -9,7 +9,7 @@ source tree.
 > code **recovered from a leaked source map of Anthropic's proprietary product**
 > (see its own README's "Legal / ethical note"). It is used here **only as
 > architectural inspiration** — we copy ideas, names, command surfaces, and file
-> layout, but **do not copy code verbatim** into `ai-chat-cli`. All
+> layout, but **do not copy code verbatim** into `cubi`. All
 > implementations must be original work written against public Anthropic
 > documentation, the MCP spec, and our own design.
 
@@ -23,7 +23,7 @@ for future PRs. Current crate version: **0.3.0**.
 - [x] **Subagent / Task tool** — main model spawns isolated worker agents
       *(`agent_run` meta-tool: fresh context, same tools minus `agent_run`, step cap)*
 - [x] **`TodoWrite` tool** + `/todos` UI — persistent per-session task checklist
-      *(now persisted across restarts at `~/.ai-chat-cli/todos/<cwd-key>.json`)*
+      *(now persisted across restarts at `~/.cubi/todos/<cwd-key>.json`)*
 - [x] **Plan mode** — read-only "plan first, then apply" toggle
       *(`/plan` toggle now gates `/mcp-call`; full tool gating expands as more
       write tools land)*
@@ -45,9 +45,9 @@ for future PRs. Current crate version: **0.3.0**.
       same plan-mode + trust gates as `bash`)*
 - [x] **Time tools** — `Sleep`, `ScheduleCron`
       *(`sleep` blocks up to 60s; `schedule` manages a list of cron-like
-      entries in `~/.ai-chat-cli/schedule.json` for an external runner)*
+      entries in `~/.cubi/schedule.json` for an external runner)*
 - [x] **Skills system** — reusable Markdown skill packs in
-      `~/.ai-chat-cli/skills/*` + `SkillTool`
+      `~/.cubi/skills/*` + `SkillTool`
 - [x] **Tool-search tool** — model searches the registry instead of receiving
       the full tool list in every prompt
 - [x] **Structured output helpers** — `Brief`, `SyntheticOutput`
@@ -55,8 +55,8 @@ for future PRs. Current crate version: **0.3.0**.
       fills a JSON Schema's properties with type-appropriate defaults — both
       deterministic, no extra model call)*
 - [x] **Inter-agent messaging** — `SendMessage`, `RemoteTrigger`
-      *(`send_message` / `recv_messages` use `~/.ai-chat-cli/messages/`;
-      `remote_trigger` drops payload+ts files in `~/.ai-chat-cli/triggers/`)*
+      *(`send_message` / `recv_messages` use `~/.cubi/messages/`;
+      `remote_trigger` drops payload+ts files in `~/.cubi/triggers/`)*
 - [x] **MCP resources & prompts** — `resources/list`, `resources/read`,
       `prompts/list`, `prompts/get`; per-server OAuth and interactive approval
       ✅ resources + interactive approval + prompts all shipped; OAuth Phase 1
@@ -88,7 +88,7 @@ Shipped previously:
 - [x] `/permissions` (lists trusted roots and gated built-in tools; also
       surfaces the active admin policy overlay if one is present)
 - [x] `/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`
-      (cross-session persistent memory at `~/.ai-chat-cli/memdir/`)
+      (cross-session persistent memory at `~/.cubi/memdir/`)
 - [x] `/rewind` (history surgery; **now also rolls back file mutations
       recorded by `edit_file` / `write_file` during the rewound turns**),
       `/compact` (automatic summarization)
@@ -111,7 +111,7 @@ Shipped previously:
 - [x] `/login` ✅, `/logout` ✅, `/oauth-refresh` ✅ *(OAuth Phase 1 backend:
       persisted token store + in-process token reload)*, `/privacy-settings` ✅
 - [x] `/mcp` ✅, `/plugin` ✅ (now backed by `plugins.rs`, lists discovered
-      `~/.ai-chat-cli/plugins/<name>/commands/*.md`), `/reload-plugins` ✅
+      `~/.cubi/plugins/<name>/commands/*.md`), `/reload-plugins` ✅
       (now reloads both skills and plugin bundles), `/skills` ✅, `/hooks` ✅
 - [x] `/stats` ✅, `/usage` ✅, `/cost` ✅, `/perf-issue` ✅, `/heapdump` ✅,
       `/debug-tool-call` ✅, `/doctor` ✅, `/env` ✅, `/bug` ✅,
@@ -125,7 +125,7 @@ Shipped previously:
 **New in this release (0.3.0):**
 
 - [x] `/settings-sync init|push|pull|status` — git-backed cross-machine sync
-      of `~/.ai-chat-cli/` (config, memdir, skills, plugins)
+      of `~/.cubi/` (config, memdir, skills, plugins)
 - [x] `/policy` — show the read-only admin-managed policy overlay, including
       the source path and any tool deny-list
 - [x] `/tip` — print a usage tip (also shown on startup in TTY mode)
@@ -139,8 +139,8 @@ Foundation work:
       `COMMANDS` and an exhaustive arm on `Cmd`.
 - [x] User-defined Markdown commands as first-class plugins
       (`src/plugins.rs`; namespaced `/<plugin>:<command>` triggers loaded
-      from `~/.ai-chat-cli/plugins/<name>/commands/*.md`). The pre-existing
-      flat `~/.ai-chat-cli/commands/*.md` loader in `file_mentions.rs`
+      from `~/.cubi/plugins/<name>/commands/*.md`). The pre-existing
+      flat `~/.cubi/commands/*.md` loader in `file_mentions.rs`
       continues to work for un-namespaced commands.
 
 ---
@@ -148,10 +148,10 @@ Foundation work:
 ## C. New subsystems / modules
 
 1. **Onboarding** (`bootstrap/`, `setup.ts`, `projectOnboardingState.ts`) —
-   first-run flow: pick model, scan project, write `AICHAT.md`, set trust
+   first-run flow: pick model, scan project, write `CUBI.md`, set trust
    level. ✅ Shipped: `src/onboarding.rs` runs once, lets the user pick a
-   model from `ollama list`, offers `/trust`, offers `AICHAT.md`. Persisted
-   to `~/.ai-chat-cli/config.json`.
+   model from `ollama list`, offers `/trust`, offers `CUBI.md`. Persisted
+   to `~/.cubi/config.json`.
 2. **Permissions system** (`utils/permissions/`) — project trust, per-tool
    allow/deny, "trust this folder" prompts, enterprise-managed policy. ✅
    Shipped: `src/permissions.rs` enforces a per-project trust store with a
@@ -160,7 +160,7 @@ Foundation work:
    `src/policy.rs` (read-only `policy.json` overlay).
 3. **Memory & compaction** (`services/compact/`, `SessionMemory/`,
    `extractMemories/`, `memdir/`) — automatic in-session compaction plus
-   cross-session persistent memory at `~/.ai-chat-cli/memdir/`. ✅ Shipped:
+   cross-session persistent memory at `~/.cubi/memdir/`. ✅ Shipped:
    `src/memdir.rs` + `/memdir*` slash commands; `/compact` summarizes old
    turns; automatic model-driven memory extraction shipped.
 4. **Proactive completions** (`PromptSuggestion/`, `fileSuggestions.ts`) —
@@ -188,8 +188,8 @@ Foundation work:
 9. **Interactive MCP approval** (`mcpServerApproval.tsx`). ✅ Shipped.
 10. **Telemetry / debug log** (`analytics/`, `diagnosticTracking.ts`,
     `internalLogging.ts`) — opt-in. ✅ Shipped: `src/telemetry.rs` appends
-    JSON-line events to `~/.ai-chat-cli/telemetry.log` when
-    `AppConfig.telemetry` (or `AICHAT_TELEMETRY=1`) is set. Each tool call
+    JSON-line events to `~/.cubi/telemetry.log` when
+    `AppConfig.telemetry` (or `CUBI_TELEMETRY=1`) is set. Each tool call
     records its duration and ok-flag.
 11. **Voice input** (`voice.ts`, `voiceStreamSTT.ts`, `voiceKeyterms.ts`).
     ⏳ **Deferred** — needs an audio pipeline (cpal/whisper.cpp) that is too
@@ -207,13 +207,13 @@ Foundation work:
     `SessionStart`, `Notification`. ✅ Shipped in `src/hooks.rs` with
     `/hooks list|add|rm`.
 15. **Plugin system** (`plugins/`, `services/plugins/`, `reload-plugins`) —
-    `~/.ai-chat-cli/plugins/*` discoverable bundles. ✅ Shipped: `src/plugins.rs`
-    loads `~/.ai-chat-cli/plugins/<name>/commands/*.md` as namespaced
+    `~/.cubi/plugins/*` discoverable bundles. ✅ Shipped: `src/plugins.rs`
+    loads `~/.cubi/plugins/<name>/commands/*.md` as namespaced
     `/<plugin>:<command>` triggers; `/plugin` lists them, `/reload-plugins`
     refreshes.
 16. **Headless / remote mode** (`server/`, `remote/`, `upstreamproxy/`,
     `bridge/`) — daemon + remote client; pairs naturally with the unused
-    `distributed.rs` (Repartir). ⏳ **Deferred** — requires a server crate
+    `distributed.rs`. ⏳ **Deferred** — requires a server crate
     plus auth + on-wire protocol design.
 17. **Auto-saved sessions + checkpointing** (`sessionStorage.js`,
     `sessionStart.js`, `history.ts`) — `/resume`, `/rewind` with
@@ -233,7 +233,7 @@ Foundation work:
 20. **Tip-of-the-day + release notes** (`buddy/`, `tips/`, `release-notes`).
     ✅ Shipped: `src/tips.rs` prints a daily tip on startup (TTY only) and
     on demand via `/tip`; tips are sourced from a built-in pool plus
-    `~/.ai-chat-cli/tips/*.txt`. `/release-notes` was already in place.
+    `~/.cubi/tips/*.txt`. `/release-notes` was already in place.
 21. **Centralized schemas** (`schemas/`, `types/`) — stricter validation than
     `serde_json::Value` everywhere. ✅ Shipped: `src/schemas.rs` exposes a
     uniform `require_str` / `require_number` / `require_bool` / `optional_str`
@@ -245,8 +245,8 @@ Foundation work:
     future-version file.
 23. **Enterprise policy** (`policyLimits/`, `remoteManagedSettings/`) —
     admin-pushed config, tool denylists. ✅ Shipped: `src/policy.rs` loads
-    a read-only `policy.json` from `$AICHAT_POLICY_FILE`, then
-    `/etc/ai-chat-cli/policy.json`, then `~/.ai-chat-cli/policy.json`. The
+    a read-only `policy.json` from `$CUBI_POLICY_FILE`, then
+    `/etc/cubi/policy.json`, then `~/.cubi/policy.json`. The
     deny-list is checked *before* the user's allow-list in the agent
     loop, so a user config can't undo an admin denial.
 24. **Settings sync** (`settingsSync/`) — cross-machine sync via Git repo.
@@ -262,13 +262,13 @@ Foundation work:
 2. Permissions system + path sandboxing + project-trust prompt. ✅ Shipped.
 3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** ✅ Plan mode gates all
    built-in write/exec tools; `/todos` and `/ask` already in place.
-4. `/init` + `AICHAT.md` + memdir + onboarding flow. ✅ All shipped.
+4. `/init` + `CUBI.md` + memdir + onboarding flow. ✅ All shipped.
 5. Auto-saved sessions + `/resume` + `/rewind` checkpoints + compaction.
    ✅ Shipped. File-mutation rollback on rewind ✅ shipped (this release).
 6. Slash-command registry + custom Markdown commands + `@file` mentions +
    prompt suggestions. ✅ Registry shipped; `@file` mentions shipped;
    user-defined Markdown commands shipped both as flat
-   `~/.ai-chat-cli/commands/*.md` and namespaced plugin bundles. Proactive
+   `~/.cubi/commands/*.md` and namespaced plugin bundles. Proactive
    prompt suggestions remain deferred (see Section C #4).
 7. Subagents (`AgentTool`) + task management tools. ✅ `agent_run` shipped.
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.

@@ -1,21 +1,21 @@
 //! First-run onboarding wizard + persistent user config.
 //!
 //! Before this module existed, the only way to override the hard-coded
-//! default model was the `AI_CHAT_CLI_MODEL` environment variable. New
+//! default model was the `CUBI_MODEL` environment variable. New
 //! users got dropped onto whichever model the binary shipped with and
 //! had no opportunity to (a) trust their project for write/exec tools or
-//! (b) opt in to a starter `AICHAT.md`.
+//! (b) opt in to a starter `CUBI.md`.
 //!
 //! This wizard runs once, gated on `config.onboarded == false`. It:
 //!
 //!   1. Lists the installed Ollama models and lets the user pick one.
 //!   2. Offers to trust the current working directory (writes into the
 //!      same `Permissions` store as `/trust`).
-//!   3. Offers to create the starter `AICHAT.md` for the project.
+//!   3. Offers to create the starter `CUBI.md` for the project.
 //!
-//! The selected model is persisted to `~/.ai-chat-cli/config.json`. On
+//! The selected model is persisted to `~/.cubi/config.json`. On
 //! subsequent runs, model resolution is:
-//! `AI_CHAT_CLI_MODEL` ▸ `config.default_model` ▸ baked-in fallback.
+//! `CUBI_MODEL` ▸ `config.default_model` ▸ baked-in fallback.
 //!
 //! Resolution order is deliberate: the env var still wins so CI / shell
 //! aliases that pre-date this module keep working.
@@ -33,7 +33,7 @@ use crate::permissions::Permissions;
 use crate::project_memory;
 
 /// Persistent user-level configuration. Lives next to the trust store at
-/// `~/.ai-chat-cli/config.json`.
+/// `~/.cubi/config.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Model selected during onboarding (or via a future `/config` command).
@@ -60,7 +60,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub vim_mode: Option<String>,
     /// Opt-in telemetry / debug logging to
-    /// `~/.ai-chat-cli/telemetry.log`. Off by default.
+    /// `~/.cubi/telemetry.log`. Off by default.
     #[serde(default)]
     pub telemetry: bool,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
@@ -72,7 +72,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn storage_path() -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".ai-chat-cli").join("config.json"))
+        Some(dirs::home_dir()?.join(".cubi").join("config.json"))
     }
 
     /// Loads the on-disk config. Missing or unreadable files yield a
@@ -102,11 +102,11 @@ impl AppConfig {
 
 /// Resolves the model to use at startup. Precedence:
 ///
-///   1. `AI_CHAT_CLI_MODEL` environment variable.
-///   2. `config.default_model` from `~/.ai-chat-cli/config.json`.
+///   1. `CUBI_MODEL` environment variable.
+///   2. `config.default_model` from `~/.cubi/config.json`.
 ///   3. The baked-in `fallback` constant from `main`.
 pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
-    if let Ok(env) = std::env::var("AI_CHAT_CLI_MODEL")
+    if let Ok(env) = std::env::var("CUBI_MODEL")
         && !env.is_empty()
     {
         return env;
@@ -153,7 +153,7 @@ pub fn is_known_non_tool_capable(model: &str) -> bool {
 /// way out.
 ///
 /// The wizard is suppressed when stdin is not a TTY (CI / piped input),
-/// when `AI_CHAT_CLI_NO_ONBOARD=1` is set (escape hatch for scripted
+/// when `CUBI_NO_ONBOARD=1` is set (escape hatch for scripted
 /// installs), or when `config.onboarded` is already true.
 pub async fn run_if_needed(
     config: &mut AppConfig,
@@ -163,7 +163,7 @@ pub async fn run_if_needed(
     if config.onboarded {
         return Ok(());
     }
-    if std::env::var("AI_CHAT_CLI_NO_ONBOARD")
+    if std::env::var("CUBI_NO_ONBOARD")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
     {
@@ -180,7 +180,7 @@ pub async fn run_if_needed(
     }
 
     println!();
-    println!("{}", "Welcome to ai-chat-cli!".bright_cyan().bold());
+    println!("{}", "Welcome to Cubi!".bright_cyan().bold());
     println!(
         "{}",
         "Let's set a few things up. You can change any of these later.".bright_white()
@@ -293,9 +293,9 @@ pub async fn run_if_needed(
     }
     println!();
 
-    // 3) AICHAT.md.
+    // 3) CUBI.md.
     if project_memory::find_memory_path().is_none() {
-        let yn = prompt("Create a starter AICHAT.md in this project? [y/N]: ")?;
+        let yn = prompt("Create a starter CUBI.md in this project? [y/N]: ")?;
         if is_yes(&yn) {
             match project_memory::write_starter_if_absent() {
                 Ok(true) => println!(
@@ -341,7 +341,7 @@ mod tests {
     use std::sync::Mutex;
 
     // `resolve_model` reads from process-global env state. Serialize the
-    // tests that touch `AI_CHAT_CLI_MODEL` so parallel test threads don't
+    // tests that touch `CUBI_MODEL` so parallel test threads don't
     // race each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -358,9 +358,9 @@ mod tests {
     #[test]
     fn resolve_model_env_beats_config() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AI_CHAT_CLI_MODEL").ok();
+        let prev = std::env::var("CUBI_MODEL").ok();
         unsafe {
-            std::env::set_var("AI_CHAT_CLI_MODEL", "env-model");
+            std::env::set_var("CUBI_MODEL", "env-model");
         }
         let cfg = AppConfig {
             default_model: Some("config-model".into()),
@@ -369,19 +369,19 @@ mod tests {
         };
         assert_eq!(resolve_model(&cfg, "fallback"), "env-model");
         unsafe {
-            std::env::remove_var("AI_CHAT_CLI_MODEL");
+            std::env::remove_var("CUBI_MODEL");
         }
         if let Some(v) = prev {
-            unsafe { std::env::set_var("AI_CHAT_CLI_MODEL", v) }
+            unsafe { std::env::set_var("CUBI_MODEL", v) }
         }
     }
 
     #[test]
     fn resolve_model_falls_through_to_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AI_CHAT_CLI_MODEL").ok();
+        let prev = std::env::var("CUBI_MODEL").ok();
         unsafe {
-            std::env::remove_var("AI_CHAT_CLI_MODEL");
+            std::env::remove_var("CUBI_MODEL");
         }
         let cfg = AppConfig::default();
         assert_eq!(resolve_model(&cfg, "fallback"), "fallback");
@@ -392,7 +392,7 @@ mod tests {
         };
         assert_eq!(resolve_model(&cfg2, "fallback"), "foo");
         if let Some(v) = prev {
-            unsafe { std::env::set_var("AI_CHAT_CLI_MODEL", v) };
+            unsafe { std::env::set_var("CUBI_MODEL", v) };
         }
     }
 

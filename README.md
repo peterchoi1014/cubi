@@ -1,6 +1,6 @@
-# AI Chat CLI
+# Cubi
 
-A powerful command-line AI chat application built with Rust, featuring local AI model inference through Ollama and distributed task execution capabilities via Repartir.
+A pocket-sized AI for your shell. Cubi is a Rust-based command-line AI chat application with local model inference through Ollama, a streaming native-tool-calling agent loop, and MCP support.
 
 <div align="center">
 
@@ -28,7 +28,7 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
   OS notifications (`notify`), plus a `think` no-op and an `agent_run`
   meta-tool for spawning focused subagents
 - 🔌 **MCP (Model Context Protocol) support** - Load external tool servers from
-  `~/.ai-chat-cli/mcp.json` and call them with `/mcp-tools`, `/mcp-call`,
+  `~/.cubi/mcp.json` and call them with `/mcp-tools`, `/mcp-call`,
   `/mcp-reload`; list and render MCP prompts with `/mcp-prompts`
 - 🌿 **Git workflow** - `/diff`, `/commit`, `/review`, `/worktree`, `/branch`,
   `/tag`, `/files` shell out to your installed `git` and respect plan mode
@@ -36,11 +36,11 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
   outside trusted directories; `/plan` toggles a read-only mode that blocks
   every write/exec path. Manage trust with `/trust` (current dir) and
   `/add-dir <path>` (additional dirs). Admins can push a read-only
-  `policy.json` (`/etc/ai-chat-cli/policy.json` or `~/.ai-chat-cli/policy.json`)
+  `policy.json` (`/etc/cubi/policy.json` or `~/.cubi/policy.json`)
   whose tool deny-list overrides any user allow; inspect with `/policy`
-- 🧠 **Project memory + persistent memdir** - Auto-injected `AICHAT.md` per
+- 🧠 **Project memory + persistent memdir** - Auto-injected `CUBI.md` per
   project (`/memory`, `/memory-reload`, `/init`) plus cross-session notes in
-  `~/.ai-chat-cli/memdir/` (`/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`)
+  `~/.cubi/memdir/` (`/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`)
 - ✅ **Todos** - `/todos`, `/todo-add`, `/todo-done`, `/todo-rm`, `/todo-clear`
   with on-disk per-project persistence
 - 💾 **Conversation Management** - Save and load chat sessions as JSON files
@@ -49,24 +49,24 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
   summarize context with `/rewind` (also rolls back any `edit_file` /
   `write_file` mutations from the rewound turns) and `/compact`
 - 🧩 **Plugins + Skills** - Drop reusable Markdown skill packs at
-  `~/.ai-chat-cli/skills/` and namespaced command bundles at
-  `~/.ai-chat-cli/plugins/<name>/commands/*.md` (invoked as
+  `~/.cubi/skills/` and namespaced command bundles at
+  `~/.cubi/plugins/<name>/commands/*.md` (invoked as
   `/<plugin>:<command>`); reload both with `/reload-plugins`
 - 🎨 **Themes + output styles** - `/theme auto|light|dark` and
   `/output-style concise|markdown|explanatory` persist in
-  `~/.ai-chat-cli/config.json`; the chosen output style is injected as a
+  `~/.cubi/config.json`; the chosen output style is injected as a
   system steering prompt on every turn
 - 🪝 **Hooks** - `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`,
   `SessionStart`, `Notification`; manage with `/hooks list|add|rm`
-- 🔁 **Cross-machine settings sync** - Wrap `~/.ai-chat-cli/` in git with
+- 🔁 **Cross-machine settings sync** - Wrap `~/.cubi/` in git with
   `/settings-sync init <remote>`, then `/settings-sync push` / `pull`
   to move config, memdir, skills, and plugins between machines
 - 📊 **Opt-in telemetry** - Set `telemetry = true` in
-  `~/.ai-chat-cli/config.json` (or `AICHAT_TELEMETRY=1`) to log every tool
-  call as one JSON line in `~/.ai-chat-cli/telemetry.log`
+  `~/.cubi/config.json` (or `CUBI_TELEMETRY=1`) to log every tool
+  call as one JSON line in `~/.cubi/telemetry.log`
 - 💡 **Tip-of-the-day** - A short tip is shown on startup (TTY only); see
   more with `/tip` and supplement the built-in pool by dropping plaintext
-  files in `~/.ai-chat-cli/tips/`
+  files in `~/.cubi/tips/`
 - 📦 **Batch Processing** - Process multiple prompts from text files
 - 🔄 **Model Switching** - Switch between different AI models on the fly
 - 🎨 **Colored Output** - Syntax-highlighted responses with emoji indicators
@@ -121,26 +121,26 @@ ollama serve
 ### 2. Download an AI Model
 
 ```bash
-# Recommended: Fast and lightweight (1.3GB)
-ollama pull llama3.2:1b
+# Recommended default: tool-call-capable, balanced size (~2.6GB)
+ollama pull qwen3:4b
 
 # Or choose another model:
-ollama pull llama3.2:3b    # Medium size (2GB)
-ollama pull phi3:mini      # Microsoft's small model (2.3GB)
-ollama pull mistral:7b     # High quality (4.1GB)
+ollama pull qwen2.5:3b     # Smaller tool-capable model (~1.9GB)
+ollama pull phi4-mini      # Microsoft's small tool-capable model (~2.5GB)
+ollama pull mistral:7b     # High quality (~4.1GB)
 ```
 
 ### 3. Clone and Build
 
 ```bash
 # Clone the repository
-git clone https://github.com/peterchoi1014/ai-chat-cli.git
-cd ai-chat-cli
+git clone https://github.com/peterchoi1014/cubi.git
+cd cubi
 
 # Build in release mode
 cargo build --release
 
-# Binary will be available at: ./target/release/ai-chat-cli
+# Binary will be available at: ./target/release/cubi
 ```
 
 ## 🚀 Quick Start
@@ -153,26 +153,28 @@ ollama serve
 cargo run --release
 
 # Or run the compiled binary directly
-./target/release/ai-chat-cli
+./target/release/cubi
 ```
 
 ### Choosing a model
 
-By default the CLI uses `llama3.2:1b`. Override at startup with the
-`AI_CHAT_CLI_MODEL` environment variable, or switch interactively with the
-`/model` command:
+By default the CLI uses `qwen3:4b` (a tool-call-capable model). Override
+at startup with the `CUBI_MODEL` environment variable, or switch
+interactively with the `/model` command:
 
 ```bash
 # Pick a different default just for this session
-AI_CHAT_CLI_MODEL=mistral:7b cargo run --release
+CUBI_MODEL=mistral:7b cargo run --release
 ```
 
 You should see:
 
 ```
-============================================================
-  AI Chat CLI - Powered by Repartir
-============================================================
+   ┌───────┐
+   │ ▣   ▣ │   Cubi
+   │   ◡   │   a pocket-sized AI for your shell
+   └───────┘
+    ░░░░░░░
 
 Type /help to list all available slash commands.
 
@@ -244,9 +246,9 @@ groups below mirror that registry.
 
 | Command | Description |
 | --- | --- |
-| `/init` | Create a starter `AICHAT.md` |
-| `/memory` | Show project memory (`AICHAT.md`) |
-| `/memory-reload` | Re-read `AICHAT.md` from disk |
+| `/init` | Create a starter `CUBI.md` |
+| `/memory` | Show project memory (`CUBI.md`) |
+| `/memory-reload` | Re-read `CUBI.md` from disk |
 | `/memdir` | List cross-session persistent memories |
 | `/memdir-add <text>` | Add a persistent memory |
 | `/memdir-rm <n>` | Remove memory by index |
@@ -282,7 +284,7 @@ groups below mirror that registry.
 | `/branch [list \| create <name> \| switch <name>]` | List, create, or switch git branches |
 | `/tag [list \| <name> \| create <name> [-m <msg>]]` | List or create git tags |
 | `/files` | List files tracked by git in this project |
-| `/init-verifiers` | Detect project verifier commands and save to `.aichat-verifiers.json` |
+| `/init-verifiers` | Detect project verifier commands and save to `.cubi-verifiers.json` |
 
 #### MCP (Model Context Protocol)
 
@@ -291,10 +293,10 @@ groups below mirror that registry.
 | `/mcp` | Show overall MCP status (servers, tools, resources) |
 | `/mcp-tools` | List available MCP tools |
 | `/mcp-call <tool> <json-args>` | Call an MCP tool |
-| `/mcp-reload` | Reload MCP configuration from `~/.ai-chat-cli/mcp.json` |
+| `/mcp-reload` | Reload MCP configuration from `~/.cubi/mcp.json` |
 | `/mcp-resources [server]` | List MCP resources |
 | `/mcp-read <uri>` | Read an MCP resource by URI |
-| `/plugin` | List plugins discovered in `~/.ai-chat-cli/plugins/` |
+| `/plugin` | List plugins discovered in `~/.cubi/plugins/` |
 | `/reload-plugins` | Rescan the plugins / skills directory |
 | `/skills [list \| run <name>]` | List or run reusable Markdown skills |
 | `/hooks [list \| add <event> <cmd> \| rm <n>]` | Manage lifecycle hooks |
@@ -319,7 +321,7 @@ groups below mirror that registry.
 
 | Command | Description |
 | --- | --- |
-| `/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]` | Store OAuth credentials in `~/.ai-chat-cli/oauth.json` and load token into this process |
+| `/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]` | Store OAuth credentials in `~/.cubi/oauth.json` and load token into this process |
 | `/logout [provider]` | Forget in-process API key and remove persisted OAuth token for a provider |
 | `/oauth-refresh [provider]` | Reload non-expired stored OAuth tokens into this process and show status |
 | `/privacy-settings [telemetry on \| off]` | Show or set local privacy preferences |
@@ -332,7 +334,7 @@ groups below mirror that registry.
 | --- | --- |
 | `/doctor` | Run environment health checks (Ollama, model, config dir, `git`) |
 | `/env` | Show resolved runtime info (version, model, cwd, plan mode, etc.) |
-| `/config` | Print the current `~/.ai-chat-cli/config.json` |
+| `/config` | Print the current `~/.cubi/config.json` |
 | `/permissions` | List trusted directories and gated built-in tools |
 | `/tool-allow <name>` / `/tool-deny <name>` | Per-tool allow / deny in the trust store |
 | `/stats` / `/usage` | Show session statistics |
@@ -355,16 +357,16 @@ groups below mirror that registry.
 | `/copy` | Copy the last assistant message to the system clipboard |
 | `/release-notes` | Print release notes for the current version |
 | `/stickers` | Print a friendly ASCII sticker sheet |
-| `/settings-sync init <remote> \| push [msg] \| pull \| status` | Git-backed sync of `~/.ai-chat-cli/` across machines |
+| `/settings-sync init <remote> \| push [msg] \| pull \| status` | Git-backed sync of `~/.cubi/` across machines |
 | `/policy` | Show the read-only admin policy overlay (deny-list + source path) |
-| `/tip` | Print a quick tip about using ai-chat-cli |
+| `/tip` | Print a quick tip about using Cubi |
 | `/mcp-prompts [server[:name]]` | List MCP prompts, or fetch a specific one |
 
 #### Examples
 
 ```
 You: /model
-Current model: llama3.2:1b
+Current model: qwen3:4b
 
 You: /model mistral:7b
 ✓ Switched to model: mistral:7b
@@ -450,11 +452,11 @@ Popular models you can use with Ollama:
 
 | Model | Size | Speed | Quality | Use Case |
 |-------|------|-------|---------|----------|
-| `llama3.2:1b` | 1.3GB | ⚡⚡⚡ | ⭐⭐ | Quick responses, limited hardware |
-| `llama3.2:3b` | 2GB | ⚡⚡ | ⭐⭐⭐ | Balanced performance |
-| `phi3:mini` | 2.3GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's efficient model |
+| `qwen3:4b` | 2.6GB | ⚡⚡ | ⭐⭐⭐⭐ | **Default** — tool-capable, balanced |
+| `qwen2.5:3b` | 1.9GB | ⚡⚡⚡ | ⭐⭐⭐ | Smaller tool-capable model |
+| `phi4-mini` | 2.5GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's tool-capable mini |
 | `mistral:7b` | 4.1GB | ⚡ | ⭐⭐⭐⭐ | High-quality responses |
-| `llama3:8b` | 4.7GB | ⚡ | ⭐⭐⭐⭐ | Latest Llama model |
+| `llama3.1:8b` | 4.7GB | ⚡ | ⭐⭐⭐⭐ | General-purpose tool-capable |
 
 Install any model with:
 ```bash
@@ -496,7 +498,7 @@ ollama list
 ### Project Structure
 
 ```
-ai-chat-cli/
+cubi/
 ├── src/
 │   ├── main.rs            # Application entry point
 │   ├── cli.rs             # Terminal UI, command dispatch, agent-loop driver
@@ -508,10 +510,10 @@ ai-chat-cli/
 │   ├── builtin_tools.rs   # bash, fs, web, repl, notebook, worktree, lsp, think
 │   ├── lsp_client.rs      # JSON-RPC client used by the `lsp` builtin tool
 │   ├── mcp_client.rs      # MCP transport (stdio + HTTP)
-│   ├── mcp_config.rs      # `~/.ai-chat-cli/mcp.json` loader
+│   ├── mcp_config.rs      # `~/.cubi/mcp.json` loader
 │   ├── mcp_manager.rs     # MCP server lifecycle & tool routing
 │   ├── permissions.rs     # Project trust store + plan-mode gates
-│   ├── project_memory.rs  # AICHAT.md discovery & loading
+│   ├── project_memory.rs  # CUBI.md discovery & loading
 │   ├── memdir.rs          # Cross-session persistent memory store
 │   ├── sessions.rs        # Per-project auto-saved session checkpoints
 │   ├── todos.rs           # Per-project todo list
@@ -519,7 +521,6 @@ ai-chat-cli/
 │   ├── file_mentions.rs   # `@file` mentions + user-defined Markdown commands
 │   ├── git_cmds.rs        # Shell-out helpers for the git slash commands
 │   ├── onboarding.rs      # First-run setup
-│   └── distributed.rs     # (Reserved) distributed task plumbing
 ├── Cargo.toml             # Dependencies
 ├── ROADMAP.md             # Architectural roadmap & shipped/open items
 └── README.md              # This file
@@ -541,7 +542,7 @@ ai-chat-cli/
 - **Permissions** (`permissions.rs`) — trust store consulted by every
   write/exec tool; also enforces `/plan` mode.
 - **Memory & sessions** (`project_memory.rs`, `memdir.rs`, `sessions.rs`,
-  `todos.rs`) — AICHAT.md auto-injection, cross-session memdir, per-project
+  `todos.rs`) — CUBI.md auto-injection, cross-session memdir, per-project
   session checkpoints, and todos.
 - **Executor & Ollama client** (`executor.rs`, `llm.rs`, `ollama.rs`) — model
   switching and streaming chat-completion calls with tool support.
@@ -608,7 +609,7 @@ ollama serve
 
 ### Model not found
 
-**Error**: `Model 'llama3.2:1b' not found`
+**Error**: `Model 'qwen3:4b' not found`
 
 **Solution**:
 ```bash
@@ -616,13 +617,13 @@ ollama serve
 ollama list
 
 # Pull the required model
-ollama pull llama3.2:1b
+ollama pull qwen3:4b
 ```
 
 ### Slow responses
 
 **Solutions**:
-1. Use a smaller model: `llama3.2:1b` instead of `mistral:7b`
+1. Use a smaller tool-capable model: `qwen2.5:3b` instead of `qwen3:4b`
 2. Close other applications to free up RAM
 3. Use GPU acceleration if available (Ollama automatic)
 
@@ -669,14 +670,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙏 Acknowledgments
 
 - **[Ollama](https://ollama.ai/)** - Local AI model runtime
-- **[Repartir](https://github.com/paiml/repartir)** - Distributed computing framework
 - **Rust Community** - For amazing tools and libraries
 
 ## 📚 Resources
 
 - [Ollama Documentation](https://github.com/ollama/ollama/blob/main/docs/api.md)
 - [Rust Book](https://doc.rust-lang.org/book/)
-- [Repartir Documentation](https://paiml.github.io/repartir/)
 
 ## 🗺️ Roadmap
 
@@ -701,6 +700,6 @@ Highlights still to come (see [`ROADMAP.md`](ROADMAP.md) for the full list):
 
 **Built with ❤️ using Rust and Ollama**
 
-[Report Bug](https://github.com/peterchoi1014/ai-chat-cli/issues) · [Request Feature](https://github.com/peterchoi1014/ai-chat-cli/issues)
+[Report Bug](https://github.com/peterchoi1014/cubi/issues) · [Request Feature](https://github.com/peterchoi1014/cubi/issues)
 
 </div>

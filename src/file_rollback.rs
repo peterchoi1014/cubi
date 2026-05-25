@@ -168,7 +168,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("ai-chat-cli-journal-{name}-{nanos}.txt"))
+        std::env::temp_dir().join(format!("cubi-journal-{name}-{nanos}.txt"))
     }
 
     #[test]

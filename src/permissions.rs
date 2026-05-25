@@ -10,7 +10,7 @@
 //!
 //! The model here is intentionally simple:
 //!
-//! * A **trust store** at `~/.ai-chat-cli/trusted_dirs.json` records the
+//! * A **trust store** at `~/.cubi/trusted_dirs.json` records the
 //!   set of directory roots the user has explicitly approved. Approval is a
 //!   conscious one-time act per project (`/trust` slash command, or the
 //!   prompt shown by the first-run wizard).
@@ -55,7 +55,7 @@ pub struct Permissions {
 }
 
 impl Permissions {
-    /// Loads `~/.ai-chat-cli/trusted_dirs.json`. Missing or unreadable
+    /// Loads `~/.cubi/trusted_dirs.json`. Missing or unreadable
     /// files yield an empty permissions set rather than an error: a
     /// well-formed absence simply means "no projects trusted yet".
     pub fn load() -> Self {
@@ -82,11 +82,7 @@ impl Permissions {
     }
 
     fn storage_path() -> Option<PathBuf> {
-        Some(
-            dirs::home_dir()?
-                .join(".ai-chat-cli")
-                .join("trusted_dirs.json"),
-        )
+        Some(dirs::home_dir()?.join(".cubi").join("trusted_dirs.json"))
     }
 
     /// Persists the current trust set. Errors are surfaced so callers can
@@ -267,7 +263,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("ai-chat-cli-perm-{label}-{nanos}"));
+        let p = std::env::temp_dir().join(format!("cubi-perm-{label}-{nanos}"));
         fs::create_dir_all(&p).unwrap();
         p
     }

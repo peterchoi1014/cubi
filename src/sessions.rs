@@ -4,7 +4,7 @@
 //! `/save <file>` — and you only ever ran it after losing one. This
 //! module turns persistence on by default: every successful assistant
 //! turn appends the entire `history` to a per-project JSON checkpoint at
-//! `~/.ai-chat-cli/sessions/<cwd-key>/<id>.json`.
+//! `~/.cubi/sessions/<cwd-key>/<id>.json`.
 //!
 //! Layout chosen deliberately:
 //!
@@ -97,7 +97,7 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Returns a store rooted at `~/.ai-chat-cli/sessions/<cwd-key>/`.
+    /// Returns a store rooted at `~/.cubi/sessions/<cwd-key>/`.
     /// `None` when neither the home directory nor the cwd can be read,
     /// in which case sessions silently degrade to "not persisted" —
     /// preferable to crashing on startup.
@@ -109,10 +109,7 @@ impl SessionStore {
     pub fn for_cwd(cwd: &Path) -> Option<Self> {
         let home = dirs::home_dir()?;
         Some(Self {
-            dir: home
-                .join(".ai-chat-cli")
-                .join("sessions")
-                .join(cwd_key(cwd)),
+            dir: home.join(".cubi").join("sessions").join(cwd_key(cwd)),
         })
     }
 
@@ -263,7 +260,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("ai-chat-cli-sess-{label}-{nanos}"));
+        let dir = std::env::temp_dir().join(format!("cubi-sess-{label}-{nanos}"));
         SessionStore { dir }
     }
 

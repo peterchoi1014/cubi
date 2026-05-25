@@ -21,7 +21,7 @@
 //! The active provider is chosen based on environment variables:
 //! * `OPENAI_API_KEY` → OpenAI-compatible mode
 //! * `OPENAI_BASE_URL` → overrides the OpenAI-compatible endpoint
-//! * otherwise local Ollama is used (optionally overridden by `AI_CHAT_CLI_BASE_URL`)
+//! * otherwise local Ollama is used (optionally overridden by `CUBI_BASE_URL`)
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -220,10 +220,10 @@ impl OpenAiClient {
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .ok()
-            .or_else(|| std::env::var("AI_CHAT_CLI_API_KEY").ok())?;
+            .or_else(|| std::env::var("CUBI_API_KEY").ok())?;
         let base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
-            .or_else(|| std::env::var("AI_CHAT_CLI_BASE_URL").ok())
+            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         Some(Self::new(
             base_url.trim_end_matches('/').to_string(),
@@ -502,7 +502,7 @@ pub fn create_provider() -> LlmBackend {
         return LlmBackend::OpenAi(client);
     }
 
-    let ollama = match std::env::var("AI_CHAT_CLI_BASE_URL") {
+    let ollama = match std::env::var("CUBI_BASE_URL") {
         Ok(url) if !url.is_empty() => OllamaClient::with_base_url(url),
         _ => OllamaClient::new(),
     };
@@ -595,11 +595,11 @@ mod tests {
 
     #[test]
     fn create_provider_defaults_to_ollama() {
-        // Without AI_CHAT_CLI_PROVIDER=openai, should default to Ollama.
+        // Without CUBI_PROVIDER=openai, should default to Ollama.
         // We don't remove the var (unsafe in edition 2024+); instead we
         // just verify that the default codepath works when it's not "openai".
         let provider = create_provider();
-        // If the env doesn't have AI_CHAT_CLI_PROVIDER=openai, we get ollama.
+        // If the env doesn't have CUBI_PROVIDER=openai, we get ollama.
         // If it does (unlikely in test), we'd get openai — both are valid.
         assert!(provider.provider_name() == "ollama" || provider.provider_name() == "openai");
     }

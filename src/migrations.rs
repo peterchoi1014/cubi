@@ -1,7 +1,7 @@
 //! Versioned config & session migrations.
 //!
 //! Roadmap item C#22: a thin forward-only migrator that bumps any old
-//! `~/.ai-chat-cli/config.json` to the latest schema and back-fills any
+//! `~/.cubi/config.json` to the latest schema and back-fills any
 //! fields that were added in newer versions. Old config files keep
 //! working because [`crate::onboarding::AppConfig`] uses
 //! `#[serde(default)]` everywhere; this module's job is to (a) record

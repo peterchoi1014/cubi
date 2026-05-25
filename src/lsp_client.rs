@@ -209,7 +209,7 @@ pub async fn run_lsp_query(
                     "synchronization": {}
                 }
             },
-            "clientInfo": { "name": "ai-chat-cli", "version": env!("CARGO_PKG_VERSION") }
+            "clientInfo": { "name": "cubi", "version": env!("CARGO_PKG_VERSION") }
         });
         let init_id = next_id;
         next_id += 1;

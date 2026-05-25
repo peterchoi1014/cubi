@@ -1,8 +1,8 @@
 //! Cross-session persistent memory (`memdir`).
 //!
-//! Implements a global memory store at `~/.ai-chat-cli/memdir/` where each
+//! Implements a global memory store at `~/.cubi/memdir/` where each
 //! "memory" is a short text snippet that the user (or the model) saves for
-//! future sessions. Unlike `AICHAT.md` (which is per-project), memdir is
+//! future sessions. Unlike `CUBI.md` (which is per-project), memdir is
 //! global and accumulates facts across all projects.
 //!
 //! Storage: one JSON file (`memories.json`) containing a flat array of
@@ -43,7 +43,7 @@ pub struct Memdir {
 }
 
 impl Memdir {
-    /// Loads the global memdir from `~/.ai-chat-cli/memdir/memories.json`.
+    /// Loads the global memdir from `~/.cubi/memdir/memories.json`.
     /// Returns an empty store if the file doesn't exist yet.
     pub fn load() -> Self {
         let path = match Self::storage_path() {
@@ -186,14 +186,10 @@ impl Memdir {
         Some(out)
     }
 
-    /// Resolves the path to `~/.ai-chat-cli/memdir/memories.json`.
+    /// Resolves the path to `~/.cubi/memdir/memories.json`.
     fn storage_path() -> Option<PathBuf> {
         let home = dirs::home_dir()?;
-        Some(
-            home.join(".ai-chat-cli")
-                .join("memdir")
-                .join("memories.json"),
-        )
+        Some(home.join(".cubi").join("memdir").join("memories.json"))
     }
 }
 
@@ -207,7 +203,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("ai-chat-cli-memdir-{label}-{nanos}.json"))
+        std::env::temp_dir().join(format!("cubi-memdir-{label}-{nanos}.json"))
     }
 
     #[test]

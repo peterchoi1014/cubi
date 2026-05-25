@@ -2,8 +2,8 @@
 //!
 //! Roadmap item C#10. Off by default — flip
 //! [`crate::onboarding::AppConfig::telemetry`] to `true` (or set the
-//! `AICHAT_TELEMETRY=1` environment variable) and structured events
-//! append to `~/.ai-chat-cli/telemetry.log`.
+//! `CUBI_TELEMETRY=1` environment variable) and structured events
+//! append to `~/.cubi/telemetry.log`.
 //!
 //! The log is intentionally append-only, line-delimited JSON so external
 //! tooling (`jq`, splunk, ...) can read it without parsing. Failures to
@@ -24,7 +24,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 /// how the rest of the CLI treats startup-time settings.
 pub fn init(config_enabled: bool) {
     let env_on = matches!(
-        std::env::var("AICHAT_TELEMETRY").as_deref(),
+        std::env::var("CUBI_TELEMETRY").as_deref(),
         Ok("1") | Ok("true") | Ok("on") | Ok("yes")
     );
     let _ = ENABLED.set(config_enabled || env_on);
@@ -35,7 +35,7 @@ pub fn is_enabled() -> bool {
 }
 
 fn log_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".ai-chat-cli").join("telemetry.log"))
+    Some(dirs::home_dir()?.join(".cubi").join("telemetry.log"))
 }
 
 /// Append one event. Silently no-ops when telemetry is disabled or the
