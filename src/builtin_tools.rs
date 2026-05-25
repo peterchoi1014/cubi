@@ -114,6 +114,7 @@ impl BuiltinToolRegistry {
             Self::repl_eval_tool(),
             Self::repl_close_tool(),
             Self::notebook_tool(),
+            Self::lsp_tool(),
         ];
 
         Self {
@@ -153,6 +154,7 @@ impl BuiltinToolRegistry {
             "repl_eval" => self.execute_repl_eval(args).await,
             "repl_close" => self.execute_repl_close(args).await,
             "notebook" => self.execute_notebook(args),
+            "lsp" => self.execute_lsp(args).await,
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -1329,6 +1331,123 @@ impl BuiltinToolRegistry {
         match result {
             Ok(text) => Ok(ToolResult::success(text)),
             Err(e) => Ok(ToolResult::error(format!("{e}"))),
+        }
+    }
+
+    // ---- LSP tool ----
+    //
+    // Spawns a fresh LSP server per query (rust-analyzer, pyright,
+    // typescript-language-server, etc.) and runs hover / definition /
+    // references against a 1-based line+column. Stateless: simpler to
+    // reason about, more predictable for a tool the model drives. See
+    // `lsp_client.rs` for the wire-protocol details.
+
+    fn lsp_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "lsp".to_string(),
+            description: "Run a one-shot LSP query (hover / definition / references) against \
+                          a file using an external language server. You specify the server \
+                          command (e.g. 'rust-analyzer', 'pyright-langserver --stdio') so this \
+                          works for any language as long as the binary is on PATH. \
+                          Read-only — no plan-mode gate."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["hover", "definition", "references"]
+                    },
+                    "server": {
+                        "type": "string",
+                        "description": "Command to launch the LSP server, e.g. 'rust-analyzer'. Arguments may be included space-separated, e.g. 'pyright-langserver --stdio'."
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Path to the file to query"
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "1-based line number (as shown in editors)"
+                    },
+                    "character": {
+                        "type": "integer",
+                        "description": "1-based column",
+                        "default": 1
+                    },
+                    "workspace_root": {
+                        "type": "string",
+                        "description": "Workspace root passed to the LSP server (default: current directory)"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Overall timeout in seconds (default 30)",
+                        "default": 30
+                    }
+                },
+                "required": ["action", "server", "file", "line"]
+            }),
+        }
+    }
+
+    async fn execute_lsp(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let action_str = args["action"]
+            .as_str()
+            .context("Missing 'action' parameter")?;
+        let action = match crate::lsp_client::LspAction::from_str(action_str) {
+            Some(a) => a,
+            None => {
+                return Ok(ToolResult::error(format!(
+                    "Unknown LSP action '{action_str}'. Use hover, definition, or references."
+                )));
+            }
+        };
+        let server_raw = args["server"]
+            .as_str()
+            .context("Missing 'server' parameter")?;
+        let file = args["file"].as_str().context("Missing 'file' parameter")?;
+        let line = args["line"].as_u64().context("Missing 'line' parameter")? as u32;
+        let character = args["character"].as_u64().unwrap_or(1) as u32;
+        let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
+
+        // Read-only tool, but we still gate on cwd trust so a model
+        // running in an untrusted project can't spawn arbitrary binaries.
+        let cwd = std::env::current_dir().context("Could not read cwd")?;
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            return Ok(ToolResult::error(format!("{e}")));
+        }
+
+        // Workspace root defaults to the caller's cwd. The LSP needs
+        // *some* root for many features (rust-analyzer especially).
+        let workspace_root = match args["workspace_root"].as_str() {
+            Some(p) => Path::new(p).to_path_buf(),
+            None => cwd.clone(),
+        };
+
+        // Split the server command into argv. Simple whitespace split — no
+        // shell-style quoting. Good enough for the common case
+        // "pyright-langserver --stdio" and avoids pulling shellwords in.
+        let mut parts = server_raw.split_whitespace();
+        let server = match parts.next() {
+            Some(s) => s.to_string(),
+            None => return Ok(ToolResult::error("server command must not be empty".into())),
+        };
+        let server_args: Vec<String> = parts.map(|s| s.to_string()).collect();
+
+        match crate::lsp_client::run_lsp_query(
+            &server,
+            &server_args,
+            &workspace_root,
+            Path::new(file),
+            line,
+            character,
+            action,
+            timeout_secs,
+        )
+        .await
+        {
+            Ok(text) => Ok(ToolResult::success(text)),
+            Err(e) => Ok(ToolResult::error(format!("lsp failed: {e}"))),
         }
     }
 }

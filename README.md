@@ -14,7 +14,19 @@ A powerful command-line AI chat application built with Rust, featuring local AI 
 
 - 🤖 **Local AI Models** - Run AI models completely offline using Ollama
 - 💬 **Interactive Chat** - Beautiful colored terminal interface with conversation history
-- 💾 **Conversation Management** - Save and load chat sessions as JSON files
+- ⚡ **Streaming + native tool-calling agent loop** - Tokens stream live; the
+  model can call built-in or MCP tools, see the results, and keep going (up
+  to 12 round-trips per turn)
+- 🧰 **Built-in tools** - shell (`bash`), filesystem (`read_file`, `write_file`,
+  `edit_file`, `list_files`, `search_glob`, `grep`), git (`worktree`), web
+  (`web_fetch`, `web_search`), long-lived `bash` REPL (`repl_start`/`eval`/`close`),
+  Jupyter `notebook` (`list`/`read`/`insert`/`replace`/`delete`), and LSP-backed
+  code intel (`lsp` for hover/definition/references via your language server),
+  plus a `think` no-op and a `agent_run` meta-tool for spawning focused subagents
+- 🛡️ **Project trust + plan mode** - Tools refuse to write/exec outside trusted
+  directories; `/plan` toggles a read-only mode that blocks every write/exec path
+- 💾 **Conversation Management** - Save and load chat sessions as JSON files;
+  every turn is auto-checkpointed and recoverable via `/sessions` / `/resume`
 - 📦 **Batch Processing** - Process multiple prompts from text files
 - 🔄 **Model Switching** - Switch between different AI models on the fly
 - 🎨 **Colored Output** - Syntax-highlighted responses with emoji indicators
