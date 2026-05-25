@@ -423,6 +423,21 @@ impl ChatCLI {
                     env!("CARGO_PKG_VERSION")
                 );
             }
+            Cmd::Doctor => {
+                self.run_doctor().await;
+            }
+            Cmd::Env => {
+                self.show_env();
+            }
+            Cmd::Config => {
+                self.show_config();
+            }
+            Cmd::Permissions => {
+                self.show_permissions();
+            }
+            Cmd::Bug => {
+                self.show_bug_url(args);
+            }
             Cmd::Status => {
                 self.show_status();
             }
@@ -857,6 +872,345 @@ impl ChatCLI {
             if trusted_count == 1 { "" } else { "s" }
         );
         println!();
+    }
+
+    /// `/doctor` — runs a sanity check on the runtime environment.
+    /// Each probe prints a ✓ / ✗ line; the function never returns an error
+    /// so users always see the full report.
+    async fn run_doctor(&self) {
+        println!("\n{}", "Doctor:".bright_yellow().bold());
+
+        // 1. Ollama reachability + model listing.
+        let ollama = crate::ollama::OllamaClient::new();
+        let model = self.executor.get_model();
+        match ollama.list_models().await {
+            Ok(models) => {
+                println!(
+                    "  {} Ollama reachable at {} ({} model{} installed)",
+                    "✓".bright_green(),
+                    "http://localhost:11434".bright_cyan(),
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" }
+                );
+                // Mirror the startup check in main.rs (prefix match handles
+                // `name` vs `name:latest`).
+                if models.iter().any(|m| m.starts_with(model)) {
+                    println!(
+                        "  {} Current model '{}' is installed",
+                        "✓".bright_green(),
+                        model.bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "  {} Current model '{}' is not installed (try `ollama pull {}`)",
+                        "✗".bright_red(),
+                        model.bright_cyan(),
+                        model
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "  {} Ollama unreachable at {}: {}",
+                    "✗".bright_red(),
+                    "http://localhost:11434".bright_cyan(),
+                    e
+                );
+                println!(
+                    "  {} Skipping model check (Ollama not reachable)",
+                    "ℹ".bright_blue()
+                );
+            }
+        }
+
+        // 2. Config directory writable.
+        match dirs::home_dir().map(|h| h.join(".ai-chat-cli")) {
+            Some(dir) => match fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    let probe = dir.join(".doctor-write-probe");
+                    match fs::write(&probe, b"ok") {
+                        Ok(()) => {
+                            let _ = fs::remove_file(&probe);
+                            println!(
+                                "  {} Config dir writable: {}",
+                                "✓".bright_green(),
+                                dir.display().to_string().bright_cyan()
+                            );
+                        }
+                        Err(e) => println!(
+                            "  {} Config dir not writable ({}): {}",
+                            "✗".bright_red(),
+                            dir.display(),
+                            e
+                        ),
+                    }
+                }
+                Err(e) => println!(
+                    "  {} Could not create config dir {}: {}",
+                    "✗".bright_red(),
+                    dir.display(),
+                    e
+                ),
+            },
+            None => println!("  {} Could not resolve home directory", "✗".bright_red()),
+        }
+
+        // 3. `git` on PATH.
+        match std::process::Command::new("git").arg("--version").output() {
+            Ok(out) if out.status.success() => {
+                let v = String::from_utf8_lossy(&out.stdout);
+                println!(
+                    "  {} {} on PATH ({})",
+                    "✓".bright_green(),
+                    "git".bright_cyan(),
+                    v.trim()
+                );
+            }
+            Ok(out) => println!(
+                "  {} `git --version` exited with status {}",
+                "✗".bright_red(),
+                out.status
+            ),
+            Err(e) => println!(
+                "  {} {} not found on PATH: {}",
+                "✗".bright_red(),
+                "git".bright_cyan(),
+                e
+            ),
+        }
+
+        println!();
+    }
+
+    /// `/env` — prints the resolved runtime: model, project dir, trust
+    /// status, plan mode, MCP server count, AICHAT.md presence, memdir
+    /// entries, session checkpoint count, todo count.
+    fn show_env(&self) {
+        let cwd = std::env::current_dir().ok();
+        let perms = self.permissions.lock().unwrap();
+        let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
+        let trusted_count = perms.trusted_count();
+        drop(perms);
+
+        let mcp_tool_count = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.list_tools().len())
+            .unwrap_or(0);
+
+        let aichat_path = project_memory::read_memory_with_path()
+            .ok()
+            .flatten()
+            .map(|(p, _)| p);
+
+        let session_count = self
+            .session_store
+            .as_ref()
+            .and_then(|s| s.list().ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        println!("\n{}", "Environment:".bright_yellow().bold());
+        println!(
+            "  {}: {} {}",
+            "binary".bright_cyan(),
+            "ai-chat-cli".bright_white(),
+            format!("v{}", env!("CARGO_PKG_VERSION")).bright_black()
+        );
+        println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
+        println!(
+            "  {}: {}",
+            "cwd".bright_cyan(),
+            cwd.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string())
+        );
+        println!(
+            "  {}: {} ({} trusted root{} total)",
+            "cwd trust".bright_cyan(),
+            if trusted_here {
+                "trusted".bright_green()
+            } else {
+                "not trusted".bright_red()
+            },
+            trusted_count,
+            if trusted_count == 1 { "" } else { "s" }
+        );
+        println!(
+            "  {}: {}",
+            "plan mode".bright_cyan(),
+            if self.plan_mode.load(Ordering::SeqCst) {
+                "on".bright_green()
+            } else {
+                "off".bright_black()
+            }
+        );
+        println!(
+            "  {}: {}",
+            "history messages".bright_cyan(),
+            self.history.len()
+        );
+        println!("  {}: {}", "mcp tools".bright_cyan(), mcp_tool_count);
+        println!(
+            "  {}: {} ({} pending)",
+            "todos".bright_cyan(),
+            self.todos.len(),
+            self.todos.pending()
+        );
+        println!(
+            "  {}: {} entries",
+            "memdir".bright_cyan(),
+            self.memdir.len()
+        );
+        println!(
+            "  {}: {}",
+            "session checkpoints".bright_cyan(),
+            session_count
+        );
+        match aichat_path {
+            Some(p) => println!(
+                "  {}: {}",
+                "project memory".bright_cyan(),
+                p.display().to_string().bright_cyan()
+            ),
+            None => println!(
+                "  {}: {}",
+                "project memory".bright_cyan(),
+                "(none — run /init to create AICHAT.md)".bright_black()
+            ),
+        }
+        println!();
+    }
+
+    /// `/config` — print the contents of `~/.ai-chat-cli/config.json`.
+    fn show_config(&self) {
+        let Some(path) = crate::onboarding::AppConfig::storage_path() else {
+            eprintln!(
+                "{} Could not resolve home directory.",
+                "Error:".bright_red()
+            );
+            return;
+        };
+        println!(
+            "\n{} ({}):",
+            "Config".bright_yellow().bold(),
+            path.display().to_string().bright_cyan()
+        );
+        println!("{}", "-".repeat(60).bright_black());
+        match fs::read_to_string(&path) {
+            Ok(raw) => println!("{}", raw.trim_end()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!(
+                "{} No config file yet — it is written on first onboarding.",
+                "ℹ".bright_blue()
+            ),
+            Err(e) => eprintln!("{} Failed to read config: {}", "Error:".bright_red(), e),
+        }
+        println!("{}\n", "-".repeat(60).bright_black());
+    }
+
+    /// `/permissions` — list trusted directories and the built-in tools
+    /// gated by the trust store.
+    fn show_permissions(&self) {
+        let perms = self.permissions.lock().unwrap();
+        let roots: Vec<_> = perms.trusted_roots().cloned().collect();
+        drop(perms);
+
+        let store_path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("trusted_dirs.json"));
+
+        println!("\n{}", "Permissions:".bright_yellow().bold());
+        if let Some(p) = &store_path {
+            println!(
+                "  {}: {}",
+                "trust store".bright_cyan(),
+                p.display().to_string().bright_cyan()
+            );
+        }
+        if roots.is_empty() {
+            println!(
+                "  {} No directories are currently trusted. Run /trust in a project to approve it.",
+                "ℹ".bright_blue()
+            );
+        } else {
+            println!(
+                "  {} {} trusted root{}:",
+                "✓".bright_green(),
+                roots.len(),
+                if roots.len() == 1 { "" } else { "s" }
+            );
+            for (i, r) in roots.iter().enumerate() {
+                println!("    {}. {}", i + 1, r.display().to_string().bright_cyan());
+            }
+        }
+        println!(
+            "  {}: bash, write_file, edit_file (write/exec only inside a trusted root)",
+            "gated tools".bright_cyan()
+        );
+        println!(
+            "  {} Plan mode also blocks these tools regardless of trust.",
+            "ℹ".bright_blue()
+        );
+        println!();
+    }
+
+    /// `/bug` — print a pre-filled GitHub Issues URL for this repo with
+    /// the runtime info from `/env` URL-encoded into the body. Optional
+    /// `args` become the issue title.
+    fn show_bug_url(&self, args: &str) {
+        let title = if args.trim().is_empty() {
+            "Bug report".to_string()
+        } else {
+            args.trim().to_string()
+        };
+
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let mcp_tool_count = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.list_tools().len())
+            .unwrap_or(0);
+        let plan_mode = if self.plan_mode.load(Ordering::SeqCst) {
+            "on"
+        } else {
+            "off"
+        };
+
+        let body = format!(
+            "## Describe the bug\n\
+             <!-- A clear and concise description. -->\n\n\
+             ## To reproduce\n\
+             1. ...\n\n\
+             ## Expected behavior\n\
+             ...\n\n\
+             ## Environment\n\
+             - ai-chat-cli: v{version}\n\
+             - model: {model}\n\
+             - cwd: {cwd}\n\
+             - plan mode: {plan_mode}\n\
+             - mcp tools: {mcp}\n\
+             - os: {os} ({arch})\n",
+            version = env!("CARGO_PKG_VERSION"),
+            model = self.executor.get_model(),
+            cwd = cwd,
+            plan_mode = plan_mode,
+            mcp = mcp_tool_count,
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+        );
+
+        let url = format!(
+            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?title={}&body={}",
+            url_encode(&title),
+            url_encode(&body),
+        );
+
+        println!("\n{}", "Bug report:".bright_yellow().bold());
+        println!(
+            "  {} Open this URL to file an issue with runtime info pre-filled:\n",
+            "ℹ".bright_blue()
+        );
+        println!("  {}\n", url.bright_cyan());
     }
 
     /// Handles `/trust` and `/trust revoke`. Both forms operate on the
@@ -2188,6 +2542,26 @@ fn parse_force_and_filename(rest: &str) -> Option<(bool, &str)> {
     Some((false, trimmed))
 }
 
+/// Minimal RFC 3986 percent-encoder for query/body params used by `/bug`.
+/// Encodes everything except the unreserved set (`A-Z a-z 0-9 - _ . ~`).
+/// Kept here to avoid pulling in the `percent-encoding` or `urlencoding`
+/// crates for one URL.
+fn url_encode(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2255,6 +2629,24 @@ mod tests {
         assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
         assert_eq!(cli_history[1].role, "user");
         assert_eq!(cli_history[2].role, "assistant");
+    }
+
+    // ---- url_encode ----
+
+    #[test]
+    fn url_encode_passes_through_unreserved() {
+        assert_eq!(url_encode("abcXYZ-_.~012"), "abcXYZ-_.~012");
+    }
+
+    #[test]
+    fn url_encode_escapes_reserved_and_unicode() {
+        // Space, slash, colon, newline, and a multi-byte character all
+        // round-trip via percent-encoding.
+        assert_eq!(url_encode(" "), "%20");
+        assert_eq!(url_encode("a/b:c"), "a%2Fb%3Ac");
+        assert_eq!(url_encode("x\ny"), "x%0Ay");
+        // U+00E9 (é) is 0xC3 0xA9 in UTF-8.
+        assert_eq!(url_encode("é"), "%C3%A9");
     }
 
     // ---- overwrite guard ----
