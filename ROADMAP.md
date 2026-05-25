@@ -23,10 +23,13 @@ for future PRs.
 - [ ] **Subagent / Task tool** — main model spawns isolated worker agents
       (`AgentTool`, `TaskCreate/Get/List/Update/Stop/OutputTool`)
 - [x] **`TodoWrite` tool** + `/todos` UI — persistent per-session task checklist
-      *(in-memory implementation; persistence is a follow-up)*
+      *(now persisted across restarts at `~/.ai-chat-cli/todos/<cwd-key>.json`)*
 - [x] **Plan mode** — read-only "plan first, then apply" toggle
-      *(`/plan` toggle; tool gating is a follow-up)*
-- [ ] **`ask_user` tool** — model pauses and asks a clarifying question
+      *(`/plan` toggle now gates `/mcp-call`; full tool gating expands as more
+      write tools land)*
+- [x] **`ask_user` tool** — model pauses and asks a clarifying question
+      *(user-driven `/ask <question>` for now; model-triggered version comes
+      with native tool-calling)*
 - [ ] **Git worktree tool** + `/worktree` — isolated worktree for risky changes
 - [ ] **`web_fetch`, `web_search`** — network tools (permission-gated)
 - [ ] **LSP-backed code intel tool** — hover / definition / references
@@ -58,6 +61,7 @@ Shipped in this PR:
 - [x] `/plan`, `/todos`, `/todo-add`, `/todo-done`, `/todo-clear`
 - [x] `/init`, `/memory`
 - [x] `/status`, `/version`, `/export`
+- [x] `/ask` (user-driven clarifying-question stand-in)
 
 Still to add (grouped by area):
 
