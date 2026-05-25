@@ -1,7 +1,7 @@
 //! User-defined plugin loader.
 //!
 //! Roadmap item B-foundation + C#15: discover plugin bundles under
-//! `~/.ai-chat-cli/plugins/` and expose any Markdown command files
+//! `~/.cubi/plugins/` and expose any Markdown command files
 //! (`<plugin>/commands/<name>.md`) as first-class user-defined slash
 //! commands. The body of the Markdown file is injected verbatim as the
 //! user-visible prompt for `/<plugin>:<name>` (Anthropic-style
@@ -47,7 +47,7 @@ impl PluginCommand {
 }
 
 pub fn plugins_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("plugins"))
+    dirs::home_dir().map(|h| h.join(".cubi").join("plugins"))
 }
 
 /// Reload all plugin bundles from disk. Always returns a (possibly
@@ -154,7 +154,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("ai-chat-cli-plugins-{label}-{nanos}"));
+        let p = std::env::temp_dir().join(format!("cubi-plugins-{label}-{nanos}"));
         fs::create_dir_all(&p).unwrap();
         p
     }

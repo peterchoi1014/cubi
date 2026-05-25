@@ -45,7 +45,7 @@ pub struct ChatCLI {
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
     todos: TodoList,
-    /// Cross-session persistent memory store (`~/.ai-chat-cli/memdir/`).
+    /// Cross-session persistent memory store (`~/.cubi/memdir/`).
     memdir: Memdir,
     /// User-defined Markdown commands loaded from disk.
     user_commands: Vec<UserCommand>,
@@ -103,7 +103,7 @@ impl ChatCLI {
             policy: Policy::load(),
         };
 
-        // Auto-inject project memory (AICHAT.md) into context, if present.
+        // Auto-inject project memory (CUBI.md) into context, if present.
         cli.inject_project_memory();
 
         // Auto-inject cross-session memdir into context, if non-empty.
@@ -112,7 +112,7 @@ impl ChatCLI {
         // Steer reply formatting via the configured output style. We push
         // a system message rather than mutating per-prompt so the
         // preset rides along with every assistant turn for the session.
-        let style = std::env::var("AICHAT_OUTPUT_STYLE")
+        let style = std::env::var("CUBI_OUTPUT_STYLE")
             .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string());
         cli.history.push(Message::text(
             "system",
@@ -122,7 +122,9 @@ impl ChatCLI {
         // Tools are advertised to the model via Ollama's native `tools:`
         // field in `agent_loop::build_tool_specs`. We deliberately do NOT
         // also inject them as a system message: small models tend to echo
-        // the schema back as content when they see it twice.
+        // the schema back as content when they see it twice. Keep this
+        // path empty unless we discover a model that benefits from the
+        // duplication.
 
         cli
     }
@@ -491,11 +493,7 @@ impl ChatCLI {
                 }
             }
             Cmd::Version => {
-                println!(
-                    "{} {}",
-                    "ai-chat-cli".bright_cyan(),
-                    env!("CARGO_PKG_VERSION")
-                );
+                println!("{} {}", "cubi".bright_cyan(), env!("CARGO_PKG_VERSION"));
             }
             Cmd::Doctor => {
                 self.run_doctor().await;
@@ -1007,16 +1005,51 @@ impl ChatCLI {
     }
 
     fn print_welcome(&self) {
-        println!("\n{}", "=".repeat(60).bright_cyan());
+        // "Cubi" mascot — a tiny isometric cube with pixel-block eyes
+        // and a smile. Box-drawing characters keep the silhouette crisp
+        // on any monospace font; the small offset shadow sells the 3D.
+        let mascot = [
+            r#"  ┌───────┐  "#,
+            r#"  │ ▣   ▣ │  "#,
+            r#"  │   ◡   │  "#,
+            r#"  └───────┘  "#,
+            r#"   ░░░░░░░   "#,
+        ];
+        let tagline = [
+            "",
+            "  hi, i'm Cubi.",
+            "  /help to see commands.",
+            "  ask me anything.",
+            "",
+        ];
+        println!();
+        for (m, t) in mascot.iter().zip(tagline.iter()) {
+            println!("{}  {}", m.bright_cyan(), t.bright_white());
+        }
+        println!();
+        println!("{}", "=".repeat(60).bright_cyan());
         println!(
             "{}",
-            "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
+            "  Cubi — a pocket-sized AI for your shell"
+                .bright_cyan()
+                .bold()
         );
         println!("{}", "=".repeat(60).bright_cyan());
+        let essentials = [
+            ("/help", "show all commands"),
+            ("/quit", "exit the chat"),
+            ("/version", "print version info"),
+        ];
         println!("\n{}", "Commands:".bright_yellow().bold());
-        for spec in COMMANDS {
-            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
+        for (usage, help) in essentials {
+            println!("  {} - {}", usage.bright_cyan(), help);
         }
+        println!(
+            "  {} {} for the full list ({} commands available)",
+            "→ type".bright_black(),
+            "/help".bright_cyan(),
+            COMMANDS.len(),
+        );
         println!(
             "\n{}\n",
             "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white()
@@ -1196,7 +1229,7 @@ impl ChatCLI {
         }
 
         // 2. Config directory writable.
-        match dirs::home_dir().map(|h| h.join(".ai-chat-cli")) {
+        match dirs::home_dir().map(|h| h.join(".cubi")) {
             Some(dir) => match fs::create_dir_all(&dir) {
                 Ok(()) => {
                     // Use a unique probe filename and `create_new` so we never
@@ -1280,7 +1313,7 @@ impl ChatCLI {
     }
 
     /// `/env` — prints the resolved runtime: model, project dir, trust
-    /// status, plan mode, MCP server count, AICHAT.md presence, memdir
+    /// status, plan mode, MCP server count, CUBI.md presence, memdir
     /// entries, session checkpoint count, todo count.
     fn show_env(&self) {
         let cwd = std::env::current_dir().ok();
@@ -1311,7 +1344,7 @@ impl ChatCLI {
         println!(
             "  {}: {} {}",
             "binary".bright_cyan(),
-            "ai-chat-cli".bright_white(),
+            "cubi".bright_white(),
             format!("v{}", env!("CARGO_PKG_VERSION")).bright_black()
         );
         println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
@@ -1373,13 +1406,13 @@ impl ChatCLI {
             None => println!(
                 "  {}: {}",
                 "project memory".bright_cyan(),
-                "(none — run /init to create AICHAT.md)".bright_black()
+                "(none — run /init to create CUBI.md)".bright_black()
             ),
         }
         println!();
     }
 
-    /// `/config` — print the contents of `~/.ai-chat-cli/config.json`.
+    /// `/config` — print the contents of `~/.cubi/config.json`.
     fn show_config(&self) {
         let Some(path) = crate::onboarding::AppConfig::storage_path() else {
             eprintln!(
@@ -1414,7 +1447,7 @@ impl ChatCLI {
         let denied: Vec<_> = perms.denied_tools().cloned().collect();
         drop(perms);
 
-        let store_path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("trusted_dirs.json"));
+        let store_path = dirs::home_dir().map(|h| h.join(".cubi").join("trusted_dirs.json"));
 
         println!("\n{}", "Permissions:".bright_yellow().bold());
         if let Some(p) = &store_path {
@@ -1560,7 +1593,7 @@ impl ChatCLI {
              ## Expected behavior\n\
              ...\n\n\
              ## Environment\n\
-             - ai-chat-cli: v{version}\n\
+             - cubi: v{version}\n\
              - model: {model}\n\
              - cwd: {cwd}\n\
              - plan mode: {plan_mode}\n\
@@ -1576,7 +1609,7 @@ impl ChatCLI {
         );
 
         let url = format!(
-            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?title={}&body={}",
+            "https://github.com/peterchoi1014/cubi/issues/new?title={}&body={}",
             url_encode(&title),
             url_encode(&body),
         );
@@ -1599,7 +1632,7 @@ impl ChatCLI {
         };
         let body = "## Problem\n<!-- What limitation are you hitting? -->\n\n## Proposed solution\n<!-- Describe the feature you want. -->\n\n## Alternatives considered\n<!-- Optional -->\n";
         let url = format!(
-            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=enhancement&title={}&body={}",
+            "https://github.com/peterchoi1014/cubi/issues/new?labels=enhancement&title={}&body={}",
             url_encode(&title),
             url_encode(body),
         );
@@ -1714,10 +1747,7 @@ impl ChatCLI {
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
             println!("\n{}", "Skills:".bright_yellow().bold());
             if self.skills.is_empty() {
-                println!(
-                    "  {} No skills found in ~/.ai-chat-cli/skills",
-                    "ℹ".bright_blue()
-                );
+                println!("  {} No skills found in ~/.cubi/skills", "ℹ".bright_blue());
             } else {
                 for skill in &self.skills {
                     println!(
@@ -1896,7 +1926,7 @@ impl ChatCLI {
                 self.history = session.history.clone();
                 self.current_session = Some(session);
                 // Re-inject project memory so resumed sessions see the
-                // current `AICHAT.md`, not a snapshot from when the
+                // current `CUBI.md`, not a snapshot from when the
                 // session was first created.
                 self.inject_project_memory();
             }
@@ -2946,7 +2976,7 @@ impl ChatCLI {
     }
 
     /// Removes any previously injected project-memory system message and
-    /// re-reads `AICHAT.md` (walking up the directory tree) into history.
+    /// re-reads `CUBI.md` (walking up the directory tree) into history.
     ///
     /// The reloaded memory is inserted **at the front** of `history` (after
     /// any earlier system messages, but before user/assistant turns) so that
@@ -3003,11 +3033,7 @@ impl ChatCLI {
         // only as a tag for future removal — the actual content comes from ctx.
         let msg = Message::text(
             "system",
-            format!(
-                "{} (from ~/.ai-chat-cli/memdir/):\n{}",
-                Self::MEMDIR_PREFIX,
-                ctx
-            ),
+            format!("{} (from ~/.cubi/memdir/):\n{}", Self::MEMDIR_PREFIX, ctx),
         );
 
         let insert_at = self
@@ -3065,6 +3091,7 @@ impl ChatCLI {
     /// are stripped, and the session is checkpointed.
     async fn agent_turn(&mut self) -> Result<()> {
         use std::io::Write;
+        use std::sync::atomic::Ordering;
 
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
@@ -3078,22 +3105,51 @@ impl ChatCLI {
         let mut any_output = false;
 
         for step in 0..MAX_AGENT_STEPS {
+            // Show a spinner while we wait for the model's first token.
+            // Label differs by step so the user can tell "first response"
+            // from "reacting to tool output".
+            let spinner_label = if step == 0 {
+                "thinking…"
+            } else {
+                "processing tool results…"
+            };
+            let spinner = crate::spinner::Spinner::start(spinner_label);
+            let stop_flag = spinner.stop_flag();
+
+            // Hold the spinner across the streaming call so the callback
+            // can clear it on the first token. We can't move `spinner`
+            // into the closure (we need to `.stop().await` after), so we
+            // share a `&Spinner` via Rc/Arc-like discipline: the closure
+            // only needs `clear_line` + `stop_flag`.
+            let spinner_ref = &spinner;
+
             // Only print the "AI:" prefix once per user turn — multi-step
-            // turns continue inline below the previous tool block.
-            if step == 0 {
-                print!("{} ", "AI:".bright_blue().bold());
-                let _ = std::io::stdout().flush();
-            }
+            // turns continue inline below the previous tool block. We
+            // defer the print until the first streamed token so the
+            // spinner has full ownership of the status line.
+            let mut printed_prefix = step > 0;
 
             let mut got_token = false;
-            let msg = self
+            let stream_result = self
                 .executor
                 .chat_stream(self.history.clone(), tools.clone(), |tok| {
+                    if !got_token {
+                        // First token: retire the spinner and lay down
+                        // the "AI:" prefix exactly once.
+                        stop_flag.store(true, Ordering::SeqCst);
+                        spinner_ref.clear_line();
+                        if !printed_prefix {
+                            print!("{} ", "AI:".bright_blue().bold());
+                            printed_prefix = true;
+                        }
+                    }
                     print!("{}", tok.bright_white());
                     let _ = std::io::stdout().flush();
                     got_token = true;
                 })
-                .await?;
+                .await;
+            spinner.stop().await;
+            let msg = stream_result?;
             if got_token {
                 any_output = true;
             }
@@ -3270,7 +3326,7 @@ impl ChatCLI {
     fn export_markdown(&self, filename: &str, force: bool) -> Result<()> {
         check_overwrite_allowed(filename, force, "/export")?;
         let mut out = String::new();
-        out.push_str("# ai-chat-cli conversation\n\n");
+        out.push_str("# cubi conversation\n\n");
         out.push_str(&format!("- model: `{}`\n", self.executor.get_model()));
         out.push_str(&format!("- messages: {}\n\n", self.history.len()));
         out.push_str("---\n\n");
@@ -3298,7 +3354,7 @@ impl ChatCLI {
     // -------- New slash command handlers (v0.2.0) --------
 
     /// `/init-verifiers` — scan the cwd for well-known build/test/lint
-    /// manifests and print (and save to `.aichat-verifiers.json`) the
+    /// manifests and print (and save to `.cubi-verifiers.json`) the
     /// inferred verifier commands.
     fn run_init_verifiers(&self) {
         let cwd = match std::env::current_dir() {
@@ -3344,7 +3400,7 @@ impl ChatCLI {
         for (k, v) in &verifiers {
             println!("  {} {}: {}", "•".bright_cyan(), k.bright_cyan(), v);
         }
-        let out_path = cwd.join(".aichat-verifiers.json");
+        let out_path = cwd.join(".cubi-verifiers.json");
         let payload: Vec<serde_json::Value> = verifiers
             .iter()
             .map(|(k, v)| serde_json::json!({ "kind": k, "command": v }))
@@ -3591,7 +3647,7 @@ impl ChatCLI {
             println!(
                 "{} theme: {} (set with /theme [{}])",
                 "ℹ".bright_blue(),
-                std::env::var("AICHAT_THEME")
+                std::env::var("CUBI_THEME")
                     .unwrap_or_else(|_| "auto".to_string())
                     .bright_cyan(),
                 themes::VALID_THEMES.join("|")
@@ -3608,7 +3664,7 @@ impl ChatCLI {
             return;
         }
         // SAFETY: handled on the readline thread, no race.
-        unsafe { std::env::set_var("AICHAT_THEME", &arg) };
+        unsafe { std::env::set_var("CUBI_THEME", &arg) };
         if let Err(e) = self.update_config(|c| c.theme = Some(arg.clone())) {
             eprintln!(
                 "{} theme set in this session but not persisted: {}",
@@ -3659,7 +3715,7 @@ impl ChatCLI {
             println!(
                 "{} output style: {} (set with /output-style [{}])",
                 "ℹ".bright_blue(),
-                std::env::var("AICHAT_OUTPUT_STYLE")
+                std::env::var("CUBI_OUTPUT_STYLE")
                     .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string())
                     .bright_cyan(),
                 output_styles::VALID_STYLES.join("|")
@@ -3675,7 +3731,7 @@ impl ChatCLI {
             );
             return;
         }
-        unsafe { std::env::set_var("AICHAT_OUTPUT_STYLE", &arg) };
+        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", &arg) };
         if let Err(e) = self.update_config(|c| c.output_style = Some(arg.clone())) {
             eprintln!(
                 "{} style set in this session but not persisted: {}",
@@ -3733,12 +3789,12 @@ impl ChatCLI {
             "" => println!(
                 "{} vim mode: {} (toggle with /vim on|off; takes effect next session)",
                 "ℹ".bright_blue(),
-                std::env::var("AICHAT_VIM_MODE")
+                std::env::var("CUBI_VIM_MODE")
                     .unwrap_or_else(|_| "off".to_string())
                     .bright_cyan()
             ),
             "on" | "off" => {
-                unsafe { std::env::set_var("AICHAT_VIM_MODE", &arg) };
+                unsafe { std::env::set_var("CUBI_VIM_MODE", &arg) };
                 if let Err(e) = self.update_config(|c| c.vim_mode = Some(arg.clone())) {
                     eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
                 }
@@ -3880,10 +3936,10 @@ impl ChatCLI {
     fn handle_privacy_settings(&self, args: &str) {
         let arg = args.trim();
         if arg.is_empty() {
-            let telemetry = std::env::var("AICHAT_TELEMETRY").unwrap_or_else(|_| "off".to_string());
+            let telemetry = std::env::var("CUBI_TELEMETRY").unwrap_or_else(|_| "off".to_string());
             println!(
                 "\n{}\n  telemetry: {} (no remote analytics implemented yet)\n  \
-                 local data: ~/.ai-chat-cli/ (sessions, memdir, schedule, messages, triggers)\n  \
+                 local data: ~/.cubi/ (sessions, memdir, schedule, messages, triggers)\n  \
                  set with: /privacy-settings telemetry on|off\n",
                 "Privacy:".bright_yellow().bold(),
                 telemetry.bright_cyan()
@@ -3893,7 +3949,7 @@ impl ChatCLI {
         let parts: Vec<&str> = arg.split_whitespace().collect();
         match parts.as_slice() {
             ["telemetry", v] if matches!(*v, "on" | "off") => {
-                unsafe { std::env::set_var("AICHAT_TELEMETRY", *v) };
+                unsafe { std::env::set_var("CUBI_TELEMETRY", *v) };
                 println!("{} telemetry set to {}", "✓".bright_green(), v);
             }
             _ => eprintln!(
@@ -3989,14 +4045,14 @@ impl ChatCLI {
             args.trim().to_string()
         };
         let body = format!(
-            "## Symptom\n<!-- What was slow? -->\n\n## Environment\n- ai-chat-cli: v{}\n- os: {} ({})\n- model: {}\n",
+            "## Symptom\n<!-- What was slow? -->\n\n## Environment\n- cubi: v{}\n- os: {} ({})\n- model: {}\n",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.executor.get_model(),
         );
         let url = format!(
-            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=performance&title={}&body={}",
+            "https://github.com/peterchoi1014/cubi/issues/new?labels=performance&title={}&body={}",
             url_encode(&title),
             url_encode(&body),
         );
@@ -4047,16 +4103,16 @@ impl ChatCLI {
             "" => println!(
                 "{} debug-tool-call: {} (toggle with /debug-tool-call on|off)",
                 "ℹ".bright_blue(),
-                std::env::var("AICHAT_DEBUG_TOOL_CALL")
+                std::env::var("CUBI_DEBUG_TOOL_CALL")
                     .unwrap_or_else(|_| "off".to_string())
                     .bright_cyan()
             ),
             "on" => {
-                unsafe { std::env::set_var("AICHAT_DEBUG_TOOL_CALL", "on") };
+                unsafe { std::env::set_var("CUBI_DEBUG_TOOL_CALL", "on") };
                 println!("{} debug-tool-call ON", "✓".bright_green());
             }
             "off" => {
-                unsafe { std::env::remove_var("AICHAT_DEBUG_TOOL_CALL") };
+                unsafe { std::env::remove_var("CUBI_DEBUG_TOOL_CALL") };
                 println!("debug-tool-call OFF");
             }
             other => eprintln!(
@@ -4069,10 +4125,10 @@ impl ChatCLI {
 
     fn show_upgrade(&self) {
         println!(
-            "\n{}\n  cd ~/code/ai-chat-cli && git pull && cargo install --path . --locked\n  \
+            "\n{}\n  cd ~/code/cubi && git pull && cargo install --path . --locked\n  \
              or download a release binary from\n  \
-             https://github.com/peterchoi1014/ai-chat-cli/releases\n",
-            "Upgrade ai-chat-cli:".bright_yellow().bold()
+             https://github.com/peterchoi1014/cubi/releases\n",
+            "Upgrade cubi:".bright_yellow().bold()
         );
     }
 
@@ -4081,14 +4137,14 @@ impl ChatCLI {
             "\n{}\n  1. install Rust: https://rustup.rs/\n  \
              2. install Ollama: https://ollama.ai/\n  \
              3. `ollama pull llama3.2:1b`\n  \
-             4. `cargo install --path .` from a clone of\n     https://github.com/peterchoi1014/ai-chat-cli\n",
-            "Install ai-chat-cli:".bright_yellow().bold()
+             4. `cargo install --path .` from a clone of\n     https://github.com/peterchoi1014/cubi\n",
+            "Install cubi:".bright_yellow().bold()
         );
     }
 
     fn show_install_github_app(&self) {
         println!(
-            "{} ai-chat-cli does not ship a GitHub App. Use the GitHub CLI (`gh`) \
+            "{} cubi does not ship a GitHub App. Use the GitHub CLI (`gh`) \
              instead for PRs/issues; see /commit-push-pr and /pr_comments.",
             "ℹ".bright_blue()
         );
@@ -4096,7 +4152,7 @@ impl ChatCLI {
 
     fn show_install_slack_app(&self) {
         println!(
-            "{} No Slack integration is bundled. You can drive ai-chat-cli from \
+            "{} No Slack integration is bundled. You can drive cubi from \
              a Slack bot by piping prompts through `--batch` mode.",
             "ℹ".bright_blue()
         );
@@ -4106,7 +4162,7 @@ impl ChatCLI {
         // The Ollama client tracks retries per-call (no persistent state), so
         // "resetting" is informational. Clear the env-var override if set so
         // backoff returns to defaults.
-        unsafe { std::env::remove_var("AICHAT_RATE_LIMIT_BACKOFF_MS") };
+        unsafe { std::env::remove_var("CUBI_RATE_LIMIT_BACKOFF_MS") };
         println!(
             "{} Rate-limit / retry state cleared (Ollama retries are per-call).",
             "✓".bright_green()
@@ -4204,7 +4260,7 @@ impl ChatCLI {
             args.trim().to_string()
         };
         let url = format!(
-            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=feedback&title={}",
+            "https://github.com/peterchoi1014/cubi/issues/new?labels=feedback&title={}",
             url_encode(&title),
         );
         println!(
@@ -4218,15 +4274,15 @@ impl ChatCLI {
         println!(
             "\n{} v{}\n\n\
              - Plugin system: namespaced `/<plugin>:<command>` triggers\n   \
-               loaded from ~/.ai-chat-cli/plugins/<name>/commands/*.md\n\
+               loaded from ~/.cubi/plugins/<name>/commands/*.md\n\
              - Themable output styles: `/theme`, `/output-style`, `/color`,\n   \
-               and `/vim` now persist to ~/.ai-chat-cli/config.json\n\
+               and `/vim` now persist to ~/.cubi/config.json\n\
              - `prevent_sleep` built-in tool (caffeinate / systemd-inhibit /\n   \
                SetThreadExecutionState)\n\
-             - Opt-in telemetry: tool calls log to ~/.ai-chat-cli/telemetry.log\n\
+             - Opt-in telemetry: tool calls log to ~/.cubi/telemetry.log\n\
              - Tip-of-the-day at startup + on-demand via `/tip`\n\
-             - Admin policy overlay (~/.ai-chat-cli/policy.json,\n   \
-               /etc/ai-chat-cli/policy.json, $AICHAT_POLICY_FILE); inspect via `/policy`\n\
+             - Admin policy overlay (~/.cubi/policy.json,\n   \
+               /etc/cubi/policy.json, $CUBI_POLICY_FILE); inspect via `/policy`\n\
              - Git-backed cross-machine sync via `/settings-sync`\n\
              - File-mutation rollback on `/rewind` (edit_file / write_file)\n\
              - MCP prompts (`prompts/list` + `prompts/get`) via `/mcp-prompts`\n\
@@ -4264,11 +4320,7 @@ impl ChatCLI {
                 settings_sync::init(rest)
             }
             "push" => {
-                let msg = if rest.is_empty() {
-                    "ai-chat-cli: sync"
-                } else {
-                    rest
-                };
+                let msg = if rest.is_empty() { "cubi: sync" } else { rest };
                 settings_sync::push(msg)
             }
             "pull" => settings_sync::pull(),
@@ -4297,7 +4349,7 @@ impl ChatCLI {
             ),
             None => {
                 println!(
-                    "  {} No policy file. Drop JSON at /etc/ai-chat-cli/policy.json or \n     ~/.ai-chat-cli/policy.json to enforce one.",
+                    "  {} No policy file. Drop JSON at /etc/cubi/policy.json or \n     ~/.cubi/policy.json to enforce one.",
                     "ℹ".bright_blue()
                 );
                 println!();
@@ -4337,7 +4389,7 @@ impl ChatCLI {
     async fn show_mcp_prompts(&mut self, args: &str) {
         let Some(mcp) = self.mcp_manager.as_mut() else {
             println!(
-                "{} No MCP servers loaded (configure ~/.ai-chat-cli/mcp.json).",
+                "{} No MCP servers loaded (configure ~/.cubi/mcp.json).",
                 "ℹ".bright_blue()
             );
             return;
@@ -4606,7 +4658,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("ai-chat-cli-overwrite-{nanos}.txt"));
+        let path = std::env::temp_dir().join(format!("cubi-overwrite-{nanos}.txt"));
         std::fs::write(&path, "existing").unwrap();
 
         let p = path.to_str().unwrap();
@@ -4631,7 +4683,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("ai-chat-cli-missing-{nanos}.txt"));
+        let path = std::env::temp_dir().join(format!("cubi-missing-{nanos}.txt"));
         let p = path.to_str().unwrap();
         check_overwrite_allowed(p, false, "/export").expect("missing file is fine");
     }
@@ -4658,7 +4710,7 @@ mod tests {
             .unwrap_or(Duration::from_secs(0))
             .as_nanos();
         std::env::temp_dir()
-            .join(format!("ai-chat-cli-{suffix}-{nanos}.json"))
+            .join(format!("cubi-{suffix}-{nanos}.json"))
             .display()
             .to_string()
     }
@@ -4668,8 +4720,8 @@ mod tests {
         let _guard = env_lock().lock().expect("lock should not be poisoned");
         let oauth_path = temp_oauth_path("oauth");
         unsafe {
-            std::env::set_var("AICHAT_OAUTH_FILE", &oauth_path);
-            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+            std::env::set_var("CUBI_OAUTH_FILE", &oauth_path);
+            std::env::remove_var("CUBI_GITHUB_API_KEY");
         }
 
         let cli = new_test_cli();
@@ -4682,19 +4734,19 @@ mod tests {
         assert_eq!(token.access_token, "token123");
         assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
         assert_eq!(
-            std::env::var("AICHAT_GITHUB_API_KEY").ok().as_deref(),
+            std::env::var("CUBI_GITHUB_API_KEY").ok().as_deref(),
             Some("token123")
         );
 
         cli.handle_logout("github");
         let after_logout = oauth::OAuthStore::load();
         assert!(after_logout.get_provider("github").is_none());
-        assert!(std::env::var("AICHAT_GITHUB_API_KEY").is_err());
+        assert!(std::env::var("CUBI_GITHUB_API_KEY").is_err());
 
         let _ = std::fs::remove_file(&oauth_path);
         unsafe {
-            std::env::remove_var("AICHAT_OAUTH_FILE");
-            std::env::remove_var("AICHAT_GITHUB_API_KEY");
+            std::env::remove_var("CUBI_OAUTH_FILE");
+            std::env::remove_var("CUBI_GITHUB_API_KEY");
         }
     }
 }

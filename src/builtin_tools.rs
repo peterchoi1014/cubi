@@ -1100,7 +1100,7 @@ impl BuiltinToolRegistry {
         // Sentinel includes a random suffix so a model echoing the literal
         // string can't trick us into ending early. UUIDs are cheap and we
         // already depend on the crate.
-        let sentinel = format!("__AICHAT_REPL_DONE_{}__", uuid::Uuid::new_v4().simple());
+        let sentinel = format!("__CUBI_REPL_DONE_{}__", uuid::Uuid::new_v4().simple());
 
         let mut child = TokioCommand::new("bash")
             .arg("--noprofile")
@@ -1697,7 +1697,7 @@ impl BuiltinToolRegistry {
     fn schedule_tool() -> BuiltinTool {
         BuiltinTool {
             name: "schedule".to_string(),
-            description: "Manage persistent scheduled triggers stored in `~/.ai-chat-cli/schedule.json`. Actions: `list`, `add` (with `name`, `when` cron-like string, and `command`), `remove` (by `name`). The CLI itself does not run them — an external runner (cron, systemd timer, launchd) reads the file.".to_string(),
+            description: "Manage persistent scheduled triggers stored in `~/.cubi/schedule.json`. Actions: `list`, `add` (with `name`, `when` cron-like string, and `command`), `remove` (by `name`). The CLI itself does not run them — an external runner (cron, systemd timer, launchd) reads the file.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1719,7 +1719,7 @@ impl BuiltinToolRegistry {
             Some(p) => p,
             None => {
                 return Ok(ToolResult::error(
-                    "Could not resolve ~/.ai-chat-cli/schedule.json".to_string(),
+                    "Could not resolve ~/.cubi/schedule.json".to_string(),
                 ));
             }
         };
@@ -1844,7 +1844,7 @@ impl BuiltinToolRegistry {
     fn send_message_tool() -> BuiltinTool {
         BuiltinTool {
             name: "send_message".to_string(),
-            description: "Append a JSON message to another agent's mailbox at `~/.ai-chat-cli/messages/<recipient>.json`. The recipient reads with `recv_messages`.".to_string(),
+            description: "Append a JSON message to another agent's mailbox at `~/.cubi/messages/<recipient>.json`. The recipient reads with `recv_messages`.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1870,7 +1870,7 @@ impl BuiltinToolRegistry {
             Some(p) => p,
             None => {
                 return Ok(ToolResult::error(
-                    "Could not resolve ~/.ai-chat-cli/messages".to_string(),
+                    "Could not resolve ~/.cubi/messages".to_string(),
                 ));
             }
         };
@@ -1891,7 +1891,7 @@ impl BuiltinToolRegistry {
     fn recv_messages_tool() -> BuiltinTool {
         BuiltinTool {
             name: "recv_messages".to_string(),
-            description: "Read pending messages for the given recipient from `~/.ai-chat-cli/messages/<recipient>.json`. With `drain: true`, the mailbox is emptied after reading.".to_string(),
+            description: "Read pending messages for the given recipient from `~/.cubi/messages/<recipient>.json`. With `drain: true`, the mailbox is emptied after reading.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1917,7 +1917,7 @@ impl BuiltinToolRegistry {
             Some(p) => p,
             None => {
                 return Ok(ToolResult::error(
-                    "Could not resolve ~/.ai-chat-cli/messages".to_string(),
+                    "Could not resolve ~/.cubi/messages".to_string(),
                 ));
             }
         };
@@ -1938,7 +1938,7 @@ impl BuiltinToolRegistry {
     fn remote_trigger_tool() -> BuiltinTool {
         BuiltinTool {
             name: "remote_trigger".to_string(),
-            description: "Write a trigger file to `~/.ai-chat-cli/triggers/<name>.json` containing a payload and timestamp. Other processes poll the directory to fire on the trigger.".to_string(),
+            description: "Write a trigger file to `~/.cubi/triggers/<name>.json` containing a payload and timestamp. Other processes poll the directory to fire on the trigger.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1962,7 +1962,7 @@ impl BuiltinToolRegistry {
             Some(p) => p,
             None => {
                 return Ok(ToolResult::error(
-                    "Could not resolve ~/.ai-chat-cli/triggers".to_string(),
+                    "Could not resolve ~/.cubi/triggers".to_string(),
                 ));
             }
         };
@@ -1992,7 +1992,7 @@ impl BuiltinToolRegistry {
     }
 
     fn execute_notify(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let title = args["title"].as_str().unwrap_or("ai-chat-cli").to_string();
+        let title = args["title"].as_str().unwrap_or("cubi").to_string();
         let message = args["message"]
             .as_str()
             .context("Missing 'message' parameter")?
@@ -2068,8 +2068,8 @@ impl BuiltinToolRegistry {
             let mut c = Command::new("systemd-inhibit");
             c.args([
                 "--what=idle:sleep",
-                "--who=ai-chat-cli",
-                "--why=ai-chat-cli prevent_sleep",
+                "--who=cubi",
+                "--why=cubi prevent_sleep",
                 "--mode=block",
                 "sleep",
                 &capped.to_string(),
@@ -2125,13 +2125,13 @@ fn host_shell() -> (&'static str, &'static str) {
 }
 
 fn schedule_path() -> Option<std::path::PathBuf> {
-    Some(app_home_dir()?.join(".ai-chat-cli").join("schedule.json"))
+    Some(app_home_dir()?.join(".cubi").join("schedule.json"))
 }
 
 fn messages_path(recipient: &str) -> Option<std::path::PathBuf> {
     Some(
         app_home_dir()?
-            .join(".ai-chat-cli")
+            .join(".cubi")
             .join("messages")
             .join(format!("{recipient}.json")),
     )
@@ -2140,7 +2140,7 @@ fn messages_path(recipient: &str) -> Option<std::path::PathBuf> {
 fn triggers_path(name: &str) -> Option<std::path::PathBuf> {
     Some(
         app_home_dir()?
-            .join(".ai-chat-cli")
+            .join(".cubi")
             .join("triggers")
             .join(format!("{name}.json")),
     )
@@ -2185,8 +2185,8 @@ fn app_home_dir() -> Option<PathBuf> {
         Some(
             TEST_HOME
                 .get_or_init(|| {
-                    let path = std::env::temp_dir()
-                        .join(format!("ai-chat-cli-test-home-{}", std::process::id()));
+                    let path =
+                        std::env::temp_dir().join(format!("cubi-test-home-{}", std::process::id()));
                     let _ = fs::create_dir_all(&path);
                     path
                 })
@@ -2623,7 +2623,7 @@ async fn http_get_text(url: &str, max_bytes: usize) -> Result<String> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent("ai-chat-cli/0.1")
+        .user_agent("cubi/0.1")
         .build()?;
     let resp = client.get(url).send().await?;
     let status = resp.status();
@@ -2873,7 +2873,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("ai-chat-cli-tool-{label}-{nanos}"));
+        let p = std::env::temp_dir().join(format!("cubi-tool-{label}-{nanos}"));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -3099,7 +3099,7 @@ mod tests {
 
     #[tokio::test]
     async fn worktree_list_runs_in_a_git_repo() {
-        // We're inside the ai-chat-cli repo, so `git worktree list` works.
+        // We're inside the cubi repo, so `git worktree list` works.
         let dir = std::env::current_dir().unwrap();
         let registry = registry_with_trust(&dir, false);
         let result = registry

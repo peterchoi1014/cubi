@@ -17,8 +17,8 @@
 //!
 //! ## User-defined Markdown commands
 //!
-//! Users can place `.md` files in `~/.ai-chat-cli/commands/` (or
-//! `.ai-chat-cli/commands/` in the project root). Each file defines a
+//! Users can place `.md` files in `~/.cubi/commands/` (or
+//! `.cubi/commands/` in the project root). Each file defines a
 //! custom slash command whose name is the filename stem (e.g.
 //! `explain.md` → `/explain`). When invoked, the Markdown content is
 //! injected as a system message for the next turn.
@@ -113,15 +113,15 @@ pub fn load_user_commands() -> Vec<UserCommand> {
     let mut commands: Vec<UserCommand> = Vec::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Project-local: .ai-chat-cli/commands/ in cwd
+    // Project-local: .cubi/commands/ in cwd
     if let Ok(cwd) = std::env::current_dir() {
-        let local_dir = cwd.join(".ai-chat-cli").join("commands");
+        let local_dir = cwd.join(".cubi").join("commands");
         load_commands_from_dir(&local_dir, &mut commands, &mut seen_names);
     }
 
-    // Global: ~/.ai-chat-cli/commands/
+    // Global: ~/.cubi/commands/
     if let Some(home) = dirs::home_dir() {
-        let global_dir = home.join(".ai-chat-cli").join("commands");
+        let global_dir = home.join(".cubi").join("commands");
         load_commands_from_dir(&global_dir, &mut commands, &mut seen_names);
     }
 
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn load_user_commands_returns_empty_when_no_dir() {
-        // In a test environment there's no ~/.ai-chat-cli/commands/ typically
+        // In a test environment there's no ~/.cubi/commands/ typically
         let cmds = load_user_commands();
         // Should not panic, just return whatever is available (likely empty)
         let _ = cmds;

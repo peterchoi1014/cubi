@@ -34,7 +34,7 @@ pub struct McpServerConfig {
     pub headers: Option<HashMap<String, String>>,
 
     /// Optional OAuth provider key used to inject an Authorization header
-    /// from ~/.ai-chat-cli/oauth.json for HTTP MCP servers.
+    /// from ~/.cubi/oauth.json for HTTP MCP servers.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "oauthProvider")]
     pub oauth_provider: Option<String>,
@@ -89,7 +89,7 @@ impl McpConfig {
     pub fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Could not find home directory")?;
 
-        Ok(home.join(".ai-chat-cli").join("mcp.json"))
+        Ok(home.join(".cubi").join("mcp.json"))
     }
 
     // Allow dead_code as these may be used for future CLI commands
