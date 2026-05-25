@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod compat;
 mod completer;
+mod completions;
 mod executor;
 mod file_mentions;
 mod file_rollback;
@@ -93,6 +94,7 @@ async fn main() -> Result<()> {
                  USAGE:\n  cubi                    Start the interactive chat REPL\n  \
                  cubi --resume [<id>]    Resume a prior chat (most recent in this\n  \
                                          directory if no id is given)\n  \
+                 cubi completions <shell> Print a completion script (bash, zsh, fish)\n  \
                  cubi --version          Print version and exit\n  \
                  cubi --help             Print this help and exit\n\n\
                  OUTPUT FLAGS (can be combined with any command):\n  \
@@ -107,6 +109,21 @@ async fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
+        }
+        Some("completions") => {
+            match residual.get(1).and_then(|a| a.to_str()) {
+                Some(shell) if residual.len() == 2 => {
+                    if let Some(script) = completions::script(shell) {
+                        print!("{script}");
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            eprintln!(
+                "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
+            );
+            std::process::exit(2);
         }
         Some("--resume") | Some("-r") | Some("resume") => {
             // Empty string means "latest"; an explicit id selects it.

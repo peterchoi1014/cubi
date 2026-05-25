@@ -200,6 +200,7 @@ You:
 ```
 cubi                    Start the interactive chat REPL
 cubi --resume [<id>]    Resume a prior chat (latest in cwd if no id given)
+cubi completions <shell> Print a completion script (bash, zsh, fish)
 cubi --version          Print version and exit
 cubi --help             Print help and exit
 
@@ -214,6 +215,10 @@ The same toggles are reachable mid-session via `/stream on|off`,
 `/markdown on|off`, and `/stats-footer on|off`. Press **Ctrl-C** during an
 in-flight reply to cancel it and return to the prompt; the unanswered user
 message is rolled back so history stays clean.
+
+Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
+or `cubi completions fish`, then install the printed script using your shell's
+normal completion setup.
 
 ### Basic Chat
 
