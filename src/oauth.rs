@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -52,23 +56,68 @@ impl OAuthStore {
             return Self::default();
         };
         match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to parse OAuth store {}: {}",
+                        path.display(),
+                        err
+                    );
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to load OAuth store from {}: {}",
+                    path.display(),
+                    err
+                );
+                Self::default()
+            }
         }
     }
 
     pub fn save(&self) -> Result<()> {
         let path = Self::storage_path().context("Could not resolve OAuth storage path")?;
+        self.save_to_path(&path)
+    }
+
+    #[cfg(test)]
+    fn load_from_path(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("Failed to parse {}", path.display()))
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("Failed to open {} for writing", path.display()))?;
+            file.write_all(json.as_bytes())
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to sync {}", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+                format!("Failed to set secure permissions on {}", path.display())
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
         }
         Ok(())
     }
@@ -183,6 +232,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parse_login_args_basic() {
@@ -271,5 +321,37 @@ mod tests {
         };
         assert!(expired.is_expired());
         assert!(!fresh.is_expired());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "ai-chat-cli-oauth-{}.json",
+            now_unix().saturating_mul(1_000_000_000)
+                + SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .subsec_nanos() as u64
+        ));
+
+        let mut store = OAuthStore::default();
+        let args = LoginArgs {
+            provider: "GitHub".to_string(),
+            access_token: "token123".to_string(),
+            refresh_token: Some("refresh123".to_string()),
+            expires_in_seconds: Some(120),
+        };
+        store.upsert_login(&args);
+        store.save_to_path(&path).expect("save should succeed");
+
+        let loaded = OAuthStore::load_from_path(&path).expect("load should succeed");
+        let token = loaded
+            .get_provider("github")
+            .expect("provider token should exist");
+        assert_eq!(token.access_token, "token123");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
+        assert!(token.expires_at_unix.is_some());
+
+        let _ = fs::remove_file(path);
     }
 }

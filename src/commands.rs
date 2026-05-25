@@ -583,7 +583,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/logout",
         usage: "/logout [provider]",
-        help: "Forget the stored API key for a provider",
+        help: "Forget a provider API key for this process and remove its persisted OAuth token",
         cmd: Cmd::Logout,
     },
     SlashCommandSpec {
