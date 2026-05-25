@@ -57,8 +57,39 @@ const DEFAULT_MODEL: &str = "qwen3:4b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Lightweight argv handling. We don't pull in clap because the chat
+    // loop has no flags of its own; this just makes `cubi --version` and
+    // `cubi --help` Do What People Expect instead of dropping them into
+    // the REPL. Use `args_os()` so non-UTF-8 argv can't panic the binary.
+    if let Some(arg) = std::env::args_os().nth(1) {
+        match arg.to_str() {
+            Some("--version") | Some("-V") | Some("version") => {
+                println!("cubi {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            Some("--help") | Some("-h") | Some("help") => {
+                println!(
+                    "cubi {} — a pocket-sized AI for your shell\n\n\
+                     USAGE:\n  cubi              Start the interactive chat REPL\n  \
+                     cubi --version     Print version and exit\n  \
+                     cubi --help        Print this help and exit\n\n\
+                     Once inside the REPL, type /help to list slash commands.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            _ => {
+                eprintln!(
+                    "cubi: unrecognized argument {:?}. Run `cubi --help` for usage.",
+                    arg
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
-    // to their new CUBI_* names and rename ~/.cubi/ → ~/.cubi/
+    // to their new CUBI_* names and rename ~/.ai-chat-cli/ → ~/.cubi/
     // exactly once. Both no-op if there's nothing to migrate.
     compat::promote_legacy_env();
     compat::migrate_config_dir();
