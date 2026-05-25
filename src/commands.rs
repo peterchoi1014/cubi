@@ -746,6 +746,10 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
 ///   `/help`" hint.
 /// * Both `/exit` and `/quit` are accepted as an exit signal (alias kept for
 ///   backward compatibility, intentionally undocumented in `/help`).
+/// * If `head` doesn't match a command exactly, the parser falls back to
+///   unique-prefix matching (e.g. `/q` -> `/quit`, `/he` -> `/help`).
+///   Ambiguous prefixes return `None` so the caller can show the standard
+///   "Unknown command" hint rather than silently picking one.
 pub fn parse(input: &str) -> Option<(Cmd, &str)> {
     let input = input.trim();
     let (head, rest) = match input.find(char::is_whitespace) {
@@ -758,8 +762,29 @@ pub fn parse(input: &str) -> Option<(Cmd, &str)> {
         return Some((Cmd::Quit, rest));
     }
 
-    let spec = COMMANDS.iter().find(|s| s.name == head)?;
-    Some((spec.cmd, rest))
+    if let Some(spec) = COMMANDS.iter().find(|s| s.name == head) {
+        return Some((spec.cmd, rest));
+    }
+
+    // Prefix fallback: accept any unambiguous `/xy...` prefix. Skip the
+    // leading `/` so a typed `/q` matches `/quit` even though it isn't a
+    // prefix of the literal string `/quit` minus its slash. Require at
+    // least one non-slash char so a bare `/` doesn't match everything.
+    let typed = head.strip_prefix('/')?;
+    if typed.is_empty() {
+        return None;
+    }
+    let mut matches = COMMANDS.iter().filter(|s| {
+        s.name
+            .strip_prefix('/')
+            .is_some_and(|n| n.starts_with(typed))
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        // More than one candidate — ambiguous, refuse to guess.
+        return None;
+    }
+    Some((first.cmd, rest))
 }
 
 #[cfg(test)]
@@ -825,6 +850,30 @@ mod tests {
     fn parse_exit_aliases_quit() {
         let (cmd, _) = parse("/exit").expect("alias works");
         assert_eq!(cmd, Cmd::Quit);
+    }
+
+    #[test]
+    fn parse_unique_prefix_resolves() {
+        // `/q` is unambiguous — only `/quit` matches.
+        let (cmd, args) = parse("/q").expect("unique prefix matches");
+        assert_eq!(cmd, Cmd::Quit);
+        assert_eq!(args, "");
+        // Prefix with args still routes correctly.
+        let (cmd, args) = parse("/qu  foo").expect("prefix with args matches");
+        assert_eq!(cmd, Cmd::Quit);
+        assert_eq!(args, "foo");
+    }
+
+    #[test]
+    fn parse_ambiguous_prefix_returns_none() {
+        // `/re` matches /release, /reload, /reset, /resume, /review,
+        // /rewind — refuse to guess.
+        assert!(parse("/re").is_none());
+    }
+
+    #[test]
+    fn parse_bare_slash_returns_none() {
+        assert!(parse("/").is_none());
     }
 
     #[test]

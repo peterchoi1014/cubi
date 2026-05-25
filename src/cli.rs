@@ -229,6 +229,18 @@ impl ChatCLI {
         // Fire Stop hooks.
         self.hooks.fire_stop();
 
+        // Leave the user with a clear hint on how to bring this chat back.
+        // Only print when there's actually something saved on disk — a
+        // brand-new chat that exited before its first assistant turn has
+        // no `current_session` and nothing to resume.
+        if let Some(session) = &self.current_session {
+            println!(
+                "\n{} resume this chat with: {}",
+                "↩".bright_cyan(),
+                format!("cubi  →  /resume {}", session.id).bright_cyan()
+            );
+        }
+
         Ok(())
     }
 
