@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command as TokioCommand};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
 use crate::permissions::Permissions;
@@ -64,6 +69,31 @@ pub struct BuiltinToolRegistry {
     /// response to `/plan`; the atomic + `Arc` lets the registry observe
     /// changes without taking a lock on every tool call.
     plan_mode: Arc<AtomicBool>,
+    /// Long-lived shell sessions owned by the REPL tool. Keyed by
+    /// caller-supplied session id (the model picks a stable string and
+    /// reuses it across `repl_eval` calls). Wrapped in a tokio
+    /// `AsyncMutex` so it can be held across the awaits needed to read
+    /// from the child process.
+    repls: Arc<AsyncMutex<HashMap<String, ReplSession>>>,
+}
+
+/// One long-lived REPL backed by `bash -i`. We use a sentinel marker to
+/// know when each `repl_eval` has finished — bash never sends EOF on its
+/// own and reading "until idle" is racy. The marker is unique per session
+/// so concurrent reads from different sessions can't be confused.
+struct ReplSession {
+    stdin: ChildStdin,
+    /// Captures stdout *and* stderr (the child is spawned with stderr
+    /// redirected to stdout) one line at a time. The reader task ends
+    /// when the child exits.
+    reader: BufReader<tokio::process::ChildStdout>,
+    /// Sentinel suffix used to identify the end of one eval's output.
+    /// We prepend a random component on `repl_start` so a model that
+    /// echoes the sentinel literally can't fool us into ending early.
+    sentinel: String,
+    /// Kept alive so the child isn't reaped while the session is open.
+    /// The wait happens implicitly when the session is dropped.
+    _child: Child,
 }
 
 impl BuiltinToolRegistry {
@@ -80,12 +110,16 @@ impl BuiltinToolRegistry {
             Self::worktree_tool(),
             Self::web_fetch_tool(),
             Self::web_search_tool(),
+            Self::repl_start_tool(),
+            Self::repl_eval_tool(),
+            Self::repl_close_tool(),
         ];
 
         Self {
             tools,
             permissions,
             plan_mode,
+            repls: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -114,6 +148,9 @@ impl BuiltinToolRegistry {
             "worktree" => self.execute_worktree(args),
             "web_fetch" => self.execute_web_fetch(args).await,
             "web_search" => self.execute_web_search(args).await,
+            "repl_start" => self.execute_repl_start(args).await,
+            "repl_eval" => self.execute_repl_eval(args).await,
+            "repl_close" => self.execute_repl_close(args).await,
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -874,6 +911,276 @@ impl BuiltinToolRegistry {
         }
         None
     }
+
+    // ---- REPL tool (long-lived bash session) ----
+    //
+    // Each session is keyed by a caller-supplied id (the model picks a
+    // stable string and reuses it across `repl_eval` calls). Output is
+    // delimited by a per-session sentinel echoed after every eval so we
+    // can tell where one command's output ends. Inherits the same
+    // plan-mode + cwd-trust gate as `bash` — a REPL is just a long-lived
+    // shell session.
+
+    fn repl_start_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "repl_start".to_string(),
+            description: "Start a long-lived bash REPL session. State (cwd, env vars, shell \
+                          functions, background processes) persists across `repl_eval` calls \
+                          using the same `session_id`. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Caller-chosen stable id. Reuse the same id on subsequent `repl_eval` calls."
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        }
+    }
+
+    fn repl_eval_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "repl_eval".to_string(),
+            description: "Run shell code in an existing REPL session and return its captured \
+                          stdout+stderr plus the exit code of the last command. Multi-line \
+                          input is supported. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Id from a previous `repl_start` call"
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Shell code to run"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Per-eval timeout in seconds (default 30)",
+                        "default": 30
+                    }
+                },
+                "required": ["session_id", "code"]
+            }),
+        }
+    }
+
+    fn repl_close_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "repl_close".to_string(),
+            description: "Terminate a REPL session and release its resources.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": ["session_id"]
+            }),
+        }
+    }
+
+    async fn execute_repl_start(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?
+            .to_string();
+        if let Some(err) = self.repl_preflight("repl_start") {
+            return Ok(err);
+        }
+
+        let mut sessions = self.repls.lock().await;
+        if sessions.contains_key(&session_id) {
+            return Ok(ToolResult::error(format!(
+                "REPL session '{session_id}' already exists. Use a different id or call `repl_close` first."
+            )));
+        }
+
+        // Sentinel includes a random suffix so a model echoing the literal
+        // string can't trick us into ending early. UUIDs are cheap and we
+        // already depend on the crate.
+        let sentinel = format!("__AICHAT_REPL_DONE_{}__", uuid::Uuid::new_v4().simple());
+
+        let mut child = TokioCommand::new("bash")
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Merge stderr into stdout so the model sees errors in-band
+            // without us having to read two streams concurrently.
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn bash for REPL")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .context("bash spawned without stdin pipe")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("bash spawned without stdout pipe")?;
+        // Forward stderr by spawning a task that drains it. Simpler than
+        // juggling a second reader in the eval loop.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = String::new();
+                // Best-effort drain; errors are ignored — when bash exits the
+                // stream closes and the loop terminates.
+                while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
+                    buf.clear();
+                }
+            });
+        }
+
+        let reader = BufReader::new(stdout);
+        sessions.insert(
+            session_id.clone(),
+            ReplSession {
+                stdin,
+                reader,
+                sentinel,
+                _child: child,
+            },
+        );
+
+        Ok(ToolResult::success(format!(
+            "REPL session '{session_id}' started (bash)."
+        )))
+    }
+
+    async fn execute_repl_eval(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?
+            .to_string();
+        let code = args["code"].as_str().context("Missing 'code' parameter")?;
+        let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
+
+        if let Some(err) = self.repl_preflight("repl_eval") {
+            return Ok(err);
+        }
+
+        let mut sessions = self.repls.lock().await;
+        let session = match sessions.get_mut(&session_id) {
+            Some(s) => s,
+            None => {
+                return Ok(ToolResult::error(format!(
+                    "No REPL session '{session_id}'. Call `repl_start` first."
+                )));
+            }
+        };
+
+        // Write the code, then a sentinel echo that includes the exit
+        // status of the *last* command (`$?` after the user code). The
+        // sentinel is printed on its own line so line-based matching is
+        // unambiguous.
+        let payload = format!(
+            "{code}\nprintf '\\n{sentinel}:%s\\n' \"$?\"\n",
+            code = code,
+            sentinel = session.sentinel
+        );
+        if let Err(e) = session.stdin.write_all(payload.as_bytes()).await {
+            return Ok(ToolResult::error(format!(
+                "Failed to send to REPL '{session_id}': {e}"
+            )));
+        }
+        if let Err(e) = session.stdin.flush().await {
+            return Ok(ToolResult::error(format!(
+                "Failed to flush REPL '{session_id}': {e}"
+            )));
+        }
+
+        // Drain stdout until we see the sentinel marker (or hit the
+        // timeout). We strip the sentinel line out of what we return to
+        // the model so it never sees the marker.
+        let needle = format!("{}:", session.sentinel);
+        let read = async {
+            let mut out = String::new();
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match session.reader.read_line(&mut buf).await {
+                    Ok(0) => break Err(anyhow::anyhow!("REPL stdout closed")),
+                    Ok(_) => {
+                        if let Some(rest) = buf.trim_end().strip_prefix(&needle) {
+                            let exit_code = rest.parse::<i32>().unwrap_or(0);
+                            break Ok((out, exit_code));
+                        }
+                        out.push_str(&buf);
+                    }
+                    Err(e) => break Err(anyhow::anyhow!("REPL read error: {e}")),
+                }
+            }
+        };
+
+        match timeout(Duration::from_secs(timeout_secs), read).await {
+            Ok(Ok((out, exit_code))) => {
+                let mut text = if out.is_empty() {
+                    String::new()
+                } else {
+                    out.trim_end().to_string()
+                };
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("[exit {exit_code}]"));
+                if exit_code == 0 {
+                    Ok(ToolResult::success(text))
+                } else {
+                    Ok(ToolResult::error(text))
+                }
+            }
+            Ok(Err(e)) => Ok(ToolResult::error(format!("REPL error: {e}"))),
+            Err(_) => Ok(ToolResult::error(format!(
+                "REPL eval timed out after {timeout_secs}s. The session may now be in an \
+                 inconsistent state; call `repl_close` and start a fresh session."
+            ))),
+        }
+    }
+
+    async fn execute_repl_close(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?
+            .to_string();
+        let mut sessions = self.repls.lock().await;
+        if let Some(mut session) = sessions.remove(&session_id) {
+            // Best-effort exit: send `exit` to bash so it cleans up its
+            // own background jobs, then let the child be dropped (which
+            // closes the pipes and reaps the process).
+            let _ = session.stdin.write_all(b"exit\n").await;
+            let _ = session.stdin.flush().await;
+            Ok(ToolResult::success(format!(
+                "REPL session '{session_id}' closed."
+            )))
+        } else {
+            Ok(ToolResult::error(format!(
+                "No REPL session '{session_id}'."
+            )))
+        }
+    }
+
+    /// Shared plan-mode + cwd-trust check for the REPL tools.
+    fn repl_preflight(&self, tool: &str) -> Option<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Some(ToolResult::error(Self::plan_mode_refusal(tool)));
+        }
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => return Some(ToolResult::error(format!("Could not read cwd: {e}"))),
+        };
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            return Some(ToolResult::error(format!("{e}")));
+        }
+        None
+    }
 }
 
 /// Cap on the response body we'll buffer from a web tool. Keeps a single
@@ -1133,6 +1440,20 @@ mod tests {
     fn registry_with_trust(dir: &Path, plan_on: bool) -> BuiltinToolRegistry {
         let mut perms = Permissions::default();
         perms.trust_dir(dir).unwrap();
+        BuiltinToolRegistry::new(
+            Arc::new(Mutex::new(perms)),
+            Arc::new(AtomicBool::new(plan_on)),
+        )
+    }
+
+    /// Registry whose trust store also covers the current working
+    /// directory. Used by tests for tools whose preflight check inspects
+    /// the cwd (REPL, web tools) rather than a specific path argument.
+    fn registry_trusting_cwd(plan_on: bool) -> BuiltinToolRegistry {
+        let mut perms = Permissions::default();
+        perms
+            .trust_dir(&std::env::current_dir().unwrap())
+            .unwrap();
         BuiltinToolRegistry::new(
             Arc::new(Mutex::new(perms)),
             Arc::new(AtomicBool::new(plan_on)),
@@ -1402,6 +1723,98 @@ mod tests {
             .expect("call ok");
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("non-empty"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- REPL tool ----
+
+    #[tokio::test]
+    async fn repl_full_lifecycle_preserves_state_across_evals() {
+        let registry = registry_trusting_cwd(false);
+
+        // Start the session.
+        let start = registry
+            .execute("repl_start", json!({ "session_id": "s1" }))
+            .await
+            .expect("call ok");
+        assert!(start.is_error.is_none(), "got {:?}", start);
+
+        // First eval: set a variable.
+        let e1 = registry
+            .execute(
+                "repl_eval",
+                json!({ "session_id": "s1", "code": "FOO=bar", "timeout": 10 }),
+            )
+            .await
+            .expect("call ok");
+        assert!(e1.is_error.is_none(), "got {:?}", e1);
+        assert!(e1.content[0].text.contains("[exit 0]"));
+
+        // Second eval: read it back. State must have persisted.
+        let e2 = registry
+            .execute(
+                "repl_eval",
+                json!({ "session_id": "s1", "code": "echo \"V=$FOO\"", "timeout": 10 }),
+            )
+            .await
+            .expect("call ok");
+        assert!(e2.is_error.is_none(), "got {:?}", e2);
+        assert!(
+            e2.content[0].text.contains("V=bar"),
+            "expected `V=bar` in output, got: {}",
+            e2.content[0].text
+        );
+
+        // Third eval: nonzero exit must surface as a tool error.
+        let e3 = registry
+            .execute(
+                "repl_eval",
+                json!({ "session_id": "s1", "code": "false", "timeout": 10 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(e3.is_error, Some(true));
+        assert!(e3.content[0].text.contains("[exit 1]"));
+
+        // Close.
+        let close = registry
+            .execute("repl_close", json!({ "session_id": "s1" }))
+            .await
+            .expect("call ok");
+        assert!(close.is_error.is_none(), "got {:?}", close);
+
+        // Closing again must error.
+        let close2 = registry
+            .execute("repl_close", json!({ "session_id": "s1" }))
+            .await
+            .expect("call ok");
+        assert_eq!(close2.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn repl_eval_unknown_session_errors() {
+        let registry = registry_trusting_cwd(false);
+        let r = registry
+            .execute(
+                "repl_eval",
+                json!({ "session_id": "nope", "code": "echo hi" }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("No REPL session"));
+    }
+
+    #[tokio::test]
+    async fn repl_start_refused_in_plan_mode() {
+        let dir = unique_tmp("repl-plan");
+        let registry = registry_with_trust(&dir, true);
+        let r = registry
+            .execute("repl_start", json!({ "session_id": "x" }))
+            .await
+            .expect("call ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("plan mode is ON"));
         fs::remove_dir_all(&dir).ok();
     }
 }
