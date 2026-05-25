@@ -213,29 +213,28 @@ impl OllamaClient {
 
         // Local closure so the trailing-buffer case after the read loop can
         // reuse the same parse-and-dispatch logic without duplication.
-        let mut handle_line = |line: &str,
-                               content: &mut String,
-                               final_msg: &mut Option<Message>| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
-                Ok(c) => c,
-                Err(_) => return, // tolerate a malformed mid-stream line
+        let mut handle_line =
+            |line: &str, content: &mut String, final_msg: &mut Option<Message>| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
+                    Ok(c) => c,
+                    Err(_) => return, // tolerate a malformed mid-stream line
+                };
+                if !parsed.message.content.is_empty() {
+                    on_token(&parsed.message.content);
+                    content.push_str(&parsed.message.content);
+                }
+                if parsed.done {
+                    let mut m = parsed.message;
+                    // Replace fragmentary content with the accumulated text so
+                    // callers don't have to reconstruct it.
+                    m.content = content.clone();
+                    *final_msg = Some(m);
+                }
             };
-            if !parsed.message.content.is_empty() {
-                on_token(&parsed.message.content);
-                content.push_str(&parsed.message.content);
-            }
-            if parsed.done {
-                let mut m = parsed.message;
-                // Replace fragmentary content with the accumulated text so
-                // callers don't have to reconstruct it.
-                m.content = content.clone();
-                *final_msg = Some(m);
-            }
-        };
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
