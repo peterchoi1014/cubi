@@ -467,13 +467,19 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
+See [`ROADMAP.md`](ROADMAP.md) for the full plan (built-in tools, slash
+commands, subsystems, and implementation priorities derived from an
+architectural review of similar tools).
+
+Highlights still to come:
+
 - [ ] Streaming responses for real-time output
 - [ ] RAG (Retrieval Augmented Generation) support
 - [ ] Multi-modal support (images, audio)
 - [ ] Web interface
 - [ ] Distributed inference across remote workers
 - [ ] Conversation search and tagging
-- [ ] Export to different formats (Markdown, PDF)
+- [ ] Export to different formats (PDF)
 - [ ] Plugin system for extensibility
 
 ---
