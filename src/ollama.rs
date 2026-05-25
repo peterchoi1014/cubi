@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
@@ -112,6 +113,33 @@ pub struct OllamaClient {
     client: reqwest::Client,
 }
 
+async fn with_retry<F, Fut, T>(max_attempts: u32, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < max_attempts && is_network_error(&err) => {
+                sleep(Duration::from_secs(1_u64 << (attempt - 1))).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_network_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .map(|e| e.is_connect() || e.is_timeout() || e.is_request() || e.is_body())
+            .unwrap_or(false)
+    })
+}
+
 impl OllamaClient {
     pub fn new() -> Self {
         Self {
@@ -142,32 +170,36 @@ impl OllamaClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<Message> {
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: false,
-            tools,
-        };
+        with_retry(3, || {
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                stream: false,
+                tools: tools.clone(),
+            };
+            async move {
+                let response = self
+                    .client
+                    .post(format!("{}/api/chat", self.base_url))
+                    .json(&request)
+                    .send()
+                    .await
+                    .context("Failed to send request to Ollama")?;
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Ollama")?;
+                if !response.status().is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    anyhow::bail!("Ollama API error: {}", error_text);
+                }
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama API error: {}", error_text);
-        }
+                let chat_response: ChatResponse = response
+                    .json()
+                    .await
+                    .context("Failed to parse Ollama response")?;
 
-        let chat_response: ChatResponse = response
-            .json()
-            .await
-            .context("Failed to parse Ollama response")?;
-
-        Ok(chat_response.message)
+                Ok(chat_response.message)
+            }
+        })
+        .await
     }
 
     /// Streaming chat. `on_token` is invoked with each text fragment as it
@@ -191,25 +223,31 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: true,
-            tools,
-        };
+        let response = with_retry(3, || {
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                stream: true,
+                tools: tools.clone(),
+            };
+            async move {
+                let response = self
+                    .client
+                    .post(format!("{}/api/chat", self.base_url))
+                    .json(&request)
+                    .send()
+                    .await
+                    .context("Failed to send streaming request to Ollama")?;
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send streaming request to Ollama")?;
+                if !response.status().is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    anyhow::bail!("Ollama API error: {}", error_text);
+                }
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama API error: {}", error_text);
-        }
+                Ok(response)
+            }
+        })
+        .await?;
 
         // NDJSON: each chunk arrives as bytes; we split on newlines and
         // parse one JSON object per non-empty line. `reqwest`'s
