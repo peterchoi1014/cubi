@@ -113,6 +113,7 @@ impl BuiltinToolRegistry {
             Self::repl_start_tool(),
             Self::repl_eval_tool(),
             Self::repl_close_tool(),
+            Self::notebook_tool(),
         ];
 
         Self {
@@ -151,6 +152,7 @@ impl BuiltinToolRegistry {
             "repl_start" => self.execute_repl_start(args).await,
             "repl_eval" => self.execute_repl_eval(args).await,
             "repl_close" => self.execute_repl_close(args).await,
+            "notebook" => self.execute_notebook(args),
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -1181,6 +1183,321 @@ impl BuiltinToolRegistry {
         }
         None
     }
+
+    // ---- Notebook tool (.ipynb cell-level edits) ----
+    //
+    // Pure JSON manipulation — no Jupyter dependency. Supports list / read
+    // / insert / replace / delete on cell indices. Write actions go through
+    // the same plan-mode + path-trust gate as `write_file` since they
+    // mutate the disk.
+
+    fn notebook_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "notebook".to_string(),
+            description: "Cell-level edits to Jupyter notebooks (.ipynb). \
+                          Actions: 'list' (shows index/type/preview), 'read' (one cell), \
+                          'insert' (new cell at index), 'replace' (overwrite source), \
+                          'delete' (remove cell). Indices are 0-based. \
+                          Write actions are plan-mode-aware and path-trust gated."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "insert", "replace", "delete"]
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the .ipynb file"
+                    },
+                    "cell_index": {
+                        "type": "integer",
+                        "description": "0-based cell index (required for read/insert/replace/delete; for insert, the cell is inserted *at* this index)"
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "enum": ["code", "markdown", "raw"],
+                        "description": "Cell type for 'insert' (default 'code')"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Cell source for insert/replace"
+                    }
+                },
+                "required": ["action", "path"]
+            }),
+        }
+    }
+
+    fn execute_notebook(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let action = args["action"]
+            .as_str()
+            .context("Missing 'action' parameter")?;
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
+
+        let is_write = matches!(action, "insert" | "replace" | "delete");
+        if is_write && self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("notebook")));
+        }
+        if is_write
+            && let Err(e) = self
+                .permissions
+                .lock()
+                .unwrap()
+                .check_write(Path::new(path))
+        {
+            return Ok(ToolResult::error(format!("{}", e)));
+        }
+
+        let raw = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => return Ok(ToolResult::error(format!("Failed to read {path}: {e}"))),
+        };
+        let mut nb: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ToolResult::error(format!(
+                    "Failed to parse {path} as JSON notebook: {e}"
+                )));
+            }
+        };
+
+        // Ensure top-level shape matches nbformat v4. Older v3 notebooks
+        // are out of scope; we surface a clear error rather than silently
+        // corrupting them.
+        if nb["cells"].as_array().is_none() {
+            return Ok(ToolResult::error(format!(
+                "{path} is not an nbformat-4 notebook (no top-level `cells` array)"
+            )));
+        }
+
+        let result = match action {
+            "list" => notebook_list(&nb),
+            "read" => {
+                let idx = args["cell_index"]
+                    .as_u64()
+                    .context("Missing 'cell_index' parameter for `read`")?
+                    as usize;
+                notebook_read(&nb, idx)
+            }
+            "insert" => {
+                let idx = args["cell_index"]
+                    .as_u64()
+                    .context("Missing 'cell_index' parameter for `insert`")?
+                    as usize;
+                let cell_type = args["cell_type"].as_str().unwrap_or("code").to_string();
+                let source = args["source"]
+                    .as_str()
+                    .context("Missing 'source' parameter for `insert`")?
+                    .to_string();
+                let r = notebook_insert(&mut nb, idx, &cell_type, &source);
+                if r.is_ok() {
+                    notebook_save(&nb, path)?;
+                }
+                r
+            }
+            "replace" => {
+                let idx = args["cell_index"]
+                    .as_u64()
+                    .context("Missing 'cell_index' parameter for `replace`")?
+                    as usize;
+                let source = args["source"]
+                    .as_str()
+                    .context("Missing 'source' parameter for `replace`")?
+                    .to_string();
+                let r = notebook_replace(&mut nb, idx, &source);
+                if r.is_ok() {
+                    notebook_save(&nb, path)?;
+                }
+                r
+            }
+            "delete" => {
+                let idx = args["cell_index"]
+                    .as_u64()
+                    .context("Missing 'cell_index' parameter for `delete`")?
+                    as usize;
+                let r = notebook_delete(&mut nb, idx);
+                if r.is_ok() {
+                    notebook_save(&nb, path)?;
+                }
+                r
+            }
+            other => Err(anyhow::anyhow!("Unknown notebook action '{other}'")),
+        };
+
+        match result {
+            Ok(text) => Ok(ToolResult::success(text)),
+            Err(e) => Ok(ToolResult::error(format!("{e}"))),
+        }
+    }
+}
+
+// ---- Notebook helpers (free functions for ease of testing) ----
+
+/// Reads a cell's `source` field, which nbformat allows to be either a
+/// string or an array of strings. Returns the concatenation.
+fn notebook_cell_source(cell: &serde_json::Value) -> String {
+    match &cell["source"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Lists all cells with a short preview. Used by the `list` action.
+fn notebook_list(nb: &serde_json::Value) -> Result<String> {
+    let cells = nb["cells"]
+        .as_array()
+        .context("notebook missing `cells` array")?;
+    let mut out = String::new();
+    out.push_str(&format!("{} cell(s):\n", cells.len()));
+    for (i, cell) in cells.iter().enumerate() {
+        let cell_type = cell["cell_type"].as_str().unwrap_or("?");
+        let source = notebook_cell_source(cell);
+        let preview: String = source
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
+        out.push_str(&format!("  [{i}] {cell_type}: {preview}\n"));
+    }
+    Ok(out)
+}
+
+/// Returns the full source of one cell.
+fn notebook_read(nb: &serde_json::Value, idx: usize) -> Result<String> {
+    let cells = nb["cells"]
+        .as_array()
+        .context("notebook missing `cells` array")?;
+    let cell = cells
+        .get(idx)
+        .with_context(|| format!("cell index {idx} out of range (have {})", cells.len()))?;
+    let cell_type = cell["cell_type"].as_str().unwrap_or("?");
+    let source = notebook_cell_source(cell);
+    Ok(format!("[{idx}] {cell_type}\n---\n{source}"))
+}
+
+/// Builds a fresh cell. We always store `source` as an array of lines (with
+/// trailing newlines preserved on all but the last) to match the convention
+/// Jupyter itself writes.
+fn build_cell(cell_type: &str, source: &str) -> serde_json::Value {
+    let lines = split_source_for_nbformat(source);
+    match cell_type {
+        "code" => json!({
+            "cell_type": "code",
+            "metadata": {},
+            "source": lines,
+            "outputs": [],
+            "execution_count": serde_json::Value::Null,
+        }),
+        "markdown" => json!({
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": lines,
+        }),
+        "raw" => json!({
+            "cell_type": "raw",
+            "metadata": {},
+            "source": lines,
+        }),
+        _ => json!({
+            "cell_type": cell_type,
+            "metadata": {},
+            "source": lines,
+        }),
+    }
+}
+
+/// Splits a source blob into the per-line array nbformat expects. Each
+/// non-final line keeps its trailing `\n` so reassembly is lossless.
+fn split_source_for_nbformat(source: &str) -> Vec<String> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = source.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            out.push(source[start..=i].to_string());
+            start = i + 1;
+        }
+    }
+    if start < source.len() {
+        out.push(source[start..].to_string());
+    }
+    out
+}
+
+fn notebook_insert(
+    nb: &mut serde_json::Value,
+    idx: usize,
+    cell_type: &str,
+    source: &str,
+) -> Result<String> {
+    let cells = nb["cells"]
+        .as_array_mut()
+        .context("notebook missing `cells` array")?;
+    if idx > cells.len() {
+        anyhow::bail!(
+            "insert index {idx} out of range (notebook has {} cell(s); valid range 0..={})",
+            cells.len(),
+            cells.len()
+        );
+    }
+    cells.insert(idx, build_cell(cell_type, source));
+    Ok(format!(
+        "Inserted {cell_type} cell at index {idx} (notebook now has {} cell(s))",
+        cells.len()
+    ))
+}
+
+fn notebook_replace(nb: &mut serde_json::Value, idx: usize, source: &str) -> Result<String> {
+    let cells = nb["cells"]
+        .as_array_mut()
+        .context("notebook missing `cells` array")?;
+    let len = cells.len();
+    let cell = cells
+        .get_mut(idx)
+        .with_context(|| format!("cell index {idx} out of range (have {})", len))?;
+    cell["source"] = json!(split_source_for_nbformat(source));
+    // Reset output state when replacing a code cell so stale outputs from
+    // the prior version of the cell don't mislead the next reader.
+    if cell["cell_type"].as_str() == Some("code") {
+        cell["outputs"] = json!([]);
+        cell["execution_count"] = serde_json::Value::Null;
+    }
+    Ok(format!("Replaced cell {idx}"))
+}
+
+fn notebook_delete(nb: &mut serde_json::Value, idx: usize) -> Result<String> {
+    let cells = nb["cells"]
+        .as_array_mut()
+        .context("notebook missing `cells` array")?;
+    if idx >= cells.len() {
+        anyhow::bail!(
+            "delete index {idx} out of range (notebook has {} cell(s))",
+            cells.len()
+        );
+    }
+    cells.remove(idx);
+    Ok(format!(
+        "Deleted cell {idx} (notebook now has {} cell(s))",
+        cells.len()
+    ))
+}
+
+fn notebook_save(nb: &serde_json::Value, path: &str) -> Result<()> {
+    let s = serde_json::to_string_pretty(nb)?;
+    fs::write(path, s).with_context(|| format!("Failed to write {path}"))?;
+    Ok(())
 }
 
 /// Cap on the response body we'll buffer from a web tool. Keeps a single
@@ -1813,6 +2130,197 @@ mod tests {
             .execute("repl_start", json!({ "session_id": "x" }))
             .await
             .expect("call ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("plan mode is ON"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Notebook tool ----
+
+    fn empty_notebook() -> serde_json::Value {
+        json!({
+            "cells": [],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        })
+    }
+
+    fn write_notebook(dir: &Path, nb: &serde_json::Value) -> std::path::PathBuf {
+        let p = dir.join("nb.ipynb");
+        fs::write(&p, serde_json::to_string(nb).unwrap()).unwrap();
+        p
+    }
+
+    #[test]
+    fn split_source_preserves_newlines_on_intermediate_lines() {
+        assert_eq!(split_source_for_nbformat(""), Vec::<String>::new());
+        assert_eq!(
+            split_source_for_nbformat("a\nb\nc"),
+            vec!["a\n".to_string(), "b\n".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            split_source_for_nbformat("a\nb\n"),
+            vec!["a\n".to_string(), "b\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn notebook_cell_source_handles_string_and_array_forms() {
+        let s = json!({ "source": "hello" });
+        assert_eq!(notebook_cell_source(&s), "hello");
+        let a = json!({ "source": ["line 1\n", "line 2"] });
+        assert_eq!(notebook_cell_source(&a), "line 1\nline 2");
+    }
+
+    #[tokio::test]
+    async fn notebook_list_and_insert_and_read_roundtrip() {
+        let dir = unique_tmp("nb-list");
+        let registry = registry_with_trust(&dir, false);
+        let path = write_notebook(&dir, &empty_notebook());
+        let p = path.to_str().unwrap().to_string();
+
+        // List on an empty notebook.
+        let r0 = registry
+            .execute("notebook", json!({ "action": "list", "path": p }))
+            .await
+            .expect("ok");
+        assert!(r0.is_error.is_none(), "got {:?}", r0);
+        assert!(r0.content[0].text.starts_with("0 cell(s)"));
+
+        // Insert a markdown cell at the top.
+        let r1 = registry
+            .execute(
+                "notebook",
+                json!({
+                    "action": "insert",
+                    "path": p,
+                    "cell_index": 0,
+                    "cell_type": "markdown",
+                    "source": "# Title\nSubtitle",
+                }),
+            )
+            .await
+            .expect("ok");
+        assert!(r1.is_error.is_none(), "got {:?}", r1);
+
+        // Insert a code cell at the end.
+        let r2 = registry
+            .execute(
+                "notebook",
+                json!({
+                    "action": "insert",
+                    "path": p,
+                    "cell_index": 1,
+                    "cell_type": "code",
+                    "source": "print('hi')",
+                }),
+            )
+            .await
+            .expect("ok");
+        assert!(r2.is_error.is_none(), "got {:?}", r2);
+
+        // Read cell 0.
+        let r3 = registry
+            .execute(
+                "notebook",
+                json!({ "action": "read", "path": p, "cell_index": 0 }),
+            )
+            .await
+            .expect("ok");
+        assert!(r3.is_error.is_none());
+        assert!(r3.content[0].text.contains("markdown"));
+        assert!(r3.content[0].text.contains("Title"));
+
+        // List after inserts.
+        let r4 = registry
+            .execute("notebook", json!({ "action": "list", "path": p }))
+            .await
+            .expect("ok");
+        assert!(r4.content[0].text.starts_with("2 cell(s)"));
+        assert!(r4.content[0].text.contains("markdown"));
+        assert!(r4.content[0].text.contains("code"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn notebook_replace_resets_outputs_on_code_cells() {
+        let dir = unique_tmp("nb-replace");
+        let registry = registry_with_trust(&dir, false);
+        let mut nb = empty_notebook();
+        nb["cells"] = json!([{
+            "cell_type": "code",
+            "source": ["old"],
+            "metadata": {},
+            "outputs": [{"output_type": "stream", "name": "stdout", "text": ["stale"]}],
+            "execution_count": 7
+        }]);
+        let path = write_notebook(&dir, &nb);
+        let p = path.to_str().unwrap().to_string();
+
+        let r = registry
+            .execute(
+                "notebook",
+                json!({
+                    "action": "replace",
+                    "path": p,
+                    "cell_index": 0,
+                    "source": "new\nsource",
+                }),
+            )
+            .await
+            .expect("ok");
+        assert!(r.is_error.is_none(), "got {:?}", r);
+
+        // Reload the file and confirm the outputs were cleared.
+        let reloaded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reloaded["cells"][0]["outputs"].as_array().unwrap().len(), 0);
+        assert!(reloaded["cells"][0]["execution_count"].is_null());
+        let src = notebook_cell_source(&reloaded["cells"][0]);
+        assert_eq!(src, "new\nsource");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn notebook_delete_out_of_range_errors() {
+        let dir = unique_tmp("nb-delete");
+        let registry = registry_with_trust(&dir, false);
+        let path = write_notebook(&dir, &empty_notebook());
+        let p = path.to_str().unwrap().to_string();
+
+        let r = registry
+            .execute(
+                "notebook",
+                json!({ "action": "delete", "path": p, "cell_index": 5 }),
+            )
+            .await
+            .expect("ok");
+        assert_eq!(r.is_error, Some(true));
+        assert!(r.content[0].text.contains("out of range"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn notebook_write_refused_in_plan_mode() {
+        let dir = unique_tmp("nb-plan");
+        let registry = registry_with_trust(&dir, true);
+        let path = write_notebook(&dir, &empty_notebook());
+        let p = path.to_str().unwrap().to_string();
+        let r = registry
+            .execute(
+                "notebook",
+                json!({
+                    "action": "insert",
+                    "path": p,
+                    "cell_index": 0,
+                    "source": "x",
+                }),
+            )
+            .await
+            .expect("ok");
         assert_eq!(r.is_error, Some(true));
         assert!(r.content[0].text.contains("plan mode is ON"));
         fs::remove_dir_all(&dir).ok();
