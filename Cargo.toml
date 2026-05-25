@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 # For async timeout
-tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "signal"] }
 
 # HTTP client for Ollama API and MCP
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -47,4 +47,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 
 # Streaming responses from Ollama
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Markdown renderer for AI replies (non-streaming mode).
+termimad = "0.30"
 
