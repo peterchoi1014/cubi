@@ -16,6 +16,7 @@ use colored::*;
 use executor::AIExecutor;
 use mcp_manager::McpManager;
 use permissions::Permissions;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Default model used when the user has not configured one. Can be overridden
@@ -74,9 +75,12 @@ async fn main() -> Result<()> {
 
     // Initialize permissions (project trust store).
     let permissions = Arc::new(Mutex::new(Permissions::load()));
+    // Shared plan-mode flag, observed by built-in write/exec tools.
+    let plan_mode = Arc::new(AtomicBool::new(false));
 
     // Initialize MCP
-    let mcp_manager = match McpManager::new(Arc::clone(&permissions)).await {
+    let mcp_manager = match McpManager::new(Arc::clone(&permissions), Arc::clone(&plan_mode)).await
+    {
         Ok(manager) => {
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
@@ -108,7 +112,7 @@ async fn main() -> Result<()> {
     println!("{} AI executor ready", "✓".bright_green());
 
     // Create and run CLI
-    let mut cli = ChatCLI::new(executor, mcp_manager, permissions);
+    let mut cli = ChatCLI::new(executor, mcp_manager, permissions, plan_mode);
     let run_result = cli.run().await;
 
     // Shut down MCP cleanly while we still have an async context. The Drop

@@ -4,6 +4,7 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -58,10 +59,15 @@ pub struct BuiltinToolRegistry {
     /// Shared trust + sandbox state. Consulted by the write/exec tools
     /// (`bash`, `edit_file`, `write_file`) before they touch the disk.
     permissions: Arc<Mutex<Permissions>>,
+    /// Plan-mode flag. When set, write/exec tools refuse so the model can
+    /// reason about the change without applying it. The CLI flips this in
+    /// response to `/plan`; the atomic + `Arc` lets the registry observe
+    /// changes without taking a lock on every tool call.
+    plan_mode: Arc<AtomicBool>,
 }
 
 impl BuiltinToolRegistry {
-    pub fn new(permissions: Arc<Mutex<Permissions>>) -> Self {
+    pub fn new(permissions: Arc<Mutex<Permissions>>, plan_mode: Arc<AtomicBool>) -> Self {
         let tools = vec![
             Self::bash_tool(),
             Self::read_file_tool(),
@@ -73,7 +79,19 @@ impl BuiltinToolRegistry {
             Self::think_tool(),
         ];
 
-        Self { tools, permissions }
+        Self {
+            tools,
+            permissions,
+            plan_mode,
+        }
+    }
+
+    /// Returns a short, model-facing refusal message when plan mode is on.
+    fn plan_mode_refusal(tool: &str) -> String {
+        format!(
+            "Refusing `{tool}`: plan mode is ON. Produce a plan and ask the user to disable \
+             plan mode (`/plan`) before retrying."
+        )
     }
 
     pub fn list_tools(&self) -> &[BuiltinTool] {
@@ -294,6 +312,12 @@ impl BuiltinToolRegistry {
 
         let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
 
+        // Plan mode: refuse before doing anything else, so the model gets
+        // a clear signal that arbitrary execution is off the table.
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("bash")));
+        }
+
         // Permissions: the cwd must be a trusted project.
         let cwd = std::env::current_dir().context("Could not read cwd")?;
         if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
@@ -505,6 +529,10 @@ impl BuiltinToolRegistry {
             .as_str()
             .context("Missing 'new_text' parameter")?;
 
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("edit_file")));
+        }
+
         if let Err(e) = self
             .permissions
             .lock()
@@ -538,6 +566,10 @@ impl BuiltinToolRegistry {
             .as_str()
             .context("Missing 'content' parameter")?;
 
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("write_file")));
+        }
+
         if let Err(e) = self
             .permissions
             .lock()
@@ -570,5 +602,131 @@ impl BuiltinToolRegistry {
             "💭 Internal reasoning:\n{}",
             thoughts
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("ai-chat-cli-tool-{label}-{nanos}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn registry_with_trust(dir: &Path, plan_on: bool) -> BuiltinToolRegistry {
+        let mut perms = Permissions::default();
+        perms.trust_dir(dir).unwrap();
+        BuiltinToolRegistry::new(
+            Arc::new(Mutex::new(perms)),
+            Arc::new(AtomicBool::new(plan_on)),
+        )
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_write_file() {
+        let dir = unique_tmp("plan-write");
+        let registry = registry_with_trust(&dir, true);
+        let path = dir.join("plan.txt");
+
+        let result = registry
+            .execute(
+                "write_file",
+                json!({ "path": path.to_str().unwrap(), "content": "x" }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("plan mode is ON"));
+        assert!(!path.exists(), "plan mode must not create the file");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_edit_file() {
+        let dir = unique_tmp("plan-edit");
+        let path = dir.join("plan-edit.txt");
+        fs::write(&path, "hello").unwrap();
+        let registry = registry_with_trust(&dir, true);
+
+        let result = registry
+            .execute(
+                "edit_file",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_text": "hello",
+                    "new_text": "world",
+                }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("plan mode is ON"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_bash() {
+        let dir = unique_tmp("plan-bash");
+        // Trust the dir so the permissions gate would otherwise allow it.
+        let registry = registry_with_trust(&dir, true);
+        let result = registry
+            .execute("bash", json!({ "command": "echo hi", "timeout": 5 }))
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("plan mode is ON"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn permissions_block_write_outside_trusted_root() {
+        let trusted = unique_tmp("perm-trusted");
+        let outside = unique_tmp("perm-outside");
+        let registry = registry_with_trust(&trusted, false);
+
+        let target = outside.join("escape.txt");
+        let result = registry
+            .execute(
+                "write_file",
+                json!({ "path": target.to_str().unwrap(), "content": "nope" }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("outside any trusted root"));
+        assert!(!target.exists());
+
+        fs::remove_dir_all(&trusted).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn write_file_inside_trusted_root_succeeds() {
+        let dir = unique_tmp("perm-ok");
+        let registry = registry_with_trust(&dir, false);
+
+        let target = dir.join("ok.txt");
+        let result = registry
+            .execute(
+                "write_file",
+                json!({ "path": target.to_str().unwrap(), "content": "yay" }),
+            )
+            .await
+            .expect("call ok");
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "yay");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

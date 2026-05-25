@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::*;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::builtin_tools::BuiltinToolRegistry;
@@ -15,12 +16,15 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    pub async fn new(permissions: Arc<Mutex<Permissions>>) -> Result<Self> {
+    pub async fn new(
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let config = McpConfig::load()?;
         let mut manager = Self {
             clients: HashMap::new(),
             tools: HashMap::new(),
-            builtin_tools: BuiltinToolRegistry::new(permissions),
+            builtin_tools: BuiltinToolRegistry::new(permissions, plan_mode),
         };
 
         // Add built-in tools first

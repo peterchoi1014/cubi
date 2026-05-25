@@ -11,6 +11,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Sentinel prefix used to tag system messages that should only influence the
@@ -28,7 +29,9 @@ pub struct ChatCLI {
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
     todos: TodoList,
-    plan_mode: bool,
+    /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
+    /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
+    plan_mode: Arc<AtomicBool>,
     permissions: Arc<Mutex<Permissions>>,
 }
 
@@ -37,13 +40,14 @@ impl ChatCLI {
         executor: AIExecutor,
         mcp_manager: Option<McpManager>,
         permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
     ) -> Self {
         let mut cli = Self {
             executor,
             history: Vec::new(),
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
-            plan_mode: false,
+            plan_mode,
             permissions,
         };
 
@@ -102,7 +106,7 @@ impl ChatCLI {
         let mut rl = DefaultEditor::new()?;
 
         loop {
-            let prompt = if self.plan_mode {
+            let prompt = if self.plan_mode.load(Ordering::SeqCst) {
                 format!(
                     "{}{} ",
                     "[plan] ".bright_yellow().bold(),
@@ -222,7 +226,7 @@ impl ChatCLI {
                 self.show_mcp_tools();
             }
             Cmd::McpCall => {
-                if self.plan_mode {
+                if self.plan_mode.load(Ordering::SeqCst) {
                     println!(
                         "{} Plan mode is on — refusing /mcp-call. Toggle off with /plan first.",
                         "✗".bright_red()
@@ -595,13 +599,15 @@ impl ChatCLI {
         }
 
         // Reload configuration and reconnect
-        self.mcp_manager = match McpManager::new(Arc::clone(&self.permissions)).await {
-            Ok(manager) => Some(manager),
-            Err(e) => {
-                eprintln!("{} {}", "Warning:".bright_yellow(), e);
-                None
-            }
-        };
+        self.mcp_manager =
+            match McpManager::new(Arc::clone(&self.permissions), Arc::clone(&self.plan_mode)).await
+            {
+                Ok(manager) => Some(manager),
+                Err(e) => {
+                    eprintln!("{} {}", "Warning:".bright_yellow(), e);
+                    None
+                }
+            };
 
         Ok(())
     }
@@ -670,7 +676,7 @@ impl ChatCLI {
         println!(
             "  {}: {}",
             "plan mode".bright_cyan(),
-            if self.plan_mode {
+            if self.plan_mode.load(Ordering::SeqCst) {
                 "on".bright_green()
             } else {
                 "off".bright_black()
@@ -756,8 +762,13 @@ impl ChatCLI {
     }
 
     fn toggle_plan_mode(&mut self) {
-        self.plan_mode = !self.plan_mode;
-        if self.plan_mode {
+        // `fetch_xor(true)` toggles the flag and returns the *previous*
+        // value, so `now_on = !prev`. Using the atomic directly keeps the
+        // CLI and `BuiltinToolRegistry` views in sync without a separate
+        // mirror field that could drift.
+        let prev = self.plan_mode.fetch_xor(true, Ordering::SeqCst);
+        let now_on = !prev;
+        if now_on {
             self.history.push(Message {
                 role: "system".to_string(),
                 content: "SYSTEM: Plan mode is ON. Do not modify files or run \
