@@ -27,6 +27,7 @@ mod schemas;
 mod sessions;
 mod settings_sync;
 pub mod skills;
+mod spinner;
 mod telemetry;
 mod themes;
 mod tips;

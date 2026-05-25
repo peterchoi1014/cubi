@@ -1013,10 +1013,21 @@ impl ChatCLI {
             "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
         );
         println!("{}", "=".repeat(60).bright_cyan());
+        let essentials = [
+            ("/help", "show all commands"),
+            ("/quit", "exit the chat"),
+            ("/version", "print version info"),
+        ];
         println!("\n{}", "Commands:".bright_yellow().bold());
-        for spec in COMMANDS {
-            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
+        for (usage, help) in essentials {
+            println!("  {} - {}", usage.bright_cyan(), help);
         }
+        println!(
+            "  {} {} for the full list ({} commands available)",
+            "→ type".bright_black(),
+            "/help".bright_cyan(),
+            COMMANDS.len(),
+        );
         println!(
             "\n{}\n",
             "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white()
@@ -3065,6 +3076,7 @@ impl ChatCLI {
     /// are stripped, and the session is checkpointed.
     async fn agent_turn(&mut self) -> Result<()> {
         use std::io::Write;
+        use std::sync::atomic::Ordering;
 
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
@@ -3078,22 +3090,50 @@ impl ChatCLI {
         let mut any_output = false;
 
         for step in 0..MAX_AGENT_STEPS {
+            // Show a spinner while we wait for the model's first token.
+            // Label differs by step so the user can tell "first response"
+            // from "reacting to tool output".
+            let spinner_label = if step == 0 {
+                "thinking…"
+            } else {
+                "processing tool results…"
+            };
+            let spinner = crate::spinner::Spinner::start(spinner_label);
+            let stop_flag = spinner.stop_flag();
+
+            // Hold the spinner across the streaming call so the callback
+            // can clear it on the first token. We can't move `spinner`
+            // into the closure (we need to `.stop().await` after), so we
+            // share a `&Spinner` via Rc/Arc-like discipline: the closure
+            // only needs `clear_line` + `stop_flag`.
+            let spinner_ref = &spinner;
+
             // Only print the "AI:" prefix once per user turn — multi-step
-            // turns continue inline below the previous tool block.
-            if step == 0 {
-                print!("{} ", "AI:".bright_blue().bold());
-                let _ = std::io::stdout().flush();
-            }
+            // turns continue inline below the previous tool block. We
+            // defer the print until the first streamed token so the
+            // spinner has full ownership of the status line.
+            let mut printed_prefix = step > 0;
 
             let mut got_token = false;
             let msg = self
                 .executor
                 .chat_stream(self.history.clone(), tools.clone(), |tok| {
+                    if !got_token {
+                        // First token: retire the spinner and lay down
+                        // the "AI:" prefix exactly once.
+                        stop_flag.store(true, Ordering::SeqCst);
+                        spinner_ref.clear_line();
+                        if !printed_prefix {
+                            print!("{} ", "AI:".bright_blue().bold());
+                            printed_prefix = true;
+                        }
+                    }
                     print!("{}", tok.bright_white());
                     let _ = std::io::stdout().flush();
                     got_token = true;
                 })
                 .await?;
+            spinner.stop().await;
             if got_token {
                 any_output = true;
             }
