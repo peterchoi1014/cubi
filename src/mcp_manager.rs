@@ -164,8 +164,20 @@ impl McpManager {
     pub async fn list_resources(&mut self) -> Result<Vec<(String, McpResource)>> {
         let mut out = Vec::new();
         for (server_name, client) in &mut self.clients {
-            for resource in client.list_resources().await.unwrap_or_default() {
-                out.push((server_name.clone(), resource));
+            match client.list_resources().await {
+                Ok(resources) => {
+                    for resource in resources {
+                        out.push((server_name.clone(), resource));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to list resources from '{}': {}",
+                        "Warning:".bright_yellow(),
+                        server_name,
+                        e
+                    );
+                }
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.uri.cmp(&b.1.uri)));

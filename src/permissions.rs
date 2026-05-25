@@ -213,6 +213,7 @@ impl Permissions {
             return;
         }
         self.denied_tools.insert(name.to_string());
+        self.allowed_tools.remove(name);
     }
 
     #[allow(dead_code)]
@@ -356,5 +357,77 @@ mod tests {
         // Second revoke is a no-op (returns false).
         assert!(!perms.revoke_dir(&dir).unwrap());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn allow_tool_empty_or_whitespace_is_noop() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("");
+        perms.allow_tool("   ");
+        assert_eq!(perms.allowed_tools().count(), 0);
+    }
+
+    #[test]
+    fn deny_tool_empty_or_whitespace_is_noop() {
+        let mut perms = Permissions::default();
+        perms.deny_tool("");
+        perms.deny_tool("   ");
+        assert_eq!(perms.denied_tools().count(), 0);
+    }
+
+    #[test]
+    fn check_tool_allowed_empty_allow_list_means_allow_all() {
+        let perms = Permissions::default();
+        // No allowed/denied entries: every tool is allowed.
+        assert!(perms.check_tool_allowed("any_tool"));
+        assert!(perms.check_tool_allowed("another_tool"));
+    }
+
+    #[test]
+    fn allow_tool_restricts_to_listed_tools() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("bash");
+        assert!(perms.check_tool_allowed("bash"));
+        assert!(!perms.check_tool_allowed("grep"));
+    }
+
+    #[test]
+    fn deny_tool_blocks_tool_regardless_of_allow_list() {
+        let mut perms = Permissions::default();
+        // deny beats allow
+        perms.allow_tool("bash");
+        perms.deny_tool("bash");
+        assert!(!perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn deny_tool_removes_from_allowed_tools() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("bash");
+        assert!(perms.check_tool_allowed("bash"));
+        perms.deny_tool("bash");
+        // 'bash' must no longer appear in the allowed set.
+        assert!(!perms.allowed_tools().any(|t| t == "bash"));
+        assert!(!perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn allow_tool_removes_from_denied_tools() {
+        let mut perms = Permissions::default();
+        perms.deny_tool("bash");
+        assert!(!perms.check_tool_allowed("bash"));
+        perms.allow_tool("bash");
+        // 'bash' must no longer appear in the denied set.
+        assert!(!perms.denied_tools().any(|t| t == "bash"));
+        assert!(perms.check_tool_allowed("bash"));
+    }
+
+    #[test]
+    fn tool_names_are_trimmed() {
+        let mut perms = Permissions::default();
+        perms.allow_tool("  bash  ");
+        assert!(perms.check_tool_allowed("bash"));
+        perms.deny_tool("  bash  ");
+        assert!(!perms.check_tool_allowed("bash"));
     }
 }
