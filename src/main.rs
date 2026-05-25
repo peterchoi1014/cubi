@@ -6,6 +6,7 @@ mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
 mod ollama;
+mod onboarding;
 mod permissions;
 mod project_memory;
 mod todos;
@@ -15,6 +16,7 @@ use cli::ChatCLI;
 use colored::*;
 use executor::AIExecutor;
 use mcp_manager::McpManager;
+use onboarding::AppConfig;
 use permissions::Permissions;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -25,19 +27,34 @@ const DEFAULT_MODEL: &str = "llama3.2:1b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Resolve the model from $AI_CHAT_CLI_MODEL, falling back to DEFAULT_MODEL.
-    // This removes the previous hard-coded lock-in and is the first small
-    // step toward the configurable onboarding flow tracked in ROADMAP.md.
-    let model_owned =
-        std::env::var("AI_CHAT_CLI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    // Initialize permissions early — the onboarding wizard may want to
+    // mutate it when the user trusts the cwd.
+    let permissions = Arc::new(Mutex::new(Permissions::load()));
+
+    // Persistent user config (model preference, onboarding flag, ...).
+    let mut config = AppConfig::load();
+
+    // First-run wizard. No-ops if already onboarded, in non-interactive
+    // shells, or when `AI_CHAT_CLI_NO_ONBOARD=1` is set.
+    let ollama_client = ollama::OllamaClient::new();
+    if let Err(e) = onboarding::run_if_needed(&mut config, &ollama_client, &permissions).await {
+        eprintln!(
+            "{} onboarding wizard failed: {} (continuing with defaults)",
+            "Warn:".bright_yellow(),
+            e
+        );
+    }
+
+    // Resolve the model from env > config > baked-in fallback. This
+    // removes the previous hard-coded lock-in.
+    let model_owned = onboarding::resolve_model(&config, DEFAULT_MODEL);
     let model: &str = &model_owned;
     let cpu_workers = 6;
 
     println!("{}", "Initializing AI Chat CLI...".bright_cyan());
 
     // Check if Ollama is running
-    let client = ollama::OllamaClient::new();
-    match client.list_models().await {
+    match ollama_client.list_models().await {
         Ok(models) => {
             println!(
                 "{} {}",
@@ -73,8 +90,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize permissions (project trust store).
-    let permissions = Arc::new(Mutex::new(Permissions::load()));
     // Shared plan-mode flag, observed by built-in write/exec tools.
     let plan_mode = Arc::new(AtomicBool::new(false));
 
