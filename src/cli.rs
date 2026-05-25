@@ -3568,7 +3568,13 @@ impl ChatCLI {
                     any_output = true;
                 }
                 if any_output && headless_mode {
-                    println!();
+                    // Streaming prints tokens via `print!` with no
+                    // trailing newline; emit exactly one for piping.
+                    // The buffered and stream-fallback paths above
+                    // already used `println!`, so don't double-up.
+                    if got_token {
+                        println!();
+                    }
                 } else if any_output {
                     println!("\n");
                 }

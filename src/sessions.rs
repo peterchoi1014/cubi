@@ -309,15 +309,14 @@ impl SessionStore {
 
     /// Latest session in the current cwd, falling back to global newest.
     pub fn latest_for_current_dir_preferred(&self) -> Result<Option<SessionFile>> {
-        let cwd = self.cwd.display().to_string();
-        let all = Self::list_all()?;
-        if let Some(meta) = all.iter().find(|m| m.cwd == cwd) {
-            return load_from_path(&meta.path).map(Some);
-        }
+        // Fast path: the per-cwd bucket already lives on disk under
+        // `self.dir`, so `self.latest()` only reads checkpoints for the
+        // current project. Avoid scanning every bucket under
+        // `~/.cubi/sessions` unless we genuinely have no local session.
         if let Some(session) = self.latest()? {
             return Ok(Some(session));
         }
-        let Some(meta) = all.into_iter().next() else {
+        let Some(meta) = Self::list_all()?.into_iter().next() else {
             return Ok(None);
         };
         load_from_path(&meta.path).map(Some)
@@ -384,28 +383,36 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// chronological prefix of a session id. Pure date math — pulling in a
 /// chrono dependency just for this would be overkill.
 fn format_timestamp(secs: u64) -> String {
-    // Days / time of day decomposition.
-    let days = (secs / 86400) as i64;
-    let tod = secs % 86400;
-    let hour = tod / 3600;
-    let minute = (tod % 3600) / 60;
+    let (y, m, d, hour, minute, second) = civil_from_unix(secs);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        y, m, d, hour, minute, second
+    )
+}
+
+/// UTC civil-time decomposition shared by session-id formatting and the
+/// `/sessions` listing in `main`. Returns `(year, month, day, hour,
+/// minute, second)`. Implements Howard Hinnant's civil-from-days
+/// algorithm — keep a single copy here so any rounding/leap-year bug is
+/// fixed once, not twice.
+pub(crate) fn civil_from_unix(secs: u64) -> (i64, u64, u64, u64, u64, u64) {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let hour = tod / 3_600;
+    let minute = (tod % 3_600) / 60;
     let second = tod % 60;
 
-    // Civil-from-days, courtesy of Howard Hinnant's date algorithm.
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        y, m, d, hour, minute, second
-    )
+    (y, m, d, hour, minute, second)
 }
 
 #[cfg(test)]
