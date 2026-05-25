@@ -140,7 +140,9 @@ impl BuiltinToolRegistry {
     fn list_files_tool() -> BuiltinTool {
         BuiltinTool {
             name: "list_files".to_string(),
-            description: "List files and directories with metadata (size, modified time, permissions).".to_string(),
+            description:
+                "List files and directories with metadata (size, modified time, permissions)."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -162,7 +164,9 @@ impl BuiltinToolRegistry {
     fn search_glob_tool() -> BuiltinTool {
         BuiltinTool {
             name: "search_glob".to_string(),
-            description: "Search for files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.json').".to_string(),
+            description:
+                "Search for files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.json')."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -278,18 +282,20 @@ impl BuiltinToolRegistry {
     // Tool Implementations
 
     async fn execute_bash(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let command = args["command"].as_str()
+        let command = args["command"]
+            .as_str()
             .context("Missing 'command' parameter")?;
-        
+
         let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
 
         // Security: Basic command validation
         let dangerous_patterns = ["rm -rf /", "dd if=", "mkfs", "format", "> /dev/"];
         for pattern in &dangerous_patterns {
             if command.contains(pattern) {
-                return Ok(ToolResult::error(
-                    format!("Command blocked for security: contains '{}'", pattern)
-                ));
+                return Ok(ToolResult::error(format!(
+                    "Command blocked for security: contains '{}'",
+                    pattern
+                )));
             }
         }
 
@@ -327,18 +333,17 @@ impl BuiltinToolRegistry {
 
         match timeout(Duration::from_secs(timeout_secs), execution).await {
             Ok(result) => result,
-            Err(_) => Ok(ToolResult::error(
-                format!("Command timed out after {} seconds", timeout_secs)
-            )),
+            Err(_) => Ok(ToolResult::error(format!(
+                "Command timed out after {} seconds",
+                timeout_secs
+            ))),
         }
     }
 
     fn execute_read_file(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let path = args["path"].as_str()
-            .context("Missing 'path' parameter")?;
-        
-        let content = fs::read_to_string(path)
-            .context(format!("Failed to read file: {}", path))?;
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
+
+        let content = fs::read_to_string(path).context(format!("Failed to read file: {}", path))?;
 
         let start_line = args["start_line"].as_u64().map(|n| n as usize);
         let end_line = args["end_line"].as_u64().map(|n| n as usize);
@@ -347,7 +352,7 @@ impl BuiltinToolRegistry {
             let lines: Vec<&str> = content.lines().collect();
             let start_idx = start.saturating_sub(1);
             let end_idx = end.min(lines.len());
-            
+
             lines[start_idx..end_idx].join("\n")
         } else {
             content
@@ -361,7 +366,7 @@ impl BuiltinToolRegistry {
         let recursive = args["recursive"].as_bool().unwrap_or(false);
 
         let mut result = String::new();
-        
+
         if recursive {
             self.list_files_recursive(Path::new(path), &mut result, 0)?;
         } else {
@@ -372,8 +377,8 @@ impl BuiltinToolRegistry {
     }
 
     fn list_files_single(&self, path: &Path, result: &mut String) -> Result<()> {
-        let entries = fs::read_dir(path)
-            .context(format!("Failed to read directory: {:?}", path))?;
+        let entries =
+            fs::read_dir(path).context(format!("Failed to read directory: {:?}", path))?;
 
         for entry in entries {
             let entry = entry?;
@@ -381,7 +386,7 @@ impl BuiltinToolRegistry {
             let file_type = if metadata.is_dir() { "DIR " } else { "FILE" };
             let size = metadata.len();
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             result.push_str(&format!("{} {:>10} {}\n", file_type, size, name));
         }
 
@@ -389,8 +394,8 @@ impl BuiltinToolRegistry {
     }
 
     fn list_files_recursive(&self, path: &Path, result: &mut String, depth: usize) -> Result<()> {
-        let entries = fs::read_dir(path)
-            .context(format!("Failed to read directory: {:?}", path))?;
+        let entries =
+            fs::read_dir(path).context(format!("Failed to read directory: {:?}", path))?;
 
         let indent = "  ".repeat(depth);
 
@@ -398,7 +403,7 @@ impl BuiltinToolRegistry {
             let entry = entry?;
             let metadata = entry.metadata()?;
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             if metadata.is_dir() {
                 result.push_str(&format!("{}📁 {}/\n", indent, name));
                 self.list_files_recursive(&entry.path(), result, depth + 1)?;
@@ -412,16 +417,17 @@ impl BuiltinToolRegistry {
     }
 
     fn execute_search_glob(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let pattern = args["pattern"].as_str()
+        let pattern = args["pattern"]
+            .as_str()
             .context("Missing 'pattern' parameter")?;
         let base_path = args["base_path"].as_str().unwrap_or(".");
 
         // Use glob crate for pattern matching
         let _glob_pattern = format!("{}/{}", base_path, pattern);
-        
+
         // For now, use basic shell globbing via bash
         let command = format!("find {} -name '{}'", base_path, pattern.replace("**", "*"));
-        
+
         let output = Command::new("sh")
             .arg("-c")
             .arg(&command)
@@ -429,7 +435,7 @@ impl BuiltinToolRegistry {
             .context("Failed to execute glob search")?;
 
         let result = String::from_utf8_lossy(&output.stdout).to_string();
-        
+
         Ok(ToolResult::success(if result.is_empty() {
             format!("No files found matching pattern: {}", pattern)
         } else {
@@ -438,15 +444,15 @@ impl BuiltinToolRegistry {
     }
 
     fn execute_grep(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let pattern = args["pattern"].as_str()
+        let pattern = args["pattern"]
+            .as_str()
             .context("Missing 'pattern' parameter")?;
-        let path = args["path"].as_str()
-            .context("Missing 'path' parameter")?;
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
         let recursive = args["recursive"].as_bool().unwrap_or(false);
         let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
 
         let mut cmd_args = vec!["grep"];
-        
+
         if ignore_case {
             cmd_args.push("-i");
         }
@@ -477,44 +483,44 @@ impl BuiltinToolRegistry {
     }
 
     fn execute_edit_file(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let path = args["path"].as_str()
-            .context("Missing 'path' parameter")?;
-        let old_text = args["old_text"].as_str()
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
+        let old_text = args["old_text"]
+            .as_str()
             .context("Missing 'old_text' parameter")?;
-        let new_text = args["new_text"].as_str()
+        let new_text = args["new_text"]
+            .as_str()
             .context("Missing 'new_text' parameter")?;
 
-        let content = fs::read_to_string(path)
-            .context(format!("Failed to read file: {}", path))?;
+        let content = fs::read_to_string(path).context(format!("Failed to read file: {}", path))?;
 
         if !content.contains(old_text) {
             return Ok(ToolResult::error(
-                "Old text not found in file. Text must match exactly.".to_string()
+                "Old text not found in file. Text must match exactly.".to_string(),
             ));
         }
 
         let new_content = content.replace(old_text, new_text);
-        
-        fs::write(path, new_content)
-            .context(format!("Failed to write file: {}", path))?;
 
-        Ok(ToolResult::success(format!("File edited successfully: {}", path)))
+        fs::write(path, new_content).context(format!("Failed to write file: {}", path))?;
+
+        Ok(ToolResult::success(format!(
+            "File edited successfully: {}",
+            path
+        )))
     }
 
     fn execute_write_file(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let path = args["path"].as_str()
-            .context("Missing 'path' parameter")?;
-        let content = args["content"].as_str()
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
+        let content = args["content"]
+            .as_str()
             .context("Missing 'content' parameter")?;
 
         // Create parent directories if needed
         if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create parent directories")?;
+            fs::create_dir_all(parent).context("Failed to create parent directories")?;
         }
 
-        fs::write(path, content)
-            .context(format!("Failed to write file: {}", path))?;
+        fs::write(path, content).context(format!("Failed to write file: {}", path))?;
 
         Ok(ToolResult::success(format!(
             "File written successfully: {} ({} bytes)",
@@ -524,7 +530,8 @@ impl BuiltinToolRegistry {
     }
 
     fn execute_think(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let thoughts = args["thoughts"].as_str()
+        let thoughts = args["thoughts"]
+            .as_str()
             .context("Missing 'thoughts' parameter")?;
 
         Ok(ToolResult::success(format!(

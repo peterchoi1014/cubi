@@ -48,8 +48,8 @@ pub fn read_memory_with_path() -> Result<Option<(PathBuf, String)>> {
     let Some(path) = find_memory_path() else {
         return Ok(None);
     };
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     Ok(Some((path, contents)))
 }
 
@@ -128,7 +128,9 @@ mod tests {
         assert!(!wrote_again, "expected second call to be a no-op");
 
         // Read it back through the public API.
-        let (path, contents) = read_memory_with_path().unwrap().expect("memory should exist");
+        let (path, contents) = read_memory_with_path()
+            .unwrap()
+            .expect("memory should exist");
         assert!(contents.contains("# Project memory for ai-chat-cli"));
         assert!(path.ends_with(MEMORY_FILENAME));
 

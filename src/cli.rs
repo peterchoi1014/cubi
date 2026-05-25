@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
-use colored::*;
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
 use crate::project_memory;
 use crate::todos::TodoList;
+use anyhow::{Context, Result};
+use colored::*;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::fs;
 use std::path::Path;
 
@@ -50,14 +50,16 @@ impl ChatCLI {
             for t in tools {
                 msg.push_str(&format!("- {}: {}\n", t.name, t.description));
             }
-            msg.push_str("\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>");
+            msg.push_str(
+                "\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>",
+            );
 
             cli.history.push(Message {
                 role: "system".to_string(),
                 content: msg,
             });
         }
-    
+
         cli
     }
 
@@ -104,7 +106,7 @@ impl ChatCLI {
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let input = line.trim();
-                    
+
                     if input.is_empty() {
                         continue;
                     }
@@ -128,11 +130,11 @@ impl ChatCLI {
 
                     // Get AI response
                     print!("{} ", "AI:".bright_blue().bold());
-                    
+
                     match self.executor.chat(self.history.clone()).await {
                         Ok(response) => {
                             println!("{}\n", response.bright_white());
-                            
+
                             // Add assistant response to history
                             self.history.push(Message {
                                 role: "assistant".to_string(),
@@ -150,7 +152,7 @@ impl ChatCLI {
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("{}",  "Use /quit to exit".yellow());
+                    println!("{}", "Use /quit to exit".yellow());
                     continue;
                 }
                 Err(ReadlineError::Eof) => {
@@ -198,15 +200,17 @@ impl ChatCLI {
                 }
                 let rest = cmd.strip_prefix("/mcp-call ").unwrap().trim();
                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                
+
                 if parts.len() < 2 {
-                    println!("{} Usage: /mcp-call <tool_name> <json_args>", 
-                        "Info:".bright_yellow());
+                    println!(
+                        "{} Usage: /mcp-call <tool_name> <json_args>",
+                        "Info:".bright_yellow()
+                    );
                     println!("Example: /mcp-call add {{\"a\": 5, \"b\": 3}}");
                 } else {
                     let tool_name = parts[0];
                     let args_str = parts[1];
-                    
+
                     match serde_json::from_str(args_str) {
                         Ok(args) => {
                             if let Err(e) = self.call_mcp_tool(tool_name, args).await {
@@ -230,7 +234,11 @@ impl ChatCLI {
                 let model = cmd.strip_prefix("/model ").unwrap().trim();
                 match self.executor.switch_model(model.to_string()).await {
                     Ok(_) => {
-                        println!("{} Switched to model: {}", "✓".bright_green(), model.bright_cyan());
+                        println!(
+                            "{} Switched to model: {}",
+                            "✓".bright_green(),
+                            model.bright_cyan()
+                        );
                         self.history.clear();
                     }
                     Err(e) => {
@@ -317,14 +325,20 @@ impl ChatCLI {
             "/batch" => {
                 println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
                 println!("Example: /batch prompts.txt");
-                println!("\nBatch file format (one prompt per line, blank lines and #-comments are skipped):");
+                println!(
+                    "\nBatch file format (one prompt per line, blank lines and #-comments are skipped):"
+                );
                 println!("  # warm-up");
                 println!("  What is Rust?");
                 println!("  Write hello world in Python");
                 println!("  Explain recursion");
             }
             "/version" => {
-                println!("{} {}", "ai-chat-cli".bright_cyan(), env!("CARGO_PKG_VERSION"));
+                println!(
+                    "{} {}",
+                    "ai-chat-cli".bright_cyan(),
+                    env!("CARGO_PKG_VERSION")
+                );
             }
             "/status" => {
                 self.show_status();
@@ -378,18 +392,11 @@ impl ChatCLI {
                             self.persist_todos();
                             println!("{} Marked todo {} as done", "✓".bright_green(), n);
                         } else {
-                            eprintln!(
-                                "{} No todo with index {}",
-                                "Error:".bright_red(),
-                                n
-                            );
+                            eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
                         }
                     }
                     Err(_) => {
-                        eprintln!(
-                            "{} Usage: /todo-done <index>",
-                            "Error:".bright_red()
-                        );
+                        eprintln!("{} Usage: /todo-done <index>", "Error:".bright_red());
                     }
                 }
             }
@@ -404,11 +411,7 @@ impl ChatCLI {
                             self.persist_todos();
                             println!("{} Removed todo {}", "✓".bright_green(), n);
                         } else {
-                            eprintln!(
-                                "{} No todo with index {}",
-                                "Error:".bright_red(),
-                                n
-                            );
+                            eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
                         }
                     }
                     Err(_) => {
@@ -448,13 +451,19 @@ impl ChatCLI {
                         Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
                     },
                     None => {
-                        println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
+                        println!(
+                            "{} Usage: /export [-f] <filename.md>",
+                            "Info:".bright_yellow()
+                        );
                         println!("       Pass -f to overwrite an existing file.");
                     }
                 }
             }
             "/export" => {
-                println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
+                println!(
+                    "{} Usage: /export [-f] <filename.md>",
+                    "Info:".bright_yellow()
+                );
                 println!("       Pass -f to overwrite an existing file.");
             }
             _ => {
@@ -464,7 +473,7 @@ impl ChatCLI {
         }
         Ok(true)
     }
-    
+
     async fn process_batch_file(&self, filename: &str) -> Result<BatchSummary> {
         let content = fs::read_to_string(filename)
             .with_context(|| format!("Failed to read batch file '{}'", filename))?;
@@ -526,11 +535,11 @@ impl ChatCLI {
 
             println!("\n{}", "Available MCP Tools:".bright_yellow().bold());
             println!("{}", "=".repeat(60).bright_black());
-        
+
             // Group by built-in vs external
             let mut builtin = Vec::new();
             let mut external = Vec::new();
-        
+
             for (server_name, tool) in mcp.get_tools_with_server().values() {
                 if server_name == "builtin" {
                     builtin.push(tool);
@@ -538,7 +547,7 @@ impl ChatCLI {
                     external.push((server_name, tool));
                 }
             }
-        
+
             if !builtin.is_empty() {
                 println!("\n{}", "Built-in Tools:".bright_blue().bold());
                 for tool in builtin {
@@ -546,18 +555,20 @@ impl ChatCLI {
                     println!("    {}", tool.description);
                 }
             }
-        
+
             if !external.is_empty() {
                 println!("\n{}", "External MCP Servers:".bright_blue().bold());
                 for (server, tool) in external {
-                    println!("\n  {} {} (from {})", 
-                        "●".bright_green(), 
+                    println!(
+                        "\n  {} {} (from {})",
+                        "●".bright_green(),
                         tool.name.bright_cyan(),
-                        server.bright_magenta());
+                        server.bright_magenta()
+                    );
                     println!("    {}", tool.description);
                 }
             }
-        
+
             println!("\n{}\n", "=".repeat(60).bright_black());
             println!("Use {} <tool> <args> to execute", "/mcp-call".bright_cyan());
         }
@@ -566,9 +577,9 @@ impl ChatCLI {
     async fn call_mcp_tool(&mut self, tool_name: &str, arguments: serde_json::Value) -> Result<()> {
         if let Some(mcp) = &mut self.mcp_manager {
             println!("{} Calling tool '{}'...", "⚙".bright_blue(), tool_name);
-            
+
             let result = mcp.call_tool(tool_name, arguments).await?;
-            
+
             for content in &result.content {
                 if content.content_type == "text" {
                     println!("{} {}", "✓".bright_green(), content.text);
@@ -577,7 +588,7 @@ impl ChatCLI {
         } else {
             anyhow::bail!("MCP not initialized");
         }
-        
+
         Ok(())
     }
 
@@ -586,7 +597,7 @@ impl ChatCLI {
         if let Some(mcp) = &mut self.mcp_manager {
             mcp.shutdown().await;
         }
-        
+
         // Reload configuration and reconnect
         self.mcp_manager = match McpManager::new().await {
             Ok(manager) => Some(manager),
@@ -595,10 +606,9 @@ impl ChatCLI {
                 None
             }
         };
-        
+
         Ok(())
     }
-    
 
     /// Single source of truth for slash commands shown in `/help` and the
     /// startup banner. `(command, description)` pairs.
@@ -634,13 +644,19 @@ impl ChatCLI {
 
     fn print_welcome(&self) {
         println!("\n{}", "=".repeat(60).bright_cyan());
-        println!("{}", "  AI Chat CLI - Powered by Repartir".bright_cyan().bold());
+        println!(
+            "{}",
+            "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
+        );
         println!("{}", "=".repeat(60).bright_cyan());
         println!("\n{}", "Commands:".bright_yellow().bold());
         for (cmd, desc) in Self::command_help() {
             println!("  {} - {}", cmd.bright_cyan(), desc);
         }
-        println!("\n{}\n", "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white());
+        println!(
+            "\n{}\n",
+            "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white()
+        );
     }
 
     fn show_help(&self) {
@@ -659,14 +675,14 @@ impl ChatCLI {
 
         println!("\n{}", "Conversation History:".bright_yellow().bold());
         println!("{}", "-".repeat(60).bright_black());
-        
+
         for (i, msg) in self.history.iter().enumerate() {
             let role = if msg.role == "user" {
                 "You".bright_green().bold()
             } else {
                 "AI".bright_blue().bold()
             };
-            
+
             println!("{} [{}]: {}", role, i + 1, msg.content);
         }
         println!("{}\n", "-".repeat(60).bright_black());
@@ -684,7 +700,11 @@ impl ChatCLI {
         println!(
             "  {}: {}",
             "plan mode".bright_cyan(),
-            if self.plan_mode { "on".bright_green() } else { "off".bright_black() }
+            if self.plan_mode {
+                "on".bright_green()
+            } else {
+                "off".bright_black()
+            }
         );
         println!(
             "  {}: {} ({} pending)",
@@ -701,11 +721,10 @@ impl ChatCLI {
         if self.plan_mode {
             self.history.push(Message {
                 role: "system".to_string(),
-                content:
-                    "SYSTEM: Plan mode is ON. Do not modify files or run \
+                content: "SYSTEM: Plan mode is ON. Do not modify files or run \
                      destructive commands. Produce a plan and wait for the \
                      user to confirm before applying changes."
-                        .to_string(),
+                    .to_string(),
             });
             println!(
                 "{} Plan mode {}",
@@ -715,8 +734,7 @@ impl ChatCLI {
         } else {
             self.history.push(Message {
                 role: "system".to_string(),
-                content: "SYSTEM: Plan mode is OFF. Normal tool use is allowed."
-                    .to_string(),
+                content: "SYSTEM: Plan mode is OFF. Normal tool use is allowed.".to_string(),
             });
             println!(
                 "{} Plan mode {}",
@@ -728,11 +746,7 @@ impl ChatCLI {
 
     fn persist_todos(&self) {
         if let Err(e) = self.todos.save() {
-            eprintln!(
-                "{} Failed to persist todos: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
+            eprintln!("{} Failed to persist todos: {}", "Warn:".bright_yellow(), e);
         }
     }
 
@@ -761,9 +775,8 @@ impl ChatCLI {
     /// Removes any system messages tagged as single-turn (see
     /// [`SINGLE_TURN_SYSTEM_TAG`]) from the history.
     fn strip_single_turn_system_messages(&mut self) {
-        self.history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
-        });
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG)));
     }
 
     fn run_init(&self) {
@@ -815,9 +828,8 @@ impl ChatCLI {
     fn inject_project_memory(&mut self) {
         // Drop any prior project-memory entries so callers can use this as
         // both an initial inject and a reload.
-        self.history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX))
-        });
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX)));
 
         let Ok(Some((path, memory))) = project_memory::read_memory_with_path() else {
             return;
@@ -1034,16 +1046,12 @@ mod tests {
     fn strip_single_turn_removes_only_tagged_system_messages() {
         let mut cli_history = vec![
             system("SYSTEM: persistent context"),
-            system(&format!(
-                "{} ephemeral question",
-                SINGLE_TURN_SYSTEM_TAG
-            )),
+            system(&format!("{} ephemeral question", SINGLE_TURN_SYSTEM_TAG)),
             user("hi"),
             assistant("hello"),
         ];
-        cli_history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
-        });
+        cli_history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG)));
         assert_eq!(cli_history.len(), 3);
         assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
         assert_eq!(cli_history[1].role, "user");
@@ -1112,7 +1120,10 @@ mod tests {
         let err = check_overwrite_allowed(p, false, "/save").unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("Refusing to overwrite"), "got: {msg}");
-        assert!(msg.contains("/save -f"), "expected hint for /save -f, got: {msg}");
+        assert!(
+            msg.contains("/save -f"),
+            "expected hint for /save -f, got: {msg}"
+        );
 
         // With force=true the guard must pass even though the file exists.
         check_overwrite_allowed(p, true, "/save").expect("force should bypass");

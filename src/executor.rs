@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::ollama::{Message, OllamaClient};
+use anyhow::Result;
 
 pub struct AIExecutor {
     ollama: OllamaClient,
@@ -12,13 +12,10 @@ impl AIExecutor {
         // Repartir pool here and use it to distribute AI inference tasks
         // across multiple workers/machines. For this demo, we're focusing
         // on the local Ollama integration.
-        
+
         let ollama = OllamaClient::new();
 
-        Ok(Self {
-            ollama,
-            model,
-        })
+        Ok(Self { ollama, model })
     }
 
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {

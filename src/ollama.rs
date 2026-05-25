@@ -72,7 +72,7 @@ impl OllamaClient {
             .context("Failed to list models")?;
 
         let data: serde_json::Value = response.json().await?;
-        
+
         let models = data["models"]
             .as_array()
             .map(|arr| {
