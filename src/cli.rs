@@ -118,21 +118,13 @@ impl ChatCLI {
             format!("SYSTEM: {}", output_styles::system_prompt_for(&style)),
         ));
 
-        // Auto-inject MCP tools into context
-        if let Some(mcp) = &cli.mcp_manager
-            && mcp.has_tools()
-        {
-            let tools = mcp.list_tools();
-            let mut msg = String::from("SYSTEM: You have access to these MCP tools:\n\n");
-            for t in tools {
-                msg.push_str(&format!("- {}: {}\n", t.name, t.description));
-            }
-            msg.push_str(
-                "\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>",
-            );
-
-            cli.history.push(Message::text("system", msg));
-        }
+        // Tools are advertised to the model via Ollama's native `tools:`
+        // field in `agent_loop::build_tool_specs`. We deliberately do NOT
+        // also inject them as a system message: small models tend to echo
+        // the schema back as content when they see it twice. Keep this
+        // path empty unless we discover a model that benefits from the
+        // duplication.
+        let _ = &cli.mcp_manager;
 
         cli
     }
