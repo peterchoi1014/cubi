@@ -1007,22 +1007,19 @@ impl ChatCLI {
     }
 
     fn print_welcome(&self) {
-        // Friendly little mascot, à la claude-code's startup. Six lines
-        // wide, hand-drawn so it stays small on narrow terminals.
+        // Tiny pixel-art mascot — chunky block character that reads as
+        // cute on any monospaced terminal. Half-block glyphs (█▀▄) keep
+        // the silhouette square; ■ eyes + ▾ mouth give it personality.
         let mascot = [
-            r#"   .-""""-.   "#,
-            r#"  / .===. \   "#,
-            r#"  \/ 6 6 \/   "#,
-            r#"  ( \___/ )   "#,
-            r#" _\_`---'_/_  "#,
-            r#"(___)   (___) "#,
+            r#"  ▄▄▄▄▄  "#,
+            r#" █ ■ ■ █ "#,
+            r#" █  ▾  █ "#,
+            r#"  ▀▀▀▀▀  "#,
         ];
         let tagline = [
             "",
-            "  hi! i'm ai-chat-cli.",
-            "  ask me anything,",
-            "  or hand me a tool",
-            "  and i'll get to work.",
+            "  hi! ready when you are.",
+            "  /help to see commands.",
             "",
         ];
         println!();
