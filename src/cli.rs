@@ -240,8 +240,8 @@ impl ChatCLI {
         Ok(())
     }
 
-    /// Tries to match a `/command` against user-defined Markdown commands.
-    /// Returns `true` if a user command was matched and handled.
+    /// Tries to match a `/command` against user-defined and plugin Markdown
+    /// commands. Returns `true` if a command was matched and handled.
     fn try_user_command(&mut self, input: &str) -> bool {
         let input = input.trim();
         let (head, args) = match input.find(char::is_whitespace) {
@@ -251,37 +251,69 @@ impl ChatCLI {
         // Strip the leading `/` to get the command name.
         let cmd_name = head.strip_prefix('/').unwrap_or(head).to_lowercase();
 
-        let matched = self
+        let matched_user = self
             .user_commands
             .iter()
             .find(|c| c.name == cmd_name)
             .cloned();
 
-        let Some(user_cmd) = matched else {
+        if let Some(user_cmd) = matched_user {
+            // Inject the Markdown body as a single-turn system message.
+            let body = if args.is_empty() {
+                user_cmd.body.clone()
+            } else {
+                format!("{}\n\nUser argument: {}", user_cmd.body, args)
+            };
+
+            self.history.push(Message::text(
+                "system",
+                format!(
+                    "{} User command /{} (from {}):\n\n{}",
+                    SINGLE_TURN_SYSTEM_TAG,
+                    user_cmd.name,
+                    user_cmd.path.display(),
+                    body
+                ),
+            ));
+            println!(
+                "{} Applied user command /{}",
+                "✓".bright_green(),
+                user_cmd.name.bright_cyan()
+            );
+            return true;
+        }
+
+        let Some(plugin_cmd) = plugins::resolve(&self.plugins, head).cloned() else {
             return false;
         };
+        let plugin_name = head
+            .strip_prefix('/')
+            .unwrap_or(head)
+            .split_once(':')
+            .map(|(ns, _)| ns)
+            .unwrap_or_default()
+            .to_string();
 
-        // Inject the Markdown body as a single-turn system message.
         let body = if args.is_empty() {
-            user_cmd.body.clone()
+            plugin_cmd.body.clone()
         } else {
-            format!("{}\n\nUser argument: {}", user_cmd.body, args)
+            format!("{}\n\nUser argument: {}", plugin_cmd.body, args)
         };
 
         self.history.push(Message::text(
             "system",
             format!(
-                "{} User command /{} (from {}):\n\n{}",
+                "{} Plugin command {} (from {}):\n\n{}",
                 SINGLE_TURN_SYSTEM_TAG,
-                user_cmd.name,
-                user_cmd.path.display(),
+                plugin_cmd.trigger(&plugin_name),
+                plugin_cmd.path.display(),
                 body
             ),
         ));
         println!(
-            "{} Applied user command /{}",
+            "{} Applied plugin command {}",
             "✓".bright_green(),
-            user_cmd.name.bright_cyan()
+            plugin_cmd.trigger(&plugin_name).bright_cyan()
         );
         true
     }
@@ -1737,6 +1769,7 @@ impl ChatCLI {
             "✓".bright_green(),
             skill.name.bright_cyan()
         );
+        self.journal.start_turn();
         if let Err(e) = self.agent_turn().await {
             eprintln!("{} {}", "Error:".bright_red(), e);
         }
@@ -2680,7 +2713,7 @@ impl ChatCLI {
         // Roll back any file edits/writes recorded by the built-in
         // tools during the rewound turns. We treat each removed
         // exchange (assumed n) as one journal turn — matches how the
-        // CLI calls `journal.start_turn` once per user prompt.
+        // CLI opens one journal turn for each agent entry point.
         let outcome = self.journal.rewind(n);
         println!(
             "{} Rewound {} message{} ({} exchange{})",
