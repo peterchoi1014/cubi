@@ -49,6 +49,8 @@ pub enum Cmd {
     McpReload,
     Model,
     Version,
+    Sessions,
+    Resume,
     Trust,
     Quit,
 }
@@ -179,6 +181,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/batch <f>",
         help: "Process batch file",
         cmd: Cmd::Batch,
+    },
+    SlashCommandSpec {
+        name: "/sessions",
+        usage: "/sessions",
+        help: "List auto-saved sessions for this project",
+        cmd: Cmd::Sessions,
+    },
+    SlashCommandSpec {
+        name: "/resume",
+        usage: "/resume [id]",
+        help: "Resume the latest (or named) auto-saved session",
+        cmd: Cmd::Resume,
     },
     SlashCommandSpec {
         name: "/trust",

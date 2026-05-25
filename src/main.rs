@@ -9,6 +9,7 @@ mod ollama;
 mod onboarding;
 mod permissions;
 mod project_memory;
+mod sessions;
 mod todos;
 
 use anyhow::{Context, Result};

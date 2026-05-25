@@ -169,7 +169,7 @@ fn storage_path_for(cwd: &Path) -> Option<PathBuf> {
 /// that two different paths whose sanitized forms collide (for example
 /// `/tmp/a/b` and `/tmp/a_b`, both of which sanitize to `_tmp_a_b`) still
 /// receive distinct keys.
-fn cwd_key(cwd: &Path) -> String {
+pub(crate) fn cwd_key(cwd: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

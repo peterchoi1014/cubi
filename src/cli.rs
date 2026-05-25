@@ -4,6 +4,7 @@ use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
 use crate::permissions::Permissions;
 use crate::project_memory;
+use crate::sessions::{SessionFile, SessionStore};
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use colored::*;
@@ -33,6 +34,12 @@ pub struct ChatCLI {
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
     permissions: Arc<Mutex<Permissions>>,
+    /// Per-project on-disk session checkpoint store, or `None` when no
+    /// home directory could be resolved (sessions degrade silently).
+    session_store: Option<SessionStore>,
+    /// The session currently being appended to. Lazily initialized so
+    /// the file isn't created until the user actually sends a message.
+    current_session: Option<SessionFile>,
 }
 
 impl ChatCLI {
@@ -49,6 +56,8 @@ impl ChatCLI {
             todos: TodoList::load_for_current_dir(),
             plan_mode,
             permissions,
+            session_store: SessionStore::for_current_dir(),
+            current_session: None,
         };
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
@@ -158,6 +167,11 @@ impl ChatCLI {
                             // (e.g. from `/ask`) so they don't keep nudging
                             // every subsequent turn.
                             self.strip_single_turn_system_messages();
+
+                            // Auto-checkpoint the session after every
+                            // successful turn so a crash never loses the
+                            // conversation.
+                            self.checkpoint_session();
                         }
                         Err(e) => {
                             eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
@@ -439,6 +453,12 @@ impl ChatCLI {
                 } else {
                     self.ask_user(args);
                 }
+            }
+            Cmd::Sessions => {
+                self.show_sessions();
+            }
+            Cmd::Resume => {
+                self.resume_session(args);
             }
             Cmd::Trust => {
                 self.handle_trust(args);
@@ -758,6 +778,129 @@ impl ChatCLI {
                 }
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Lists checkpointed sessions for the current project, newest first.
+    fn show_sessions(&self) {
+        let Some(store) = &self.session_store else {
+            println!(
+                "{} Sessions disabled: could not resolve home directory.",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        match store.list() {
+            Ok(list) if list.is_empty() => {
+                println!(
+                    "{} No sessions saved yet for this project.",
+                    "ℹ".bright_blue()
+                );
+            }
+            Ok(list) => {
+                println!("\n{}", "Sessions (newest first):".bright_yellow().bold());
+                for (i, meta) in list.iter().enumerate() {
+                    let active = self
+                        .current_session
+                        .as_ref()
+                        .map(|s| s.id == meta.id)
+                        .unwrap_or(false);
+                    let marker = if active { "▶" } else { " " };
+                    println!(
+                        "  {} {}. {} ({} msgs, model={}) {}",
+                        marker.bright_green(),
+                        i + 1,
+                        meta.id.bright_cyan(),
+                        meta.message_count,
+                        meta.model.bright_magenta(),
+                        if meta.preview.is_empty() {
+                            String::new()
+                        } else {
+                            format!("— {}", meta.preview.bright_white())
+                        }
+                    );
+                }
+                println!(
+                    "\nUse {} to resume the most recent, or {} <id> to resume a specific one.\n",
+                    "/resume".bright_cyan(),
+                    "/resume".bright_cyan()
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Resumes the latest session, or a named one if `args` is non-empty.
+    fn resume_session(&mut self, args: &str) {
+        let Some(store) = &self.session_store else {
+            println!(
+                "{} Sessions disabled: could not resolve home directory.",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        let target = args.trim();
+        let loaded = if target.is_empty() {
+            store.latest()
+        } else {
+            store.load(target)
+        };
+        match loaded {
+            Ok(Some(session)) => {
+                println!(
+                    "{} Resumed session {} ({} messages)",
+                    "✓".bright_green(),
+                    session.id.bright_cyan(),
+                    session.history.len()
+                );
+                self.history = session.history.clone();
+                self.current_session = Some(session);
+                // Re-inject project memory so resumed sessions see the
+                // current `AICHAT.md`, not a snapshot from when the
+                // session was first created.
+                self.inject_project_memory();
+            }
+            Ok(None) => {
+                if target.is_empty() {
+                    println!(
+                        "{} No sessions to resume. Start chatting and one will be created.",
+                        "ℹ".bright_blue()
+                    );
+                } else {
+                    eprintln!(
+                        "{} No session with id '{}'. Use /sessions to list.",
+                        "Error:".bright_red(),
+                        target
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Writes the current history to the per-project session store.
+    /// Lazily allocates a new session on first call. Failures are
+    /// logged as warnings but never abort the chat — the user always
+    /// has the in-memory copy and can `/save` manually.
+    fn checkpoint_session(&mut self) {
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        if self.current_session.is_none() {
+            self.current_session = Some(store.new_session(self.executor.get_model().to_string()));
+        }
+        if let Some(session) = self.current_session.as_mut() {
+            // Refresh the model field so a `/model <name>` mid-session
+            // is reflected in the snapshot.
+            session.model = self.executor.get_model().to_string();
+            session.history = self.history.clone();
+            if let Err(e) = store.save(session) {
+                eprintln!(
+                    "{} Failed to checkpoint session: {}",
+                    "Warn:".bright_yellow(),
+                    e
+                );
+            }
         }
     }
 
