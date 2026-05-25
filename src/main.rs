@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     let model: &str = &model_owned;
     let cpu_workers = 6;
 
-    println!("{}", "Initializing AI Chat CLI...".bright_cyan());
+    println!("{}", "Initializing Cubi...".bright_cyan());
 
     // Shared plan-mode flag, observed by built-in write/exec tools.
     let plan_mode = Arc::new(AtomicBool::new(false));
