@@ -62,16 +62,17 @@ Shipped in this PR:
 - [x] `/init`, `/memory`, `/memory-reload`
 - [x] `/status`, `/version`, `/export` (with overwrite protection)
 - [x] `/ask` (user-driven clarifying-question stand-in, single-turn)
+- [x] `/sessions`, `/resume` (auto-saved per-project checkpoints)
+- [x] `/diff`, `/commit`, `/review` (git workflow; `/commit` is plan-mode-aware)
+- [x] `/trust` (project-trust gate for write/exec tools)
 
 Still to add (grouped by area):
 
 - **Project / workspace:** `/add-dir`, `/files`, `/init-verifiers`
-- **Git workflow:** `/commit`, `/commit-push-pr`, `/branch`, `/tag`,
-  `/pr_comments`, `/review`, `/security-review`, `/autofix-pr`, `/issue`,
-  `/diff`, `/undo`
+- **Git workflow:** `/commit-push-pr`, `/branch`, `/tag`, `/pr_comments`,
+  `/security-review`, `/autofix-pr`, `/issue`, `/undo`
 - **Agent control:** `/agents`, `/tasks`, `/teleport`, `/rewind`, `/passes`,
   `/effort`, `/compact`
-- **Sessions:** `/sessions`, `/resume`
 - **Output / theming:** `/theme`, `/color`, `/output-style`, `/statusline`,
   `/keybindings`, `/vim`
 - **Auth / accounts:** `/login`, `/logout`, `/oauth-refresh`,
@@ -86,9 +87,11 @@ Still to add (grouped by area):
 - **Social / sharing:** `/share`, `/copy`, `/feedback`, `/release-notes`,
   `/stickers`
 
-Foundation work: refactor the flat `match` in `cli.rs::handle_command` into a
-`SlashCommand` trait + registry, and support user-defined Markdown commands as
-first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
+Foundation work: the flat `match` in `cli.rs::handle_command` is now a
+`SlashCommand` registry (`src/commands.rs`) — adding a command requires a row
+in `COMMANDS` and an exhaustive arm on `Cmd`. Still to do: user-defined
+Markdown commands as first-class plugins (cf. leaked
+`createMovedToPluginCommand.ts`).
 
 ---
 
@@ -96,10 +99,14 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
 
 1. **Onboarding** (`bootstrap/`, `setup.ts`, `projectOnboardingState.ts`) —
    first-run flow: pick model, scan project, write `AICHAT.md`, set trust
-   level. *(Hard-coded `let model = "llama3.2:1b"` is now overridable via
-   `AI_CHAT_CLI_MODEL`; a real wizard is the follow-up.)*
+   level. ✅ Shipped: `src/onboarding.rs` runs once, lets the user pick a
+   model from `ollama list`, offers `/trust`, offers `AICHAT.md`. Persisted
+   to `~/.ai-chat-cli/config.json`.
 2. **Permissions system** (`utils/permissions/`) — project trust, per-tool
-   allow/deny, "trust this folder" prompts, enterprise-managed policy.
+   allow/deny, "trust this folder" prompts, enterprise-managed policy. ✅
+   Foundation shipped: `src/permissions.rs` enforces a per-project trust
+   store with a path sandbox; `bash`, `edit_file`, `write_file` are gated.
+   Per-tool allow/deny lists and enterprise policy are still open.
 3. **Memory & compaction** (`services/compact/`, `SessionMemory/`,
    `extractMemories/`, `memdir/`) — automatic in-session compaction plus
    cross-session persistent memory at `~/.ai-chat-cli/memdir/`.
@@ -129,7 +136,10 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
     `distributed.rs` (Repartir).
 17. **Auto-saved sessions + checkpointing** (`sessionStorage.js`,
     `sessionStart.js`, `history.ts`) — `/resume`, `/rewind` with file-mutation
-    rollback.
+    rollback. ✅ Foundation shipped: `src/sessions.rs` auto-checkpoints to
+    `~/.ai-chat-cli/sessions/<cwd-key>/<id>.json` after every turn; `/sessions`
+    + `/resume [id]` are wired up. `/rewind` and file-mutation rollback are
+    still open.
 18. **TUI rewrite** (`screens/`, `components/`, Ink → `ratatui`) — panes for
     chat / tool output / todos / status line.
 19. **Deep-link / browser integration** (`claudeInChrome/`, `deepLink/`,
@@ -147,14 +157,19 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
 ## D. Implementation priorities
 
 1. Agent loop + native tool-calling + streaming.
-2. Permissions system + path sandboxing + project-trust prompt.
-3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** *(partially in this PR)*
-4. `/init` + `AICHAT.md` + memdir + onboarding flow. *(partially in this PR)*
+2. Permissions system + path sandboxing + project-trust prompt. ✅ Shipped.
+3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** ✅ Plan mode now gates all
+   built-in write/exec tools; `/todos` and `/ask` already in place.
+4. `/init` + `AICHAT.md` + memdir + onboarding flow. ✅ Onboarding wizard
+   shipped; memdir (cross-session persistent memory) is still open.
 5. Auto-saved sessions + `/resume` + `/rewind` checkpoints + compaction.
+   ✅ Sessions + `/resume` shipped; `/rewind` and compaction are still open.
 6. Slash-command registry + custom Markdown commands + `@file` mentions +
-   prompt suggestions.
+   prompt suggestions. ✅ Registry shipped (`src/commands.rs`); user-defined
+   Markdown commands and `@file` mentions still open.
 7. Subagents (`AgentTool`) + task management tools.
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.
+   ✅ `/diff`, `/commit`, `/review` shipped (`src/git_cmds.rs`).
 9. Multi-provider LLM abstraction + token estimator + rate-limit / retry.
 10. Web tools (`web_fetch`, `web_search`) + LSP service & tool + REPL tool +
     notebook tool.

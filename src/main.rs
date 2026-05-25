@@ -2,6 +2,7 @@ mod builtin_tools;
 mod cli;
 mod commands;
 mod executor;
+mod git_cmds;
 mod mcp_client;
 mod mcp_config;
 mod mcp_manager;

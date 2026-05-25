@@ -1,5 +1,6 @@
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
+use crate::git_cmds;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
 use crate::permissions::Permissions;
@@ -463,6 +464,22 @@ impl ChatCLI {
             Cmd::Trust => {
                 self.handle_trust(args);
             }
+            Cmd::Diff => {
+                self.run_diff(args);
+            }
+            Cmd::Commit => {
+                if self.plan_mode.load(Ordering::SeqCst) {
+                    println!(
+                        "{} Plan mode is on — refusing /commit. Toggle off with /plan first.",
+                        "✗".bright_red()
+                    );
+                    return Ok(true);
+                }
+                self.run_commit(args);
+            }
+            Cmd::Review => {
+                self.run_review().await;
+            }
             Cmd::Export => {
                 if args.is_empty() {
                     println!(
@@ -901,6 +918,148 @@ impl ChatCLI {
                     e
                 );
             }
+        }
+    }
+
+    /// `/diff [path]` — print the current `git diff`. Empty diffs get a
+    /// short hint instead of a blank line so the user knows the command
+    /// actually ran.
+    fn run_diff(&self, args: &str) {
+        match git_cmds::diff(args) {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git diff failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if out.stdout.trim().is_empty() {
+                    println!("{} No changes in the working tree.", "ℹ".bright_blue());
+                } else {
+                    print!("{}", out.stdout);
+                    if !out.stderr.trim().is_empty() {
+                        eprintln!("{}", out.stderr.trim().bright_black());
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/commit [-a] <msg>` — wrap `git commit`. Always echoes git's own
+    /// stdout/stderr so the user sees the resulting commit summary.
+    fn run_commit(&self, args: &str) {
+        let Some((stage_all, msg)) = git_cmds::parse_commit_args(args) else {
+            println!("{} Usage: /commit [-a] <message>", "Info:".bright_yellow());
+            println!("       -a stages tracked files before committing.");
+            return;
+        };
+        match git_cmds::commit(stage_all, msg) {
+            Ok(out) => {
+                if out.exit_ok {
+                    if !out.stdout.trim().is_empty() {
+                        print!("{}", out.stdout);
+                    }
+                    println!("{} Commit created.", "✓".bright_green());
+                } else {
+                    eprintln!(
+                        "{} git commit failed (exit non-zero).",
+                        "Error:".bright_red()
+                    );
+                    if !out.stdout.trim().is_empty() {
+                        eprintln!("{}", out.stdout.trim());
+                    }
+                    if !out.stderr.trim().is_empty() {
+                        eprintln!("{}", out.stderr.trim());
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/review` — ask the model to review the current `git diff HEAD`.
+    /// The exchange is transient: it's printed to stdout but not added
+    /// to the persistent conversation history, so successive `/review`
+    /// calls don't accumulate stale diffs in context.
+    async fn run_review(&self) {
+        let out = match git_cmds::diff_for_review() {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if !out.exit_ok {
+            eprintln!(
+                "{} git diff failed: {}",
+                "Error:".bright_red(),
+                out.stderr.trim()
+            );
+            return;
+        }
+        if out.stdout.trim().is_empty() {
+            println!(
+                "{} No changes to review (working tree clean against HEAD).",
+                "ℹ".bright_blue()
+            );
+            return;
+        }
+
+        // Cap the diff so we don't blow the model's context on a huge
+        // change. The truncation marker tells both the model and the
+        // user that the bottom of the diff was omitted.
+        const MAX_DIFF_CHARS: usize = 20_000;
+        let (diff_for_model, truncated) = if out.stdout.len() > MAX_DIFF_CHARS {
+            let truncated: String = out.stdout.chars().take(MAX_DIFF_CHARS).collect();
+            (truncated, true)
+        } else {
+            (out.stdout.clone(), false)
+        };
+
+        let truncation_note = if truncated {
+            "\n\n[diff was truncated for length; review only what's shown above]"
+        } else {
+            ""
+        };
+        let review_messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are a focused code reviewer. Read the diff and respond with: \
+                          (1) a one-sentence summary, (2) bugs or correctness issues, \
+                          (3) style/clarity nits, (4) any tests that look missing. \
+                          Be terse — use bullet points, no preamble."
+                    .to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: format!(
+                    "Please review this `git diff`:\n\n```diff\n{}\n```{}",
+                    diff_for_model, truncation_note
+                ),
+            },
+        ];
+
+        println!(
+            "{} Asking the model to review the diff...",
+            "⚙".bright_blue()
+        );
+        match self.executor.chat(review_messages).await {
+            Ok(response) => {
+                println!("\n{}\n", "Review:".bright_yellow().bold());
+                println!("{}\n", response.bright_white());
+                if truncated {
+                    println!(
+                        "{} Diff was truncated to {} characters; re-run after splitting \
+                         the change for a complete review.",
+                        "ℹ".bright_blue(),
+                        MAX_DIFF_CHARS
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
     }
 
