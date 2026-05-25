@@ -430,6 +430,10 @@ enum PrimaryCommand {
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
+    if value.trim().is_empty() {
+        eprintln!("cubi: --prompt/-p requires non-empty inline prompt text.");
+        std::process::exit(2);
+    }
     if slot.replace(value).is_some() {
         eprintln!("cubi: --prompt/-p may only be provided once.");
         std::process::exit(2);
