@@ -59,6 +59,8 @@ pub enum Cmd {
     MemdirAdd,
     MemdirRm,
     MemdirClear,
+    Rewind,
+    Compact,
     Quit,
 }
 
@@ -248,6 +250,18 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/memdir-clear",
         help: "Clear all persistent memories",
         cmd: Cmd::MemdirClear,
+    },
+    SlashCommandSpec {
+        name: "/rewind",
+        usage: "/rewind [n]",
+        help: "Remove the last n exchanges (default 1)",
+        cmd: Cmd::Rewind,
+    },
+    SlashCommandSpec {
+        name: "/compact",
+        usage: "/compact",
+        help: "Summarize old turns to reduce context length",
+        cmd: Cmd::Compact,
     },
     SlashCommandSpec {
         name: "/mcp-tools",
