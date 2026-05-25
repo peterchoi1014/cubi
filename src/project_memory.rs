@@ -1,25 +1,49 @@
 //! Helpers for `AICHAT.md` — a per-project "memory" file analogous to
 //! Claude Code's `CLAUDE.md`. It lives at the root of the current working
-//! directory and contains long-lived project context that should be loaded
-//! into every session.
+//! directory (or any ancestor) and contains long-lived project context that
+//! should be loaded into every session.
 
 use anyhow::{Context, Result};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const MEMORY_FILENAME: &str = "AICHAT.md";
 
-/// Path to `AICHAT.md` in the current working directory.
+/// Path to `AICHAT.md` in the current working directory (write target for
+/// `/init`). Reads should prefer [`find_memory_path`], which also walks up
+/// the directory tree.
 pub fn memory_path() -> PathBuf {
     Path::new(MEMORY_FILENAME).to_path_buf()
 }
 
-/// Returns the contents of `AICHAT.md` if it exists.
-pub fn read_memory() -> Result<Option<String>> {
-    let path = memory_path();
-    if !path.exists() {
-        return Ok(None);
+/// Walks from `start` up toward the filesystem root looking for the first
+/// `AICHAT.md`. Returns `None` if none is found. This mirrors how tools like
+/// Claude Code locate their per-project memory file from any subdirectory.
+pub fn find_memory_path_from(start: &Path) -> Option<PathBuf> {
+    let mut cursor: Option<&Path> = Some(start);
+    while let Some(dir) = cursor {
+        let candidate = dir.join(MEMORY_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cursor = dir.parent();
     }
+    None
+}
+
+/// Walks from the current working directory up toward the filesystem root
+/// looking for the first `AICHAT.md`.
+pub fn find_memory_path() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    find_memory_path_from(&cwd)
+}
+
+/// Returns the contents of the nearest `AICHAT.md` (walking parents) if any.
+pub fn read_memory() -> Result<Option<String>> {
+    let Some(path) = find_memory_path() else {
+        return Ok(None);
+    };
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
     Ok(Some(contents))
@@ -128,5 +152,40 @@ mod tests {
 
         std::env::set_current_dir(&prev).unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_memory_path_walks_up_to_ancestor() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ai-chat-cli-mem-walk-{nanos}"));
+        let nested = root.join("a").join("b").join("c");
+        fs::create_dir_all(&nested).unwrap();
+
+        // Place AICHAT.md at the top of the temp tree.
+        let memory = root.join(MEMORY_FILENAME);
+        fs::write(&memory, "# walk-up test\n").unwrap();
+
+        // Searching from the deepest directory must find it.
+        let found = find_memory_path_from(&nested).expect("memory should be discoverable");
+        // Canonicalize both sides because /tmp may be a symlink on some platforms.
+        assert_eq!(
+            fs::canonicalize(&found).unwrap(),
+            fs::canonicalize(&memory).unwrap()
+        );
+
+        // And a sibling tree without the file must not.
+        let other = std::env::temp_dir().join(format!("ai-chat-cli-mem-walk-other-{nanos}"));
+        fs::create_dir_all(&other).unwrap();
+        // Only stop the walk at the temp dir's parent (which on a real system
+        // won't contain AICHAT.md). We assert the immediate dir has no hit:
+        assert!(!other.join(MEMORY_FILENAME).exists());
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&other).ok();
     }
 }

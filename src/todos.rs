@@ -58,6 +58,22 @@ impl TodoList {
         }
     }
 
+    /// Removes the 1-based item. Returns `true` if the index was valid.
+    /// Lets users drop a single bad todo without nuking the whole list with
+    /// `/todo-clear`.
+    pub fn remove(&mut self, one_based_index: usize) -> bool {
+        if one_based_index == 0 {
+            return false;
+        }
+        let idx = one_based_index - 1;
+        if idx < self.items.len() {
+            self.items.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn clear(&mut self) {
         self.items.clear();
     }
@@ -214,6 +230,23 @@ mod tests {
         list.add("b");
         list.clear();
         assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn remove_uses_one_based_index_and_shifts() {
+        let mut list = TodoList::default();
+        list.add("one");
+        list.add("two");
+        list.add("three");
+
+        assert!(!list.remove(0));
+        assert!(!list.remove(99));
+        assert!(list.remove(2));
+
+        assert_eq!(list.len(), 2);
+        // "two" was removed; "three" should now be index 2.
+        assert!(list.remove(2));
+        assert_eq!(list.len(), 1);
     }
 
     #[test]

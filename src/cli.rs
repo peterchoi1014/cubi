@@ -8,6 +8,17 @@ use crate::ollama::Message;
 use crate::project_memory;
 use crate::todos::TodoList;
 use std::fs;
+use std::path::Path;
+
+/// Sentinel prefix used to tag system messages that should only influence the
+/// next assistant turn (e.g. `/ask`). After the model responds once, any
+/// system message starting with this prefix is stripped from `history` so the
+/// hint does not poison every subsequent turn.
+const SINGLE_TURN_SYSTEM_TAG: &str = "SYSTEM[single-turn]:";
+
+/// Prefix used to tag the auto-injected project-memory system message so it
+/// can be located and replaced on `/memory-reload`.
+const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 
 pub struct ChatCLI {
     executor: AIExecutor,
@@ -28,16 +39,7 @@ impl ChatCLI {
         };
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
-        if let Ok(Some(memory)) = project_memory::read_memory() {
-            cli.history.push(Message {
-                role: "system".to_string(),
-                content: format!(
-                    "SYSTEM: Project memory loaded from {}:\n\n{}",
-                    project_memory::MEMORY_FILENAME,
-                    memory.trim()
-                ),
-            });
-        }
+        cli.inject_project_memory();
 
         // Auto-inject MCP tools into context
         if let Some(mcp) = &cli.mcp_manager
@@ -79,8 +81,16 @@ impl ChatCLI {
         let mut rl = DefaultEditor::new()?;
 
         loop {
-            let prompt = format!("{} ", "You:".bright_green().bold());
-            
+            let prompt = if self.plan_mode {
+                format!(
+                    "{}{} ",
+                    "[plan] ".bright_yellow().bold(),
+                    "You:".bright_green().bold()
+                )
+            } else {
+                format!("{} ", "You:".bright_green().bold())
+            };
+
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let input = line.trim();
@@ -118,6 +128,11 @@ impl ChatCLI {
                                 role: "assistant".to_string(),
                                 content: response,
                             });
+
+                            // Drop any system messages tagged as single-turn
+                            // (e.g. from `/ask`) so they don't keep nudging
+                            // every subsequent turn.
+                            self.strip_single_turn_system_messages();
                         }
                         Err(e) => {
                             eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
@@ -268,6 +283,21 @@ impl ChatCLI {
             "/memory" => {
                 self.show_memory();
             }
+            "/memory-reload" => {
+                self.inject_project_memory();
+                match project_memory::find_memory_path() {
+                    Some(p) => println!(
+                        "{} Reloaded project memory from {}",
+                        "✓".bright_green(),
+                        p.display().to_string().bright_cyan()
+                    ),
+                    None => println!(
+                        "{} No {} found in cwd or any ancestor",
+                        "ℹ".bright_blue(),
+                        project_memory::MEMORY_FILENAME.bright_cyan()
+                    ),
+                }
+            }
             "/todos" => {
                 self.todos.render();
             }
@@ -310,6 +340,29 @@ impl ChatCLI {
             "/todo-done" => {
                 println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
             }
+            cmd if cmd.starts_with("/todo-rm ") => {
+                let arg = cmd.strip_prefix("/todo-rm ").unwrap().trim();
+                match arg.parse::<usize>() {
+                    Ok(n) => {
+                        if self.todos.remove(n) {
+                            self.persist_todos();
+                            println!("{} Removed todo {}", "✓".bright_green(), n);
+                        } else {
+                            eprintln!(
+                                "{} No todo with index {}",
+                                "Error:".bright_red(),
+                                n
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("{} Usage: /todo-rm <index>", "Error:".bright_red());
+                    }
+                }
+            }
+            "/todo-rm" => {
+                println!("{} Usage: /todo-rm <index>", "Info:".bright_yellow());
+            }
             "/todo-clear" => {
                 self.todos.clear();
                 self.persist_todos();
@@ -328,21 +381,31 @@ impl ChatCLI {
                 println!("Records a clarifying question to be answered on the next turn.");
             }
             cmd if cmd.starts_with("/export ") => {
-                let filename = cmd.strip_prefix("/export ").unwrap().trim();
-                if filename.is_empty() {
-                    println!("{} Usage: /export <filename.md>", "Info:".bright_yellow());
-                } else if let Err(e) = self.export_markdown(filename) {
-                    eprintln!("{} Failed to export: {}", "Error:".bright_red(), e);
+                let rest = cmd.strip_prefix("/export ").unwrap().trim();
+                if rest.is_empty() {
+                    println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
                 } else {
-                    println!(
-                        "{} Conversation exported to {}",
-                        "✓".bright_green(),
-                        filename.bright_cyan()
-                    );
+                    let (force, filename) = match rest.strip_prefix("-f ") {
+                        Some(after) => (true, after.trim()),
+                        None => (false, rest),
+                    };
+                    if filename.is_empty() {
+                        println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
+                    } else {
+                        match self.export_markdown(filename, force) {
+                            Ok(()) => println!(
+                                "{} Conversation exported to {}",
+                                "✓".bright_green(),
+                                filename.bright_cyan()
+                            ),
+                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                        }
+                    }
                 }
             }
             "/export" => {
-                println!("{} Usage: /export <filename.md>", "Info:".bright_yellow());
+                println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
+                println!("       Pass -f to overwrite an existing file.");
             }
             _ => {
                 println!("{} {}", "Unknown command:".bright_red(), cmd);
@@ -456,60 +519,55 @@ impl ChatCLI {
     }
     
 
+    /// Single source of truth for slash commands shown in `/help` and the
+    /// startup banner. `(command, description)` pairs.
+    fn command_help() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("/help", "Show this help message"),
+            ("/status", "Show session status"),
+            ("/plan", "Toggle plan mode (read-only)"),
+            ("/init", "Create starter AICHAT.md"),
+            ("/memory", "Show project memory (AICHAT.md)"),
+            ("/memory-reload", "Re-read AICHAT.md from disk"),
+            ("/todos", "List todos"),
+            ("/todo-add <text>", "Add a todo"),
+            ("/todo-done <n>", "Mark todo n as done"),
+            ("/todo-rm <n>", "Remove todo n"),
+            ("/todo-clear", "Clear all todos"),
+            ("/ask <q>", "Record a clarifying question (single-turn)"),
+            ("/clear", "Clear conversation history"),
+            ("/history", "Show conversation history"),
+            ("/export [-f] <f.md>", "Export conversation as Markdown"),
+            ("/save <f.json>", "Save conversation"),
+            ("/load <f.json>", "Load conversation"),
+            ("/batch <f>", "Process batch file"),
+            ("/mcp-tools", "List available MCP tools"),
+            ("/mcp-call <t> <a>", "Call MCP tool"),
+            ("/mcp-reload", "Reload MCP configuration"),
+            ("/model", "Show current model"),
+            ("/model <name>", "Switch to a different model"),
+            ("/version", "Show version"),
+            ("/quit", "Exit the chat"),
+        ]
+    }
+
     fn print_welcome(&self) {
         println!("\n{}", "=".repeat(60).bright_cyan());
         println!("{}", "  AI Chat CLI - Powered by Repartir".bright_cyan().bold());
         println!("{}", "=".repeat(60).bright_cyan());
         println!("\n{}", "Commands:".bright_yellow().bold());
-        println!("  {} - Show this help message", "/help".bright_cyan());
-        println!("  {} - Show session status", "/status".bright_cyan());
-        println!("  {} - Toggle plan mode (read-only)", "/plan".bright_cyan());
-        println!("  {} - Create starter AICHAT.md", "/init".bright_cyan());
-        println!("  {} - Show project memory (AICHAT.md)", "/memory".bright_cyan());
-        println!("  {} / {} / {} / {} - manage todos",
-            "/todos".bright_cyan(),
-            "/todo-add".bright_cyan(),
-            "/todo-done".bright_cyan(),
-            "/todo-clear".bright_cyan());
-        println!("  {} <question> - Record a clarifying question for the next turn", "/ask".bright_cyan());
-        println!("  {} - Clear conversation history", "/clear".bright_cyan());
-        println!("  {} - Show conversation history", "/history".bright_cyan());
-        println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
-        println!("  {} - List available MCP tools", "/mcp-tools".bright_cyan());
-        println!("  {} <t> <a> - Call MCP tool", "/mcp-call".bright_cyan());
-        println!("  {} - Reload MCP configuration", "/mcp-reload".bright_cyan());
-        println!("  {} - Show current model", "/model".bright_cyan());
-        println!("  {} <name> - Switch to different model", "/model".bright_cyan());
-        println!("  {} - Show version", "/version".bright_cyan());
-        println!("  {} - Exit the chat", "/quit".bright_cyan());
+        for (cmd, desc) in Self::command_help() {
+            println!("  {} - {}", cmd.bright_cyan(), desc);
+        }
         println!("\n{}\n", "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white());
     }
 
     fn show_help(&self) {
         println!("\n{}", "Available Commands:".bright_yellow().bold());
-        println!("  {} - Show this help message", "/help".bright_cyan());
-        println!("  {} - Show session status", "/status".bright_cyan());
-        println!("  {} - Toggle plan mode (read-only)", "/plan".bright_cyan());
-        println!("  {} - Create starter AICHAT.md", "/init".bright_cyan());
-        println!("  {} - Show project memory (AICHAT.md)", "/memory".bright_cyan());
-        println!("  {} - List todos", "/todos".bright_cyan());
-        println!("  {} <text> - Add a todo", "/todo-add".bright_cyan());
-        println!("  {} <n> - Mark todo n as done", "/todo-done".bright_cyan());
-        println!("  {} - Clear todos", "/todo-clear".bright_cyan());
-        println!("  {} <q> - Record a clarifying question for the next turn", "/ask".bright_cyan());
-        println!("  {} - Clear conversation history", "/clear".bright_cyan());
-        println!("  {} - Show conversation history", "/history".bright_cyan());
-        println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
-        println!("  {} <f.json> - Save conversation", "/save".bright_cyan());
-        println!("  {} <f.json> - Load conversation", "/load".bright_cyan());
-        println!("  {} <f> - Process batch file", "/batch".bright_cyan());
-        println!("  {} - List available MCP tools", "/mcp-tools".bright_cyan());
-        println!("  {} <t> <a> - Call MCP tool", "/mcp-call".bright_cyan());
-        println!("  {} - Reload MCP configuration", "/mcp-reload".bright_cyan());
-        println!("  {} - Show current model", "/model".bright_cyan());
-        println!("  {} <name> - Switch to different model", "/model".bright_cyan());
-        println!("  {} - Show version", "/version".bright_cyan());
-        println!("  {} - Exit the chat\n", "/quit".bright_cyan());
+        for (cmd, desc) in Self::command_help() {
+            println!("  {} - {}", cmd.bright_cyan(), desc);
+        }
+        println!();
     }
 
     fn show_history(&self) {
@@ -600,19 +658,31 @@ impl ChatCLI {
     /// Records a clarifying question from the user. Until the model can
     /// invoke `ask_user` itself, this command lets the user front-load a
     /// pointed question that the next turn's system context highlights.
+    ///
+    /// The injected system message is tagged with [`SINGLE_TURN_SYSTEM_TAG`]
+    /// so it is removed after the next assistant response and doesn't
+    /// re-emphasize the same question on every subsequent turn.
     fn ask_user(&mut self, question: &str) {
         self.history.push(Message {
             role: "system".to_string(),
             content: format!(
-                "SYSTEM: The user has a clarifying question they want addressed \
+                "{} The user has a clarifying question they want addressed \
                  directly and concisely on the next turn:\n\n{}",
-                question
+                SINGLE_TURN_SYSTEM_TAG, question
             ),
         });
         println!(
-            "{} Question recorded. It will be highlighted on the next turn.",
+            "{} Question recorded. It will be highlighted on the next turn only.",
             "✓".bright_green()
         );
+    }
+
+    /// Removes any system messages tagged as single-turn (see
+    /// [`SINGLE_TURN_SYSTEM_TAG`]) from the history.
+    fn strip_single_turn_system_messages(&mut self) {
+        self.history.retain(|m| {
+            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
+        });
     }
 
     fn run_init(&self) {
@@ -634,10 +704,13 @@ impl ChatCLI {
     fn show_memory(&self) {
         match project_memory::read_memory() {
             Ok(Some(contents)) => {
+                let location = project_memory::find_memory_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| project_memory::MEMORY_FILENAME.to_string());
                 println!(
                     "\n{} ({}):",
                     "Project memory".bright_yellow().bold(),
-                    project_memory::MEMORY_FILENAME.bright_cyan()
+                    location.bright_cyan()
                 );
                 println!("{}", "-".repeat(60).bright_black());
                 println!("{}", contents);
@@ -652,7 +725,47 @@ impl ChatCLI {
         }
     }
 
-    fn export_markdown(&self, filename: &str) -> Result<()> {
+    /// Removes any previously injected project-memory system message and
+    /// re-reads `AICHAT.md` (walking up the directory tree) into history.
+    fn inject_project_memory(&mut self) {
+        // Drop any prior project-memory entries so callers can use this as
+        // both an initial inject and a reload.
+        self.history.retain(|m| {
+            !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX))
+        });
+
+        if let Ok(Some(memory)) = project_memory::read_memory() {
+            let location = project_memory::find_memory_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| project_memory::MEMORY_FILENAME.to_string());
+            self.history.push(Message {
+                role: "system".to_string(),
+                content: format!(
+                    "{} {}:\n\n{}",
+                    PROJECT_MEMORY_PREFIX,
+                    location,
+                    memory.trim()
+                ),
+            });
+        }
+    }
+
+    /// Cleanly shuts down any owned MCP connections. Call this from an
+    /// async context **before** dropping the CLI; the `Drop` impl is only a
+    /// best-effort safety net.
+    pub async fn shutdown(&mut self) {
+        if let Some(mcp) = &mut self.mcp_manager {
+            mcp.shutdown().await;
+        }
+    }
+
+    fn export_markdown(&self, filename: &str, force: bool) -> Result<()> {
+        if !force && Path::new(filename).exists() {
+            anyhow::bail!(
+                "Refusing to overwrite existing file '{}'. Re-run with /export -f <file> to force.",
+                filename
+            );
+        }
         let mut out = String::new();
         out.push_str("# ai-chat-cli conversation\n\n");
         out.push_str(&format!("- model: `{}`\n", self.executor.get_model()));
@@ -680,15 +793,31 @@ impl ChatCLI {
     }
 }
 
-// Update Drop implementation
+// Best-effort fallback if `shutdown()` was never called. We intentionally do
+// **not** spin up a fresh `tokio::runtime::Runtime` here: doing so from inside
+// the outer `#[tokio::main]` runtime panics, and previously caused a crash on
+// every clean exit that actually had MCP cleanup to do. Callers should
+// `cli.shutdown().await` from `main` instead.
 impl Drop for ChatCLI {
     fn drop(&mut self) {
-        if let Some(mcp) = &mut self.mcp_manager {
-            // Spawn blocking task to shutdown MCP
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                mcp.shutdown().await;
-            });
+        if self.mcp_manager.is_some() {
+            // Try the cheap path: if there's a current Tokio runtime handle
+            // available, spawn a detached cleanup task. Otherwise log and move
+            // on — losing the MCP shutdown on a hard drop is preferable to
+            // panicking.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if let Some(mut mcp) = self.mcp_manager.take() {
+                    handle.spawn(async move {
+                        mcp.shutdown().await;
+                    });
+                }
+            } else {
+                eprintln!(
+                    "{} ChatCLI dropped without an explicit shutdown(); \
+                     MCP servers may not be cleanly stopped.",
+                    "Warning:".bright_yellow()
+                );
+            }
         }
     }
 }

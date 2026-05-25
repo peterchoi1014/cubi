@@ -104,6 +104,17 @@ cargo run --release
 ./target/release/ai-chat-cli
 ```
 
+### Choosing a model
+
+By default the CLI uses `llama3.2:1b`. Override at startup with the
+`AI_CHAT_CLI_MODEL` environment variable, or switch interactively with the
+`/model` command:
+
+```bash
+# Pick a different default just for this session
+AI_CHAT_CLI_MODEL=mistral:7b cargo run --release
+```
+
 You should see:
 
 ```
