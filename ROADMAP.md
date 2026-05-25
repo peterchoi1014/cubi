@@ -13,8 +13,8 @@ source tree.
 > implementations must be original work written against public Anthropic
 > documentation, the MCP spec, and our own design.
 
-Items already shipped in this PR are marked `[x]`. Everything else is open work
-for future PRs.
+Items already shipped are marked `[x]`. Everything else is open work
+for future PRs. Current crate version: **0.1.0**.
 
 ---
 
