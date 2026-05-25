@@ -245,17 +245,16 @@ impl ChatCLI {
                 && store.exists(&session.id)
             {
                 Some(format!(
-                    "\n{} To pick this chat back up, run {} and then type {}",
+                    "\n{} To pick this chat back up, run {}",
                     "↩".bright_cyan(),
-                    "cubi".bright_cyan(),
-                    format!("/resume {}", session.id).bright_cyan()
+                    format!("cubi --resume {}", session.id).bright_cyan()
                 ))
             } else if store.list().map(|l| !l.is_empty()).unwrap_or(false) {
                 Some(format!(
-                    "\n{} Run {} and type {} to see prior chats in this directory.",
+                    "\n{} Run {} to jump back into your most recent chat, or {} for a list.",
                     "↩".bright_cyan(),
-                    "cubi".bright_cyan(),
-                    "/sessions".bright_cyan()
+                    "cubi --resume".bright_cyan(),
+                    "cubi  →  /sessions".bright_cyan()
                 ))
             } else {
                 None
