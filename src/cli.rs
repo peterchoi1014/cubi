@@ -1007,7 +1007,30 @@ impl ChatCLI {
     }
 
     fn print_welcome(&self) {
-        println!("\n{}", "=".repeat(60).bright_cyan());
+        // Friendly little mascot, à la claude-code's startup. Six lines
+        // wide, hand-drawn so it stays small on narrow terminals.
+        let mascot = [
+            r#"   .-""""-.   "#,
+            r#"  / .===. \   "#,
+            r#"  \/ 6 6 \/   "#,
+            r#"  ( \___/ )   "#,
+            r#" _\_`---'_/_  "#,
+            r#"(___)   (___) "#,
+        ];
+        let tagline = [
+            "",
+            "  hi! i'm ai-chat-cli.",
+            "  ask me anything,",
+            "  or hand me a tool",
+            "  and i'll get to work.",
+            "",
+        ];
+        println!();
+        for (m, t) in mascot.iter().zip(tagline.iter()) {
+            println!("{}  {}", m.bright_cyan(), t.bright_white());
+        }
+        println!();
+        println!("{}", "=".repeat(60).bright_cyan());
         println!(
             "{}",
             "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
