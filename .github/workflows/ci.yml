@@ -54,13 +54,23 @@ jobs:
           cargo build --locked --bin cubi
           BIN=target/debug/cubi
 
+          # --version: must start with "cubi " followed by the Cargo
+          # version. We use grep -F so pre-release/build metadata (e.g.
+          # "0.3.0-alpha.1+build7") flows through unmodified.
+          pkg_ver="$(cargo pkgid --offline | awk -F'[#@]' '{print $NF}')"
           out="$("$BIN" --version)"
           echo "$out"
-          [[ "$out" =~ ^cubi\ [0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "--version output unexpected"; exit 1; }
+          echo "$out" | grep -Fxq "cubi $pkg_ver" \
+            || { echo "expected: cubi $pkg_ver"; exit 1; }
 
           "$BIN" --help | grep -q "USAGE:" || { echo "--help missing USAGE section"; exit 1; }
 
-          # Unknown flag must exit non-zero (2) without hanging in the REPL.
-          if "$BIN" --definitely-not-a-flag; then
-            echo "unknown flag should have failed"; exit 1
+          # Unknown flag must exit with status 2 specifically — not just
+          # any non-zero — so we don't silently regress to e.g. 1.
+          set +e
+          "$BIN" --definitely-not-a-flag
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "unknown flag should exit 2, got $status"; exit 1
           fi
