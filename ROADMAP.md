@@ -20,8 +20,8 @@ for future PRs.
 
 ## A. Built-in tools to add (`src/builtin_tools.rs` extensions)
 
-- [ ] **Subagent / Task tool** — main model spawns isolated worker agents
-      (`AgentTool`, `TaskCreate/Get/List/Update/Stop/OutputTool`)
+- [x] **Subagent / Task tool** — main model spawns isolated worker agents
+      *(`agent_run` meta-tool: fresh context, same tools minus `agent_run`, step cap)*
 - [x] **`TodoWrite` tool** + `/todos` UI — persistent per-session task checklist
       *(now persisted across restarts at `~/.ai-chat-cli/todos/<cwd-key>.json`)*
 - [x] **Plan mode** — read-only "plan first, then apply" toggle
@@ -30,11 +30,16 @@ for future PRs.
 - [x] **`ask_user` tool** — model pauses and asks a clarifying question
       *(user-driven `/ask <question>` for now; model-triggered version comes
       with native tool-calling)*
-- [ ] **Git worktree tool** + `/worktree` — isolated worktree for risky changes
-- [ ] **`web_fetch`, `web_search`** — network tools (permission-gated)
-- [ ] **LSP-backed code intel tool** — hover / definition / references
-- [ ] **Jupyter notebook tool** — cell-level edits to `.ipynb`
-- [ ] **Persistent REPL tool** — long-lived shell / Python / Node session
+- [x] **Git worktree tool** — `worktree` builtin (list/add/remove), auto-trusts
+      new paths; CLI-side `/worktree` is still TODO
+- [x] **`web_fetch`, `web_search`** — network tools (permission-gated)
+      *(HTTP(S) GET with 64 KB cap; DuckDuckGo lite-mode scrape — no API key)*
+- [x] **LSP-backed code intel tool** — hover / definition / references
+      *(`lsp` builtin: caller specifies server command + 1-based line/col)*
+- [x] **Jupyter notebook tool** — cell-level edits to `.ipynb`
+      *(`notebook` builtin: list/read/insert/replace/delete; pure JSON, no Jupyter dep)*
+- [x] **Persistent REPL tool** — long-lived shell / Python / Node session
+      *(bash-only for now; `repl_start` / `repl_eval` / `repl_close`)*
 - [ ] **Cross-platform shell tool** — `bash` vs `pwsh` based on host OS
 - [ ] **Time tools** — `Sleep`, `ScheduleCron`
 - [ ] **Skills system** — reusable Markdown skill packs in
@@ -62,16 +67,17 @@ Shipped in this PR:
 - [x] `/init`, `/memory`, `/memory-reload`
 - [x] `/status`, `/version`, `/export` (with overwrite protection)
 - [x] `/ask` (user-driven clarifying-question stand-in, single-turn)
+- [x] `/sessions`, `/resume` (auto-saved per-project checkpoints)
+- [x] `/diff`, `/commit`, `/review` (git workflow; `/commit` is plan-mode-aware)
+- [x] `/trust` (project-trust gate for write/exec tools)
 
 Still to add (grouped by area):
 
 - **Project / workspace:** `/add-dir`, `/files`, `/init-verifiers`
-- **Git workflow:** `/commit`, `/commit-push-pr`, `/branch`, `/tag`,
-  `/pr_comments`, `/review`, `/security-review`, `/autofix-pr`, `/issue`,
-  `/diff`, `/undo`
+- **Git workflow:** `/commit-push-pr`, `/branch`, `/tag`, `/pr_comments`,
+  `/security-review`, `/autofix-pr`, `/issue`, `/undo`
 - **Agent control:** `/agents`, `/tasks`, `/teleport`, `/rewind`, `/passes`,
   `/effort`, `/compact`
-- **Sessions:** `/sessions`, `/resume`
 - **Output / theming:** `/theme`, `/color`, `/output-style`, `/statusline`,
   `/keybindings`, `/vim`
 - **Auth / accounts:** `/login`, `/logout`, `/oauth-refresh`,
@@ -86,9 +92,11 @@ Still to add (grouped by area):
 - **Social / sharing:** `/share`, `/copy`, `/feedback`, `/release-notes`,
   `/stickers`
 
-Foundation work: refactor the flat `match` in `cli.rs::handle_command` into a
-`SlashCommand` trait + registry, and support user-defined Markdown commands as
-first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
+Foundation work: the flat `match` in `cli.rs::handle_command` is now a
+`SlashCommand` registry (`src/commands.rs`) — adding a command requires a row
+in `COMMANDS` and an exhaustive arm on `Cmd`. Still to do: user-defined
+Markdown commands as first-class plugins (cf. leaked
+`createMovedToPluginCommand.ts`).
 
 ---
 
@@ -96,10 +104,14 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
 
 1. **Onboarding** (`bootstrap/`, `setup.ts`, `projectOnboardingState.ts`) —
    first-run flow: pick model, scan project, write `AICHAT.md`, set trust
-   level. *(Hard-coded `let model = "llama3.2:1b"` is now overridable via
-   `AI_CHAT_CLI_MODEL`; a real wizard is the follow-up.)*
+   level. ✅ Shipped: `src/onboarding.rs` runs once, lets the user pick a
+   model from `ollama list`, offers `/trust`, offers `AICHAT.md`. Persisted
+   to `~/.ai-chat-cli/config.json`.
 2. **Permissions system** (`utils/permissions/`) — project trust, per-tool
-   allow/deny, "trust this folder" prompts, enterprise-managed policy.
+   allow/deny, "trust this folder" prompts, enterprise-managed policy. ✅
+   Foundation shipped: `src/permissions.rs` enforces a per-project trust
+   store with a path sandbox; `bash`, `edit_file`, `write_file` are gated.
+   Per-tool allow/deny lists and enterprise policy are still open.
 3. **Memory & compaction** (`services/compact/`, `SessionMemory/`,
    `extractMemories/`, `memdir/`) — automatic in-session compaction plus
    cross-session persistent memory at `~/.ai-chat-cli/memdir/`.
@@ -129,7 +141,10 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
     `distributed.rs` (Repartir).
 17. **Auto-saved sessions + checkpointing** (`sessionStorage.js`,
     `sessionStart.js`, `history.ts`) — `/resume`, `/rewind` with file-mutation
-    rollback.
+    rollback. ✅ Foundation shipped: `src/sessions.rs` auto-checkpoints to
+    `~/.ai-chat-cli/sessions/<cwd-key>/<id>.json` after every turn; `/sessions`
+    + `/resume [id]` are wired up. `/rewind` and file-mutation rollback are
+    still open.
 18. **TUI rewrite** (`screens/`, `components/`, Ink → `ratatui`) — panes for
     chat / tool output / todos / status line.
 19. **Deep-link / browser integration** (`claudeInChrome/`, `deepLink/`,
@@ -146,18 +161,26 @@ first-class plugins (cf. leaked `createMovedToPluginCommand.ts`).
 
 ## D. Implementation priorities
 
-1. Agent loop + native tool-calling + streaming.
-2. Permissions system + path sandboxing + project-trust prompt.
-3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** *(partially in this PR)*
-4. `/init` + `AICHAT.md` + memdir + onboarding flow. *(partially in this PR)*
+1. Agent loop + native tool-calling + streaming. ✅ Shipped (NDJSON streaming
+   in `ollama.rs`; `agent_loop.rs` drives multi-step tool round-trips via
+   Ollama's `tools` parameter, with a 12-step safety cap).
+2. Permissions system + path sandboxing + project-trust prompt. ✅ Shipped.
+3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** ✅ Plan mode now gates all
+   built-in write/exec tools; `/todos` and `/ask` already in place.
+4. `/init` + `AICHAT.md` + memdir + onboarding flow. ✅ Onboarding wizard
+   shipped; memdir (cross-session persistent memory) is still open.
 5. Auto-saved sessions + `/resume` + `/rewind` checkpoints + compaction.
+   ✅ Sessions + `/resume` shipped; `/rewind` and compaction are still open.
 6. Slash-command registry + custom Markdown commands + `@file` mentions +
-   prompt suggestions.
-7. Subagents (`AgentTool`) + task management tools.
+   prompt suggestions. ✅ Registry shipped (`src/commands.rs`); user-defined
+   Markdown commands and `@file` mentions still open.
+7. Subagents (`AgentTool`) + task management tools. ✅ `agent_run` meta-tool
+   shipped (fresh-context inner loop; recursion disallowed).
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.
+   ✅ `/diff`, `/commit`, `/review` + `worktree` builtin shipped.
 9. Multi-provider LLM abstraction + token estimator + rate-limit / retry.
 10. Web tools (`web_fetch`, `web_search`) + LSP service & tool + REPL tool +
-    notebook tool.
+    notebook tool. ✅ All four shipped as built-in tools.
 11. Hooks, plugins, skills, MCP resources / prompts / OAuth, MCP approval UI.
 12. TUI (ratatui) rewrite with panes, vim keybindings, output styles, themes,
     statusline.
