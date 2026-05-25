@@ -221,8 +221,14 @@ impl SessionStore {
                 preview,
             });
         }
-        // Newest first.
-        out.sort_by_key(|m| std::cmp::Reverse(m.modified_at));
+        // Newest first. Tie-break on id so that bursts of checkpoints
+        // sharing the same mtime (coarse-resolution filesystems) still
+        // produce a deterministic ordering.
+        out.sort_by(|a, b| {
+            b.modified_at
+                .cmp(&a.modified_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(out)
     }
 
@@ -293,7 +299,11 @@ impl SessionStore {
                 });
             }
         }
-        out.sort_by_key(|m| std::cmp::Reverse(m.modified_at));
+        out.sort_by(|a, b| {
+            b.modified_at
+                .cmp(&a.modified_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(out)
     }
 

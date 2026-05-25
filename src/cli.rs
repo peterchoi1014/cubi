@@ -3672,19 +3672,16 @@ impl ChatCLI {
         Ok(())
     }
 
-    fn cancel_tool_calls(&mut self, turn_start: usize, calls: &[ToolCall], current_idx: usize) {
+    fn cancel_tool_calls(&mut self, turn_start: usize, _calls: &[ToolCall], current_idx: usize) {
         let msg = format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
         if self.headless_mode {
             eprintln!("{msg}");
         } else {
             println!("{msg}");
         }
-        for call in calls.iter().skip(current_idx) {
-            self.history.push(Message::tool_result(
-                &call.function.name,
-                "[tool cancelled by user]",
-            ));
-        }
+        // History is truncated back to `turn_start` to discard the in-flight
+        // turn, so we deliberately do not push "[tool cancelled]" markers —
+        // they would be dropped immediately by the truncate below.
         self.history.truncate(turn_start);
         self.journal.discard_last_turn_if_empty();
         let caveat = format!(
@@ -3695,6 +3692,20 @@ impl ChatCLI {
             eprintln!("{caveat}");
         } else {
             println!("{caveat}");
+        }
+        // Mirror the model-cancel path: warn that earlier tools in this
+        // same turn may have already mutated state, and point at `/rewind`.
+        if current_idx > 0 {
+            let rewind = format!(
+                "  {} prior tool side-effects in this turn may have run; \
+                 `/rewind` can undo file edits.",
+                "ℹ".bright_blue()
+            );
+            if self.headless_mode {
+                eprintln!("{rewind}");
+            } else {
+                println!("{rewind}");
+            }
         }
     }
 
