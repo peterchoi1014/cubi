@@ -1009,19 +1009,21 @@ impl ChatCLI {
     }
 
     fn print_welcome(&self) {
-        // Tiny pixel-art mascot — chunky block character that reads as
-        // cute on any monospaced terminal. Half-block glyphs (█▀▄) keep
-        // the silhouette square; ■ eyes + ▾ mouth give it personality.
+        // "Cubi" mascot — a tiny isometric cube with pixel-block eyes
+        // and a smile. Box-drawing characters keep the silhouette crisp
+        // on any monospace font; the small offset shadow sells the 3D.
         let mascot = [
-            r#"  ▄▄▄▄▄  "#,
-            r#" █ ■ ■ █ "#,
-            r#" █  ▾  █ "#,
-            r#"  ▀▀▀▀▀  "#,
+            r#"  ┌───────┐  "#,
+            r#"  │ ▣   ▣ │  "#,
+            r#"  │   ◡   │  "#,
+            r#"  └───────┘  "#,
+            r#"   ░░░░░░░   "#,
         ];
         let tagline = [
             "",
-            "  hi! ready when you are.",
+            "  hi, i'm Cubi.",
             "  /help to see commands.",
+            "  ask me anything.",
             "",
         ];
         println!();
@@ -1032,7 +1034,9 @@ impl ChatCLI {
         println!("{}", "=".repeat(60).bright_cyan());
         println!(
             "{}",
-            "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
+            "  Cubi — a pocket-sized AI for your shell"
+                .bright_cyan()
+                .bold()
         );
         println!("{}", "=".repeat(60).bright_cyan());
         let essentials = [
