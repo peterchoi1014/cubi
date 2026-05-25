@@ -3,6 +3,7 @@ use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::file_mentions::{self, UserCommand};
 use crate::git_cmds;
+use crate::hooks::HookRegistry;
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
 use crate::ollama::Message;
@@ -38,6 +39,8 @@ pub struct ChatCLI {
     memdir: Memdir,
     /// User-defined Markdown commands loaded from disk.
     user_commands: Vec<UserCommand>,
+    /// Hook registry for lifecycle events.
+    hooks: HookRegistry,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -64,6 +67,7 @@ impl ChatCLI {
             todos: TodoList::load_for_current_dir(),
             memdir: Memdir::load(),
             user_commands: file_mentions::load_user_commands(),
+            hooks: HookRegistry::load(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -121,6 +125,9 @@ impl ChatCLI {
 
     pub async fn run(&mut self) -> Result<()> {
         self.print_welcome();
+
+        // Fire SessionStart hooks.
+        self.hooks.fire_session_start(self.executor.get_model());
 
         let mut rl = DefaultEditor::new()?;
 
@@ -184,6 +191,9 @@ impl ChatCLI {
                 }
             }
         }
+
+        // Fire Stop hooks.
+        self.hooks.fire_stop();
 
         Ok(())
     }
@@ -1581,7 +1591,20 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 );
 
-                let result_text = if call.function.name == AGENT_TOOL_NAME {
+                // Fire PreToolUse hook — may deny the call.
+                use crate::hooks::HookDecision;
+                let hook_decision = self
+                    .hooks
+                    .fire_pre_tool_use(&call.function.name, &call.function.arguments);
+
+                let result_text = if let HookDecision::Deny(reason) = hook_decision {
+                    println!(
+                        "  {} {}",
+                        "✗".bright_red(),
+                        "denied by PreToolUse hook".bright_red()
+                    );
+                    format!("[tool denied] {reason}")
+                } else if call.function.name == AGENT_TOOL_NAME {
                     // Meta-tool: spawn a focused subagent with fresh
                     // context. Handled here (not in `McpManager`) because
                     // it needs the executor to drive its own inner loop.
@@ -1631,6 +1654,12 @@ impl ChatCLI {
                         ),
                     }
                 };
+
+                // Fire PostToolUse hook.
+                let is_error = result_text.starts_with("[tool error]")
+                    || result_text.starts_with("[tool denied]");
+                self.hooks
+                    .fire_post_tool_use(&call.function.name, &result_text, is_error);
 
                 // Print a short preview so the user can see what came back
                 // without us dumping a 10 KB log into the terminal.
