@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod compat;
 mod completer;
+mod completions;
 mod executor;
 mod file_mentions;
 mod file_rollback;
@@ -112,6 +113,28 @@ async fn main() -> Result<()> {
                     &mut one_shot_prompt,
                     arg.trim_start_matches("--prompt=").to_string(),
                 );
+            }
+            "completions" => {
+                let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
+                    );
+                    std::process::exit(2);
+                };
+                if argv.get(i + 2).is_some() {
+                    eprintln!(
+                        "cubi: completions requires exactly one shell argument (bash, zsh, fish)."
+                    );
+                    std::process::exit(2);
+                }
+                if let Some(script) = completions::script(shell) {
+                    print!("{script}");
+                    return Ok(());
+                }
+                eprintln!(
+                    "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
+                );
+                std::process::exit(2);
             }
             "--resume" | "-r" | "resume" => {
                 set_primary(&mut primary, PrimaryCommand::Resume(String::new()));
@@ -468,6 +491,7 @@ fn print_help() {
                                       global latest)\n  \
          cubi --list-sessions         List saved sessions newest-first\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\
          OUTPUT FLAGS (can be combined with chat commands):\n  \

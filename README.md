@@ -206,6 +206,7 @@ cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
                              session from the current cwd, then global latest
 cubi --list-sessions         List all saved sessions newest-first
 cubi --delete-session <id>   Delete by full id or unique prefix
+cubi completions <shell>     Print a completion script (bash, zsh, fish)
 cubi --version               Print version and exit
 cubi --help                  Print help and exit
 
@@ -224,6 +225,10 @@ stream tokens. Press **Ctrl-C** during an in-flight reply or tool call to cancel
 it and return to the prompt; the unanswered user message is rolled back so
 history stays clean. Dropping a tool future cannot always stop subprocesses
 already spawned by shell-out tools.
+
+Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
+or `cubi completions fish`, then install the printed script using your shell's
+normal completion setup.
 
 ### Basic Chat
 
