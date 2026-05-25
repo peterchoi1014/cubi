@@ -3,6 +3,7 @@ mod builtin_tools;
 mod cli;
 mod commands;
 mod compat;
+mod completer;
 mod executor;
 mod file_mentions;
 mod file_rollback;
@@ -61,30 +62,53 @@ async fn main() -> Result<()> {
     // loop has no flags of its own; this just makes `cubi --version` and
     // `cubi --help` Do What People Expect instead of dropping them into
     // the REPL. Use `args_os()` so non-UTF-8 argv can't panic the binary.
-    if let Some(arg) = std::env::args_os().nth(1) {
-        match arg.to_str() {
-            Some("--version") | Some("-V") | Some("version") => {
-                println!("cubi {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            Some("--help") | Some("-h") | Some("help") => {
-                println!(
-                    "cubi {} — a pocket-sized AI for your shell\n\n\
-                     USAGE:\n  cubi              Start the interactive chat REPL\n  \
-                     cubi --version     Print version and exit\n  \
-                     cubi --help        Print this help and exit\n\n\
-                     Once inside the REPL, type /help to list slash commands.",
-                    env!("CARGO_PKG_VERSION")
-                );
-                return Ok(());
-            }
-            _ => {
+    // Lightweight argv handling. We don't pull in clap because the chat
+    // loop has no flags of its own; this just makes `cubi --version`,
+    // `cubi --help`, and `cubi --resume [id]` Do What People Expect
+    // instead of dropping them straight into the REPL. Use `args_os()`
+    // so non-UTF-8 argv can't panic the binary.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut resume_request: Option<String> = None;
+    match argv.first().and_then(|a| a.to_str()) {
+        None => {}
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("cubi {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            println!(
+                "cubi {} — a pocket-sized AI for your shell\n\n\
+                 USAGE:\n  cubi                    Start the interactive chat REPL\n  \
+                 cubi --resume [<id>]    Resume a prior chat (most recent in this\n  \
+                                         directory if no id is given)\n  \
+                 cubi --version          Print version and exit\n  \
+                 cubi --help             Print this help and exit\n\n\
+                 Once inside the REPL, type /help to list slash commands.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        Some("--resume") | Some("-r") | Some("resume") => {
+            // Empty string means "latest"; an explicit id selects it.
+            resume_request = Some(
+                argv.get(1)
+                    .and_then(|a| a.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            if argv.len() > 2 {
                 eprintln!(
-                    "cubi: unrecognized argument {:?}. Run `cubi --help` for usage.",
-                    arg
+                    "cubi: --resume takes at most one argument. Run `cubi --help` for usage."
                 );
                 std::process::exit(2);
             }
+        }
+        Some(_) => {
+            eprintln!(
+                "cubi: unrecognized argument {:?}. Run `cubi --help` for usage.",
+                argv[0]
+            );
+            std::process::exit(2);
         }
     }
 
@@ -280,6 +304,9 @@ async fn main() -> Result<()> {
 
     // Create and run CLI
     let mut cli = ChatCLI::new(executor, mcp_manager, permissions, plan_mode, journal);
+    if let Some(target) = resume_request {
+        cli.resume_session(&target);
+    }
     let run_result = cli.run().await;
 
     // Shut down MCP cleanly while we still have an async context. The Drop

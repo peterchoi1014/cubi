@@ -47,3 +47,20 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: smoke-test --version / --help / unknown flag
+        run: |
+          set -e
+          cargo build --locked --bin cubi
+          BIN=target/debug/cubi
+
+          out="$("$BIN" --version)"
+          echo "$out"
+          [[ "$out" =~ ^cubi\ [0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "--version output unexpected"; exit 1; }
+
+          "$BIN" --help | grep -q "USAGE:" || { echo "--help missing USAGE section"; exit 1; }
+
+          # Unknown flag must exit non-zero (2) without hanging in the REPL.
+          if "$BIN" --definitely-not-a-flag; then
+            echo "unknown flag should have failed"; exit 1
+          fi

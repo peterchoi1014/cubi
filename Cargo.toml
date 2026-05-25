@@ -2,7 +2,20 @@
 name = "cubi"
 version = "0.3.0"
 edition = "2024"
-description = "Cubi — a pocket-sized AI for your shell"
+description = "Cubi — a pocket-sized AI for your shell with local model inference, native tool-calling, and MCP support"
+license = "MIT"
+repository = "https://github.com/peterchoi1014/cubi"
+homepage = "https://github.com/peterchoi1014/cubi"
+documentation = "https://github.com/peterchoi1014/cubi#readme"
+readme = "README.md"
+keywords = ["ai", "cli", "ollama", "llm", "mcp"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
+exclude = [
+    "docs/assets/*",
+    ".github/*",
+    "target/*",
+]
 
 [[bin]]
 name = "cubi"
