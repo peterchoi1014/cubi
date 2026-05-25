@@ -1,6 +1,7 @@
 use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
+use crate::file_mentions::{self, UserCommand};
 use crate::git_cmds;
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
@@ -35,6 +36,8 @@ pub struct ChatCLI {
     todos: TodoList,
     /// Cross-session persistent memory store (`~/.ai-chat-cli/memdir/`).
     memdir: Memdir,
+    /// User-defined Markdown commands loaded from disk.
+    user_commands: Vec<UserCommand>,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -60,6 +63,7 @@ impl ChatCLI {
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
             memdir: Memdir::load(),
+            user_commands: file_mentions::load_user_commands(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -141,6 +145,10 @@ impl ChatCLI {
 
                     // Handle commands
                     if input.starts_with('/') {
+                        // Check user-defined commands first.
+                        if self.try_user_command(input) {
+                            continue;
+                        }
                         if !self.handle_command(input).await? {
                             break;
                         }
@@ -150,8 +158,11 @@ impl ChatCLI {
                     // Add line to readline history
                     rl.add_history_entry(input)?;
 
+                    // Expand @file mentions in user input.
+                    let expanded = file_mentions::expand_file_mentions(input);
+
                     // Add user message to history
-                    self.history.push(Message::text("user", input));
+                    self.history.push(Message::text("user", &expanded));
 
                     // Run the agent: stream model output, execute any
                     // requested tools, loop until the model returns plain
@@ -175,6 +186,52 @@ impl ChatCLI {
         }
 
         Ok(())
+    }
+
+    /// Tries to match a `/command` against user-defined Markdown commands.
+    /// Returns `true` if a user command was matched and handled.
+    fn try_user_command(&mut self, input: &str) -> bool {
+        let input = input.trim();
+        let (head, args) = match input.find(char::is_whitespace) {
+            Some(i) => (&input[..i], input[i..].trim()),
+            None => (input, ""),
+        };
+        // Strip the leading `/` to get the command name.
+        let cmd_name = head.strip_prefix('/').unwrap_or(head).to_lowercase();
+
+        let matched = self
+            .user_commands
+            .iter()
+            .find(|c| c.name == cmd_name)
+            .cloned();
+
+        let Some(user_cmd) = matched else {
+            return false;
+        };
+
+        // Inject the Markdown body as a single-turn system message.
+        let body = if args.is_empty() {
+            user_cmd.body.clone()
+        } else {
+            format!("{}\n\nUser argument: {}", user_cmd.body, args)
+        };
+
+        self.history.push(Message::text(
+            "system",
+            format!(
+                "{} User command /{} (from {}):\n\n{}",
+                SINGLE_TURN_SYSTEM_TAG,
+                user_cmd.name,
+                user_cmd.path.display(),
+                body
+            ),
+        ));
+        println!(
+            "{} Applied user command /{}",
+            "✓".bright_green(),
+            user_cmd.name.bright_cyan()
+        );
+        true
     }
 
     async fn handle_command(&mut self, input: &str) -> Result<bool> {
