@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod executor;
 mod git_cmds;
+mod lsp_client;
 mod mcp_client;
 mod mcp_config;
 mod mcp_manager;

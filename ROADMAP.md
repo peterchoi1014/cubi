@@ -20,8 +20,8 @@ for future PRs.
 
 ## A. Built-in tools to add (`src/builtin_tools.rs` extensions)
 
-- [ ] **Subagent / Task tool** — main model spawns isolated worker agents
-      (`AgentTool`, `TaskCreate/Get/List/Update/Stop/OutputTool`)
+- [x] **Subagent / Task tool** — main model spawns isolated worker agents
+      *(`agent_run` meta-tool: fresh context, same tools minus `agent_run`, step cap)*
 - [x] **`TodoWrite` tool** + `/todos` UI — persistent per-session task checklist
       *(now persisted across restarts at `~/.ai-chat-cli/todos/<cwd-key>.json`)*
 - [x] **Plan mode** — read-only "plan first, then apply" toggle
@@ -30,11 +30,16 @@ for future PRs.
 - [x] **`ask_user` tool** — model pauses and asks a clarifying question
       *(user-driven `/ask <question>` for now; model-triggered version comes
       with native tool-calling)*
-- [ ] **Git worktree tool** + `/worktree` — isolated worktree for risky changes
-- [ ] **`web_fetch`, `web_search`** — network tools (permission-gated)
-- [ ] **LSP-backed code intel tool** — hover / definition / references
-- [ ] **Jupyter notebook tool** — cell-level edits to `.ipynb`
-- [ ] **Persistent REPL tool** — long-lived shell / Python / Node session
+- [x] **Git worktree tool** — `worktree` builtin (list/add/remove), auto-trusts
+      new paths; CLI-side `/worktree` is still TODO
+- [x] **`web_fetch`, `web_search`** — network tools (permission-gated)
+      *(HTTP(S) GET with 64 KB cap; DuckDuckGo lite-mode scrape — no API key)*
+- [x] **LSP-backed code intel tool** — hover / definition / references
+      *(`lsp` builtin: caller specifies server command + 1-based line/col)*
+- [x] **Jupyter notebook tool** — cell-level edits to `.ipynb`
+      *(`notebook` builtin: list/read/insert/replace/delete; pure JSON, no Jupyter dep)*
+- [x] **Persistent REPL tool** — long-lived shell / Python / Node session
+      *(bash-only for now; `repl_start` / `repl_eval` / `repl_close`)*
 - [ ] **Cross-platform shell tool** — `bash` vs `pwsh` based on host OS
 - [ ] **Time tools** — `Sleep`, `ScheduleCron`
 - [ ] **Skills system** — reusable Markdown skill packs in
@@ -156,7 +161,9 @@ Markdown commands as first-class plugins (cf. leaked
 
 ## D. Implementation priorities
 
-1. Agent loop + native tool-calling + streaming.
+1. Agent loop + native tool-calling + streaming. ✅ Shipped (NDJSON streaming
+   in `ollama.rs`; `agent_loop.rs` drives multi-step tool round-trips via
+   Ollama's `tools` parameter, with a 12-step safety cap).
 2. Permissions system + path sandboxing + project-trust prompt. ✅ Shipped.
 3. **Plan mode + `TodoWrite` + `AskUserQuestion`.** ✅ Plan mode now gates all
    built-in write/exec tools; `/todos` and `/ask` already in place.
@@ -167,12 +174,13 @@ Markdown commands as first-class plugins (cf. leaked
 6. Slash-command registry + custom Markdown commands + `@file` mentions +
    prompt suggestions. ✅ Registry shipped (`src/commands.rs`); user-defined
    Markdown commands and `@file` mentions still open.
-7. Subagents (`AgentTool`) + task management tools.
+7. Subagents (`AgentTool`) + task management tools. ✅ `agent_run` meta-tool
+   shipped (fresh-context inner loop; recursion disallowed).
 8. Git tools: `/commit`, `/commit-push-pr`, `/diff`, `/review`, worktree tools.
-   ✅ `/diff`, `/commit`, `/review` shipped (`src/git_cmds.rs`).
+   ✅ `/diff`, `/commit`, `/review` + `worktree` builtin shipped.
 9. Multi-provider LLM abstraction + token estimator + rate-limit / retry.
 10. Web tools (`web_fetch`, `web_search`) + LSP service & tool + REPL tool +
-    notebook tool.
+    notebook tool. ✅ All four shipped as built-in tools.
 11. Hooks, plugins, skills, MCP resources / prompts / OAuth, MCP approval UI.
 12. TUI (ratatui) rewrite with panes, vim keybindings, output styles, themes,
     statusline.
