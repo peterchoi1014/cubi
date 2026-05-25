@@ -1,14 +1,21 @@
-use anyhow::{Context, Result};
-use colored::*;
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
+use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
+use crate::git_cmds;
 use crate::mcp_manager::McpManager;
 use crate::ollama::Message;
+use crate::permissions::Permissions;
 use crate::project_memory;
+use crate::sessions::{SessionFile, SessionStore};
 use crate::todos::TodoList;
+use anyhow::{Context, Result};
+use colored::*;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Sentinel prefix used to tag system messages that should only influence the
 /// next assistant turn (e.g. `/ask`). After the model responds once, any
@@ -25,17 +32,34 @@ pub struct ChatCLI {
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
     todos: TodoList,
-    plan_mode: bool,
+    /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
+    /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
+    plan_mode: Arc<AtomicBool>,
+    permissions: Arc<Mutex<Permissions>>,
+    /// Per-project on-disk session checkpoint store, or `None` when no
+    /// home directory could be resolved (sessions degrade silently).
+    session_store: Option<SessionStore>,
+    /// The session currently being appended to. Lazily initialized so
+    /// the file isn't created until the user actually sends a message.
+    current_session: Option<SessionFile>,
 }
 
 impl ChatCLI {
-    pub fn new(executor: AIExecutor, mcp_manager: Option<McpManager>) -> Self {
+    pub fn new(
+        executor: AIExecutor,
+        mcp_manager: Option<McpManager>,
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+    ) -> Self {
         let mut cli = Self {
             executor,
             history: Vec::new(),
             mcp_manager,
             todos: TodoList::load_for_current_dir(),
-            plan_mode: false,
+            plan_mode,
+            permissions,
+            session_store: SessionStore::for_current_dir(),
+            current_session: None,
         };
 
         // Auto-inject project memory (AICHAT.md) into context, if present.
@@ -50,14 +74,13 @@ impl ChatCLI {
             for t in tools {
                 msg.push_str(&format!("- {}: {}\n", t.name, t.description));
             }
-            msg.push_str("\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>");
+            msg.push_str(
+                "\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>",
+            );
 
-            cli.history.push(Message {
-                role: "system".to_string(),
-                content: msg,
-            });
+            cli.history.push(Message::text("system", msg));
         }
-    
+
         cli
     }
 
@@ -91,7 +114,7 @@ impl ChatCLI {
         let mut rl = DefaultEditor::new()?;
 
         loop {
-            let prompt = if self.plan_mode {
+            let prompt = if self.plan_mode.load(Ordering::SeqCst) {
                 format!(
                     "{}{} ",
                     "[plan] ".bright_yellow().bold(),
@@ -104,7 +127,7 @@ impl ChatCLI {
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let input = line.trim();
-                    
+
                     if input.is_empty() {
                         continue;
                     }
@@ -121,36 +144,17 @@ impl ChatCLI {
                     rl.add_history_entry(input)?;
 
                     // Add user message to history
-                    self.history.push(Message {
-                        role: "user".to_string(),
-                        content: input.to_string(),
-                    });
+                    self.history.push(Message::text("user", input));
 
-                    // Get AI response
-                    print!("{} ", "AI:".bright_blue().bold());
-                    
-                    match self.executor.chat(self.history.clone()).await {
-                        Ok(response) => {
-                            println!("{}\n", response.bright_white());
-                            
-                            // Add assistant response to history
-                            self.history.push(Message {
-                                role: "assistant".to_string(),
-                                content: response,
-                            });
-
-                            // Drop any system messages tagged as single-turn
-                            // (e.g. from `/ask`) so they don't keep nudging
-                            // every subsequent turn.
-                            self.strip_single_turn_system_messages();
-                        }
-                        Err(e) => {
-                            eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
-                        }
+                    // Run the agent: stream model output, execute any
+                    // requested tools, loop until the model returns plain
+                    // content (or we hit the safety cap).
+                    if let Err(e) = self.agent_turn().await {
+                        eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("{}",  "Use /quit to exit".yellow());
+                    println!("{}", "Use /quit to exit".yellow());
                     continue;
                 }
                 Err(ReadlineError::Eof) => {
@@ -166,50 +170,83 @@ impl ChatCLI {
         Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: &str) -> Result<bool> {
+    async fn handle_command(&mut self, input: &str) -> Result<bool> {
+        let Some((cmd, args)) = commands::parse(input) else {
+            println!("{} {}", "Unknown command:".bright_red(), input);
+            println!("Type {} for available commands", "/help".bright_cyan());
+            return Ok(true);
+        };
+
         match cmd {
-            "/quit" | "/exit" => {
+            Cmd::Quit => {
                 println!("{}", "Goodbye!".bright_cyan());
                 return Ok(false);
             }
-            "/clear" => {
+            Cmd::Clear => {
                 self.history.clear();
+                // Drop the in-memory session pointer too: leaving it set
+                // would make the next assistant turn overwrite the saved
+                // checkpoint with an (almost) empty history, effectively
+                // discarding the prior conversation from disk. A fresh
+                // `current_session` is allocated lazily on the next
+                // `checkpoint_session` call.
+                self.current_session = None;
                 println!("{}", "Conversation history cleared.".yellow());
             }
-            "/history" => {
+            Cmd::History => {
                 self.show_history();
             }
-            "/help" => {
+            Cmd::Help => {
                 self.show_help();
             }
-            "/model" => {
-                println!("Current model: {}", self.executor.get_model().bright_cyan());
+            Cmd::Model => {
+                if args.is_empty() {
+                    println!("Current model: {}", self.executor.get_model().bright_cyan());
+                } else {
+                    match self.executor.switch_model(args.to_string()).await {
+                        Ok(_) => {
+                            println!(
+                                "{} Switched to model: {}",
+                                "✓".bright_green(),
+                                args.bright_cyan()
+                            );
+                            self.history.clear();
+                            // Same reasoning as `/clear`: don't keep
+                            // overwriting the prior session's checkpoint
+                            // with a fresh history after a model switch.
+                            self.current_session = None;
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "Error:".bright_red(), e);
+                        }
+                    }
+                }
             }
-            "/mcp-tools" => {
+            Cmd::McpTools => {
                 self.show_mcp_tools();
             }
-            cmd if cmd.starts_with("/mcp-call ") => {
-                if self.plan_mode {
+            Cmd::McpCall => {
+                if self.plan_mode.load(Ordering::SeqCst) {
                     println!(
                         "{} Plan mode is on — refusing /mcp-call. Toggle off with /plan first.",
                         "✗".bright_red()
                     );
                     return Ok(true);
                 }
-                let rest = cmd.strip_prefix("/mcp-call ").unwrap().trim();
-                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                
-                if parts.len() < 2 {
-                    println!("{} Usage: /mcp-call <tool_name> <json_args>", 
-                        "Info:".bright_yellow());
+                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if args.is_empty() || parts.len() < 2 {
+                    println!(
+                        "{} Usage: /mcp-call <tool_name> <json_args>",
+                        "Info:".bright_yellow()
+                    );
                     println!("Example: /mcp-call add {{\"a\": 5, \"b\": 3}}");
                 } else {
                     let tool_name = parts[0];
                     let args_str = parts[1];
-                    
+
                     match serde_json::from_str(args_str) {
-                        Ok(args) => {
-                            if let Err(e) = self.call_mcp_tool(tool_name, args).await {
+                        Ok(json_args) => {
+                            if let Err(e) = self.call_mcp_tool(tool_name, json_args).await {
                                 eprintln!("{} {}", "Error:".bright_red(), e);
                             }
                         }
@@ -219,52 +256,40 @@ impl ChatCLI {
                     }
                 }
             }
-            "/mcp-reload" => {
+            Cmd::McpReload => {
                 if let Err(e) = self.reload_mcp().await {
                     eprintln!("{} Failed to reload MCP: {}", "Error:".bright_red(), e);
                 } else {
                     println!("{} MCP configuration reloaded", "✓".bright_green());
                 }
             }
-            cmd if cmd.starts_with("/model ") => {
-                let model = cmd.strip_prefix("/model ").unwrap().trim();
-                match self.executor.switch_model(model.to_string()).await {
-                    Ok(_) => {
-                        println!("{} Switched to model: {}", "✓".bright_green(), model.bright_cyan());
-                        self.history.clear();
-                    }
-                    Err(e) => {
-                        eprintln!("{} {}", "Error:".bright_red(), e);
-                    }
-                }
-            }
-            cmd if cmd.starts_with("/save ") => {
-                let rest = cmd.strip_prefix("/save ").unwrap().trim();
-                match parse_force_and_filename(rest) {
-                    Some((force, filename)) => match self.save_conversation(filename, force) {
-                        Ok(()) => println!(
-                            "{} Conversation saved to {}",
-                            "✓".bright_green(),
-                            filename.bright_cyan()
-                        ),
-                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
-                    },
-                    None => {
-                        println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
-                        println!("       Pass -f to overwrite an existing file.");
+            Cmd::Save => {
+                if args.is_empty() {
+                    println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                    println!("       Pass -f to overwrite an existing file.");
+                    println!("Example: /save my_chat.json");
+                } else {
+                    match parse_force_and_filename(args) {
+                        Some((force, filename)) => match self.save_conversation(filename, force) {
+                            Ok(()) => println!(
+                                "{} Conversation saved to {}",
+                                "✓".bright_green(),
+                                filename.bright_cyan()
+                            ),
+                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                        },
+                        None => {
+                            println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
+                            println!("       Pass -f to overwrite an existing file.");
+                        }
                     }
                 }
             }
-            "/save" => {
-                println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
-                println!("       Pass -f to overwrite an existing file.");
-                println!("Example: /save my_chat.json");
-            }
-            cmd if cmd.starts_with("/load ") => {
-                let filename = cmd.strip_prefix("/load ").unwrap().trim();
-                if filename.is_empty() {
+            Cmd::Load => {
+                if args.is_empty() {
                     println!("{} Usage: /load <filename>", "Info:".bright_yellow());
-                } else if let Err(e) = self.load_conversation(filename) {
+                    println!("Example: /load my_chat.json");
+                } else if let Err(e) = self.load_conversation(args) {
                     // History intentionally preserved; surface the error
                     // chain so the user can tell read vs. parse failures
                     // apart.
@@ -277,20 +302,23 @@ impl ChatCLI {
                     println!(
                         "{} Conversation loaded from {}",
                         "✓".bright_green(),
-                        filename.bright_cyan()
+                        args.bright_cyan()
                     );
                 }
             }
-            "/load" => {
-                println!("{} Usage: /load <filename>", "Info:".bright_yellow());
-                println!("Example: /load my_chat.json");
-            }
-            cmd if cmd.starts_with("/batch ") => {
-                let filename = cmd.strip_prefix("/batch ").unwrap().trim();
-                if filename.is_empty() {
+            Cmd::Batch => {
+                if args.is_empty() {
                     println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
+                    println!("Example: /batch prompts.txt");
+                    println!(
+                        "\nBatch file format (one prompt per line, blank lines and #-comments are skipped):"
+                    );
+                    println!("  # warm-up");
+                    println!("  What is Rust?");
+                    println!("  Write hello world in Python");
+                    println!("  Explain recursion");
                 } else {
-                    match self.process_batch_file(filename).await {
+                    match self.process_batch_file(args).await {
                         Ok(BatchSummary { ok, failed }) => {
                             if failed == 0 {
                                 println!(
@@ -314,31 +342,26 @@ impl ChatCLI {
                     }
                 }
             }
-            "/batch" => {
-                println!("{} Usage: /batch <filename>", "Info:".bright_yellow());
-                println!("Example: /batch prompts.txt");
-                println!("\nBatch file format (one prompt per line, blank lines and #-comments are skipped):");
-                println!("  # warm-up");
-                println!("  What is Rust?");
-                println!("  Write hello world in Python");
-                println!("  Explain recursion");
+            Cmd::Version => {
+                println!(
+                    "{} {}",
+                    "ai-chat-cli".bright_cyan(),
+                    env!("CARGO_PKG_VERSION")
+                );
             }
-            "/version" => {
-                println!("{} {}", "ai-chat-cli".bright_cyan(), env!("CARGO_PKG_VERSION"));
-            }
-            "/status" => {
+            Cmd::Status => {
                 self.show_status();
             }
-            "/plan" => {
+            Cmd::Plan => {
                 self.toggle_plan_mode();
             }
-            "/init" => {
+            Cmd::Init => {
                 self.run_init();
             }
-            "/memory" => {
+            Cmd::Memory => {
                 self.show_memory();
             }
-            "/memory-reload" => {
+            Cmd::MemoryReload => {
                 self.inject_project_memory();
                 match project_memory::read_memory_with_path() {
                     Ok(Some((p, _))) => println!(
@@ -354,117 +377,125 @@ impl ChatCLI {
                     Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
                 }
             }
-            "/todos" => {
+            Cmd::Todos => {
                 self.todos.render();
             }
-            cmd if cmd.starts_with("/todo-add ") => {
-                let text = cmd.strip_prefix("/todo-add ").unwrap().trim();
-                if text.is_empty() {
+            Cmd::TodoAdd => {
+                if args.is_empty() {
                     println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
                 } else {
-                    self.todos.add(text);
+                    self.todos.add(args);
                     self.persist_todos();
                     println!("{} Added todo", "✓".bright_green());
                 }
             }
-            "/todo-add" => {
-                println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
-            }
-            cmd if cmd.starts_with("/todo-done ") => {
-                let arg = cmd.strip_prefix("/todo-done ").unwrap().trim();
-                match arg.parse::<usize>() {
-                    Ok(n) => {
-                        if self.todos.mark_done(n) {
-                            self.persist_todos();
-                            println!("{} Marked todo {} as done", "✓".bright_green(), n);
-                        } else {
-                            eprintln!(
-                                "{} No todo with index {}",
-                                "Error:".bright_red(),
-                                n
-                            );
+            Cmd::TodoDone => {
+                if args.is_empty() {
+                    println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.todos.mark_done(n) {
+                                self.persist_todos();
+                                println!("{} Marked todo {} as done", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+                            }
                         }
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "{} Usage: /todo-done <index>",
-                            "Error:".bright_red()
-                        );
+                        Err(_) => {
+                            eprintln!("{} Usage: /todo-done <index>", "Error:".bright_red());
+                        }
                     }
                 }
             }
-            "/todo-done" => {
-                println!("{} Usage: /todo-done <index>", "Info:".bright_yellow());
-            }
-            cmd if cmd.starts_with("/todo-rm ") => {
-                let arg = cmd.strip_prefix("/todo-rm ").unwrap().trim();
-                match arg.parse::<usize>() {
-                    Ok(n) => {
-                        if self.todos.remove(n) {
-                            self.persist_todos();
-                            println!("{} Removed todo {}", "✓".bright_green(), n);
-                        } else {
-                            eprintln!(
-                                "{} No todo with index {}",
-                                "Error:".bright_red(),
-                                n
-                            );
+            Cmd::TodoRm => {
+                if args.is_empty() {
+                    println!("{} Usage: /todo-rm <index>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) => {
+                            if self.todos.remove(n) {
+                                self.persist_todos();
+                                println!("{} Removed todo {}", "✓".bright_green(), n);
+                            } else {
+                                eprintln!("{} No todo with index {}", "Error:".bright_red(), n);
+                            }
                         }
-                    }
-                    Err(_) => {
-                        eprintln!("{} Usage: /todo-rm <index>", "Error:".bright_red());
+                        Err(_) => {
+                            eprintln!("{} Usage: /todo-rm <index>", "Error:".bright_red());
+                        }
                     }
                 }
             }
-            "/todo-rm" => {
-                println!("{} Usage: /todo-rm <index>", "Info:".bright_yellow());
-            }
-            "/todo-clear" => {
+            Cmd::TodoClear => {
                 self.todos.clear();
                 self.persist_todos();
                 println!("{} Cleared todos", "✓".bright_green());
             }
-            cmd if cmd.starts_with("/ask ") => {
-                let question = cmd.strip_prefix("/ask ").unwrap().trim();
-                if question.is_empty() {
+            Cmd::Ask => {
+                if args.is_empty() {
                     println!("{} Usage: /ask <question>", "Info:".bright_yellow());
+                    println!("Records a clarifying question to be answered on the next turn.");
                 } else {
-                    self.ask_user(question);
+                    self.ask_user(args);
                 }
             }
-            "/ask" => {
-                println!("{} Usage: /ask <question>", "Info:".bright_yellow());
-                println!("Records a clarifying question to be answered on the next turn.");
+            Cmd::Sessions => {
+                self.show_sessions();
             }
-            cmd if cmd.starts_with("/export ") => {
-                let rest = cmd.strip_prefix("/export ").unwrap().trim();
-                match parse_force_and_filename(rest) {
-                    Some((force, filename)) => match self.export_markdown(filename, force) {
-                        Ok(()) => println!(
-                            "{} Conversation exported to {}",
-                            "✓".bright_green(),
-                            filename.bright_cyan()
-                        ),
-                        Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
-                    },
-                    None => {
-                        println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
-                        println!("       Pass -f to overwrite an existing file.");
+            Cmd::Resume => {
+                self.resume_session(args);
+            }
+            Cmd::Trust => {
+                self.handle_trust(args);
+            }
+            Cmd::Diff => {
+                self.run_diff(args);
+            }
+            Cmd::Commit => {
+                if self.plan_mode.load(Ordering::SeqCst) {
+                    println!(
+                        "{} Plan mode is on — refusing /commit. Toggle off with /plan first.",
+                        "✗".bright_red()
+                    );
+                    return Ok(true);
+                }
+                self.run_commit(args);
+            }
+            Cmd::Review => {
+                self.run_review().await;
+            }
+            Cmd::Export => {
+                if args.is_empty() {
+                    println!(
+                        "{} Usage: /export [-f] <filename.md>",
+                        "Info:".bright_yellow()
+                    );
+                    println!("       Pass -f to overwrite an existing file.");
+                } else {
+                    match parse_force_and_filename(args) {
+                        Some((force, filename)) => match self.export_markdown(filename, force) {
+                            Ok(()) => println!(
+                                "{} Conversation exported to {}",
+                                "✓".bright_green(),
+                                filename.bright_cyan()
+                            ),
+                            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                        },
+                        None => {
+                            println!(
+                                "{} Usage: /export [-f] <filename.md>",
+                                "Info:".bright_yellow()
+                            );
+                            println!("       Pass -f to overwrite an existing file.");
+                        }
                     }
                 }
-            }
-            "/export" => {
-                println!("{} Usage: /export [-f] <filename.md>", "Info:".bright_yellow());
-                println!("       Pass -f to overwrite an existing file.");
-            }
-            _ => {
-                println!("{} {}", "Unknown command:".bright_red(), cmd);
-                println!("Type {} for available commands", "/help".bright_cyan());
             }
         }
         Ok(true)
     }
-    
+
     async fn process_batch_file(&self, filename: &str) -> Result<BatchSummary> {
         let content = fs::read_to_string(filename)
             .with_context(|| format!("Failed to read batch file '{}'", filename))?;
@@ -493,10 +524,7 @@ impl ChatCLI {
             println!("\n[{}/{}] {}", i + 1, prompts.len(), prompt);
             match self
                 .executor
-                .chat(vec![Message {
-                    role: "user".to_string(),
-                    content: prompt.clone(),
-                }])
+                .chat(vec![Message::text("user", prompt.clone())])
                 .await
             {
                 Ok(response) => {
@@ -526,11 +554,11 @@ impl ChatCLI {
 
             println!("\n{}", "Available MCP Tools:".bright_yellow().bold());
             println!("{}", "=".repeat(60).bright_black());
-        
+
             // Group by built-in vs external
             let mut builtin = Vec::new();
             let mut external = Vec::new();
-        
+
             for (server_name, tool) in mcp.get_tools_with_server().values() {
                 if server_name == "builtin" {
                     builtin.push(tool);
@@ -538,7 +566,7 @@ impl ChatCLI {
                     external.push((server_name, tool));
                 }
             }
-        
+
             if !builtin.is_empty() {
                 println!("\n{}", "Built-in Tools:".bright_blue().bold());
                 for tool in builtin {
@@ -546,18 +574,20 @@ impl ChatCLI {
                     println!("    {}", tool.description);
                 }
             }
-        
+
             if !external.is_empty() {
                 println!("\n{}", "External MCP Servers:".bright_blue().bold());
                 for (server, tool) in external {
-                    println!("\n  {} {} (from {})", 
-                        "●".bright_green(), 
+                    println!(
+                        "\n  {} {} (from {})",
+                        "●".bright_green(),
                         tool.name.bright_cyan(),
-                        server.bright_magenta());
+                        server.bright_magenta()
+                    );
                     println!("    {}", tool.description);
                 }
             }
-        
+
             println!("\n{}\n", "=".repeat(60).bright_black());
             println!("Use {} <tool> <args> to execute", "/mcp-call".bright_cyan());
         }
@@ -566,9 +596,9 @@ impl ChatCLI {
     async fn call_mcp_tool(&mut self, tool_name: &str, arguments: serde_json::Value) -> Result<()> {
         if let Some(mcp) = &mut self.mcp_manager {
             println!("{} Calling tool '{}'...", "⚙".bright_blue(), tool_name);
-            
+
             let result = mcp.call_tool(tool_name, arguments).await?;
-            
+
             for content in &result.content {
                 if content.content_type == "text" {
                     println!("{} {}", "✓".bright_green(), content.text);
@@ -577,7 +607,7 @@ impl ChatCLI {
         } else {
             anyhow::bail!("MCP not initialized");
         }
-        
+
         Ok(())
     }
 
@@ -586,67 +616,42 @@ impl ChatCLI {
         if let Some(mcp) = &mut self.mcp_manager {
             mcp.shutdown().await;
         }
-        
-        // Reload configuration and reconnect
-        self.mcp_manager = match McpManager::new().await {
-            Ok(manager) => Some(manager),
-            Err(e) => {
-                eprintln!("{} {}", "Warning:".bright_yellow(), e);
-                None
-            }
-        };
-        
-        Ok(())
-    }
-    
 
-    /// Single source of truth for slash commands shown in `/help` and the
-    /// startup banner. `(command, description)` pairs.
-    fn command_help() -> &'static [(&'static str, &'static str)] {
-        &[
-            ("/help", "Show this help message"),
-            ("/status", "Show session status"),
-            ("/plan", "Toggle plan mode (read-only)"),
-            ("/init", "Create starter AICHAT.md"),
-            ("/memory", "Show project memory (AICHAT.md)"),
-            ("/memory-reload", "Re-read AICHAT.md from disk"),
-            ("/todos", "List todos"),
-            ("/todo-add <text>", "Add a todo"),
-            ("/todo-done <n>", "Mark todo n as done"),
-            ("/todo-rm <n>", "Remove todo n"),
-            ("/todo-clear", "Clear all todos"),
-            ("/ask <q>", "Record a clarifying question (single-turn)"),
-            ("/clear", "Clear conversation history"),
-            ("/history", "Show conversation history"),
-            ("/export [-f] <f.md>", "Export conversation as Markdown"),
-            ("/save [-f] <f.json>", "Save conversation (-f overwrites)"),
-            ("/load <f.json>", "Load conversation"),
-            ("/batch <f>", "Process batch file"),
-            ("/mcp-tools", "List available MCP tools"),
-            ("/mcp-call <t> <a>", "Call MCP tool"),
-            ("/mcp-reload", "Reload MCP configuration"),
-            ("/model", "Show current model"),
-            ("/model <name>", "Switch to a different model"),
-            ("/version", "Show version"),
-            ("/quit", "Exit the chat"),
-        ]
+        // Reload configuration and reconnect
+        self.mcp_manager =
+            match McpManager::new(Arc::clone(&self.permissions), Arc::clone(&self.plan_mode)).await
+            {
+                Ok(manager) => Some(manager),
+                Err(e) => {
+                    eprintln!("{} {}", "Warning:".bright_yellow(), e);
+                    None
+                }
+            };
+
+        Ok(())
     }
 
     fn print_welcome(&self) {
         println!("\n{}", "=".repeat(60).bright_cyan());
-        println!("{}", "  AI Chat CLI - Powered by Repartir".bright_cyan().bold());
+        println!(
+            "{}",
+            "  AI Chat CLI - Powered by Repartir".bright_cyan().bold()
+        );
         println!("{}", "=".repeat(60).bright_cyan());
         println!("\n{}", "Commands:".bright_yellow().bold());
-        for (cmd, desc) in Self::command_help() {
-            println!("  {} - {}", cmd.bright_cyan(), desc);
+        for spec in COMMANDS {
+            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
         }
-        println!("\n{}\n", "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white());
+        println!(
+            "\n{}\n",
+            "Start chatting! (Ctrl+C to interrupt, /quit to exit)".bright_white()
+        );
     }
 
     fn show_help(&self) {
         println!("\n{}", "Available Commands:".bright_yellow().bold());
-        for (cmd, desc) in Self::command_help() {
-            println!("  {} - {}", cmd.bright_cyan(), desc);
+        for spec in COMMANDS {
+            println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
         }
         println!();
     }
@@ -659,14 +664,14 @@ impl ChatCLI {
 
         println!("\n{}", "Conversation History:".bright_yellow().bold());
         println!("{}", "-".repeat(60).bright_black());
-        
+
         for (i, msg) in self.history.iter().enumerate() {
             let role = if msg.role == "user" {
                 "You".bright_green().bold()
             } else {
                 "AI".bright_blue().bold()
             };
-            
+
             println!("{} [{}]: {}", role, i + 1, msg.content);
         }
         println!("{}\n", "-".repeat(60).bright_black());
@@ -678,13 +683,23 @@ impl ChatCLI {
             .as_ref()
             .map(|m| m.list_tools().len())
             .unwrap_or(0);
+        let cwd = std::env::current_dir().ok();
+        let perms = self.permissions.lock().unwrap();
+        let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
+        let trusted_count = perms.trusted_count();
+        drop(perms);
+
         println!("\n{}", "Status:".bright_yellow().bold());
         println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
         println!("  {}: {}", "messages".bright_cyan(), self.history.len());
         println!(
             "  {}: {}",
             "plan mode".bright_cyan(),
-            if self.plan_mode { "on".bright_green() } else { "off".bright_black() }
+            if self.plan_mode.load(Ordering::SeqCst) {
+                "on".bright_green()
+            } else {
+                "off".bright_black()
+            }
         );
         println!(
             "  {}: {} ({} pending)",
@@ -693,31 +708,366 @@ impl ChatCLI {
             self.todos.pending()
         );
         println!("  {}: {}", "mcp tools".bright_cyan(), mcp_tool_count);
+        println!(
+            "  {}: {} ({} trusted root{} total)",
+            "cwd trust".bright_cyan(),
+            if trusted_here {
+                "trusted".bright_green()
+            } else {
+                "not trusted".bright_red()
+            },
+            trusted_count,
+            if trusted_count == 1 { "" } else { "s" }
+        );
         println!();
     }
 
+    /// Handles `/trust` and `/trust revoke`. Both forms operate on the
+    /// current working directory.
+    fn handle_trust(&self, args: &str) {
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let mut perms = self.permissions.lock().unwrap();
+        let result = match args.trim() {
+            "" | "add" => perms.trust_dir(&cwd).map(|added| (added, true)),
+            "revoke" | "remove" | "rm" => perms.revoke_dir(&cwd).map(|removed| (removed, false)),
+            other => {
+                eprintln!(
+                    "{} Unknown argument '{}'. Usage: /trust [revoke]",
+                    "Error:".bright_red(),
+                    other
+                );
+                return;
+            }
+        };
+        match result {
+            Ok((changed, added)) => {
+                if let Err(e) = perms.save() {
+                    eprintln!(
+                        "{} Failed to persist trust store: {}",
+                        "Warn:".bright_yellow(),
+                        e
+                    );
+                }
+                let verb = if added { "trusted" } else { "revoked" };
+                if changed {
+                    println!(
+                        "{} {} {}",
+                        "✓".bright_green(),
+                        verb.bright_green(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                } else if added {
+                    println!(
+                        "{} {} was already trusted",
+                        "ℹ".bright_blue(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                } else {
+                    println!(
+                        "{} {} was not in the trust list",
+                        "ℹ".bright_blue(),
+                        cwd.display().to_string().bright_cyan()
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Lists checkpointed sessions for the current project, newest first.
+    fn show_sessions(&self) {
+        let Some(store) = &self.session_store else {
+            println!(
+                "{} Sessions disabled: could not resolve home directory.",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        match store.list() {
+            Ok(list) if list.is_empty() => {
+                println!(
+                    "{} No sessions saved yet for this project.",
+                    "ℹ".bright_blue()
+                );
+            }
+            Ok(list) => {
+                println!("\n{}", "Sessions (newest first):".bright_yellow().bold());
+                for (i, meta) in list.iter().enumerate() {
+                    let active = self
+                        .current_session
+                        .as_ref()
+                        .map(|s| s.id == meta.id)
+                        .unwrap_or(false);
+                    let marker = if active { "▶" } else { " " };
+                    println!(
+                        "  {} {}. {} ({} msgs, model={}) {}",
+                        marker.bright_green(),
+                        i + 1,
+                        meta.id.bright_cyan(),
+                        meta.message_count,
+                        meta.model.bright_magenta(),
+                        if meta.preview.is_empty() {
+                            String::new()
+                        } else {
+                            format!("— {}", meta.preview.bright_white())
+                        }
+                    );
+                }
+                println!(
+                    "\nUse {} to resume the most recent, or {} <id> to resume a specific one.\n",
+                    "/resume".bright_cyan(),
+                    "/resume".bright_cyan()
+                );
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Resumes the latest session, or a named one if `args` is non-empty.
+    fn resume_session(&mut self, args: &str) {
+        let Some(store) = &self.session_store else {
+            println!(
+                "{} Sessions disabled: could not resolve home directory.",
+                "ℹ".bright_blue()
+            );
+            return;
+        };
+        let target = args.trim();
+        let loaded = if target.is_empty() {
+            store.latest()
+        } else {
+            store.load(target)
+        };
+        match loaded {
+            Ok(Some(session)) => {
+                println!(
+                    "{} Resumed session {} ({} messages)",
+                    "✓".bright_green(),
+                    session.id.bright_cyan(),
+                    session.history.len()
+                );
+                self.history = session.history.clone();
+                self.current_session = Some(session);
+                // Re-inject project memory so resumed sessions see the
+                // current `AICHAT.md`, not a snapshot from when the
+                // session was first created.
+                self.inject_project_memory();
+            }
+            Ok(None) => {
+                if target.is_empty() {
+                    println!(
+                        "{} No sessions to resume. Start chatting and one will be created.",
+                        "ℹ".bright_blue()
+                    );
+                } else {
+                    eprintln!(
+                        "{} No session with id '{}'. Use /sessions to list.",
+                        "Error:".bright_red(),
+                        target
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// Writes the current history to the per-project session store.
+    /// Lazily allocates a new session on first call. Failures are
+    /// logged as warnings but never abort the chat — the user always
+    /// has the in-memory copy and can `/save` manually.
+    fn checkpoint_session(&mut self) {
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        if self.current_session.is_none() {
+            self.current_session = Some(store.new_session(self.executor.get_model().to_string()));
+        }
+        if let Some(session) = self.current_session.as_mut() {
+            // Refresh the model field so a `/model <name>` mid-session
+            // is reflected in the snapshot.
+            session.model = self.executor.get_model().to_string();
+            session.history = self.history.clone();
+            if let Err(e) = store.save(session) {
+                eprintln!(
+                    "{} Failed to checkpoint session: {}",
+                    "Warn:".bright_yellow(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// `/diff [path]` — print the current `git diff`. Empty diffs get a
+    /// short hint instead of a blank line so the user knows the command
+    /// actually ran.
+    fn run_diff(&self, args: &str) {
+        match git_cmds::diff(args) {
+            Ok(out) => {
+                if !out.exit_ok {
+                    eprintln!(
+                        "{} git diff failed: {}",
+                        "Error:".bright_red(),
+                        out.stderr.trim()
+                    );
+                    return;
+                }
+                if out.stdout.trim().is_empty() {
+                    println!("{} No changes in the working tree.", "ℹ".bright_blue());
+                } else {
+                    print!("{}", out.stdout);
+                    if !out.stderr.trim().is_empty() {
+                        eprintln!("{}", out.stderr.trim().bright_black());
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/commit [-a] <msg>` — wrap `git commit`. Always echoes git's own
+    /// stdout/stderr so the user sees the resulting commit summary.
+    fn run_commit(&self, args: &str) {
+        let Some((stage_all, msg)) = git_cmds::parse_commit_args(args) else {
+            println!("{} Usage: /commit [-a] <message>", "Info:".bright_yellow());
+            println!("       -a stages tracked files before committing.");
+            return;
+        };
+        match git_cmds::commit(stage_all, msg) {
+            Ok(out) => {
+                if out.exit_ok {
+                    if !out.stdout.trim().is_empty() {
+                        print!("{}", out.stdout);
+                    }
+                    println!("{} Commit created.", "✓".bright_green());
+                } else {
+                    eprintln!(
+                        "{} git commit failed (exit non-zero).",
+                        "Error:".bright_red()
+                    );
+                    if !out.stdout.trim().is_empty() {
+                        eprintln!("{}", out.stdout.trim());
+                    }
+                    if !out.stderr.trim().is_empty() {
+                        eprintln!("{}", out.stderr.trim());
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    /// `/review` — ask the model to review the current `git diff HEAD`.
+    /// The exchange is transient: it's printed to stdout but not added
+    /// to the persistent conversation history, so successive `/review`
+    /// calls don't accumulate stale diffs in context.
+    async fn run_review(&self) {
+        let out = match git_cmds::diff_for_review() {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if !out.exit_ok {
+            eprintln!(
+                "{} git diff failed: {}",
+                "Error:".bright_red(),
+                out.stderr.trim()
+            );
+            return;
+        }
+        if out.stdout.trim().is_empty() {
+            println!(
+                "{} No changes to review (working tree clean against HEAD).",
+                "ℹ".bright_blue()
+            );
+            return;
+        }
+
+        // Cap the diff so we don't blow the model's context on a huge
+        // change. The truncation marker tells both the model and the
+        // user that the bottom of the diff was omitted.
+        const MAX_DIFF_CHARS: usize = 20_000;
+        let (diff_for_model, truncated) = if out.stdout.len() > MAX_DIFF_CHARS {
+            let truncated: String = out.stdout.chars().take(MAX_DIFF_CHARS).collect();
+            (truncated, true)
+        } else {
+            (out.stdout.clone(), false)
+        };
+
+        let truncation_note = if truncated {
+            "\n\n[diff was truncated for length; review only what's shown above]"
+        } else {
+            ""
+        };
+        let review_messages = vec![
+            Message::text(
+                "system",
+                "You are a focused code reviewer. Read the diff and respond with: \
+                 (1) a one-sentence summary, (2) bugs or correctness issues, \
+                 (3) style/clarity nits, (4) any tests that look missing. \
+                 Be terse — use bullet points, no preamble.",
+            ),
+            Message::text(
+                "user",
+                format!(
+                    "Please review this `git diff`:\n\n```diff\n{}\n```{}",
+                    diff_for_model, truncation_note
+                ),
+            ),
+        ];
+
+        println!(
+            "{} Asking the model to review the diff...",
+            "⚙".bright_blue()
+        );
+        match self.executor.chat(review_messages).await {
+            Ok(response) => {
+                println!("\n{}\n", "Review:".bright_yellow().bold());
+                println!("{}\n", response.bright_white());
+                if truncated {
+                    println!(
+                        "{} Diff was truncated to {} characters; re-run after splitting \
+                         the change for a complete review.",
+                        "ℹ".bright_blue(),
+                        MAX_DIFF_CHARS
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
     fn toggle_plan_mode(&mut self) {
-        self.plan_mode = !self.plan_mode;
-        if self.plan_mode {
-            self.history.push(Message {
-                role: "system".to_string(),
-                content:
-                    "SYSTEM: Plan mode is ON. Do not modify files or run \
-                     destructive commands. Produce a plan and wait for the \
-                     user to confirm before applying changes."
-                        .to_string(),
-            });
+        // `fetch_xor(true)` toggles the flag and returns the *previous*
+        // value, so `now_on = !prev`. Using the atomic directly keeps the
+        // CLI and `BuiltinToolRegistry` views in sync without a separate
+        // mirror field that could drift.
+        let prev = self.plan_mode.fetch_xor(true, Ordering::SeqCst);
+        let now_on = !prev;
+        if now_on {
+            self.history.push(Message::text(
+                "system",
+                "SYSTEM: Plan mode is ON. Do not modify files or run \
+                 destructive commands. Produce a plan and wait for the \
+                 user to confirm before applying changes.",
+            ));
             println!(
                 "{} Plan mode {}",
                 "✓".bright_green(),
                 "enabled".bright_green()
             );
         } else {
-            self.history.push(Message {
-                role: "system".to_string(),
-                content: "SYSTEM: Plan mode is OFF. Normal tool use is allowed."
-                    .to_string(),
-            });
+            self.history.push(Message::text(
+                "system",
+                "SYSTEM: Plan mode is OFF. Normal tool use is allowed.",
+            ));
             println!(
                 "{} Plan mode {}",
                 "✓".bright_green(),
@@ -728,11 +1078,7 @@ impl ChatCLI {
 
     fn persist_todos(&self) {
         if let Err(e) = self.todos.save() {
-            eprintln!(
-                "{} Failed to persist todos: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
+            eprintln!("{} Failed to persist todos: {}", "Warn:".bright_yellow(), e);
         }
     }
 
@@ -744,14 +1090,14 @@ impl ChatCLI {
     /// so it is removed after the next assistant response and doesn't
     /// re-emphasize the same question on every subsequent turn.
     fn ask_user(&mut self, question: &str) {
-        self.history.push(Message {
-            role: "system".to_string(),
-            content: format!(
+        self.history.push(Message::text(
+            "system",
+            format!(
                 "{} The user has a clarifying question they want addressed \
                  directly and concisely on the next turn:\n\n{}",
                 SINGLE_TURN_SYSTEM_TAG, question
             ),
-        });
+        ));
         println!(
             "{} Question recorded. It will be highlighted on the next turn only.",
             "✓".bright_green()
@@ -761,9 +1107,8 @@ impl ChatCLI {
     /// Removes any system messages tagged as single-turn (see
     /// [`SINGLE_TURN_SYSTEM_TAG`]) from the history.
     fn strip_single_turn_system_messages(&mut self) {
-        self.history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
-        });
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG)));
     }
 
     fn run_init(&self) {
@@ -815,23 +1160,22 @@ impl ChatCLI {
     fn inject_project_memory(&mut self) {
         // Drop any prior project-memory entries so callers can use this as
         // both an initial inject and a reload.
-        self.history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX))
-        });
+        self.history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(PROJECT_MEMORY_PREFIX)));
 
         let Ok(Some((path, memory))) = project_memory::read_memory_with_path() else {
             return;
         };
 
-        let msg = Message {
-            role: "system".to_string(),
-            content: format!(
+        let msg = Message::text(
+            "system",
+            format!(
                 "{} {}:\n\n{}",
                 PROJECT_MEMORY_PREFIX,
                 path.display(),
                 memory.trim()
             ),
-        };
+        );
 
         // Find the boundary: the first non-system message. We want the
         // project-memory entry to sit with the other system messages,
@@ -842,6 +1186,177 @@ impl ChatCLI {
             .position(|m| m.role != "system")
             .unwrap_or(self.history.len());
         self.history.insert(insert_at, msg);
+    }
+
+    /// Drives one user turn through the native tool-calling agent loop.
+    ///
+    /// * Streams the assistant's tokens to stdout as they arrive.
+    /// * If the model returns `tool_calls`, executes each one through the
+    ///   [`McpManager`] (which routes built-in vs. external tools), appends
+    ///   the result as a `role:"tool"` message, and loops.
+    /// * Honors plan mode at the call site: write/exec tools already refuse
+    ///   in plan mode (see `BuiltinToolRegistry`), so the loop simply
+    ///   reflects those refusals back to the model and lets it adapt.
+    /// * Caps iterations at [`MAX_AGENT_STEPS`] so a confused model can't
+    ///   spin forever.
+    ///
+    /// On a successful exchange (any number of tool round-trips), the final
+    /// assistant message is appended to history, single-turn system hints
+    /// are stripped, and the session is checkpointed.
+    async fn agent_turn(&mut self) -> Result<()> {
+        use std::io::Write;
+
+        // Build the tool list once per turn. Older / non-tool-capable models
+        // ignore it silently, so this is safe to always send.
+        let tools = self
+            .mcp_manager
+            .as_ref()
+            .and_then(agent_loop::build_tool_specs);
+
+        // Track whether we've printed visible content on this turn so we
+        // can choose when to add separating blank lines.
+        let mut any_output = false;
+
+        for step in 0..MAX_AGENT_STEPS {
+            // Only print the "AI:" prefix once per user turn — multi-step
+            // turns continue inline below the previous tool block.
+            if step == 0 {
+                print!("{} ", "AI:".bright_blue().bold());
+                let _ = std::io::stdout().flush();
+            }
+
+            let mut got_token = false;
+            let msg = self
+                .executor
+                .chat_stream(self.history.clone(), tools.clone(), |tok| {
+                    print!("{}", tok.bright_white());
+                    let _ = std::io::stdout().flush();
+                    got_token = true;
+                })
+                .await?;
+            if got_token {
+                any_output = true;
+            }
+
+            let calls = msg.tool_calls.clone().unwrap_or_default();
+
+            // Persist the assistant message verbatim — including any
+            // tool_calls — so the next iteration's context matches what the
+            // model sent us.
+            self.history.push(msg);
+
+            if calls.is_empty() {
+                // Plain text response: we're done with this turn.
+                if any_output {
+                    println!("\n");
+                }
+                break;
+            }
+
+            // The model asked us to run one or more tools. Visually break
+            // the stream so the user can tell the tools apart from the
+            // model's prose.
+            if any_output {
+                println!();
+            }
+
+            for call in calls {
+                println!(
+                    "{} {} {}",
+                    "⚙".bright_blue(),
+                    "tool:".bright_blue(),
+                    call.function.name.bright_cyan()
+                );
+
+                let result_text = if call.function.name == AGENT_TOOL_NAME {
+                    // Meta-tool: spawn a focused subagent with fresh
+                    // context. Handled here (not in `McpManager`) because
+                    // it needs the executor to drive its own inner loop.
+                    let goal = call.function.arguments["goal"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let max_steps = call.function.arguments["max_steps"]
+                        .as_u64()
+                        .map(|n| n as usize)
+                        .unwrap_or(SUBAGENT_DEFAULT_STEPS);
+                    if goal.is_empty() {
+                        "[tool error] `agent_run` requires a non-empty `goal`".to_string()
+                    } else {
+                        println!(
+                            "  {} subagent goal: {}",
+                            "↳".bright_magenta(),
+                            goal.chars().take(120).collect::<String>().bright_white()
+                        );
+                        match agent_loop::run_subagent(
+                            &self.executor,
+                            &mut self.mcp_manager,
+                            &goal,
+                            max_steps,
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                println!("  {} subagent done", "↳".bright_magenta());
+                                report
+                            }
+                            Err(e) => format!("[tool error] subagent failed: {e}"),
+                        }
+                    }
+                } else {
+                    match self.mcp_manager.as_mut() {
+                        Some(mcp) => match mcp
+                            .call_tool(&call.function.name, call.function.arguments.clone())
+                            .await
+                        {
+                            Ok(r) => agent_loop::render_tool_result(&r),
+                            Err(e) => format!("[tool error] {e}"),
+                        },
+                        None => format!(
+                            "[tool error] no MCP manager available to execute `{}`",
+                            call.function.name
+                        ),
+                    }
+                };
+
+                // Print a short preview so the user can see what came back
+                // without us dumping a 10 KB log into the terminal.
+                let preview: String = result_text.chars().take(400).collect();
+                let ellipsis = if result_text.len() > preview.len() {
+                    " …"
+                } else {
+                    ""
+                };
+                println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
+
+                self.history
+                    .push(Message::tool_result(&call.function.name, result_text));
+            }
+
+            // Loop back: feed the tool outputs into the next model call.
+            any_output = false;
+
+            // Diagnostic if we hit the cap mid-loop. The body of the loop
+            // executed the tools for this step; if `step + 1 == MAX`, the
+            // next call_stream is what we're skipping, so warn here.
+            if step + 1 == MAX_AGENT_STEPS {
+                eprintln!(
+                    "{} agent loop hit step cap ({}); stopping. Ask me to continue \
+                     if you want me to keep going.",
+                    "Warn:".bright_yellow(),
+                    MAX_AGENT_STEPS
+                );
+            }
+        }
+
+        // Drop any system messages tagged as single-turn (e.g. from `/ask`)
+        // so they don't keep nudging every subsequent turn.
+        self.strip_single_turn_system_messages();
+
+        // Auto-checkpoint the session after every successful turn so a
+        // crash never loses the conversation.
+        self.checkpoint_session();
+        Ok(())
     }
 
     /// Cleanly shuts down any owned MCP connections. Call this from an
@@ -973,24 +1488,15 @@ mod tests {
     use super::*;
 
     fn user(s: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("user", s)
     }
 
     fn assistant(s: &str) -> Message {
-        Message {
-            role: "assistant".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("assistant", s)
     }
 
     fn system(s: &str) -> Message {
-        Message {
-            role: "system".to_string(),
-            content: s.to_string(),
-        }
+        Message::text("system", s)
     }
 
     // ---- parse_force_and_filename ----
@@ -1034,66 +1540,16 @@ mod tests {
     fn strip_single_turn_removes_only_tagged_system_messages() {
         let mut cli_history = vec![
             system("SYSTEM: persistent context"),
-            system(&format!(
-                "{} ephemeral question",
-                SINGLE_TURN_SYSTEM_TAG
-            )),
+            system(&format!("{} ephemeral question", SINGLE_TURN_SYSTEM_TAG)),
             user("hi"),
             assistant("hello"),
         ];
-        cli_history.retain(|m| {
-            !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG))
-        });
+        cli_history
+            .retain(|m| !(m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG)));
         assert_eq!(cli_history.len(), 3);
         assert_eq!(cli_history[0].content, "SYSTEM: persistent context");
         assert_eq!(cli_history[1].role, "user");
         assert_eq!(cli_history[2].role, "assistant");
-    }
-
-    // ---- command_help / handle_command parity ----
-    //
-    // Guards against the drift that bit us before this PR: a command added
-    // to `handle_command` but not to `command_help()` (or vice versa). We
-    // assert every command listed in the help table is mentioned by name in
-    // the handler source, and that a handful of must-have commands are in
-    // the help table.
-
-    #[test]
-    fn command_help_lists_match_handler() {
-        let source = include_str!("cli.rs");
-        for (cmd, _desc) in ChatCLI::command_help() {
-            // Strip any argument placeholder after the first space so we look
-            // up just the `/foo` part — that's what appears in `handle_command`.
-            let bare = cmd.split_whitespace().next().unwrap();
-            assert!(
-                source.contains(&format!("\"{}\"", bare))
-                    || source.contains(&format!("starts_with(\"{} \")", bare)),
-                "command `{}` listed in help but not handled in cli.rs",
-                bare
-            );
-        }
-    }
-
-    #[test]
-    fn command_help_covers_core_commands() {
-        let cmds: Vec<&str> = ChatCLI::command_help()
-            .iter()
-            .map(|(c, _)| c.split_whitespace().next().unwrap())
-            .collect();
-        for must in [
-            "/help",
-            "/quit",
-            "/save",
-            "/load",
-            "/batch",
-            "/export",
-            "/memory",
-            "/memory-reload",
-            "/todo-add",
-            "/todo-rm",
-        ] {
-            assert!(cmds.contains(&must), "missing core command in help: {must}");
-        }
     }
 
     // ---- overwrite guard ----
@@ -1112,7 +1568,10 @@ mod tests {
         let err = check_overwrite_allowed(p, false, "/save").unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("Refusing to overwrite"), "got: {msg}");
-        assert!(msg.contains("/save -f"), "expected hint for /save -f, got: {msg}");
+        assert!(
+            msg.contains("/save -f"),
+            "expected hint for /save -f, got: {msg}"
+        );
 
         // With force=true the guard must pass even though the file exists.
         check_overwrite_allowed(p, true, "/save").expect("force should bypass");

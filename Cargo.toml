@@ -12,7 +12,7 @@ edition = "2024"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
 
 # HTTP client for Ollama API and MCP
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # JSON handling
 serde = { version = "1.0", features = ["derive"] }
@@ -30,4 +30,7 @@ dirs = "5.0"
 
 # UUID for request IDs
 uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Streaming responses from Ollama
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 

@@ -36,7 +36,11 @@ pub enum McpClient {
 }
 
 impl McpClient {
-    pub async fn connect_stdio(command: String, args: Vec<String>, env: HashMap<String, String>) -> Result<Self> {
+    pub async fn connect_stdio(
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    ) -> Result<Self> {
         let client = StdioClient::new(command, args, env).await?;
         Ok(McpClient::Stdio(client))
     }
@@ -53,7 +57,11 @@ impl McpClient {
         }
     }
 
-    pub async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<ToolCallResult> {
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolCallResult> {
         match self {
             McpClient::Stdio(client) => client.call_tool(name, arguments).await,
             McpClient::Http(client) => client.call_tool(name, arguments).await,
@@ -87,7 +95,8 @@ impl StdioClient {
             cmd.env(key, value);
         }
 
-        let process = cmd.spawn()
+        let process = cmd
+            .spawn()
             .context(format!("Failed to spawn MCP server: {}", command))?;
 
         let mut client = Self {
@@ -131,32 +140,33 @@ impl StdioClient {
     }
 
     async fn send_request(&mut self, request: serde_json::Value) -> Result<serde_json::Value> {
-        let stdin = self.process.stdin.as_mut()
-            .context("Failed to get stdin")?;
-        
+        let stdin = self.process.stdin.as_mut().context("Failed to get stdin")?;
+
         let request_str = serde_json::to_string(&request)?;
         stdin.write_all(request_str.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
 
         // Read response
-        let stdout = self.process.stdout.as_mut()
+        let stdout = self
+            .process
+            .stdout
+            .as_mut()
             .context("Failed to get stdout")?;
-        
+
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
 
-        let response: serde_json::Value = serde_json::from_str(&line)
-            .context("Failed to parse MCP response")?;
+        let response: serde_json::Value =
+            serde_json::from_str(&line).context("Failed to parse MCP response")?;
 
         Ok(response)
     }
 
     async fn send_notification(&mut self, notification: serde_json::Value) -> Result<()> {
-        let stdin = self.process.stdin.as_mut()
-            .context("Failed to get stdin")?;
-        
+        let stdin = self.process.stdin.as_mut().context("Failed to get stdin")?;
+
         let notification_str = serde_json::to_string(&notification)?;
         stdin.write_all(notification_str.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
@@ -174,12 +184,16 @@ impl StdioClient {
         self.request_id += 1;
 
         let response = self.send_request(request).await?;
-        
+
         let tools: Vec<Tool> = serde_json::from_value(response["result"]["tools"].clone())?;
         Ok(tools)
     }
 
-    async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<ToolCallResult> {
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolCallResult> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": self.request_id,
@@ -192,7 +206,7 @@ impl StdioClient {
         self.request_id += 1;
 
         let response = self.send_request(request).await?;
-        
+
         let result: ToolCallResult = serde_json::from_value(response["result"].clone())?;
         Ok(result)
     }
@@ -214,7 +228,7 @@ pub struct HttpClient {
 impl HttpClient {
     async fn new(url: String, headers: HashMap<String, String>) -> Result<Self> {
         let client = reqwest::Client::new();
-        
+
         let http_client = Self {
             url: url.clone(),
             headers,
@@ -248,21 +262,24 @@ impl HttpClient {
     }
 
     async fn send_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {
-        let mut req = self.client.post(&self.url)
-            .json(&request);
+        let mut req = self.client.post(&self.url).json(&request);
 
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }
 
-        let response = req.send().await
+        let response = req
+            .send()
+            .await
             .context("Failed to send HTTP request to MCP server")?;
 
         if !response.status().is_success() {
             anyhow::bail!("MCP server returned error: {}", response.status());
         }
 
-        let json: serde_json::Value = response.json().await
+        let json: serde_json::Value = response
+            .json()
+            .await
             .context("Failed to parse MCP response")?;
 
         Ok(json)
@@ -276,7 +293,7 @@ impl HttpClient {
         });
 
         let response = self.send_request(request).await?;
-        
+
         let tools: Vec<Tool> = serde_json::from_value(response["result"]["tools"].clone())?;
         Ok(tools)
     }
@@ -293,7 +310,7 @@ impl HttpClient {
         });
 
         let response = self.send_request(request).await?;
-        
+
         let result: ToolCallResult = serde_json::from_value(response["result"].clone())?;
         Ok(result)
     }
