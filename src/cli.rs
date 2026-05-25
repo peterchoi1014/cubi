@@ -8,7 +8,6 @@ use crate::ollama::Message;
 use crate::project_memory;
 use crate::todos::TodoList;
 use std::fs;
-use serde_json;
 
 pub struct ChatCLI {
     executor: AIExecutor,
@@ -41,20 +40,20 @@ impl ChatCLI {
         }
 
         // Auto-inject MCP tools into context
-        if let Some(mcp) = &cli.mcp_manager {
-            if mcp.has_tools() {
-                let tools = mcp.list_tools();
-                let mut msg = String::from("SYSTEM: You have access to these MCP tools:\n\n");
-                for t in tools {
-                    msg.push_str(&format!("- {}: {}\n", t.name, t.description));
-                }
-                msg.push_str("\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>");
-            
-                cli.history.push(Message {
-                    role: "system".to_string(),
-                    content: msg,
-                });
+        if let Some(mcp) = &cli.mcp_manager
+            && mcp.has_tools()
+        {
+            let tools = mcp.list_tools();
+            let mut msg = String::from("SYSTEM: You have access to these MCP tools:\n\n");
+            for t in tools {
+                msg.push_str(&format!("- {}: {}\n", t.name, t.description));
             }
+            msg.push_str("\nWhen relevant, tell users they can execute these with /mcp-call <tool> <args>");
+
+            cli.history.push(Message {
+                role: "system".to_string(),
+                content: msg,
+            });
         }
     
         cli
@@ -366,7 +365,7 @@ impl ChatCLI {
             let mut builtin = Vec::new();
             let mut external = Vec::new();
         
-            for (_tool_name, (server_name, tool)) in mcp.get_tools_with_server() {
+            for (server_name, tool) in mcp.get_tools_with_server().values() {
                 if server_name == "builtin" {
                     builtin.push(tool);
                 } else {
