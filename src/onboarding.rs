@@ -47,7 +47,7 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    fn storage_path() -> Option<PathBuf> {
+    pub fn storage_path() -> Option<PathBuf> {
         Some(dirs::home_dir()?.join(".ai-chat-cli").join("config.json"))
     }
 

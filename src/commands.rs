@@ -66,6 +66,11 @@ pub enum Cmd {
     MemdirClear,
     Rewind,
     Compact,
+    Doctor,
+    Env,
+    Config,
+    Permissions,
+    Bug,
     Quit,
 }
 
@@ -327,6 +332,36 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/version",
         help: "Show version",
         cmd: Cmd::Version,
+    },
+    SlashCommandSpec {
+        name: "/doctor",
+        usage: "/doctor",
+        help: "Sanity-check the runtime (Ollama, model, config dir, git)",
+        cmd: Cmd::Doctor,
+    },
+    SlashCommandSpec {
+        name: "/env",
+        usage: "/env",
+        help: "Show resolved runtime environment",
+        cmd: Cmd::Env,
+    },
+    SlashCommandSpec {
+        name: "/config",
+        usage: "/config",
+        help: "Show contents of ~/.ai-chat-cli/config.json",
+        cmd: Cmd::Config,
+    },
+    SlashCommandSpec {
+        name: "/permissions",
+        usage: "/permissions",
+        help: "List trusted directories and gated built-in tools",
+        cmd: Cmd::Permissions,
+    },
+    SlashCommandSpec {
+        name: "/bug",
+        usage: "/bug [summary]",
+        help: "Print a pre-filled GitHub Issues URL with runtime info",
+        cmd: Cmd::Bug,
     },
     SlashCommandSpec {
         name: "/quit",

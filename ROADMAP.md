@@ -70,6 +70,7 @@ Shipped in this PR:
 - [x] `/sessions`, `/resume` (auto-saved per-project checkpoints)
 - [x] `/diff`, `/commit`, `/review` (git workflow; `/commit` is plan-mode-aware)
 - [x] `/trust` (project-trust gate for write/exec tools)
+- [x] `/permissions` (lists trusted roots and gated built-in tools)
 - [x] `/memdir`, `/memdir-add`, `/memdir-rm`, `/memdir-clear`
       (cross-session persistent memory at `~/.ai-chat-cli/memdir/`)
 - [x] `/rewind`, `/compact` (history surgery + automatic summarization)
@@ -78,6 +79,7 @@ Shipped in this PR:
 - [x] `/tag` (list/create; create plan-mode-aware)
 - [x] `/files` (lists tracked files via `git ls-files`)
 - [x] `/add-dir` (trust an additional directory for write/exec tools)
+- [x] `/doctor`, `/env`, `/config`, `/bug` (diagnostics & runtime transparency)
 
 Still to add (grouped by area):
 
@@ -93,8 +95,8 @@ Still to add (grouped by area):
 - **MCP / plugins / skills:** `/mcp`, `/plugin`, `/reload-plugins`, `/skills`,
   `/hooks`
 - **Diagnostics / perf:** `/stats`, `/usage`, `/cost`, `/perf-issue`,
-  `/heapdump`, `/debug-tool-call`, `/env`, `/doctor`, `/bug`, `/permissions`,
-  `/config`
+  `/heapdump`, `/debug-tool-call`, `/doctor` ✅, `/env` ✅, `/bug` ✅,
+  `/permissions` ✅, `/config` ✅
 - **Lifecycle:** `/upgrade`, `/install`, `/install-github-app`,
   `/install-slack-app`, `/sandbox-toggle`, `/reset-limits`
 - **Social / sharing:** `/share`, `/copy`, `/feedback`, `/release-notes`,
