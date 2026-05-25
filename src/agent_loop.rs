@@ -179,7 +179,7 @@ pub async fn run_subagent(
     ];
 
     for step in 0..max_steps {
-        let msg = executor
+        let (msg, _stats) = executor
             .chat_with_tools(history.clone(), tools.clone())
             .await?;
         let calls = msg.tool_calls.clone().unwrap_or_default();

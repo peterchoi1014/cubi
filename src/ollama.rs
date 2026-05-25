@@ -96,6 +96,17 @@ pub struct ChatResponse {
     // Note: 'done' field exists in API but we don't need it for non-streaming
     #[allow(dead_code)]
     pub done: bool,
+    /// Number of tokens in the prompt (Ollama only sends this on the final
+    /// chunk, or on the single non-streaming response).
+    #[serde(default)]
+    pub prompt_eval_count: Option<u64>,
+    /// Number of tokens generated.
+    #[serde(default)]
+    pub eval_count: Option<u64>,
+    /// End-to-end duration of the request, in nanoseconds. Includes load,
+    /// prompt eval, and generation.
+    #[serde(default)]
+    pub total_duration: Option<u64>,
 }
 
 /// One streaming chunk from `/api/chat` when `stream: true`. Each NDJSON
@@ -106,6 +117,45 @@ pub struct ChatResponse {
 pub struct ChatStreamChunk {
     pub message: Message,
     pub done: bool,
+    /// Token counts. Present only on the final chunk; intermediate chunks
+    /// have these as `None`.
+    #[serde(default)]
+    pub prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    pub eval_count: Option<u64>,
+    /// End-to-end duration in nanoseconds. Final chunk only.
+    #[serde(default)]
+    pub total_duration: Option<u64>,
+}
+
+/// Per-call inference statistics. Populated from whatever the provider
+/// returned (Ollama: `eval_count`/`prompt_eval_count`; OpenAI: `usage`). All
+/// fields default to zero so they can be summed without optionality noise.
+#[derive(Debug, Clone, Default)]
+pub struct ChatStats {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub elapsed_ms: u64,
+}
+
+impl ChatStats {
+    #[allow(dead_code)]
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+
+    /// Accumulates `other` into `self`. Used for session-level totals.
+    pub fn add(&mut self, other: &Self) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.elapsed_ms += other.elapsed_ms;
+    }
+
+    /// True when no field was populated. Used to decide whether to print a
+    /// footer (skip if the provider returned nothing useful).
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.elapsed_ms == 0
+    }
 }
 
 pub struct OllamaClient {
@@ -157,19 +207,19 @@ impl OllamaClient {
     }
 
     pub async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
-        let msg = self.chat_with_tools(model, messages, None).await?;
+        let (msg, _) = self.chat_with_tools(model, messages, None).await?;
         Ok(msg.content)
     }
 
     /// Non-streaming chat that optionally forwards a native tool list. Returns
-    /// the full assistant [`Message`] so the caller can inspect `tool_calls`
-    /// and run an agent loop on top.
+    /// the full assistant [`Message`] plus per-call [`ChatStats`] so the
+    /// caller can inspect `tool_calls` and run an agent loop on top.
     pub async fn chat_with_tools(
         &self,
         model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-    ) -> Result<Message> {
+    ) -> Result<(Message, ChatStats)> {
         with_retry(3, || {
             let request = ChatRequest {
                 model: model.to_string(),
@@ -196,7 +246,16 @@ impl OllamaClient {
                     .await
                     .context("Failed to parse Ollama response")?;
 
-                Ok(chat_response.message)
+                let stats = ChatStats {
+                    prompt_tokens: chat_response.prompt_eval_count.unwrap_or(0),
+                    completion_tokens: chat_response.eval_count.unwrap_or(0),
+                    elapsed_ms: chat_response
+                        .total_duration
+                        .map(|ns| ns / 1_000_000)
+                        .unwrap_or(0),
+                };
+
+                Ok((chat_response.message, stats))
             }
         })
         .await
@@ -219,7 +278,7 @@ impl OllamaClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
         mut on_token: F,
-    ) -> Result<Message>
+    ) -> Result<(Message, ChatStats)>
     where
         F: FnMut(&str),
     {
@@ -256,31 +315,38 @@ impl OllamaClient {
         let mut buf = String::new();
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
+        let mut stats = ChatStats::default();
 
         // Local closure so the trailing-buffer case after the read loop can
         // reuse the same parse-and-dispatch logic without duplication.
-        let mut handle_line =
-            |line: &str, content: &mut String, final_msg: &mut Option<Message>| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return;
-                }
-                let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
-                    Ok(c) => c,
-                    Err(_) => return, // tolerate a malformed mid-stream line
-                };
-                if !parsed.message.content.is_empty() {
-                    on_token(&parsed.message.content);
-                    content.push_str(&parsed.message.content);
-                }
-                if parsed.done {
-                    let mut m = parsed.message;
-                    // Replace fragmentary content with the accumulated text so
-                    // callers don't have to reconstruct it.
-                    m.content = content.clone();
-                    *final_msg = Some(m);
-                }
+        let mut handle_line = |line: &str,
+                               content: &mut String,
+                               final_msg: &mut Option<Message>,
+                               stats: &mut ChatStats| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
+                Ok(c) => c,
+                Err(_) => return, // tolerate a malformed mid-stream line
             };
+            if !parsed.message.content.is_empty() {
+                on_token(&parsed.message.content);
+                content.push_str(&parsed.message.content);
+            }
+            if parsed.done {
+                // Capture provider stats from the terminal chunk.
+                stats.prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
+                stats.completion_tokens = parsed.eval_count.unwrap_or(0);
+                stats.elapsed_ms = parsed.total_duration.map(|ns| ns / 1_000_000).unwrap_or(0);
+                let mut m = parsed.message;
+                // Replace fragmentary content with the accumulated text so
+                // callers don't have to reconstruct it.
+                m.content = content.clone();
+                *final_msg = Some(m);
+            }
+        };
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
@@ -288,7 +354,7 @@ impl OllamaClient {
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].to_string();
                 buf.drain(..=nl);
-                handle_line(&line, &mut content, &mut final_msg);
+                handle_line(&line, &mut content, &mut final_msg, &mut stats);
             }
         }
 
@@ -298,10 +364,12 @@ impl OllamaClient {
         // done chunk". Flush whatever's left.
         if !buf.trim().is_empty() {
             let remaining = std::mem::take(&mut buf);
-            handle_line(&remaining, &mut content, &mut final_msg);
+            handle_line(&remaining, &mut content, &mut final_msg, &mut stats);
         }
 
-        final_msg.ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))
+        let msg = final_msg
+            .ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))?;
+        Ok((msg, stats))
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
