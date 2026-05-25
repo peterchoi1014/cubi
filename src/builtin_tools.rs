@@ -1012,16 +1012,24 @@ impl BuiltinToolRegistry {
         let mut child = TokioCommand::new("bash")
             .arg("--noprofile")
             .arg("--norc")
-            .arg("-i")
+            // Intentionally NOT `-i`: interactive mode pulls in job control
+            // and the SIGTTIN dance, which makes multiple parallel sessions
+            // (e.g. inside tests) deadlock on the controlling terminal.
+            // Non-interactive bash still happily accepts commands over a
+            // stdin pipe and keeps its environment / cwd / functions
+            // between reads, which is all the REPL feature needs.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Merge stderr into stdout so the model sees errors in-band
-            // without us having to read two streams concurrently.
+            // We pipe stderr separately and immediately redirect it to
+            // stdout *inside the shell* via `exec 2>&1` (below). That way
+            // every subsequent command — including compilation errors,
+            // `set -x` traces, etc. — lands on the same FD we read from
+            // and is captured in the eval's output.
             .stderr(Stdio::piped())
             .spawn()
             .context("Failed to spawn bash for REPL")?;
 
-        let stdin = child
+        let mut stdin = child
             .stdin
             .take()
             .context("bash spawned without stdin pipe")?;
@@ -1029,14 +1037,26 @@ impl BuiltinToolRegistry {
             .stdout
             .take()
             .context("bash spawned without stdout pipe")?;
-        // Forward stderr by spawning a task that drains it. Simpler than
-        // juggling a second reader in the eval loop.
+        // Bash, once we send this, will dup stderr onto stdout for itself
+        // and every child it spawns. Done as the very first input so it
+        // applies to the user's first eval, too.
+        stdin
+            .write_all(b"exec 2>&1\n")
+            .await
+            .context("Failed to merge REPL stderr into stdout")?;
+        stdin
+            .flush()
+            .await
+            .context("Failed to flush REPL stderr merge")?;
+
+        // Anything bash wrote to its own stderr *before* `exec 2>&1` took
+        // effect (e.g. interactive-shell warnings on some hosts) still
+        // comes out the original stderr pipe. Drain it on a background
+        // task so the pipe doesn't fill up and stall the child.
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = String::new();
-                // Best-effort drain; errors are ignored — when bash exits the
-                // stream closes and the loop terminates.
                 while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
                     buf.clear();
                 }
@@ -1623,9 +1643,14 @@ fn notebook_save(nb: &serde_json::Value, path: &str) -> Result<()> {
 /// rogue URL from blowing the model's context window or the process's RAM.
 const MAX_WEB_BYTES: usize = 64 * 1024;
 
-/// HTTP GET with a body cap. If the response is HTML, the tags are
-/// stripped to plain text before being returned.
+/// HTTP GET with a body cap. The response is streamed and we stop
+/// reading once we've accumulated `max_bytes`, so an upstream sending a
+/// gigabyte file doesn't blow process RAM just because the model asked
+/// to look at it. If the response is HTML, the tags are stripped to
+/// plain text before being returned.
 async fn http_get_text(url: &str, max_bytes: usize) -> Result<String> {
+    use futures_util::StreamExt;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent("ai-chat-cli/0.1")
@@ -1638,13 +1663,26 @@ async fn http_get_text(url: &str, max_bytes: usize) -> Result<String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = resp.bytes().await?;
-    let truncated = bytes.len() > max_bytes;
-    let body = if truncated {
-        String::from_utf8_lossy(&bytes[..max_bytes]).to_string()
-    } else {
-        String::from_utf8_lossy(&bytes).to_string()
-    };
+
+    // Stream and stop once we hit the cap. `take(max_bytes + 1)` on the
+    // accumulated length lets us detect truncation cheaply (we read one
+    // chunk past the cap, then trim).
+    let mut buf: Vec<u8> = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut stream = resp.bytes_stream();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = max_bytes.saturating_sub(buf.len());
+        if chunk.len() <= remaining {
+            buf.extend_from_slice(&chunk);
+        } else {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+    }
+
+    let body = String::from_utf8_lossy(&buf).to_string();
     let mut text = if content_type.contains("html") {
         strip_html(&body)
     } else {
@@ -1667,60 +1705,60 @@ async fn http_get_text(url: &str, max_bytes: usize) -> Result<String> {
 /// Crude HTML → text conversion: drops `<script>` / `<style>` blocks, then
 /// strips every remaining tag and collapses whitespace. Good enough for
 /// search-result snippets and short articles; not a real HTML parser.
+///
+/// Iterates by `char` so non-ASCII content (CJK, accents, emoji…) round-trips
+/// intact; tag markers and the `<script>` / `<style>` lookahead are still
+/// ASCII-only, which is true of all real-world HTML.
 fn strip_html(input: &str) -> String {
-    // Lowercase scan helps the script/style match, but we want to slice
-    // from the original string to preserve case in the output.
     let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
     let mut in_tag = false;
-    let mut skip_until: Option<&'static [u8]> = None;
-    while i < bytes.len() {
+    let mut skip_until: Option<&'static str> = None;
+    let lower = input.to_ascii_lowercase();
+    let mut iter = input.char_indices().peekable();
+    while let Some((i, ch)) = iter.next() {
         if let Some(end_tag) = skip_until {
-            // Look for the closing tag (case-insensitive ASCII).
-            if i + end_tag.len() <= bytes.len()
-                && bytes[i..i + end_tag.len()].eq_ignore_ascii_case(end_tag)
-            {
-                i += end_tag.len();
+            // Look for the closing tag (case-insensitive ASCII) at the
+            // current byte offset; advance past it on match.
+            if lower[i..].starts_with(end_tag) {
+                // Skip past the end tag in the iterator too.
+                let mut to_skip = end_tag.len() - ch.len_utf8();
+                while to_skip > 0 {
+                    if let Some((_, c)) = iter.next() {
+                        to_skip = to_skip.saturating_sub(c.len_utf8());
+                    } else {
+                        break;
+                    }
+                }
                 skip_until = None;
-            } else {
-                i += 1;
             }
             continue;
         }
-        let b = bytes[i];
-        if b == b'<' {
+        if ch == '<' {
             // Detect <script ...> and <style ...> openings to drop their bodies.
-            let rest_lower: String =
-                bytes[i..(i + 8).min(bytes.len())].iter().map(|c| c.to_ascii_lowercase() as char).collect();
-            if rest_lower.starts_with("<script") {
-                skip_until = Some(b"</script>");
-                i += 1;
+            let rest = &lower[i..];
+            if rest.starts_with("<script") {
+                skip_until = Some("</script>");
                 continue;
             }
-            if rest_lower.starts_with("<style") {
-                skip_until = Some(b"</style>");
-                i += 1;
+            if rest.starts_with("<style") {
+                skip_until = Some("</style>");
                 continue;
             }
             in_tag = true;
-            i += 1;
             continue;
         }
-        if b == b'>' {
+        if ch == '>' {
             in_tag = false;
             // Tag boundaries act as whitespace so adjacent words don't
             // glue together when we strip the markup.
             if !out.ends_with(' ') && !out.is_empty() {
                 out.push(' ');
             }
-            i += 1;
             continue;
         }
         if !in_tag {
-            out.push(b as char);
+            out.push(ch);
         }
-        i += 1;
     }
     // Decode the handful of HTML entities that crop up in DDG output.
     let decoded = out
@@ -2039,6 +2077,28 @@ mod tests {
     }
 
     #[test]
+    fn strip_html_preserves_non_ascii_utf8() {
+        // Mix of CJK, accented Latin, and emoji — must round-trip
+        // through the tag stripper without being mangled into mojibake.
+        let out = strip_html("<p>こんにちは <b>café</b> 🎉 — naïve</p>");
+        assert!(out.contains("こんにちは"), "got: {out}");
+        assert!(out.contains("café"), "got: {out}");
+        assert!(out.contains("🎉"), "got: {out}");
+        assert!(out.contains("naïve"), "got: {out}");
+    }
+
+    #[test]
+    fn strip_html_drops_script_with_non_ascii_body() {
+        let out = strip_html(
+            "before<script>let x = 'こんにちは'; alert(x);</script>after",
+        );
+        assert!(!out.contains("alert"), "got: {out}");
+        assert!(!out.contains("こんにちは"), "got: {out}");
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
     fn unwrap_ddg_redirect_returns_destination() {
         let href = "/l/?kh=-1&uddg=https%3A%2F%2Fexample.com%2Fpage&rut=foo";
         assert_eq!(
@@ -2239,6 +2299,38 @@ mod tests {
             .expect("call ok");
         assert_eq!(r.is_error, Some(true));
         assert!(r.content[0].text.contains("No REPL session"));
+    }
+
+    #[tokio::test]
+    async fn repl_eval_captures_stderr_in_band() {
+        // Reviewer concern: stderr was being silently drained. After the
+        // fix, `exec 2>&1` is injected so anything a command writes to
+        // its stderr appears in the eval output.
+        let registry = registry_trusting_cwd(false);
+        let _ = registry
+            .execute("repl_start", json!({ "session_id": "err" }))
+            .await
+            .expect("start ok");
+        let r = registry
+            .execute(
+                "repl_eval",
+                json!({
+                    "session_id": "err",
+                    "code": "echo to-stderr 1>&2",
+                    "timeout": 10
+                }),
+            )
+            .await
+            .expect("eval ok");
+        assert!(r.is_error.is_none(), "got {:?}", r);
+        assert!(
+            r.content[0].text.contains("to-stderr"),
+            "expected stderr-merged output, got: {}",
+            r.content[0].text
+        );
+        let _ = registry
+            .execute("repl_close", json!({ "session_id": "err" }))
+            .await;
     }
 
     #[tokio::test]

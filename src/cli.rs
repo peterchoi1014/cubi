@@ -184,6 +184,13 @@ impl ChatCLI {
             }
             Cmd::Clear => {
                 self.history.clear();
+                // Drop the in-memory session pointer too: leaving it set
+                // would make the next assistant turn overwrite the saved
+                // checkpoint with an (almost) empty history, effectively
+                // discarding the prior conversation from disk. A fresh
+                // `current_session` is allocated lazily on the next
+                // `checkpoint_session` call.
+                self.current_session = None;
                 println!("{}", "Conversation history cleared.".yellow());
             }
             Cmd::History => {
@@ -204,6 +211,10 @@ impl ChatCLI {
                                 args.bright_cyan()
                             );
                             self.history.clear();
+                            // Same reasoning as `/clear`: don't keep
+                            // overwriting the prior session's checkpoint
+                            // with a fresh history after a model switch.
+                            self.current_session = None;
                         }
                         Err(e) => {
                             eprintln!("{} {}", "Error:".bright_red(), e);

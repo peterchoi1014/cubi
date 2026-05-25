@@ -211,31 +211,49 @@ impl OllamaClient {
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
 
+        // Local closure so the trailing-buffer case after the read loop can
+        // reuse the same parse-and-dispatch logic without duplication.
+        let mut handle_line = |line: &str,
+                               content: &mut String,
+                               final_msg: &mut Option<Message>| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
+                Ok(c) => c,
+                Err(_) => return, // tolerate a malformed mid-stream line
+            };
+            if !parsed.message.content.is_empty() {
+                on_token(&parsed.message.content);
+                content.push_str(&parsed.message.content);
+            }
+            if parsed.done {
+                let mut m = parsed.message;
+                // Replace fragmentary content with the accumulated text so
+                // callers don't have to reconstruct it.
+                m.content = content.clone();
+                *final_msg = Some(m);
+            }
+        };
+
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
+                let line = buf[..nl].to_string();
                 buf.drain(..=nl);
-                if line.is_empty() {
-                    continue;
-                }
-                let parsed: ChatStreamChunk = match serde_json::from_str(&line) {
-                    Ok(c) => c,
-                    Err(_) => continue, // tolerate a malformed mid-stream line
-                };
-                if !parsed.message.content.is_empty() {
-                    on_token(&parsed.message.content);
-                    content.push_str(&parsed.message.content);
-                }
-                if parsed.done {
-                    let mut m = parsed.message;
-                    // Replace fragmentary content with the accumulated text
-                    // so callers don't have to reconstruct it.
-                    m.content = content.clone();
-                    final_msg = Some(m);
-                }
+                handle_line(&line, &mut content, &mut final_msg);
             }
+        }
+
+        // NDJSON isn't required to end with a trailing newline. If the
+        // server sent the final `done:true` object without `\n`, it would
+        // otherwise sit in `buf` forever and we'd report "ended without
+        // done chunk". Flush whatever's left.
+        if !buf.trim().is_empty() {
+            let remaining = std::mem::take(&mut buf);
+            handle_line(&remaining, &mut content, &mut final_msg);
         }
 
         final_msg.ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))
