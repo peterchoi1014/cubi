@@ -646,7 +646,15 @@ impl ChatCLI {
                 self.show_stats();
             }
             Cmd::Stream => {
-                self.stream_enabled = parse_toggle(args, self.stream_enabled);
+                let Some(next) = parse_toggle(args, self.stream_enabled) else {
+                    eprintln!(
+                        "{} Usage: /stream [on|off] (got {:?})",
+                        "Error:".bright_red(),
+                        args
+                    );
+                    return Ok(false);
+                };
+                self.stream_enabled = next;
                 println!(
                     "{} Streaming is now {}",
                     "✓".bright_green(),
@@ -664,7 +672,15 @@ impl ChatCLI {
                 }
             }
             Cmd::Markdown => {
-                self.markdown_enabled = parse_toggle(args, self.markdown_enabled);
+                let Some(next) = parse_toggle(args, self.markdown_enabled) else {
+                    eprintln!(
+                        "{} Usage: /markdown [on|off] (got {:?})",
+                        "Error:".bright_red(),
+                        args
+                    );
+                    return Ok(false);
+                };
+                self.markdown_enabled = next;
                 println!(
                     "{} Markdown rendering is now {}",
                     "✓".bright_green(),
@@ -682,7 +698,15 @@ impl ChatCLI {
                 }
             }
             Cmd::StatsFooter => {
-                self.stats_footer_enabled = parse_toggle(args, self.stats_footer_enabled);
+                let Some(next) = parse_toggle(args, self.stats_footer_enabled) else {
+                    eprintln!(
+                        "{} Usage: /stats-footer [on|off] (got {:?})",
+                        "Error:".bright_red(),
+                        args
+                    );
+                    return Ok(false);
+                };
+                self.stats_footer_enabled = next;
                 println!(
                     "{} Per-turn stats footer is now {}",
                     "✓".bright_green(),
@@ -3359,6 +3383,11 @@ impl ChatCLI {
                         "ℹ".bright_blue()
                     );
                 }
+                // Drop the journal bucket that `run()` opened for this
+                // turn if no tools have actually snapshotted anything yet,
+                // so `/rewind 1` still targets the previous completed
+                // turn instead of an empty bucket.
+                self.journal.discard_last_turn_if_empty();
                 self.history.truncate(turn_start);
                 return Ok(());
             };
@@ -4726,13 +4755,19 @@ struct BatchSummary {
 }
 
 /// Parses an on/off/toggle argument for boolean slash commands. Accepts
-/// `on`, `off`, `true`, `false`, `1`, `0`, `enable`, `disable`. An empty
-/// or unrecognized arg toggles the current value.
-fn parse_toggle(arg: &str, current: bool) -> bool {
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" | "1" | "enable" | "enabled" | "yes" => true,
-        "off" | "false" | "0" | "disable" | "disabled" | "no" => false,
-        _ => !current,
+/// `on`, `off`, `true`, `false`, `1`, `0`, `enable`, `disable`. Only the
+/// first whitespace-delimited token is inspected; trailing words are
+/// ignored so users can type `/stream off please` without surprise.
+/// Returns `None` when the token is non-empty and unrecognized so the
+/// caller can refuse the change instead of silently toggling. An empty
+/// arg is treated as a toggle of the current value.
+fn parse_toggle(arg: &str, current: bool) -> Option<bool> {
+    let first = arg.split_whitespace().next().unwrap_or("");
+    match first.to_ascii_lowercase().as_str() {
+        "" => Some(!current),
+        "on" | "true" | "1" | "enable" | "enabled" | "yes" => Some(true),
+        "off" | "false" | "0" | "disable" | "disabled" | "no" => Some(false),
+        _ => None,
     }
 }
 

@@ -204,9 +204,10 @@ cubi --version          Print version and exit
 cubi --help             Print help and exit
 
 Output flags (combine with any command):
-  --no-stream             Wait for the full reply instead of streaming tokens
-  --no-markdown           Disable markdown rendering (only affects --no-stream)
-  --show-stats-footer     Print a token/timing footer after each reply
+  --stream / --no-stream         Stream tokens live (default) or wait for the full reply
+  --markdown / --no-markdown     Enable / disable markdown rendering. Markdown only
+                                 applies with --no-stream; auto-disabled for non-TTY
+  --show-stats-footer            Print a token/timing footer after each reply
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,
