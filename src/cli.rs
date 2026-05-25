@@ -9,7 +9,7 @@ use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
 use crate::oauth;
-use crate::ollama::Message;
+use crate::ollama::{ChatStats, Message};
 use crate::onboarding::AppConfig;
 use crate::output_styles;
 use crate::permissions::Permissions;
@@ -76,15 +76,71 @@ pub struct ChatCLI {
     /// Read-only admin policy overlay (see `policy.rs`). Loaded once at
     /// startup; surfaced by `/permissions`.
     policy: Policy,
+    /// Whether to stream tokens live (the default). When false, the model's
+    /// response is buffered until complete and then printed in one shot —
+    /// which is also the only mode that triggers markdown rendering.
+    stream_enabled: bool,
+    /// Whether to render the assistant's final reply as markdown via
+    /// termimad. Only takes effect when `stream_enabled == false`. Auto-
+    /// disabled when stdout is not a TTY.
+    markdown_enabled: bool,
+    /// Whether to print a one-line usage footer (tokens, ms, tok/s) after
+    /// each assistant turn. Off by default to avoid noise; togglable via
+    /// `/stats-footer`.
+    stats_footer_enabled: bool,
+    /// Cumulative provider-reported usage for *this run* (does not persist
+    /// across `/resume`). Surfaced by `/stats`.
+    session_stats: ChatStats,
+}
+
+/// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
+/// struct so the cli/main boundary stays explicit rather than threaded
+/// through positional bools.
+#[derive(Debug, Clone, Copy)]
+pub struct CliFlags {
+    pub stream: bool,
+    pub markdown: bool,
+    pub stats_footer: bool,
+}
+
+impl Default for CliFlags {
+    fn default() -> Self {
+        // Auto-detect TTY for markdown so piped/redirected output stays
+        // plain. Other flags default to their "good UX" values.
+        Self {
+            stream: true,
+            markdown: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            stats_footer: false,
+        }
+    }
 }
 
 impl ChatCLI {
+    #[allow(dead_code)]
     pub fn new(
         executor: AIExecutor,
         mcp_manager: Option<McpManager>,
         permissions: Arc<Mutex<Permissions>>,
         plan_mode: Arc<AtomicBool>,
         journal: FileJournal,
+    ) -> Self {
+        Self::new_with_flags(
+            executor,
+            mcp_manager,
+            permissions,
+            plan_mode,
+            journal,
+            CliFlags::default(),
+        )
+    }
+
+    pub fn new_with_flags(
+        executor: AIExecutor,
+        mcp_manager: Option<McpManager>,
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+        journal: FileJournal,
+        flags: CliFlags,
     ) -> Self {
         let mut cli = Self {
             executor,
@@ -103,6 +159,10 @@ impl ChatCLI {
             journal,
             plugins: plugins::load_plugins(),
             policy: Policy::load(),
+            stream_enabled: flags.stream,
+            markdown_enabled: flags.markdown,
+            stats_footer_enabled: flags.stats_footer,
+            session_stats: ChatStats::default(),
         };
 
         // Auto-inject project memory (CUBI.md) into context, if present.
@@ -201,6 +261,12 @@ impl ChatCLI {
                     // Expand @file mentions in user input.
                     let expanded = file_mentions::expand_file_mentions(input);
 
+                    // Snapshot history length BEFORE pushing the user
+                    // message so a mid-turn Ctrl-C can truncate back to a
+                    // clean state (no dangling user message, no orphaned
+                    // tool turns).
+                    let turn_start = self.history.len();
+
                     // Add user message to history
                     self.history.push(Message::text("user", &expanded));
 
@@ -211,7 +277,7 @@ impl ChatCLI {
                     // Run the agent: stream model output, execute any
                     // requested tools, loop until the model returns plain
                     // content (or we hit the safety cap).
-                    if let Err(e) = self.agent_turn().await {
+                    if let Err(e) = self.agent_turn(turn_start).await {
                         eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
                     }
                 }
@@ -578,6 +644,54 @@ impl ChatCLI {
             }
             Cmd::Stats | Cmd::Usage => {
                 self.show_stats();
+            }
+            Cmd::Stream => {
+                self.stream_enabled = parse_toggle(args, self.stream_enabled);
+                println!(
+                    "{} Streaming is now {}",
+                    "✓".bright_green(),
+                    if self.stream_enabled {
+                        "on".bright_green()
+                    } else {
+                        "off".bright_yellow()
+                    }
+                );
+                if self.stream_enabled && self.markdown_enabled {
+                    println!(
+                        "  {} Markdown rendering only applies with `/stream off`.",
+                        "ℹ".bright_blue()
+                    );
+                }
+            }
+            Cmd::Markdown => {
+                self.markdown_enabled = parse_toggle(args, self.markdown_enabled);
+                println!(
+                    "{} Markdown rendering is now {}",
+                    "✓".bright_green(),
+                    if self.markdown_enabled {
+                        "on".bright_green()
+                    } else {
+                        "off".bright_yellow()
+                    }
+                );
+                if self.markdown_enabled && self.stream_enabled {
+                    println!(
+                        "  {} Takes effect when streaming is off (`/stream off`).",
+                        "ℹ".bright_blue()
+                    );
+                }
+            }
+            Cmd::StatsFooter => {
+                self.stats_footer_enabled = parse_toggle(args, self.stats_footer_enabled);
+                println!(
+                    "{} Per-turn stats footer is now {}",
+                    "✓".bright_green(),
+                    if self.stats_footer_enabled {
+                        "on".bright_green()
+                    } else {
+                        "off".bright_yellow()
+                    }
+                );
             }
             Cmd::Plan => {
                 self.toggle_plan_mode();
@@ -1197,6 +1311,21 @@ impl ChatCLI {
         );
         println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
         println!("  {}: ~{}", "tokens".bright_cyan(), token_estimate);
+        if !self.session_stats.is_empty() {
+            println!(
+                "  {}: {} in / {} out (this run)",
+                "provider tokens".bright_cyan(),
+                self.session_stats.prompt_tokens,
+                self.session_stats.completion_tokens
+            );
+            if self.session_stats.elapsed_ms > 0 {
+                println!(
+                    "  {}: {} ms (this run)",
+                    "model time".bright_cyan(),
+                    self.session_stats.elapsed_ms
+                );
+            }
+        }
         println!(
             "  {}: {}/{} pending",
             "todos".bright_cyan(),
@@ -1822,7 +1951,11 @@ impl ChatCLI {
             skill.name.bright_cyan()
         );
         self.journal.start_turn();
-        if let Err(e) = self.agent_turn().await {
+        // For /skills, the user "message" is the system-injected skill body;
+        // there's no plain user turn to roll back, so snapshot whatever the
+        // history length happens to be now.
+        let turn_start = self.history.len();
+        if let Err(e) = self.agent_turn(turn_start).await {
             eprintln!("{} {}", "Error:".bright_red(), e);
         }
     }
@@ -3121,7 +3254,7 @@ impl ChatCLI {
     /// On a successful exchange (any number of tool round-trips), the final
     /// assistant message is appended to history, single-turn system hints
     /// are stripped, and the session is checkpointed.
-    async fn agent_turn(&mut self) -> Result<()> {
+    async fn agent_turn(&mut self, turn_start: usize) -> Result<()> {
         use std::io::Write;
         use std::sync::atomic::Ordering;
 
@@ -3135,6 +3268,13 @@ impl ChatCLI {
         // Track whether we've printed visible content on this turn so we
         // can choose when to add separating blank lines.
         let mut any_output = false;
+        // Per-turn provider-usage accumulator. Summed into `session_stats`
+        // at the very end so cancelled or errored turns don't pollute totals.
+        let mut turn_stats = ChatStats::default();
+
+        // Snapshot the journal start so /rewind still works after Ctrl-C
+        // cancel: we leave file edits in place but pop the history.
+        // (turn_start was captured before the user message was pushed.)
 
         for step in 0..MAX_AGENT_STEPS {
             // Show a spinner while we wait for the model's first token.
@@ -3160,33 +3300,79 @@ impl ChatCLI {
             // defer the print until the first streamed token so the
             // spinner has full ownership of the status line.
             let mut printed_prefix = step > 0;
-
             let mut got_token = false;
-            let stream_result = self
-                .executor
-                .chat_stream(self.history.clone(), tools.clone(), |tok| {
-                    if !got_token {
-                        // First token: retire the spinner and lay down
-                        // the "AI:" prefix exactly once.
-                        stop_flag.store(true, Ordering::SeqCst);
-                        spinner_ref.clear_line();
-                        if !printed_prefix {
-                            print!("{} ", "AI:".bright_blue().bold());
-                            printed_prefix = true;
-                        }
-                    }
-                    print!("{}", tok.bright_white());
-                    let _ = std::io::stdout().flush();
-                    got_token = true;
-                })
-                .await;
+
+            // Either stream tokens (default) or run buffered chat_with_tools
+            // when the user has /stream off (markdown mode is buffered-only).
+            // Cancellation: SIGINT (Ctrl-C) interrupts only the in-flight
+            // model call; in-flight tool execution is NOT yet interruptible.
+            let outcome: Option<Result<(Message, ChatStats)>> = if self.stream_enabled {
+                let stream_fut =
+                    self.executor
+                        .chat_stream(self.history.clone(), tools.clone(), |tok| {
+                            if !got_token {
+                                stop_flag.store(true, Ordering::SeqCst);
+                                spinner_ref.clear_line();
+                                if !printed_prefix {
+                                    print!("{} ", "AI:".bright_blue().bold());
+                                    printed_prefix = true;
+                                }
+                            }
+                            print!("{}", tok.bright_white());
+                            let _ = std::io::stdout().flush();
+                            got_token = true;
+                        });
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => None,
+                    r = stream_fut => Some(r),
+                }
+            } else {
+                let buf_fut = self
+                    .executor
+                    .chat_with_tools(self.history.clone(), tools.clone());
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => None,
+                    r = buf_fut => Some(r),
+                }
+            };
+            // Always retire the spinner before we print anything else.
+            stop_flag.store(true, Ordering::SeqCst);
             spinner.stop().await;
-            let msg = stream_result?;
+
+            // None == user pressed Ctrl-C mid-call. Truncate the history
+            // back to the pre-turn snapshot so the conversation has no
+            // dangling user / orphaned tool turns. File edits from prior
+            // steps in this turn (if any) survive: use `/rewind` to undo
+            // them.
+            let Some(stream_result) = outcome else {
+                if got_token {
+                    // Move past any partial output.
+                    println!();
+                }
+                println!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
+                if step > 0 {
+                    println!(
+                        "  {} prior tool side-effects in this turn may have run; \
+                         `/rewind` can undo file edits.",
+                        "ℹ".bright_blue()
+                    );
+                }
+                self.history.truncate(turn_start);
+                return Ok(());
+            };
+            let (msg, stats) = stream_result?;
+            turn_stats.add(&stats);
+
             if got_token {
                 any_output = true;
             }
 
             let calls = msg.tool_calls.clone().unwrap_or_default();
+            // Capture the final-content text BEFORE moving the message into
+            // history — used by the markdown re-render below.
+            let msg_content = msg.content.clone();
 
             // Persist the assistant message verbatim — including any
             // tool_calls — so the next iteration's context matches what the
@@ -3195,6 +3381,12 @@ impl ChatCLI {
 
             if calls.is_empty() {
                 // Plain text response: we're done with this turn.
+                if !self.stream_enabled && !msg_content.is_empty() {
+                    // Buffered mode: render the message now. Markdown if
+                    // enabled, otherwise plain text.
+                    self.render_final_reply(&msg_content);
+                    any_output = true;
+                }
                 if any_output {
                     println!("\n");
                 }
@@ -3336,6 +3528,15 @@ impl ChatCLI {
             }
         }
 
+        // Per-turn footer (opt-in via `/stats-footer on`). Skipped when the
+        // provider returned nothing useful.
+        if self.stats_footer_enabled && !turn_stats.is_empty() {
+            print_stats_footer(&turn_stats);
+        }
+        // Roll the per-turn usage into the run-total. Done last so an early
+        // cancel return (above) doesn't poison the counter.
+        self.session_stats.add(&turn_stats);
+
         // Drop any system messages tagged as single-turn (e.g. from `/ask`)
         // so they don't keep nudging every subsequent turn.
         self.strip_single_turn_system_messages();
@@ -3344,6 +3545,22 @@ impl ChatCLI {
         // crash never loses the conversation.
         self.checkpoint_session();
         Ok(())
+    }
+
+    /// Renders the model's final reply when streaming is off. Uses termimad
+    /// for markdown when enabled and the terminal supports it; falls back to
+    /// the same colored plain-text the streaming path produces.
+    fn render_final_reply(&self, content: &str) {
+        print!("{} ", "AI:".bright_blue().bold());
+        if self.markdown_enabled && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            // termimad prints with its own trailing newline; we leave the
+            // outer println!("\n") in agent_turn to add the post-reply gap.
+            println!();
+            let skin = termimad::MadSkin::default();
+            skin.print_text(content);
+        } else {
+            println!("{}", content.bright_white());
+        }
     }
 
     /// Cleanly shuts down any owned MCP connections. Call this from an
@@ -4506,6 +4723,45 @@ impl Drop for ChatCLI {
 struct BatchSummary {
     ok: usize,
     failed: usize,
+}
+
+/// Parses an on/off/toggle argument for boolean slash commands. Accepts
+/// `on`, `off`, `true`, `false`, `1`, `0`, `enable`, `disable`. An empty
+/// or unrecognized arg toggles the current value.
+fn parse_toggle(arg: &str, current: bool) -> bool {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "enable" | "enabled" | "yes" => true,
+        "off" | "false" | "0" | "disable" | "disabled" | "no" => false,
+        _ => !current,
+    }
+}
+
+/// Prints a one-line dim footer summarizing token usage and wall time for
+/// the just-completed turn. Only the fields the provider actually returned
+/// are shown; missing fields are skipped to avoid printing "0 in / 0 out".
+fn print_stats_footer(stats: &ChatStats) {
+    let mut parts: Vec<String> = Vec::new();
+    if stats.prompt_tokens > 0 || stats.completion_tokens > 0 {
+        parts.push(format!(
+            "{} in / {} out",
+            stats.prompt_tokens, stats.completion_tokens
+        ));
+    }
+    if stats.elapsed_ms > 0 {
+        parts.push(format!("{} ms", stats.elapsed_ms));
+        if stats.completion_tokens > 0 {
+            let tps = (stats.completion_tokens as f64) * 1000.0 / (stats.elapsed_ms as f64);
+            parts.push(format!("{:.1} tok/s", tps));
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    println!(
+        "{} {}",
+        "↳".bright_black(),
+        parts.join(" · ").bright_black()
+    );
 }
 
 /// Refuses to overwrite `filename` unless `force` is true. Shared between

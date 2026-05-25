@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::ollama::{Message, OllamaClient, ToolCall, ToolCallFunction, ToolSpec};
+use crate::ollama::{ChatStats, Message, OllamaClient, ToolCall, ToolCallFunction, ToolSpec};
 
 // ─── Provider enum (object-safe dispatch without async_trait) ────────────────
 
@@ -44,7 +44,7 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.chat(model, messages).await,
             Self::OpenAi(c) => {
-                let msg = c.chat_with_tools(model, messages, None).await?;
+                let (msg, _) = c.chat_with_tools(model, messages, None).await?;
                 Ok(msg.content)
             }
         }
@@ -56,7 +56,7 @@ impl LlmBackend {
         model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-    ) -> Result<Message> {
+    ) -> Result<(Message, ChatStats)> {
         match self {
             Self::Ollama(c) => c.chat_with_tools(model, messages, tools).await,
             Self::OpenAi(c) => c.chat_with_tools(model, messages, tools).await,
@@ -70,7 +70,7 @@ impl LlmBackend {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
         on_token: F,
-    ) -> Result<Message>
+    ) -> Result<(Message, ChatStats)>
     where
         F: FnMut(&str),
     {
@@ -112,6 +112,16 @@ pub struct OpenAiClient {
 #[derive(Debug, Deserialize)]
 struct OaiResponse {
     choices: Vec<OaiChoice>,
+    #[serde(default)]
+    usage: Option<OaiUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OaiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,7 +155,10 @@ struct OaiToolCallFunction {
 /// OpenAI streaming chunk.
 #[derive(Debug, Deserialize)]
 struct OaiStreamChunk {
+    #[serde(default)]
     choices: Vec<OaiStreamChoice>,
+    #[serde(default)]
+    usage: Option<OaiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +310,7 @@ impl OpenAiClient {
 impl OpenAiClient {
     #[allow(dead_code)]
     pub async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
-        let msg = self.chat_with_tools(model, messages, None).await?;
+        let (msg, _) = self.chat_with_tools(model, messages, None).await?;
         Ok(msg.content)
     }
 
@@ -306,7 +319,8 @@ impl OpenAiClient {
         model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-    ) -> Result<Message> {
+    ) -> Result<(Message, ChatStats)> {
+        let started = std::time::Instant::now();
         let mut body = serde_json::json!({
             "model": model,
             "messages": Self::convert_messages(&messages),
@@ -345,7 +359,20 @@ impl OpenAiClient {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No choices in OpenAI response"))?;
 
-        Ok(Self::oai_message_to_message(choice.message))
+        let stats = ChatStats {
+            prompt_tokens: oai_resp
+                .usage
+                .as_ref()
+                .map(|u| u.prompt_tokens)
+                .unwrap_or(0),
+            completion_tokens: oai_resp
+                .usage
+                .as_ref()
+                .map(|u| u.completion_tokens)
+                .unwrap_or(0),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        };
+        Ok((Self::oai_message_to_message(choice.message), stats))
     }
 
     pub async fn chat_stream<F>(
@@ -354,14 +381,19 @@ impl OpenAiClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
         mut on_token: F,
-    ) -> Result<Message>
+    ) -> Result<(Message, ChatStats)>
     where
         F: FnMut(&str),
     {
+        let started = std::time::Instant::now();
         let mut body = serde_json::json!({
             "model": model,
             "messages": Self::convert_messages(&messages),
             "stream": true,
+            // Ask OpenAI to include a final `usage` block in the stream
+            // (otherwise streaming responses omit it entirely). Providers
+            // that don't honor `stream_options` will simply ignore the field.
+            "stream_options": { "include_usage": true },
         });
 
         if let Some(tools) = &tools
@@ -389,6 +421,7 @@ impl OpenAiClient {
         let mut buf = String::new();
         let mut content = String::new();
         let mut tool_calls_builder: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+        let mut usage: Option<OaiUsage> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
@@ -405,6 +438,9 @@ impl OpenAiClient {
                 let Ok(chunk) = serde_json::from_str::<OaiStreamChunk>(data) else {
                     continue;
                 };
+                if let Some(u) = chunk.usage {
+                    usage = Some(u);
+                }
                 for choice in chunk.choices {
                     if let Some(text) = &choice.delta.content
                         && !text.is_empty()
@@ -458,12 +494,21 @@ impl OpenAiClient {
             )
         };
 
-        Ok(Message {
-            role: "assistant".to_string(),
-            content,
-            tool_calls,
-            tool_name: None,
-        })
+        let stats = ChatStats {
+            prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+            completion_tokens: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        };
+
+        Ok((
+            Message {
+                role: "assistant".to_string(),
+                content,
+                tool_calls,
+                tool_name: None,
+            },
+            stats,
+        ))
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {

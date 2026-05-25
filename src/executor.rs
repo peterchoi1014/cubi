@@ -1,5 +1,5 @@
 use crate::llm::{LlmBackend, create_provider};
-use crate::ollama::{Message, ToolSpec};
+use crate::ollama::{ChatStats, Message, ToolSpec};
 use anyhow::Result;
 
 pub struct AIExecutor {
@@ -28,7 +28,7 @@ impl AIExecutor {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
         on_token: F,
-    ) -> Result<Message>
+    ) -> Result<(Message, ChatStats)>
     where
         F: FnMut(&str),
     {
@@ -41,7 +41,7 @@ impl AIExecutor {
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-    ) -> Result<Message> {
+    ) -> Result<(Message, ChatStats)> {
         self.backend
             .chat_with_tools(&self.model, messages, tools)
             .await

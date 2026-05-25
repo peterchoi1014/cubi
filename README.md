@@ -195,6 +195,25 @@ You:
 
 ## 💡 Usage
 
+### Command-line flags
+
+```
+cubi                    Start the interactive chat REPL
+cubi --resume [<id>]    Resume a prior chat (latest in cwd if no id given)
+cubi --version          Print version and exit
+cubi --help             Print help and exit
+
+Output flags (combine with any command):
+  --no-stream             Wait for the full reply instead of streaming tokens
+  --no-markdown           Disable markdown rendering (only affects --no-stream)
+  --show-stats-footer     Print a token/timing footer after each reply
+```
+
+The same toggles are reachable mid-session via `/stream on|off`,
+`/markdown on|off`, and `/stats-footer on|off`. Press **Ctrl-C** during an
+in-flight reply to cancel it and return to the prompt; the unanswered user
+message is rolled back so history stays clean.
+
 ### Basic Chat
 
 Simply type your message and press Enter:
