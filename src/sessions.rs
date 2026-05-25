@@ -41,8 +41,16 @@ pub struct SessionFile {
     pub history: Vec<Message>,
 }
 
-/// Lightweight listing entry for `/sessions`. Skips loading the full
-/// history so the command stays cheap for long-lived projects.
+/// Lightweight listing entry for `/sessions`. Carries just enough to
+/// render the list (preview, message count, model, timestamp) without
+/// surfacing the full message history.
+///
+/// Note: today's on-disk format is one self-contained JSON document per
+/// session — there's no sidecar index — so `SessionStore::list` still has
+/// to read each file. To keep listing cheap on long-lived projects it
+/// deserializes into [`SessionMetaFile`] (which only walks the `history`
+/// array's length, not its message bodies) rather than into the full
+/// [`SessionFile`].
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: String,
@@ -55,6 +63,30 @@ pub struct SessionMeta {
     pub path: PathBuf,
     /// First user message, truncated to ~80 chars for the listing.
     pub preview: String,
+}
+
+/// On-disk shape used by `SessionStore::list` to extract metadata
+/// cheaply: each cell in `history` is parsed as a minimal `PreviewMessage`
+/// so per-message content is only retained until we've decided whether
+/// it's the preview. Reusing the full `SessionFile` here would force
+/// every listing to clone every assistant token + tool result into RAM.
+#[derive(Debug, Deserialize)]
+struct SessionMetaFile {
+    id: String,
+    started_at: u64,
+    model: String,
+    history: Vec<PreviewMessage>,
+}
+
+/// Stripped-down `Message` used during listing. Only carries `role` so
+/// `message_count` is honest, plus `content` so we can pick the first
+/// user message as a preview. Tool-call payloads and the like are
+/// discarded by serde because they aren't in the struct.
+#[derive(Debug, Deserialize)]
+struct PreviewMessage {
+    role: String,
+    #[serde(default)]
+    content: String,
 }
 
 /// Per-cwd session store. Cheap to clone — only carries the directory
@@ -149,7 +181,7 @@ impl SessionStore {
             let Ok(raw) = fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(file) = serde_json::from_str::<SessionFile>(&raw) else {
+            let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
                 continue;
             };
             let preview = file

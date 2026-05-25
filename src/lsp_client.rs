@@ -57,18 +57,46 @@ impl LspAction {
 
 /// Convert a `file://` URI string from the LSP back into a plain path so
 /// our renderer can match it against the request's path. Falls back to the
-/// raw string if it doesn't look like a `file:` URI.
+/// raw string if it doesn't look like a `file:` URI. Percent-escapes are
+/// decoded so a path containing spaces or other reserved characters is
+/// copy-pasteable in the rendered output.
 fn uri_to_path(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("file://") {
+    let raw = if let Some(rest) = uri.strip_prefix("file://") {
         // The local file URI form: file:///abs/path. The first `/` after
         // the scheme is the host separator, the rest is the path.
         if let Some(stripped) = rest.strip_prefix("/") {
-            // Re-prepend the leading `/` to get an absolute Unix path.
-            return format!("/{}", stripped);
+            format!("/{}", stripped)
+        } else {
+            rest.to_string()
         }
-        return rest.to_string();
+    } else {
+        return uri.to_string();
+    };
+    percent_decode(&raw)
+}
+
+/// Minimal percent-decoder for the path portion of a `file://` URI.
+/// Tolerant of malformed `%XX` sequences (passed through verbatim) so a
+/// weird LSP response can never make `uri_to_path` panic. Inlined here so
+/// `lsp_client` doesn't have to depend on `builtin_tools`.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
-    uri.to_string()
+    String::from_utf8_lossy(&out).to_string()
 }
 
 /// Render a hover-response `contents` field. LSP spec lets the server
@@ -450,6 +478,16 @@ mod tests {
         assert_eq!(uri_to_path("file:///tmp/foo"), "/tmp/foo");
         // Non-URI input is returned unchanged.
         assert_eq!(uri_to_path("/tmp/foo"), "/tmp/foo");
+    }
+
+    #[test]
+    fn uri_to_path_decodes_percent_escapes() {
+        assert_eq!(
+            uri_to_path("file:///home/user/My%20Project/main.rs"),
+            "/home/user/My Project/main.rs"
+        );
+        // Malformed escapes are left as-is rather than panicking.
+        assert_eq!(uri_to_path("file:///a%2"), "/a%2");
     }
 
     #[test]
