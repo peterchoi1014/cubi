@@ -300,6 +300,26 @@ mod tests {
         assert_eq!(nested, cwd_key(Path::new("/tmp/a/b")));
     }
 
+    #[test]
+    fn add_remove_mark_done_clear_and_pending() {
+        let mut list = TodoList::default();
+        list.add("first");
+        list.add("second");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.pending(), 2);
+
+        assert!(list.mark_done(1));
+        assert_eq!(list.pending(), 1);
+
+        assert!(list.remove(2));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.pending(), 0);
+
+        list.clear();
+        assert_eq!(list.len(), 0);
+        assert_eq!(list.pending(), 0);
+    }
+
     fn unique_suffix() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()

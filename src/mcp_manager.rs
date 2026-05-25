@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::builtin_tools::BuiltinToolRegistry;
-use crate::mcp_client::{McpClient, Tool, ToolCallResult};
+use crate::mcp_client::{McpClient, McpResource, McpResourceContent, Tool, ToolCallResult};
 use crate::mcp_config::{McpConfig, McpServerConfig};
 use crate::permissions::Permissions;
 
@@ -159,6 +159,41 @@ impl McpManager {
 
     pub fn has_tools(&self) -> bool {
         !self.tools.is_empty()
+    }
+
+    pub async fn list_resources(&mut self) -> Result<Vec<(String, McpResource)>> {
+        let mut out = Vec::new();
+        for (server_name, client) in &mut self.clients {
+            match client.list_resources().await {
+                Ok(resources) => {
+                    for resource in resources {
+                        out.push((server_name.clone(), resource));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to list resources from '{}': {}",
+                        "Warning:".bright_yellow(),
+                        server_name,
+                        e
+                    );
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.uri.cmp(&b.1.uri)));
+        Ok(out)
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        server: &str,
+        uri: &str,
+    ) -> Result<Vec<McpResourceContent>> {
+        let client = self
+            .clients
+            .get_mut(server)
+            .context(format!("Server '{}' not connected", server))?;
+        client.read_resource(uri).await
     }
 
     pub async fn shutdown(&mut self) {

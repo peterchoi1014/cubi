@@ -103,6 +103,7 @@ impl BuiltinToolRegistry {
             Self::read_file_tool(),
             Self::list_files_tool(),
             Self::search_glob_tool(),
+            Self::search_tools_tool(),
             Self::grep_tool(),
             Self::edit_file_tool(),
             Self::write_file_tool(),
@@ -143,6 +144,7 @@ impl BuiltinToolRegistry {
             "read_file" => self.execute_read_file(args),
             "list_files" => self.execute_list_files(args),
             "search_glob" => self.execute_search_glob(args),
+            "search_tools" => self.execute_search_tools(args),
             "grep" => self.execute_grep(args),
             "edit_file" => self.execute_edit_file(args),
             "write_file" => self.execute_write_file(args),
@@ -252,6 +254,23 @@ impl BuiltinToolRegistry {
                     }
                 },
                 "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn search_tools_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "search_tools".to_string(),
+            description: "Search available tools by name or description keyword".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search keyword"
+                    }
+                },
+                "required": ["query"]
             }),
         }
     }
@@ -526,6 +545,23 @@ impl BuiltinToolRegistry {
         } else {
             result
         }))
+    }
+
+    fn execute_search_tools(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let query = args["query"].as_str().context("Missing 'query' field")?;
+        let needle = query.to_ascii_lowercase();
+        let mut matches = Vec::new();
+        for tool in &self.tools {
+            let haystack = format!("{} {}", tool.name, tool.description).to_ascii_lowercase();
+            if haystack.contains(&needle) {
+                matches.push(format!("- {}: {}", tool.name, tool.description));
+            }
+        }
+        if matches.is_empty() {
+            Ok(ToolResult::success(format!("No tools matched '{}'", query)))
+        } else {
+            Ok(ToolResult::success(matches.join("\n")))
+        }
     }
 
     fn execute_grep(&self, args: serde_json::Value) -> Result<ToolResult> {

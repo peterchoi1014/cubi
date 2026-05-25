@@ -3,18 +3,20 @@ use crate::commands::{self, COMMANDS, Cmd};
 use crate::executor::AIExecutor;
 use crate::file_mentions::{self, UserCommand};
 use crate::git_cmds;
-use crate::hooks::HookRegistry;
+use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
 use crate::ollama::Message;
 use crate::permissions::Permissions;
 use crate::project_memory;
 use crate::sessions::{SessionFile, SessionStore};
+use crate::skills::{self, Skill};
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use colored::*;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +43,10 @@ pub struct ChatCLI {
     user_commands: Vec<UserCommand>,
     /// Hook registry for lifecycle events.
     hooks: HookRegistry,
+    /// Loaded Markdown skills.
+    skills: Vec<Skill>,
+    /// Per-session approved tools for untrusted directories.
+    approved_tools: HashSet<String>,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -68,6 +74,8 @@ impl ChatCLI {
             memdir: Memdir::load(),
             user_commands: file_mentions::load_user_commands(),
             hooks: HookRegistry::load(),
+            skills: skills::load_skills(),
+            approved_tools: HashSet::new(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -337,6 +345,12 @@ impl ChatCLI {
                     println!("{} MCP configuration reloaded", "✓".bright_green());
                 }
             }
+            Cmd::McpResources => {
+                self.show_mcp_resources(args).await;
+            }
+            Cmd::McpRead => {
+                self.read_mcp_resource(args).await;
+            }
             Cmd::Save => {
                 if args.is_empty() {
                     println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());
@@ -435,11 +449,26 @@ impl ChatCLI {
             Cmd::Permissions => {
                 self.show_permissions();
             }
+            Cmd::ToolAllow => {
+                self.handle_tool_allow(args);
+            }
+            Cmd::ToolDeny => {
+                self.handle_tool_deny(args);
+            }
             Cmd::Bug => {
                 self.show_bug_url(args);
             }
+            Cmd::Issue => {
+                self.show_issue_url(args);
+            }
+            Cmd::Undo => {
+                self.run_undo(args);
+            }
             Cmd::Status => {
                 self.show_status();
+            }
+            Cmd::Stats | Cmd::Usage => {
+                self.show_stats();
             }
             Cmd::Plan => {
                 self.toggle_plan_mode();
@@ -569,6 +598,12 @@ impl ChatCLI {
             Cmd::Compact => {
                 self.compact().await;
             }
+            Cmd::Skills => {
+                self.handle_skills(args).await;
+            }
+            Cmd::Hooks => {
+                self.handle_hooks(args);
+            }
             Cmd::Ask => {
                 if args.is_empty() {
                     println!("{} Usage: /ask <question>", "Info:".bright_yellow());
@@ -598,6 +633,9 @@ impl ChatCLI {
                     return Ok(true);
                 }
                 self.run_commit(args);
+            }
+            Cmd::CommitPushPr => {
+                self.run_commit_push_pr(args);
             }
             Cmd::Review => {
                 self.run_review().await;
@@ -763,6 +801,91 @@ impl ChatCLI {
         Ok(())
     }
 
+    async fn show_mcp_resources(&mut self, args: &str) {
+        let Some(mcp) = &mut self.mcp_manager else {
+            eprintln!("{} MCP not initialized", "Error:".bright_red());
+            return;
+        };
+        let server_filter = args.trim();
+        match mcp.list_resources().await {
+            Ok(resources) => {
+                let filtered: Vec<_> = resources
+                    .into_iter()
+                    .filter(|(server, _)| server_filter.is_empty() || server == server_filter)
+                    .collect();
+                if filtered.is_empty() {
+                    println!("{} No MCP resources found.", "ℹ".bright_blue());
+                    return;
+                }
+                println!("\n{}", "MCP resources:".bright_yellow().bold());
+                for (server, resource) in filtered {
+                    let description = resource.description.unwrap_or_default();
+                    println!(
+                        "  [{}] {} - {}",
+                        server.bright_cyan(),
+                        resource.uri.bright_white(),
+                        description.bright_black()
+                    );
+                }
+                println!();
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    async fn read_mcp_resource(&mut self, args: &str) {
+        let uri = args.trim();
+        if uri.is_empty() {
+            println!("{} Usage: /mcp-read <uri>", "Info:".bright_yellow());
+            return;
+        }
+        let Some(mcp) = &mut self.mcp_manager else {
+            eprintln!("{} MCP not initialized", "Error:".bright_red());
+            return;
+        };
+        let matches: Vec<_> = match mcp.list_resources().await {
+            Ok(resources) => resources
+                .into_iter()
+                .filter(|(_, r)| r.uri == uri)
+                .collect(),
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if matches.is_empty() {
+            eprintln!("{} No MCP resource with URI {}", "Error:".bright_red(), uri);
+            return;
+        }
+        if matches.len() > 1 {
+            eprintln!(
+                "{} Resource URI is ambiguous across servers. Use /mcp-resources <server> first.",
+                "Error:".bright_red()
+            );
+            return;
+        }
+        let server = &matches[0].0;
+        match mcp.read_resource(server, uri).await {
+            Ok(contents) => {
+                println!(
+                    "\n{} {} ({})",
+                    "Resource:".bright_yellow().bold(),
+                    uri.bright_cyan(),
+                    server.bright_cyan()
+                );
+                for content in contents {
+                    if let Some(text) = content.text {
+                        println!("{}", text);
+                    } else {
+                        println!("{} {}", "ℹ".bright_blue(), content.uri);
+                    }
+                }
+                println!();
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
     async fn reload_mcp(&mut self) -> Result<()> {
         // Shutdown existing MCP connections
         if let Some(mcp) = &mut self.mcp_manager {
@@ -870,6 +993,55 @@ impl ChatCLI {
             },
             trusted_count,
             if trusted_count == 1 { "" } else { "s" }
+        );
+        println!();
+    }
+
+    fn show_stats(&self) {
+        let total = self.history.len();
+        let user = self.history.iter().filter(|m| m.role == "user").count();
+        let assistant = self
+            .history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .count();
+        let system = self.history.iter().filter(|m| m.role == "system").count();
+        let token_estimate = self
+            .history
+            .iter()
+            .map(|m| m.content.len())
+            .sum::<usize>()
+            .div_ceil(4);
+
+        println!("\n{}", "Session statistics:".bright_yellow().bold());
+        println!("  {}: {}", "messages".bright_cyan(), total);
+        println!(
+            "  {}: user={}, assistant={}, system={}",
+            "breakdown".bright_cyan(),
+            user,
+            assistant,
+            system
+        );
+        println!(
+            "  {}: {}",
+            "session id".bright_cyan(),
+            self.current_session
+                .as_ref()
+                .map(|s| s.id.as_str())
+                .unwrap_or("<inactive>")
+        );
+        println!("  {}: {}", "model".bright_cyan(), self.executor.get_model());
+        println!("  {}: ~{}", "tokens".bright_cyan(), token_estimate);
+        println!(
+            "  {}: {}/{} pending",
+            "todos".bright_cyan(),
+            self.todos.pending(),
+            self.todos.len()
+        );
+        println!(
+            "  {}: {}",
+            "memdir entries".bright_cyan(),
+            self.memdir.len()
         );
         println!();
     }
@@ -1138,6 +1310,8 @@ impl ChatCLI {
     fn show_permissions(&self) {
         let perms = self.permissions.lock().unwrap();
         let roots: Vec<_> = perms.trusted_roots().cloned().collect();
+        let allowed: Vec<_> = perms.allowed_tools().cloned().collect();
+        let denied: Vec<_> = perms.denied_tools().cloned().collect();
         drop(perms);
 
         let store_path = dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("trusted_dirs.json"));
@@ -1171,10 +1345,64 @@ impl ChatCLI {
             "gated tools".bright_cyan()
         );
         println!(
-            "  {} Plan mode also blocks these tools regardless of trust.",
+            "  {}: {}",
+            "allowed tools".bright_cyan(),
+            if allowed.is_empty() {
+                "all tools allowed unless denied".to_string()
+            } else {
+                allowed.join(", ")
+            }
+        );
+        println!(
+            "  {}: {}",
+            "denied tools".bright_cyan(),
+            if denied.is_empty() {
+                "none".to_string()
+            } else {
+                denied.join(", ")
+            }
+        );
+        println!(
+            "  {} Plan mode also blocks write/exec tools regardless of trust.",
             "ℹ".bright_blue()
         );
         println!();
+    }
+
+    fn handle_tool_allow(&self, args: &str) {
+        let tool = args.trim();
+        if tool.is_empty() {
+            println!("{} Usage: /tool-allow <name>", "Info:".bright_yellow());
+            return;
+        }
+        let mut perms = self.permissions.lock().unwrap();
+        perms.allow_tool(tool);
+        match perms.save() {
+            Ok(()) => println!("{} Allowed tool {}", "✓".bright_green(), tool.bright_cyan()),
+            Err(e) => eprintln!(
+                "{} Failed to persist permissions: {}",
+                "Error:".bright_red(),
+                e
+            ),
+        }
+    }
+
+    fn handle_tool_deny(&self, args: &str) {
+        let tool = args.trim();
+        if tool.is_empty() {
+            println!("{} Usage: /tool-deny <name>", "Info:".bright_yellow());
+            return;
+        }
+        let mut perms = self.permissions.lock().unwrap();
+        perms.deny_tool(tool);
+        match perms.save() {
+            Ok(()) => println!("{} Denied tool {}", "✓".bright_green(), tool.bright_cyan()),
+            Err(e) => eprintln!(
+                "{} Failed to persist permissions: {}",
+                "Error:".bright_red(),
+                e
+            ),
+        }
     }
 
     /// `/bug` — print a pre-filled GitHub Issues URL for this repo with
@@ -1240,6 +1468,179 @@ impl ChatCLI {
 
     /// Handles `/trust` and `/trust revoke`. Both forms operate on the
     /// current working directory.
+    fn show_issue_url(&self, args: &str) {
+        let title = if args.trim().is_empty() {
+            "Feature request".to_string()
+        } else {
+            args.trim().to_string()
+        };
+        let body = "## Problem\n<!-- What limitation are you hitting? -->\n\n## Proposed solution\n<!-- Describe the feature you want. -->\n\n## Alternatives considered\n<!-- Optional -->\n";
+        let url = format!(
+            "https://github.com/peterchoi1014/ai-chat-cli/issues/new?labels=enhancement&title={}&body={}",
+            url_encode(&title),
+            url_encode(body),
+        );
+
+        println!("\n{}", "Feature request:".bright_yellow().bold());
+        println!(
+            "  {} Open this URL to file a feature request:\n",
+            "ℹ".bright_blue()
+        );
+        println!("  {}\n", url.bright_cyan());
+    }
+
+    fn load_global_hooks(&self) -> Vec<HookDef> {
+        let Some(path) = crate::hooks::global_hooks_path() else {
+            return Vec::new();
+        };
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<HooksConfig>(&raw).ok())
+            .map(|cfg| cfg.hooks)
+            .unwrap_or_default()
+    }
+
+    fn handle_hooks(&mut self, args: &str) {
+        let trimmed = args.trim();
+        let mut hooks = self.load_global_hooks();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+            println!("\n{}", "Hooks:".bright_yellow().bold());
+            if hooks.is_empty() {
+                println!("  {} No hooks configured.", "ℹ".bright_blue());
+            } else {
+                for (idx, hook) in hooks.iter().enumerate() {
+                    println!(
+                        "  {}. {} {} {}",
+                        idx + 1,
+                        hook.event.as_str().bright_cyan(),
+                        hook.match_tool
+                            .as_deref()
+                            .map(|m| format!("[match_tool={}]", m))
+                            .unwrap_or_default()
+                            .bright_black(),
+                        hook.command.bright_white()
+                    );
+                }
+            }
+            println!();
+            return;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("add ") {
+            let mut parts = rest.trim().splitn(2, char::is_whitespace);
+            let event_name = parts.next().unwrap_or("");
+            let command = parts.next().unwrap_or("").trim();
+            let Some(event) = HookEvent::parse(event_name) else {
+                eprintln!(
+                    "{} Unknown hook event '{}'.",
+                    "Error:".bright_red(),
+                    event_name
+                );
+                return;
+            };
+            if command.is_empty() {
+                println!(
+                    "{} Usage: /hooks add <event> <command>",
+                    "Info:".bright_yellow()
+                );
+                return;
+            }
+            hooks.push(HookDef {
+                event,
+                match_tool: None,
+                command: command.to_string(),
+            });
+            match crate::hooks::save_global(&hooks) {
+                Ok(()) => {
+                    self.hooks = HookRegistry::load();
+                    println!("{} Hook added.", "✓".bright_green());
+                }
+                Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
+            }
+            return;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("rm ") {
+            let Ok(index) = rest.trim().parse::<usize>() else {
+                eprintln!("{} Usage: /hooks rm <n>", "Error:".bright_red());
+                return;
+            };
+            if index == 0 || index > hooks.len() {
+                eprintln!("{} No hook with index {}", "Error:".bright_red(), index);
+                return;
+            }
+            hooks.remove(index - 1);
+            match crate::hooks::save_global(&hooks) {
+                Ok(()) => {
+                    self.hooks = HookRegistry::load();
+                    println!("{} Hook removed.", "✓".bright_green());
+                }
+                Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
+            }
+            return;
+        }
+
+        println!(
+            "{} Usage: /hooks [list | add <event> <cmd> | rm <n>]",
+            "Info:".bright_yellow()
+        );
+    }
+
+    async fn handle_skills(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+            println!("\n{}", "Skills:".bright_yellow().bold());
+            if self.skills.is_empty() {
+                println!(
+                    "  {} No skills found in ~/.ai-chat-cli/skills",
+                    "ℹ".bright_blue()
+                );
+            } else {
+                for skill in &self.skills {
+                    println!(
+                        "  {} - {}",
+                        skill.name.bright_cyan(),
+                        skill.description.bright_white()
+                    );
+                }
+            }
+            println!();
+            return;
+        }
+
+        let Some(name) = trimmed.strip_prefix("run ") else {
+            println!(
+                "{} Usage: /skills [list|run <name>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+        let lookup = name.trim().to_ascii_lowercase();
+        let Some(skill) = self.skills.iter().find(|s| s.name == lookup).cloned() else {
+            eprintln!("{} Unknown skill '{}'", "Error:".bright_red(), name.trim());
+            return;
+        };
+
+        self.history.push(Message::text(
+            "system",
+            format!(
+                "{} Skill /{} (from {}):\n\n{}",
+                SINGLE_TURN_SYSTEM_TAG,
+                skill.name,
+                skill.path.display(),
+                skill.body
+            ),
+        ));
+        println!(
+            "{} Applied skill /{}",
+            "✓".bright_green(),
+            skill.name.bright_cyan()
+        );
+        if let Err(e) = self.agent_turn().await {
+            eprintln!("{} {}", "Error:".bright_red(), e);
+        }
+    }
+
     fn handle_trust(&self, args: &str) {
         let cwd = match std::env::current_dir() {
             Ok(c) => c,
@@ -1476,6 +1877,191 @@ impl ChatCLI {
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
+    }
+
+    fn run_undo(&self, args: &str) {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /undo. Toggle off with /plan first.",
+                "✗".bright_red()
+            );
+            return;
+        }
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            eprintln!("{} {}", "Error:".bright_red(), e);
+            return;
+        }
+
+        let hard = matches!(args.trim(), "hard");
+        if !args.trim().is_empty() && !hard {
+            println!("{} Usage: /undo [hard]", "Info:".bright_yellow());
+            return;
+        }
+
+        let result = if hard {
+            git_cmds::git_reset_hard_head1()
+        } else {
+            git_cmds::git_revert_head()
+        };
+
+        match result {
+            Ok(out) if out.exit_ok => {
+                if !out.stdout.trim().is_empty() {
+                    print!("{}", out.stdout);
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim());
+                }
+                println!(
+                    "{} {}",
+                    "✓".bright_green(),
+                    if hard {
+                        "Reset HEAD to HEAD~1."
+                    } else {
+                        "Reverted HEAD."
+                    }
+                );
+            }
+            Ok(out) => {
+                eprintln!("{} git undo failed.", "Error:".bright_red());
+                if !out.stdout.trim().is_empty() {
+                    eprintln!("{}", out.stdout.trim());
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim());
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn run_commit_push_pr(&self, args: &str) {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            println!(
+                "{} Plan mode is on — refusing /commit-push-pr. Toggle off with /plan first.",
+                "✗".bright_red()
+            );
+            return;
+        }
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{} Could not read cwd: {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            eprintln!("{} {}", "Error:".bright_red(), e);
+            return;
+        }
+
+        let Some((stage_all, msg)) = git_cmds::parse_commit_args(args) else {
+            println!(
+                "{} Usage: /commit-push-pr [-a] <message>",
+                "Info:".bright_yellow()
+            );
+            return;
+        };
+
+        let commit = match git_cmds::commit(stage_all, msg) {
+            Ok(out) if out.exit_ok => out,
+            Ok(out) => {
+                eprintln!("{} git commit failed.", "Error:".bright_red());
+                if !out.stdout.trim().is_empty() {
+                    eprintln!("{}", out.stdout.trim());
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim());
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if !commit.stdout.trim().is_empty() {
+            print!("{}", commit.stdout);
+        }
+        if !commit.stderr.trim().is_empty() {
+            eprintln!("{}", commit.stderr.trim());
+        }
+
+        let push = match git_cmds::git_push() {
+            Ok(out) if out.exit_ok => out,
+            Ok(out) => {
+                eprintln!("{} git push failed.", "Error:".bright_red());
+                if !out.stdout.trim().is_empty() {
+                    eprintln!("{}", out.stdout.trim());
+                }
+                if !out.stderr.trim().is_empty() {
+                    eprintln!("{}", out.stderr.trim());
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        if !push.stdout.trim().is_empty() {
+            print!("{}", push.stdout);
+        }
+        if !push.stderr.trim().is_empty() {
+            eprintln!("{}", push.stderr.trim());
+        }
+
+        let branch = match git_cmds::current_branch() {
+            Ok(out) if out.exit_ok => out.stdout.trim().to_string(),
+            Ok(out) => {
+                eprintln!(
+                    "{} Failed to read current branch: {}",
+                    "Error:".bright_red(),
+                    out.stderr.trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let remote = match git_cmds::remote_get_url("origin") {
+            Ok(out) if out.exit_ok => out.stdout.trim().to_string(),
+            Ok(out) => {
+                eprintln!(
+                    "{} Failed to read origin URL: {}",
+                    "Error:".bright_red(),
+                    out.stderr.trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+                return;
+            }
+        };
+        let Some((owner, repo)) = github_repo_from_remote(&remote) else {
+            eprintln!(
+                "{} Could not parse GitHub origin URL: {}",
+                "Error:".bright_red(),
+                remote
+            );
+            return;
+        };
+        let url = format!(
+            "https://github.com/{owner}/{repo}/compare/{}?expand=1",
+            url_encode(&branch)
+        );
+        println!("{} Commit pushed. Open this PR URL:", "✓".bright_green());
+        println!("  {}", url.bright_cyan());
     }
 
     /// `/review` — ask the model to review the current `git diff HEAD`.
@@ -2106,6 +2692,37 @@ impl ChatCLI {
                     "✓".bright_green(),
                     self.history.len()
                 );
+
+                let extract_prompt = vec![
+                    Message::text(
+                        "system",
+                        "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
+                    ),
+                    Message::text("user", &summary),
+                ];
+                if let Ok(extracted) = self.executor.chat(extract_prompt).await
+                    && extracted.contains("- ")
+                {
+                    let bullets: Vec<_> = extracted
+                        .lines()
+                        .map(str::trim)
+                        .filter_map(|line| line.strip_prefix("- "))
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect();
+                    if !bullets.is_empty() {
+                        for bullet in &bullets {
+                            self.memdir.add(bullet, Some("auto-extracted"));
+                        }
+                        self.persist_memdir();
+                        self.inject_memdir();
+                        println!(
+                            "{} Extracted {} memories to memdir.",
+                            "ℹ".bright_blue(),
+                            bullets.len()
+                        );
+                    }
+                }
                 self.checkpoint_session();
             }
             Err(e) => {
@@ -2253,6 +2870,36 @@ impl ChatCLI {
         self.history.insert(insert_at, msg);
     }
 
+    fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
+        let cwd = std::env::current_dir().ok();
+        let trusted = cwd
+            .as_deref()
+            .map(|path| self.permissions.lock().unwrap().contains(path))
+            .unwrap_or(false);
+        if trusted || self.approved_tools.contains(tool_name) {
+            return true;
+        }
+
+        use std::io::{self, Write};
+        print!(
+            "⚠ Tool `{}` wants to run. Allow? [y/N/a(lways)] ",
+            tool_name
+        );
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return false;
+        }
+        match input.trim().to_ascii_lowercase().as_str() {
+            "y" => true,
+            "a" => {
+                self.approved_tools.insert(tool_name.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Drives one user turn through the native tool-calling agent loop.
     ///
     /// * Streams the assistant's tokens to stdout as they arrive.
@@ -2346,6 +2993,21 @@ impl ChatCLI {
                         "denied by PreToolUse hook".bright_red()
                     );
                     format!("[tool denied] {reason}")
+                } else if !self
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .check_tool_allowed(&call.function.name)
+                {
+                    format!(
+                        "[tool denied] `{}` is blocked by your tool permissions",
+                        call.function.name
+                    )
+                } else if !self.prompt_tool_approval(&call.function.name) {
+                    format!(
+                        "[tool denied] user declined approval for `{}`",
+                        call.function.name
+                    )
                 } else if call.function.name == AGENT_TOOL_NAME {
                     // Meta-tool: spawn a focused subagent with fresh
                     // context. Handled here (not in `McpManager`) because
@@ -2571,6 +3233,22 @@ fn parse_force_and_filename(rest: &str) -> Option<(bool, &str)> {
 /// Encodes everything except the unreserved set (`A-Z a-z 0-9 - _ . ~`).
 /// Kept here to avoid pulling in the `percent-encoding` or `urlencoding`
 /// crates for one URL.
+fn github_repo_from_remote(remote: &str) -> Option<(String, String)> {
+    let trimmed = remote.trim();
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let repo = rest.strip_suffix(".git").unwrap_or(rest);
+        let (owner, name) = repo.split_once('/')?;
+        return Some((owner.to_string(), name.to_string()));
+    }
+    let https_prefix = "https://github.com/";
+    if let Some(rest) = trimmed.strip_prefix(https_prefix) {
+        let repo = rest.strip_suffix(".git").unwrap_or(rest);
+        let (owner, name) = repo.split_once('/')?;
+        return Some((owner.to_string(), name.to_string()));
+    }
+    None
+}
+
 fn url_encode(input: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
