@@ -518,7 +518,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/teleport",
         usage: "/teleport <path>",
-        help: "Change cwd (auto-trusts the destination if already trusted)",
+        help: "Change cwd to a trusted directory (use /trust to approve first)",
         cmd: Cmd::Teleport,
     },
     SlashCommandSpec {

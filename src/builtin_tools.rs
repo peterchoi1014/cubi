@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
@@ -1576,10 +1577,17 @@ impl BuiltinToolRegistry {
         let flag = flag.to_string();
         let program = program.to_string();
         let execution = async move {
-            let output = Command::new(&program)
+            let child = TokioCommand::new(&program)
                 .arg(&flag)
                 .arg(&command)
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .context("Failed to execute command")?;
+            let output = child
+                .wait_with_output()
+                .await
                 .context("Failed to execute command")?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1638,10 +1646,9 @@ impl BuiltinToolRegistry {
             .as_f64()
             .or_else(|| args["seconds"].as_u64().map(|n| n as f64))
             .context("Missing 'seconds' parameter")?;
-        if !seconds.is_finite() || seconds < 0.0 {
+        let Some(capped) = capped_sleep_seconds(seconds) else {
             return Ok(ToolResult::error("'seconds' must be >= 0".to_string()));
-        }
-        let capped = seconds.min(60.0);
+        };
         let ms = (capped * 1000.0) as u64;
         tokio::time::sleep(Duration::from_millis(ms)).await;
         Ok(ToolResult::success(format!("slept {capped:.3}s")))
@@ -1676,10 +1683,7 @@ impl BuiltinToolRegistry {
                 ));
             }
         };
-        let mut entries: Vec<serde_json::Value> = match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let mut entries = read_json_array_or_empty(&path, "schedule entries")?;
 
         match action {
             "list" => {
@@ -1830,10 +1834,8 @@ impl BuiltinToolRegistry {
                 ));
             }
         };
-        let mut msgs: Vec<serde_json::Value> = fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let _lock = acquire_file_lock(&path)?;
+        let mut msgs = read_json_array_or_empty(&path, "mailbox")?;
         msgs.push(json!({
             "from": from,
             "body": body,
@@ -1879,10 +1881,12 @@ impl BuiltinToolRegistry {
                 ));
             }
         };
-        let msgs: Vec<serde_json::Value> = fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let _lock = if drain {
+            Some(acquire_file_lock(&path)?)
+        } else {
+            None
+        };
+        let msgs = read_json_array_or_empty(&path, "mailbox")?;
         if drain && path.exists() {
             // Truncate rather than delete, so concurrent senders see a valid
             // (empty) array instead of falling back to defaults mid-write.
@@ -1967,23 +1971,23 @@ impl BuiltinToolRegistry {
 /// the host OS, preferring PowerShell on Windows and POSIX `sh` elsewhere.
 fn host_shell() -> (&'static str, &'static str) {
     if cfg!(windows) {
-        // `pwsh` is the cross-platform PowerShell 7+, `powershell` is the
-        // legacy Windows-only one. We can't `which` at compile time, so
-        // assume `pwsh` is on PATH (it ships with modern Windows installs);
-        // operators on older boxes can symlink.
-        ("pwsh", "-Command")
+        if is_program_on_path("pwsh") {
+            ("pwsh", "-Command")
+        } else {
+            ("powershell", "-Command")
+        }
     } else {
         ("sh", "-c")
     }
 }
 
 fn schedule_path() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".ai-chat-cli").join("schedule.json"))
+    Some(app_home_dir()?.join(".ai-chat-cli").join("schedule.json"))
 }
 
 fn messages_path(recipient: &str) -> Option<std::path::PathBuf> {
     Some(
-        dirs::home_dir()?
+        app_home_dir()?
             .join(".ai-chat-cli")
             .join("messages")
             .join(format!("{recipient}.json")),
@@ -1992,7 +1996,7 @@ fn messages_path(recipient: &str) -> Option<std::path::PathBuf> {
 
 fn triggers_path(name: &str) -> Option<std::path::PathBuf> {
     Some(
-        dirs::home_dir()?
+        app_home_dir()?
             .join(".ai-chat-cli")
             .join("triggers")
             .join(format!("{name}.json")),
@@ -2000,12 +2004,129 @@ fn triggers_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn write_json<P: AsRef<Path>, T: Serialize>(path: P, value: &T) -> Result<()> {
-    if let Some(parent) = path.as_ref().parent() {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(value)?;
-    fs::write(&path, raw).with_context(|| format!("write {}", path.as_ref().display()))?;
+    let parent = path
+        .parent()
+        .context(format!("resolve parent for {}", path.display()))?;
+    let tmp_name = format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("write_json"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp_path = parent.join(tmp_name);
+    fs::write(&tmp_path, raw).with_context(|| format!("write {}", tmp_path.display()))?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
     Ok(())
+}
+
+fn app_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+        Some(
+            TEST_HOME
+                .get_or_init(|| {
+                    let path = std::env::temp_dir()
+                        .join(format!("ai-chat-cli-test-home-{}", std::process::id()));
+                    let _ = fs::create_dir_all(&path);
+                    path
+                })
+                .clone(),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        dirs::home_dir()
+    }
+}
+
+fn read_json_array_or_empty(path: &Path, context: &str) -> Result<Vec<serde_json::Value>> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse {context} JSON at {}", path.display()))
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ))
+}
+
+struct FileLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
+    let lock = lock_path(path);
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(FileLockGuard { path: lock }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("timed out acquiring lock {}", lock.display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e).with_context(|| format!("lock {}", lock.display())),
+        }
+    }
+}
+
+fn is_program_on_path(program: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        {
+            for candidate in [program.to_string(), format!("{program}.exe")] {
+                if dir.join(candidate).is_file() {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if dir.join(program).is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_safe_agent_name(s: &str) -> bool {
@@ -2016,10 +2137,18 @@ fn is_safe_agent_name(s: &str) -> bool {
 }
 
 fn unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn capped_sleep_seconds(seconds: f64) -> Option<f64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        None
+    } else {
+        Some(seconds.min(60.0))
+    }
 }
 
 /// Validates that `expr` looks like a 5-field cron expression: minute, hour,
@@ -3237,7 +3366,7 @@ mod tests {
     fn host_shell_matches_target_os() {
         let (program, flag) = host_shell();
         if cfg!(windows) {
-            assert_eq!(program, "pwsh");
+            assert!(program == "pwsh" || program == "powershell");
             assert_eq!(flag, "-Command");
         } else {
             assert_eq!(program, "sh");
@@ -3334,18 +3463,11 @@ mod tests {
         assert!(r.content[0].text.contains("slept"));
     }
 
-    #[tokio::test]
-    async fn sleep_caps_at_sixty_seconds() {
-        // We don't actually want to wait 60 seconds, so just verify the
-        // cap message via the response — request a value above the cap
-        // but use 0 so we don't block the test.
-        let registry = registry_trusting_cwd(false);
-        let r = registry
-            .execute("sleep", json!({ "seconds": 0 }))
-            .await
-            .expect("ok");
-        assert!(r.is_error.is_none());
-        assert!(r.content[0].text.contains("slept 0.000s"));
+    #[test]
+    fn sleep_caps_at_sixty_seconds() {
+        assert_eq!(capped_sleep_seconds(90.0), Some(60.0));
+        assert_eq!(capped_sleep_seconds(0.0), Some(0.0));
+        assert_eq!(capped_sleep_seconds(-1.0), None);
     }
 
     #[tokio::test]
