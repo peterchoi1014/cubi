@@ -3,6 +3,7 @@ mod builtin_tools;
 mod cli;
 mod commands;
 mod executor;
+mod file_mentions;
 mod git_cmds;
 mod lsp_client;
 mod mcp_client;
