@@ -147,6 +147,12 @@ cargo build --release
 # Binary will be available at: ./target/release/cubi
 ```
 
+Or, once the crate is published, you can install Cubi directly with:
+
+```bash
+cargo install cubi
+```
+
 ## 🚀 Quick Start
 
 ```bash
