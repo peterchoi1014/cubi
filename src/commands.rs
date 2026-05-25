@@ -180,19 +180,19 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/init",
         usage: "/init",
-        help: "Create starter AICHAT.md",
+        help: "Create starter CUBI.md",
         cmd: Cmd::Init,
     },
     SlashCommandSpec {
         name: "/memory",
         usage: "/memory",
-        help: "Show project memory (AICHAT.md)",
+        help: "Show project memory (CUBI.md)",
         cmd: Cmd::Memory,
     },
     SlashCommandSpec {
         name: "/memory-reload",
         usage: "/memory-reload",
-        help: "Re-read AICHAT.md from disk",
+        help: "Re-read CUBI.md from disk",
         cmd: Cmd::MemoryReload,
     },
     SlashCommandSpec {
@@ -450,7 +450,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/config",
         usage: "/config",
-        help: "Show contents of ~/.ai-chat-cli/config.json",
+        help: "Show contents of ~/.cubi/config.json",
         cmd: Cmd::Config,
     },
     SlashCommandSpec {
@@ -577,7 +577,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/login",
         usage: "/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
-        help: "Store an OAuth token for a provider (persisted in ~/.ai-chat-cli/oauth.json)",
+        help: "Store an OAuth token for a provider (persisted in ~/.cubi/oauth.json)",
         cmd: Cmd::Login,
     },
     SlashCommandSpec {
@@ -607,7 +607,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/plugin",
         usage: "/plugin [list]",
-        help: "List plugins discovered in ~/.ai-chat-cli/plugins/",
+        help: "List plugins discovered in ~/.cubi/plugins/",
         cmd: Cmd::Plugin,
     },
     SlashCommandSpec {
@@ -643,13 +643,13 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/upgrade",
         usage: "/upgrade",
-        help: "Print upgrade instructions for ai-chat-cli",
+        help: "Print upgrade instructions for cubi",
         cmd: Cmd::Upgrade,
     },
     SlashCommandSpec {
         name: "/install",
         usage: "/install",
-        help: "Print install instructions for ai-chat-cli + Ollama",
+        help: "Print install instructions for cubi + Ollama",
         cmd: Cmd::Install,
     },
     SlashCommandSpec {
@@ -709,7 +709,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/settings-sync",
         usage: "/settings-sync [init <remote>|push [msg]|pull|status]",
-        help: "Sync ~/.ai-chat-cli/ via git (cross-machine config + memdir + skills)",
+        help: "Sync ~/.cubi/ via git (cross-machine config + memdir + skills)",
         cmd: Cmd::SettingsSync,
     },
     SlashCommandSpec {
@@ -721,7 +721,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/tip",
         usage: "/tip",
-        help: "Show a quick tip about using ai-chat-cli",
+        help: "Show a quick tip about using cubi",
         cmd: Cmd::Tip,
     },
     SlashCommandSpec {

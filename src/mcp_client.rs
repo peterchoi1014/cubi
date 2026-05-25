@@ -174,7 +174,7 @@ impl StdioClient {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "ai-chat-cli",
+                    "name": "cubi",
                     "version": "0.3.0"
                 }
             }
@@ -357,7 +357,7 @@ impl HttpClient {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "ai-chat-cli",
+                    "name": "cubi",
                     "version": "0.3.0"
                 }
             }

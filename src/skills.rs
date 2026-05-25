@@ -52,5 +52,5 @@ pub fn load_skills() -> Vec<Skill> {
 }
 
 pub fn skills_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("skills"))
+    dirs::home_dir().map(|h| h.join(".cubi").join("skills"))
 }

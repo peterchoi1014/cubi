@@ -1,7 +1,12 @@
 [package]
-name = "ai-chat-cli"
+name = "cubi"
 version = "0.3.0"
 edition = "2024"
+description = "Cubi — a pocket-sized AI for your shell"
+
+[[bin]]
+name = "cubi"
+path = "src/main.rs"
 
 [dependencies]
 # Repartir for distributed task execution

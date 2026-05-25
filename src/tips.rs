@@ -2,7 +2,7 @@
 //!
 //! Roadmap item C#20: print a short, single-line tip when the CLI starts
 //! up. Tips are drawn from a small built-in pool plus any user-supplied
-//! lines in `~/.ai-chat-cli/tips/*.txt` (one tip per non-empty line).
+//! lines in `~/.cubi/tips/*.txt` (one tip per non-empty line).
 //! Selection is deterministic per day so users don't get the same tip
 //! twice in a single session by rolling random twice.
 
@@ -18,17 +18,17 @@ const BUILTIN_TIPS: &[&str] = &[
     "Use /sessions to find any prior chat in this directory; /resume <id> brings it back.",
     "Use /compact to summarize old turns and reclaim context window space.",
     "Use /rewind [n] to undo the last n exchanges (file mutations roll back too).",
-    "Drop user-defined slash commands as Markdown files in ~/.ai-chat-cli/plugins/<name>/commands/.",
+    "Drop user-defined slash commands as Markdown files in ~/.cubi/plugins/<name>/commands/.",
     "Use /skills to see the reusable Markdown skill packs the agent can load on demand.",
     "Use /commit-push-pr to commit, push, and open a PR in one go.",
     "Use /diff to inspect uncommitted changes without leaving the chat.",
     "Use /worktree add <path> to spin up an isolated branch checkout.",
-    "Enable opt-in debug logging with telemetry=true in ~/.ai-chat-cli/config.json.",
+    "Enable opt-in debug logging with telemetry=true in ~/.cubi/config.json.",
     "Use /output-style concise|markdown|explanatory to switch reply formatting.",
 ];
 
 pub fn tips_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ai-chat-cli").join("tips"))
+    dirs::home_dir().map(|h| h.join(".cubi").join("tips"))
 }
 
 /// Returns the tip for today, or `None` if no tips are available. The
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn builtin_tip_is_returned_when_no_user_dir() {
-        // Even with no $HOME/.ai-chat-cli/tips, we should always get a
+        // Even with no $HOME/.cubi/tips, we should always get a
         // tip from the built-in pool.
         assert!(tip_of_the_day().is_some());
     }

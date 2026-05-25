@@ -7,9 +7,9 @@
 //! module reads a separate, *read-only* JSON file (`policy.json`) from
 //! whichever of these locations exists first:
 //!
-//! 1. `$AICHAT_POLICY_FILE` (escape hatch for tests / CI).
-//! 2. `/etc/ai-chat-cli/policy.json` (Unix system-wide).
-//! 3. `~/.ai-chat-cli/policy.json` (per-user fallback, useful for the
+//! 1. `$CUBI_POLICY_FILE` (escape hatch for tests / CI).
+//! 2. `/etc/cubi/policy.json` (Unix system-wide).
+//! 3. `~/.cubi/policy.json` (per-user fallback, useful for the
 //!    Windows case where step 2 doesn't exist).
 //!
 //! The deny list it carries is checked **before** the user's allow/deny
@@ -50,13 +50,13 @@ impl Policy {
     }
 
     /// Returns the path actually checked (useful for `/permissions` to
-    /// say "policy: /etc/ai-chat-cli/policy.json").
+    /// say "policy: /etc/cubi/policy.json").
     pub fn active_path() -> Option<PathBuf> {
         Self::resolve_path()
     }
 
     fn resolve_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("AICHAT_POLICY_FILE") {
+        if let Ok(p) = std::env::var("CUBI_POLICY_FILE") {
             let path = PathBuf::from(p);
             if path.exists() {
                 return Some(path);
@@ -64,12 +64,12 @@ impl Policy {
         }
         #[cfg(unix)]
         {
-            let system = PathBuf::from("/etc/ai-chat-cli/policy.json");
+            let system = PathBuf::from("/etc/cubi/policy.json");
             if system.exists() {
                 return Some(system);
             }
         }
-        let user = dirs::home_dir()?.join(".ai-chat-cli").join("policy.json");
+        let user = dirs::home_dir()?.join(".cubi").join("policy.json");
         if user.exists() { Some(user) } else { None }
     }
 
@@ -91,32 +91,32 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("ai-chat-cli-policy-{name}-{nanos}.json"))
+        std::env::temp_dir().join(format!("cubi-policy-{name}-{nanos}.json"))
     }
 
     #[test]
     fn missing_file_yields_empty_policy() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
+        let prev = std::env::var("CUBI_POLICY_FILE").ok();
         // Point at a path that definitely doesn't exist.
         let p = tmp_file("missing");
         unsafe {
-            std::env::set_var("AICHAT_POLICY_FILE", &p);
+            std::env::set_var("CUBI_POLICY_FILE", &p);
         }
         let pol = Policy::load();
         assert!(pol.denied_tools.is_empty());
         unsafe {
-            std::env::remove_var("AICHAT_POLICY_FILE");
+            std::env::remove_var("CUBI_POLICY_FILE");
         }
         if let Some(v) = prev {
-            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
+            unsafe { std::env::set_var("CUBI_POLICY_FILE", v) };
         }
     }
 
     #[test]
     fn loads_deny_list_from_env_path() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
+        let prev = std::env::var("CUBI_POLICY_FILE").ok();
         let p = tmp_file("deny");
         fs::write(
             &p,
@@ -124,7 +124,7 @@ mod tests {
         )
         .unwrap();
         unsafe {
-            std::env::set_var("AICHAT_POLICY_FILE", &p);
+            std::env::set_var("CUBI_POLICY_FILE", &p);
         }
         let pol = Policy::load();
         assert!(pol.is_denied("bash"));
@@ -133,30 +133,30 @@ mod tests {
         assert_eq!(pol.note.as_deref(), Some("corp policy"));
         fs::remove_file(&p).ok();
         unsafe {
-            std::env::remove_var("AICHAT_POLICY_FILE");
+            std::env::remove_var("CUBI_POLICY_FILE");
         }
         if let Some(v) = prev {
-            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
+            unsafe { std::env::set_var("CUBI_POLICY_FILE", v) };
         }
     }
 
     #[test]
     fn corrupt_file_is_treated_as_empty() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AICHAT_POLICY_FILE").ok();
+        let prev = std::env::var("CUBI_POLICY_FILE").ok();
         let p = tmp_file("corrupt");
         fs::write(&p, "not json {{{").unwrap();
         unsafe {
-            std::env::set_var("AICHAT_POLICY_FILE", &p);
+            std::env::set_var("CUBI_POLICY_FILE", &p);
         }
         let pol = Policy::load();
         assert!(pol.denied_tools.is_empty());
         fs::remove_file(&p).ok();
         unsafe {
-            std::env::remove_var("AICHAT_POLICY_FILE");
+            std::env::remove_var("CUBI_POLICY_FILE");
         }
         if let Some(v) = prev {
-            unsafe { std::env::set_var("AICHAT_POLICY_FILE", v) };
+            unsafe { std::env::set_var("CUBI_POLICY_FILE", v) };
         }
     }
 }
