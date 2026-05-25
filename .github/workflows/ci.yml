@@ -42,16 +42,9 @@ jobs:
       - name: cargo build
         run: cargo build --all-targets --locked
 
-      - name: cargo test
-        run: cargo test --all-targets --locked
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       - name: smoke-test --version / --help / unknown flag
         run: |
           set -e
-          cargo build --locked --bin cubi
           BIN=target/debug/cubi
 
           # --version: must start with "cubi " followed by the Cargo
@@ -74,3 +67,9 @@ jobs:
           if [ "$status" -ne 2 ]; then
             echo "unknown flag should exit 2, got $status"; exit 1
           fi
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
