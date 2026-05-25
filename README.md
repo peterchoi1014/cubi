@@ -259,6 +259,16 @@ groups below mirror that registry.
 | `/mcp-call <tool> <json-args>` | Call an MCP tool |
 | `/mcp-reload` | Reload MCP configuration from `~/.ai-chat-cli/mcp.json` |
 
+#### Diagnostics & transparency
+
+| Command | Description |
+| --- | --- |
+| `/doctor` | Run environment health checks (Ollama, model, config dir, `git`) |
+| `/env` | Show resolved runtime info (version, model, cwd, plan mode, etc.) |
+| `/config` | Print the current `~/.ai-chat-cli/config.json` |
+| `/permissions` | List trusted directories and gated built-in tools |
+| `/bug [summary]` | Print a pre-filled GitHub issue URL with environment details |
+
 #### Examples
 
 ```

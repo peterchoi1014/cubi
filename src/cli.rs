@@ -927,15 +927,40 @@ impl ChatCLI {
         match dirs::home_dir().map(|h| h.join(".ai-chat-cli")) {
             Some(dir) => match fs::create_dir_all(&dir) {
                 Ok(()) => {
-                    let probe = dir.join(".doctor-write-probe");
-                    match fs::write(&probe, b"ok") {
-                        Ok(()) => {
+                    // Use a unique probe filename and `create_new` so we never
+                    // truncate a pre-existing file the user may have placed here.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let probe = dir.join(format!(
+                        ".doctor-write-probe-{}-{}",
+                        std::process::id(),
+                        nanos
+                    ));
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&probe)
+                    {
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            let write_res = f.write_all(b"ok");
+                            drop(f);
                             let _ = fs::remove_file(&probe);
-                            println!(
-                                "  {} Config dir writable: {}",
-                                "✓".bright_green(),
-                                dir.display().to_string().bright_cyan()
-                            );
+                            match write_res {
+                                Ok(()) => println!(
+                                    "  {} Config dir writable: {}",
+                                    "✓".bright_green(),
+                                    dir.display().to_string().bright_cyan()
+                                ),
+                                Err(e) => println!(
+                                    "  {} Config dir not writable ({}): {}",
+                                    "✗".bright_red(),
+                                    dir.display(),
+                                    e
+                                ),
+                            }
                         }
                         Err(e) => println!(
                             "  {} Config dir not writable ({}): {}",
