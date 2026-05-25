@@ -15,20 +15,20 @@ pub struct McpServerConfig {
     /// Command to run (for STDIO transport)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    
+
     /// Arguments for the command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
-    
+
     /// Environment variables
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
-    
+
     /// HTTP URL (for remote servers)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "httpUrl")]
     pub http_url: Option<String>,
-    
+
     /// HTTP headers (for authentication)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
@@ -47,7 +47,7 @@ impl McpServerConfig {
 impl McpConfig {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
-        
+
         if !config_path.exists() {
             // Create empty config
             let empty_config = McpConfig {
@@ -57,18 +57,18 @@ impl McpConfig {
             return Ok(empty_config);
         }
 
-        let content = fs::read_to_string(&config_path)
-            .context("Failed to read MCP configuration file")?;
-        
-        let config: McpConfig = serde_json::from_str(&content)
-            .context("Failed to parse MCP configuration")?;
-        
+        let content =
+            fs::read_to_string(&config_path).context("Failed to read MCP configuration file")?;
+
+        let config: McpConfig =
+            serde_json::from_str(&content).context("Failed to parse MCP configuration")?;
+
         Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
-        
+
         // Ensure parent directory exists
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
@@ -76,14 +76,13 @@ impl McpConfig {
 
         let json = serde_json::to_string_pretty(self)?;
         fs::write(&config_path, json)?;
-        
+
         Ok(())
     }
 
     pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .context("Could not find home directory")?;
-        
+        let home = dirs::home_dir().context("Could not find home directory")?;
+
         Ok(home.join(".ai-chat-cli").join("mcp.json"))
     }
 

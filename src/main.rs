@@ -1,17 +1,17 @@
+mod builtin_tools;
 mod cli;
 mod executor;
-mod ollama;
-mod mcp_config;
 mod mcp_client;
+mod mcp_config;
 mod mcp_manager;
-mod builtin_tools;
-mod todos;
+mod ollama;
 mod project_memory;
+mod todos;
 
 use anyhow::{Context, Result};
+use cli::ChatCLI;
 use colored::*;
 use executor::AIExecutor;
-use cli::ChatCLI;
 use mcp_manager::McpManager;
 
 /// Default model used when the user has not configured one. Can be overridden
@@ -23,8 +23,8 @@ async fn main() -> Result<()> {
     // Resolve the model from $AI_CHAT_CLI_MODEL, falling back to DEFAULT_MODEL.
     // This removes the previous hard-coded lock-in and is the first small
     // step toward the configurable onboarding flow tracked in ROADMAP.md.
-    let model_owned = std::env::var("AI_CHAT_CLI_MODEL")
-        .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model_owned =
+        std::env::var("AI_CHAT_CLI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let model: &str = &model_owned;
     let cpu_workers = 6;
 
@@ -34,8 +34,12 @@ async fn main() -> Result<()> {
     let client = ollama::OllamaClient::new();
     match client.list_models().await {
         Ok(models) => {
-            println!("{} {}", "✓".bright_green(), "Connected to Ollama".bright_white());
-            
+            println!(
+                "{} {}",
+                "✓".bright_green(),
+                "Connected to Ollama".bright_white()
+            );
+
             if !models.iter().any(|m| m.starts_with(model)) {
                 eprintln!(
                     "{} Model '{}' not found. Available models: {:?}",
@@ -43,12 +47,18 @@ async fn main() -> Result<()> {
                     model,
                     models
                 );
-                eprintln!("\nInstall the model with: {}", 
-                    format!("ollama pull {}", model).bright_cyan());
+                eprintln!(
+                    "\nInstall the model with: {}",
+                    format!("ollama pull {}", model).bright_cyan()
+                );
                 std::process::exit(1);
             }
-            
-            println!("{} Using model: {}", "✓".bright_green(), model.bright_cyan());
+
+            println!(
+                "{} Using model: {}",
+                "✓".bright_green(),
+                model.bright_cyan()
+            );
         }
         Err(e) => {
             eprintln!("{} {}", "Error:".bright_red().bold(), e);
@@ -63,18 +73,22 @@ async fn main() -> Result<()> {
         Ok(manager) => {
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
-                println!("{} Loaded {} MCP tool(s)", 
-                    "✓".bright_green(), tool_count);
+                println!("{} Loaded {} MCP tool(s)", "✓".bright_green(), tool_count);
                 Some(manager)
             } else {
-                println!("{} No MCP tools configured (create ~/.ai-chat-cli/mcp.json)", 
-                    "ℹ".bright_blue());
+                println!(
+                    "{} No MCP tools configured (create ~/.ai-chat-cli/mcp.json)",
+                    "ℹ".bright_blue()
+                );
                 None
             }
         }
         Err(e) => {
-            eprintln!("{} Failed to initialize MCP: {}", 
-                "Warning:".bright_yellow(), e);
+            eprintln!(
+                "{} Failed to initialize MCP: {}",
+                "Warning:".bright_yellow(),
+                e
+            );
             None
         }
     };

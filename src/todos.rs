@@ -115,8 +115,7 @@ impl TodoList {
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.items)?;
-        fs::write(path, json)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -189,8 +188,8 @@ fn cwd_key(cwd: &Path) -> String {
 }
 
 fn read_list(path: &Path) -> Result<Vec<TodoItem>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let items: Vec<TodoItem> = serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(items)
@@ -251,10 +250,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai-chat-cli-todos-test-{}",
-            unique_suffix()
-        ));
+        let dir = std::env::temp_dir().join(format!("ai-chat-cli-todos-test-{}", unique_suffix()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("todos.json");
 

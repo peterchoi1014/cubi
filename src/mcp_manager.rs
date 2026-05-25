@@ -28,24 +28,33 @@ impl McpManager {
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
             };
-            manager.tools.insert(
-                tool.name.clone(),
-                ("builtin".to_string(), mcp_tool)
-            );
+            manager
+                .tools
+                .insert(tool.name.clone(), ("builtin".to_string(), mcp_tool));
         }
-        
-        println!("{} Loaded {} built-in tools", 
-            "✓".bright_green(), 
-            manager.builtin_tools.list_tools().len());
+
+        println!(
+            "{} Loaded {} built-in tools",
+            "✓".bright_green(),
+            manager.builtin_tools.list_tools().len()
+        );
 
         // Connect to configured MCP servers
         for (name, server_config) in config.mcp_servers {
             if let Err(e) = manager.connect_server(&name, &server_config).await {
-                eprintln!("{} Failed to connect to MCP server '{}': {}", 
-                    "Warning:".bright_yellow(), name, e);
+                eprintln!(
+                    "{} Failed to connect to MCP server '{}': {}",
+                    "Warning:".bright_yellow(),
+                    name,
+                    e
+                );
                 continue;
             }
-            println!("{} Connected to MCP server: {}", "✓".bright_green(), name.bright_cyan());
+            println!(
+                "{} Connected to MCP server: {}",
+                "✓".bright_green(),
+                name.bright_cyan()
+            );
         }
 
         // Discover tools from external servers
@@ -58,30 +67,40 @@ impl McpManager {
         &self.tools
     }
 
-    pub async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<ToolCallResult> {
-        let (server_name, _) = self.tools.get(name)
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolCallResult> {
+        let (server_name, _) = self
+            .tools
+            .get(name)
             .context(format!("Tool '{}' not found", name))?;
-        
+
         // Handle built-in tools
         if server_name == "builtin" {
             let result = self.builtin_tools.execute(name, arguments).await?;
-            
+
             // Convert BuiltinToolResult to ToolCallResult
             return Ok(ToolCallResult {
-                content: result.content.into_iter().map(|c| {
-                    crate::mcp_client::Content {
+                content: result
+                    .content
+                    .into_iter()
+                    .map(|c| crate::mcp_client::Content {
                         content_type: c.content_type,
                         text: c.text,
-                    }
-                }).collect(),
+                    })
+                    .collect(),
                 is_error: result.is_error,
             });
         }
-        
+
         // Handle external MCP server tools
-        let client = self.clients.get_mut(server_name)
+        let client = self
+            .clients
+            .get_mut(server_name)
             .context(format!("Server '{}' not connected", server_name))?;
-        
+
         client.call_tool(name, arguments).await
     }
 
@@ -90,12 +109,12 @@ impl McpManager {
             let command = config.command.clone().unwrap();
             let args = config.args.clone().unwrap_or_default();
             let env = config.env.clone().unwrap_or_default();
-            
+
             McpClient::connect_stdio(command, args, env).await?
         } else if config.is_http() {
             let url = config.http_url.clone().unwrap();
             let headers = config.headers.clone().unwrap_or_default();
-            
+
             McpClient::connect_http(url, headers).await?
         } else {
             anyhow::bail!("Server configuration must specify either command or httpUrl");
@@ -110,15 +129,17 @@ impl McpManager {
             match client.list_tools().await {
                 Ok(tools) => {
                     for tool in tools {
-                        self.tools.insert(
-                            tool.name.clone(),
-                            (server_name.clone(), tool)
-                        );
+                        self.tools
+                            .insert(tool.name.clone(), (server_name.clone(), tool));
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} Failed to list tools from '{}': {}", 
-                        "Warning:".bright_yellow(), server_name, e);
+                    eprintln!(
+                        "{} Failed to list tools from '{}': {}",
+                        "Warning:".bright_yellow(),
+                        server_name,
+                        e
+                    );
                 }
             }
         }
