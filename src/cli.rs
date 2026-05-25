@@ -23,7 +23,7 @@ impl ChatCLI {
             executor,
             history: Vec::new(),
             mcp_manager,
-            todos: TodoList::new(),
+            todos: TodoList::load_for_current_dir(),
             plan_mode: false,
         };
 
@@ -164,6 +164,13 @@ impl ChatCLI {
                 self.show_mcp_tools();
             }
             cmd if cmd.starts_with("/mcp-call ") => {
+                if self.plan_mode {
+                    println!(
+                        "{} Plan mode is on — refusing /mcp-call. Toggle off with /plan first.",
+                        "✗".bright_red()
+                    );
+                    return Ok(true);
+                }
                 let rest = cmd.strip_prefix("/mcp-call ").unwrap().trim();
                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                 
@@ -270,6 +277,7 @@ impl ChatCLI {
                     println!("{} Usage: /todo-add <text>", "Info:".bright_yellow());
                 } else {
                     self.todos.add(text);
+                    self.persist_todos();
                     println!("{} Added todo", "✓".bright_green());
                 }
             }
@@ -281,6 +289,7 @@ impl ChatCLI {
                 match arg.parse::<usize>() {
                     Ok(n) => {
                         if self.todos.mark_done(n) {
+                            self.persist_todos();
                             println!("{} Marked todo {} as done", "✓".bright_green(), n);
                         } else {
                             eprintln!(
@@ -303,7 +312,20 @@ impl ChatCLI {
             }
             "/todo-clear" => {
                 self.todos.clear();
+                self.persist_todos();
                 println!("{} Cleared todos", "✓".bright_green());
+            }
+            cmd if cmd.starts_with("/ask ") => {
+                let question = cmd.strip_prefix("/ask ").unwrap().trim();
+                if question.is_empty() {
+                    println!("{} Usage: /ask <question>", "Info:".bright_yellow());
+                } else {
+                    self.ask_user(question);
+                }
+            }
+            "/ask" => {
+                println!("{} Usage: /ask <question>", "Info:".bright_yellow());
+                println!("Records a clarifying question to be answered on the next turn.");
             }
             cmd if cmd.starts_with("/export ") => {
                 let filename = cmd.strip_prefix("/export ").unwrap().trim();
@@ -449,6 +471,7 @@ impl ChatCLI {
             "/todo-add".bright_cyan(),
             "/todo-done".bright_cyan(),
             "/todo-clear".bright_cyan());
+        println!("  {} <question> - Record a clarifying question for the next turn", "/ask".bright_cyan());
         println!("  {} - Clear conversation history", "/clear".bright_cyan());
         println!("  {} - Show conversation history", "/history".bright_cyan());
         println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
@@ -473,6 +496,7 @@ impl ChatCLI {
         println!("  {} <text> - Add a todo", "/todo-add".bright_cyan());
         println!("  {} <n> - Mark todo n as done", "/todo-done".bright_cyan());
         println!("  {} - Clear todos", "/todo-clear".bright_cyan());
+        println!("  {} <q> - Record a clarifying question for the next turn", "/ask".bright_cyan());
         println!("  {} - Clear conversation history", "/clear".bright_cyan());
         println!("  {} - Show conversation history", "/history".bright_cyan());
         println!("  {} <f.md> - Export conversation as Markdown", "/export".bright_cyan());
@@ -561,6 +585,34 @@ impl ChatCLI {
                 "disabled".bright_black()
             );
         }
+    }
+
+    fn persist_todos(&self) {
+        if let Err(e) = self.todos.save() {
+            eprintln!(
+                "{} Failed to persist todos: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
+    }
+
+    /// Records a clarifying question from the user. Until the model can
+    /// invoke `ask_user` itself, this command lets the user front-load a
+    /// pointed question that the next turn's system context highlights.
+    fn ask_user(&mut self, question: &str) {
+        self.history.push(Message {
+            role: "system".to_string(),
+            content: format!(
+                "SYSTEM: The user has a clarifying question they want addressed \
+                 directly and concisely on the next turn:\n\n{}",
+                question
+            ),
+        });
+        println!(
+            "{} Question recorded. It will be highlighted on the next turn.",
+            "✓".bright_green()
+        );
     }
 
     fn run_init(&self) {
