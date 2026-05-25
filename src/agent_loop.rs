@@ -19,8 +19,12 @@
 //! single iteration of streaming chat — no behavioral regression for users
 //! who haven't pulled a tool-capable model yet.
 
+use anyhow::Result;
+use serde_json::json;
+
+use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
-use crate::ollama::{ToolFunction, ToolSpec};
+use crate::ollama::{Message, ToolFunction, ToolSpec};
 
 /// Maximum number of "model → tool → model" iterations per user turn before
 /// the loop bails out with a diagnostic. Generous enough for realistic
@@ -28,28 +32,93 @@ use crate::ollama::{ToolFunction, ToolSpec};
 /// small enough that a runaway model gives up well before the user does.
 pub const MAX_AGENT_STEPS: usize = 12;
 
+/// Default ceiling on a subagent's own loop. The subagent always uses the
+/// minimum of (caller-supplied `max_steps`, this constant) so a misbehaving
+/// `agent_run` call can never grow the parent's budget by surprise.
+pub const SUBAGENT_DEFAULT_STEPS: usize = 8;
+pub const SUBAGENT_MAX_STEPS: usize = MAX_AGENT_STEPS;
+
+/// Name of the meta-tool the model uses to spawn a subagent. Kept as a
+/// constant so the agent-loop dispatcher and the tool-spec builder can't
+/// drift out of sync.
+pub const AGENT_TOOL_NAME: &str = "agent_run";
+
+/// System prompt prepended to every subagent's context. Kept terse — the
+/// subagent inherits the model's general capabilities, but we want to keep
+/// it focused on the single goal and discourage it from chatting back.
+const SUBAGENT_SYSTEM_PROMPT: &str = "You are a focused worker subagent spawned by a larger \
+assistant. You will receive ONE goal. Accomplish it using the tools you have, then return a \
+single concise final report describing what you did and what you found. Do not ask clarifying \
+questions — make a reasonable assumption and note it. Do not chat — emit only the final report \
+when finished.";
+
 /// Builds the Ollama-shaped `tools` list from every tool the MCP manager
-/// knows about (built-in + each connected external server). Returns `None`
-/// when there are no tools at all so the caller can skip the field and let
-/// older Ollama versions handle the payload identically to before.
+/// knows about (built-in + each connected external server), plus the
+/// `agent_run` meta-tool. Returns `None` when there are no tools at all
+/// (and `mcp` is empty), so the caller can skip the field and let older
+/// Ollama versions handle the payload identically to before.
 pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
-    let tools = mcp.list_tools();
-    if tools.is_empty() {
+    let mcp_tools = mcp.list_tools();
+    if mcp_tools.is_empty() {
+        // Even with no MCP tools, the agent_run meta-tool is meaningless
+        // without other tools for the subagent to use, so we skip it too.
         return None;
     }
-    Some(
-        tools
-            .into_iter()
-            .map(|t| ToolSpec {
-                tool_type: "function".to_string(),
-                function: ToolFunction {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
+    let mut specs: Vec<ToolSpec> = mcp_tools
+        .into_iter()
+        .map(|t| ToolSpec {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.input_schema.clone(),
+            },
+        })
+        .collect();
+    specs.push(agent_run_spec());
+    Some(specs)
+}
+
+/// `ToolSpec` for the [`AGENT_TOOL_NAME`] meta-tool. Kept in this module so
+/// the schema and the dispatch logic live next to each other.
+pub fn agent_run_spec() -> ToolSpec {
+    ToolSpec {
+        tool_type: "function".to_string(),
+        function: ToolFunction {
+            name: AGENT_TOOL_NAME.to_string(),
+            description: "Spawn a focused worker subagent with its own fresh context and the \
+                          same toolset (minus this meta-tool) to accomplish ONE specific goal \
+                          independently. Use this for chunks of work that don't need the full \
+                          conversation history — investigations, batch edits, focused research \
+                          — to keep the main context lean."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Self-contained description of what the subagent should accomplish. Include all context it will need; the subagent does NOT see the parent conversation."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Maximum model→tool round-trips the subagent may take (default 8, capped at 12)",
+                        "default": SUBAGENT_DEFAULT_STEPS
+                    }
                 },
-            })
-            .collect(),
-    )
+                "required": ["goal"]
+            }),
+        },
+    }
+}
+
+/// Strip the `agent_run` meta-tool from a tool list. Called when building
+/// the subagent's tool list so subagents can't recursively spawn their own
+/// subagents (which would blow up cost and depth tracking).
+pub fn without_agent_tool(tools: Option<Vec<ToolSpec>>) -> Option<Vec<ToolSpec>> {
+    tools.map(|mut v| {
+        v.retain(|t| t.function.name != AGENT_TOOL_NAME);
+        v
+    })
 }
 
 /// Renders a tool's `ToolCallResult` content into a single plain-text blob
@@ -82,6 +151,92 @@ pub fn render_tool_result(result: &crate::mcp_client::ToolCallResult) -> String 
         }
     }
     buf
+}
+
+/// Runs a subagent loop with a fresh context. Returns the subagent's final
+/// assistant message text. Used by the top-level agent loop in response to
+/// an `agent_run` tool call from the parent model.
+///
+/// The subagent has access to the same toolset as the parent, *minus* the
+/// `agent_run` meta-tool itself — recursion is intentionally disallowed
+/// (cheap to add later, but the failure modes are nasty without explicit
+/// depth/cost accounting).
+pub async fn run_subagent(
+    executor: &AIExecutor,
+    mcp: &mut Option<McpManager>,
+    goal: &str,
+    requested_max_steps: usize,
+) -> Result<String> {
+    // Hard-cap the caller's budget so the parent can't be tricked into
+    // burning unbounded budget via a large `max_steps`.
+    let max_steps = requested_max_steps.clamp(1, SUBAGENT_MAX_STEPS);
+
+    let tools = without_agent_tool(mcp.as_ref().and_then(build_tool_specs));
+
+    let mut history = vec![
+        Message::text("system", SUBAGENT_SYSTEM_PROMPT),
+        Message::text("user", goal),
+    ];
+
+    for step in 0..max_steps {
+        let msg = executor
+            .chat_with_tools(history.clone(), tools.clone())
+            .await?;
+        let calls = msg.tool_calls.clone().unwrap_or_default();
+        let content = msg.content.clone();
+        history.push(msg);
+
+        if calls.is_empty() {
+            // No more tools to run — this is the subagent's final report.
+            return Ok(if content.is_empty() {
+                "[subagent returned empty report]".to_string()
+            } else {
+                content
+            });
+        }
+
+        for call in calls {
+            // Recursion guard: even though we strip `agent_run` from the
+            // tool list, a confused model might emit the name anyway.
+            // Reject explicitly so it shows up as a tool error and the
+            // model gives up rather than us silently doing nothing.
+            let result_text = if call.function.name == AGENT_TOOL_NAME {
+                "[tool error] nested `agent_run` is not allowed".to_string()
+            } else if let Some(m) = mcp.as_mut() {
+                match m
+                    .call_tool(&call.function.name, call.function.arguments.clone())
+                    .await
+                {
+                    Ok(r) => render_tool_result(&r),
+                    Err(e) => format!("[tool error] {e}"),
+                }
+            } else {
+                format!(
+                    "[tool error] no MCP manager available to execute `{}`",
+                    call.function.name
+                )
+            };
+            history.push(Message::tool_result(&call.function.name, result_text));
+        }
+
+        // If we're about to leave the loop without ever getting a clean
+        // final-content turn, return the last non-empty assistant content
+        // as a best-effort report.
+        if step + 1 == max_steps {
+            let last_text = history
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant" && !m.content.is_empty())
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            return Ok(format!(
+                "[subagent hit step cap of {max_steps}; partial result:]\n{last_text}"
+            ));
+        }
+    }
+    // Unreachable: the `step + 1 == max_steps` branch above always returns
+    // on the final iteration. Kept as a safety net.
+    Ok(String::new())
 }
 
 #[cfg(test)]
@@ -139,5 +294,39 @@ mod tests {
         };
         let out = render_tool_result(&r);
         assert!(out.contains("[non-text content: image]"), "got: {out}");
+    }
+
+    #[test]
+    fn agent_run_spec_has_required_goal_parameter() {
+        let spec = agent_run_spec();
+        assert_eq!(spec.function.name, AGENT_TOOL_NAME);
+        assert_eq!(spec.function.parameters["required"][0], "goal");
+        assert!(
+            spec.function.parameters["properties"]["goal"].is_object(),
+            "goal parameter must be an object"
+        );
+    }
+
+    #[test]
+    fn without_agent_tool_strips_only_the_meta_tool() {
+        let specs = Some(vec![
+            agent_run_spec(),
+            ToolSpec {
+                tool_type: "function".into(),
+                function: ToolFunction {
+                    name: "bash".into(),
+                    description: "shell".into(),
+                    parameters: json!({}),
+                },
+            },
+        ]);
+        let stripped = without_agent_tool(specs).unwrap();
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(stripped[0].function.name, "bash");
+    }
+
+    #[test]
+    fn without_agent_tool_handles_none() {
+        assert!(without_agent_tool(None).is_none());
     }
 }
