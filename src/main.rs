@@ -1,3 +1,4 @@
+mod agent_loop;
 mod builtin_tools;
 mod cli;
 mod commands;

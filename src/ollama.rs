@@ -60,7 +60,6 @@ impl Message {
 
     /// Constructor for a tool-result message produced by the host after
     /// executing a model-requested tool call.
-    #[allow(dead_code)] // Wired up by the agent loop in the next commit.
     pub fn tool_result(tool_name: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
