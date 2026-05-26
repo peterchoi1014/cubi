@@ -16,7 +16,7 @@ use crate::permissions::Permissions;
 use crate::plugins::{self, Plugin};
 use crate::policy::Policy;
 use crate::project_memory;
-use crate::sessions::{SessionFile, SessionStore};
+use crate::sessions::{DeleteSessionResult, FindSessionResult, SessionFile, SessionStore};
 use crate::settings_sync;
 use crate::skills::{self, Skill};
 use crate::style::CubiStyle;
@@ -958,7 +958,7 @@ impl ChatCLI {
                 }
             }
             Cmd::Sessions => {
-                self.show_sessions();
+                self.handle_sessions(args);
             }
             Cmd::Resume => {
                 self.resume_session(args);
@@ -2123,6 +2123,80 @@ impl ChatCLI {
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
+    }
+
+    fn handle_sessions(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("delete") {
+            let id = rest.trim();
+            if id.is_empty() {
+                println!(
+                    "{} Usage: /sessions delete <id-or-prefix>",
+                    "Info:".bright_yellow()
+                );
+                return;
+            }
+            self.delete_session_by_prefix(id);
+            return;
+        }
+        if !trimmed.is_empty() {
+            println!(
+                "{} Usage: /sessions [delete <id-or-prefix>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        }
+        self.show_sessions();
+    }
+
+    fn delete_session_by_prefix(&mut self, id: &str) {
+        match SessionStore::find_by_prefix(id) {
+            Ok(FindSessionResult::Found(meta)) => {
+                if !self.confirm_session_delete(&meta.id) {
+                    println!("{} Delete cancelled.", "ℹ".bright_blue());
+                    return;
+                }
+                match SessionStore::delete_by_prefix(&meta.id) {
+                    Ok(DeleteSessionResult::Deleted(meta)) => {
+                        if self
+                            .current_session
+                            .as_ref()
+                            .map(|s| s.id == meta.id)
+                            .unwrap_or(false)
+                        {
+                            self.current_session = None;
+                        }
+                        println!("Deleted session {}", meta.id.bright_cyan());
+                    }
+                    Ok(DeleteSessionResult::NotFound) => {
+                        eprintln!("cubi: no session matches '{}'.", id);
+                    }
+                    Ok(DeleteSessionResult::Ambiguous(_)) => {
+                        eprintln!("cubi: session disappeared while deleting '{}'.", id);
+                    }
+                    Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                }
+            }
+            Ok(FindSessionResult::NotFound) => eprintln!("cubi: no session matches '{}'.", id),
+            Ok(FindSessionResult::Ambiguous(candidates)) => {
+                eprintln!("cubi: session prefix '{}' is ambiguous. Candidates:", id);
+                for meta in candidates {
+                    eprintln!("  {}  {}", meta.id, meta.cwd);
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn confirm_session_delete(&self, id: &str) -> bool {
+        use std::io::{self, Write};
+        print!("Delete session {}? [y/N] ", id.bright_cyan());
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map(|_| matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+            .unwrap_or(false)
     }
 
     /// Lists checkpointed sessions for the current project, newest first.
