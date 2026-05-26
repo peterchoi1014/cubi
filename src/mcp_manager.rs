@@ -304,6 +304,9 @@ impl McpManager {
         }
 
         // Handle external MCP server tools
+        // Clone args so we can retry once on transport death.
+        let retry_args = arguments.clone();
+
         let client = self
             .clients
             .get_mut(&server_name)
@@ -332,6 +335,78 @@ impl McpManager {
             },
             None => client.call_tool(name, arguments).await,
         };
+
+        // Auto-reconnect once for stdio servers whose transport looks
+        // dead (broken pipe / closed stream). Drop the dead client first
+        // so the borrow on self.clients ends before we mutate. http
+        // servers don't get this treatment because reqwest already
+        // tears down the connection on each call.
+        let result = match result {
+            Ok(ok) => Ok(ok),
+            Err(err) if is_transport_dead(&err) => {
+                tracing::warn!(
+                    target: "cubi::mcp",
+                    server = %server_name,
+                    error = %err,
+                    "stdio MCP transport looks dead; reconnecting and retrying once"
+                );
+                self.clients.remove(&server_name);
+                match Self::reconnect_stdio(&server_name).await {
+                    Ok(new_client) => {
+                        self.clients.insert(server_name.clone(), new_client);
+                        let client = self.clients.get_mut(&server_name).expect("just inserted");
+                        let retry_result = match timeout_secs {
+                            Some(secs) => match tokio::time::timeout(
+                                Duration::from_secs(secs),
+                                client.call_tool(name, retry_args),
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    crate::telemetry::record_tool_call(
+                                        crate::telemetry::ToolCallEvent {
+                                            tool: name,
+                                            ok: false,
+                                            duration_ms: started.elapsed().as_millis() as u64,
+                                        },
+                                    );
+                                    return Err(ToolTimeoutError {
+                                        name: name.to_string(),
+                                        secs,
+                                    }
+                                    .into());
+                                }
+                            },
+                            None => client.call_tool(name, retry_args).await,
+                        };
+                        match retry_result {
+                            Ok(ok) => Ok(ok),
+                            Err(retry_err) => {
+                                tracing::warn!(
+                                    target: "cubi::mcp",
+                                    server = %server_name,
+                                    retry_error = %retry_err,
+                                    "MCP retry after reconnect failed; surfacing original error"
+                                );
+                                Err(err)
+                            }
+                        }
+                    }
+                    Err(reconnect_err) => {
+                        tracing::warn!(
+                            target: "cubi::mcp",
+                            server = %server_name,
+                            error = %reconnect_err,
+                            "MCP reconnect failed; surfacing original error"
+                        );
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        };
+
         crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
             tool: name,
             ok: result
@@ -343,9 +418,27 @@ impl McpManager {
         result
     }
 
+    /// Re-loads the MCP config and reconnects the named server if its
+    /// configuration is still a stdio transport. Returns an error
+    /// otherwise — callers should not invoke this for http servers.
+    async fn reconnect_stdio(name: &str) -> Result<McpClient> {
+        let config = McpConfig::load()?;
+        let server_config = config
+            .mcp_servers
+            .get(name)
+            .with_context(|| format!("MCP server '{}' no longer in mcp.json", name))?
+            .clone();
+        if !server_config.is_stdio() {
+            anyhow::bail!("server '{}' is not stdio; refusing to reconnect", name);
+        }
+        with_mcp_startup_timeout(Self::connect_client(&server_config)).await
+    }
+
     async fn connect_server(&mut self, name: &str, config: &McpServerConfig) -> Result<()> {
+        tracing::debug!(target: "cubi::mcp", server = %name, "connecting to MCP server");
         let client = Self::connect_client(config).await?;
         self.clients.insert(name.to_string(), client);
+        tracing::debug!(target: "cubi::mcp", server = %name, "MCP server connected");
         Ok(())
     }
 
@@ -489,7 +582,7 @@ impl McpManager {
     pub async fn shutdown(&mut self) {
         for (name, client) in &mut self.clients {
             if let Err(e) = client.shutdown().await {
-                eprintln!("Failed to shutdown MCP server '{}': {}", name, e);
+                tracing::warn!(target: "cubi::mcp", server = %name, error = %e, "failed to shutdown MCP server");
             }
         }
     }
@@ -500,6 +593,39 @@ fn strip_timeout_override(arguments: &mut serde_json::Value) -> Option<u64> {
     object
         .remove("_timeout_secs")
         .and_then(|value| value.as_u64())
+}
+
+/// Returns `true` when the error chain looks like the underlying
+/// transport went away (broken pipe / closed stream / connection lost)
+/// rather than the tool itself returning a failure. Used to decide
+/// whether reconnecting and retrying once is appropriate.
+pub fn is_transport_dead(err: &anyhow::Error) -> bool {
+    // Walk the cause chain and look for io::ErrorKind::BrokenPipe /
+    // UnexpectedEof, or any sub-error whose Display contains markers
+    // that mcp_client surfaces on a dead stdio peer.
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset => return true,
+                _ => {}
+            }
+        }
+        let msg = cause.to_string().to_ascii_lowercase();
+        if msg.contains("broken pipe")
+            || msg.contains("connection lost")
+            || msg.contains("connection closed")
+            || msg.contains("stream closed")
+            || msg.contains("channel closed")
+            || msg.contains("unexpected end of file")
+            || msg.contains("server exited")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -523,5 +649,40 @@ mod tests {
         let mut args = serde_json::json!({"command": "echo ok", "_timeout_secs": 2});
         assert_eq!(strip_timeout_override(&mut args), Some(2));
         assert_eq!(args, serde_json::json!({"command": "echo ok"}));
+    }
+
+    #[test]
+    fn is_transport_dead_detects_broken_pipe_io_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe gone");
+        let err: anyhow::Error = io_err.into();
+        assert!(is_transport_dead(&err));
+    }
+
+    #[test]
+    fn is_transport_dead_detects_unexpected_eof() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof");
+        let err: anyhow::Error = io_err.into();
+        assert!(is_transport_dead(&err));
+    }
+
+    #[test]
+    fn is_transport_dead_detects_text_markers() {
+        for msg in [
+            "Server exited unexpectedly",
+            "broken pipe",
+            "connection lost while reading frame",
+            "stream closed",
+        ] {
+            let err: anyhow::Error = anyhow::anyhow!(msg.to_string());
+            assert!(is_transport_dead(&err), "expected {msg:?} to be dead");
+        }
+    }
+
+    #[test]
+    fn is_transport_dead_returns_false_for_application_errors() {
+        let err: anyhow::Error = anyhow::anyhow!("tool 'bash' returned non-zero exit code");
+        assert!(!is_transport_dead(&err));
+        let err = anyhow::anyhow!("invalid arguments: missing field 'command'");
+        assert!(!is_transport_dead(&err));
     }
 }

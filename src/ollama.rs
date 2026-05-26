@@ -228,6 +228,7 @@ impl OllamaClient {
                 tools: tools.clone(),
             };
             async move {
+                tracing::debug!(target: "cubi::llm::ollama", model = %model, "ollama chat request");
                 let response = self
                     .client
                     .post(format!("{}/api/chat", self.base_url))
@@ -237,7 +238,9 @@ impl OllamaClient {
                     .context("Failed to send request to Ollama")?;
 
                 if !response.status().is_success() {
+                    let status = response.status();
                     let error_text = response.text().await.unwrap_or_default();
+                    tracing::warn!(target: "cubi::llm::ollama", status = status.as_u16(), "ollama non-success");
                     anyhow::bail!("Ollama API error: {}", error_text);
                 }
 

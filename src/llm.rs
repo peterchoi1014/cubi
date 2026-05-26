@@ -26,6 +26,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::ollama::{ChatStats, Message, OllamaClient, ToolCall, ToolCallFunction, ToolSpec};
 
@@ -345,20 +346,79 @@ impl OpenAiClient {
             }
         }
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send request to OpenAI-compatible API")?;
+        tracing::debug!(
+            target: "cubi::llm",
+            model = %model,
+            base_url = %self.base_url,
+            "openai chat_with_tools request"
+        );
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API error: {}", error_text);
-        }
+        let url = format!("{}/chat/completions", self.base_url);
+        let max_retries = current_max_retries();
+        let mut attempt: u32 = 0;
+        let response = loop {
+            let send_result = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match send_result {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_retry_after);
+                    match classify_retry(Some(status.as_u16()), attempt, max_retries, retry_after) {
+                        RetryAction::Retry(wait) => {
+                            tracing::warn!(
+                                target: "cubi::llm",
+                                status = status.as_u16(),
+                                attempt = attempt + 1,
+                                max = max_retries,
+                                "LLM request failed; retrying"
+                            );
+                            tokio::time::sleep(wait).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        RetryAction::Stop => {
+                            let error_text = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                target: "cubi::llm",
+                                status = status.as_u16(),
+                                "openai non-success response"
+                            );
+                            anyhow::bail!("OpenAI API error: {}", error_text);
+                        }
+                    }
+                }
+                Err(err) => match classify_retry(None, attempt, max_retries, None) {
+                    RetryAction::Retry(wait) => {
+                        tracing::warn!(
+                            target: "cubi::llm",
+                            error = %err,
+                            attempt = attempt + 1,
+                            max = max_retries,
+                            "LLM connect error; retrying"
+                        );
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    RetryAction::Stop => {
+                        return Err(anyhow::Error::new(err))
+                            .context("Failed to send request to OpenAI-compatible API");
+                    }
+                },
+            }
+        };
 
         let oai_resp: OaiResponse = response
             .json()
@@ -414,20 +474,82 @@ impl OpenAiClient {
             }
         }
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send streaming request to OpenAI-compatible API")?;
+        tracing::debug!(
+            target: "cubi::llm",
+            model = %model,
+            base_url = %self.base_url,
+            "openai chat_stream request"
+        );
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API error: {}", error_text);
-        }
+        let url = format!("{}/chat/completions", self.base_url);
+        let max_retries = current_max_retries();
+        let mut attempt: u32 = 0;
+        // Only the initial send is retried — once bytes start flowing,
+        // mid-stream failures surface as-is since we may have already
+        // streamed tokens to the caller.
+        let response = loop {
+            let send_result = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match send_result {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_retry_after);
+                    match classify_retry(Some(status.as_u16()), attempt, max_retries, retry_after) {
+                        RetryAction::Retry(wait) => {
+                            tracing::warn!(
+                                target: "cubi::llm",
+                                status = status.as_u16(),
+                                attempt = attempt + 1,
+                                max = max_retries,
+                                "LLM stream request failed; retrying"
+                            );
+                            tokio::time::sleep(wait).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        RetryAction::Stop => {
+                            let error_text = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                target: "cubi::llm",
+                                status = status.as_u16(),
+                                "openai stream non-success response"
+                            );
+                            anyhow::bail!("OpenAI API error: {}", error_text);
+                        }
+                    }
+                }
+                Err(err) => match classify_retry(None, attempt, max_retries, None) {
+                    RetryAction::Retry(wait) => {
+                        tracing::warn!(
+                            target: "cubi::llm",
+                            error = %err,
+                            attempt = attempt + 1,
+                            max = max_retries,
+                            "LLM stream connect error; retrying"
+                        );
+                        tokio::time::sleep(wait).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    RetryAction::Stop => {
+                        return Err(anyhow::Error::new(err))
+                            .context("Failed to send streaming request to OpenAI-compatible API");
+                    }
+                },
+            }
+        };
 
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
@@ -579,7 +701,78 @@ fn fake_stats() -> ChatStats {
     }
 }
 
-// ─── Provider factory ───────────────────────────────────────────────────────
+/// Decision returned by [`classify_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    /// Retry after the given wait duration.
+    Retry(Duration),
+    /// Do not retry; surface the error to the caller.
+    Stop,
+}
+
+/// Pure helper: given an HTTP response status (or `None` for a connect
+/// error) and the attempt number (starting at 0), return whether we
+/// should retry and how long to wait first.
+///
+/// Retry policy:
+///   * connect errors (None) — retry.
+///   * 408 Request Timeout — retry.
+///   * 429 Too Many Requests — retry, honoring `Retry-After` when given.
+///   * 5xx (500/502/503/504/other 5xx) — retry.
+///   * any other 4xx — do not retry (client error).
+///   * 2xx/3xx — caller should not call this in the first place; we
+///     return `Stop` defensively.
+///
+/// Backoff is `250ms * 2^attempt + jitter` capped at 5s. `retry_after`
+/// (seconds) trumps the computed backoff when present.
+pub fn classify_retry(
+    status: Option<u16>,
+    attempt: u32,
+    max_retries: u32,
+    retry_after: Option<Duration>,
+) -> RetryAction {
+    if attempt >= max_retries {
+        return RetryAction::Stop;
+    }
+    let transient = match status {
+        None => true, // connect / IO error
+        Some(s) if s == 408 || s == 429 || (500..600).contains(&s) => true,
+        _ => false,
+    };
+    if !transient {
+        return RetryAction::Stop;
+    }
+    if let Some(wait) = retry_after {
+        return RetryAction::Retry(wait.min(Duration::from_secs(30)));
+    }
+    let base_ms: u64 = 250u64 * (1u64 << attempt.min(5));
+    let jitter_ms = (attempt as u64).wrapping_mul(37) % 100;
+    let total = Duration::from_millis(base_ms + jitter_ms);
+    RetryAction::Retry(total.min(Duration::from_secs(5)))
+}
+
+/// Parses a `Retry-After` header value, accepting either an integer
+/// seconds count (`30`) or an HTTP-date. Falls back to `None` on
+/// unparseable input.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    if let Ok(secs) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date parsing is intentionally not pulled in — providers
+    // overwhelmingly use the integer-seconds form. Surface as None so
+    // the caller falls back to computed backoff.
+    None
+}
+
+fn current_max_retries() -> u32 {
+    if let Ok(v) = std::env::var("CUBI_LLM_MAX_RETRIES") {
+        if let Ok(n) = v.parse::<u32>() {
+            return n;
+        }
+    }
+    let cfg = crate::onboarding::AppConfig::load();
+    cfg.llm_max_retries
+}
 
 /// Creates the appropriate LLM provider based on environment configuration.
 pub fn create_provider() -> LlmBackend {
@@ -652,6 +845,107 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_retry_retries_5xx_until_max() {
+        assert!(matches!(
+            classify_retry(Some(500), 0, 2, None),
+            RetryAction::Retry(_)
+        ));
+        assert!(matches!(
+            classify_retry(Some(503), 1, 2, None),
+            RetryAction::Retry(_)
+        ));
+        assert!(matches!(
+            classify_retry(Some(500), 2, 2, None),
+            RetryAction::Stop
+        ));
+    }
+
+    #[test]
+    fn classify_retry_retries_429_and_408() {
+        assert!(matches!(
+            classify_retry(Some(429), 0, 2, None),
+            RetryAction::Retry(_)
+        ));
+        assert!(matches!(
+            classify_retry(Some(408), 0, 2, None),
+            RetryAction::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn classify_retry_skips_other_4xx() {
+        assert!(matches!(
+            classify_retry(Some(400), 0, 5, None),
+            RetryAction::Stop
+        ));
+        assert!(matches!(
+            classify_retry(Some(401), 0, 5, None),
+            RetryAction::Stop
+        ));
+        assert!(matches!(
+            classify_retry(Some(404), 0, 5, None),
+            RetryAction::Stop
+        ));
+    }
+
+    #[test]
+    fn classify_retry_retries_connect_errors() {
+        assert!(matches!(
+            classify_retry(None, 0, 2, None),
+            RetryAction::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn classify_retry_honors_retry_after() {
+        let wait = Duration::from_secs(7);
+        if let RetryAction::Retry(d) = classify_retry(Some(429), 0, 5, Some(wait)) {
+            assert_eq!(d, wait);
+        } else {
+            panic!("expected retry");
+        }
+    }
+
+    #[test]
+    fn classify_retry_caps_retry_after_at_30s() {
+        if let RetryAction::Retry(d) =
+            classify_retry(Some(429), 0, 5, Some(Duration::from_secs(120)))
+        {
+            assert_eq!(d, Duration::from_secs(30));
+        } else {
+            panic!("expected retry");
+        }
+    }
+
+    #[test]
+    fn classify_retry_disabled_when_max_zero() {
+        assert!(matches!(
+            classify_retry(Some(500), 0, 0, None),
+            RetryAction::Stop
+        ));
+    }
+
+    #[test]
+    fn classify_retry_backoff_caps_at_5s() {
+        for attempt in 0..20 {
+            if let RetryAction::Retry(d) = classify_retry(Some(500), attempt, 100, None) {
+                assert!(d <= Duration::from_secs(5), "attempt {attempt} -> {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_integer_seconds() {
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("  5 "), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date() {
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    }
 
     #[test]
     fn estimate_tokens_basic() {

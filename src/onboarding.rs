@@ -72,6 +72,11 @@ pub struct AppConfig {
     ///   explicit opt-out.
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: Option<u64>,
+    /// Max number of LLM HTTP retry attempts on transient failures
+    /// (connect errors, 408/429/5xx). Respects `Retry-After` when
+    /// present. `0` disables retries entirely. Default is 2.
+    #[serde(default = "default_llm_max_retries")]
+    pub llm_max_retries: u32,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
     /// when a breaking change to this struct is introduced; older configs
     /// are migrated forward on load.
@@ -81,6 +86,10 @@ pub struct AppConfig {
 
 fn default_tool_timeout_secs() -> Option<u64> {
     Some(60)
+}
+
+fn default_llm_max_retries() -> u32 {
+    2
 }
 
 impl Default for AppConfig {
@@ -94,6 +103,7 @@ impl Default for AppConfig {
             vim_mode: None,
             telemetry: false,
             tool_timeout_secs: default_tool_timeout_secs(),
+            llm_max_retries: default_llm_max_retries(),
             config_version: 0,
         }
     }
@@ -101,7 +111,11 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn storage_path() -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".cubi").join("config.json"))
+        Some(
+            crate::sessions::home_dir()?
+                .join(".cubi")
+                .join("config.json"),
+        )
     }
 
     /// Loads the on-disk config. Missing or unreadable files yield a

@@ -178,6 +178,11 @@ interactively with the `/model` command:
 CUBI_MODEL=mistral:7b cargo run --release
 ```
 
+Enable diagnostic logging by setting `CUBI_LOG` (off by default; output
+goes to stderr only). For example, `CUBI_LOG=cubi=debug` traces every
+module, and `CUBI_LOG=cubi::llm=debug` narrows it to the LLM client. See
+[`docs/troubleshooting.md`](docs/troubleshooting.md) for more.
+
 You should see:
 
 ```

@@ -6,3 +6,8 @@
 - Tool timed out: increase `tool_timeout_secs` in `~/.cubi/config.json` or pass `_timeout_secs` in a tool call when appropriate.
 - No color or too much color: set `NO_COLOR=1` or `CUBI_COLOR=off`; set `CUBI_COLOR=on` to force color.
 - Completions missing: run `cubi completions bash`, `cubi completions zsh`, or `cubi completions fish` and install the printed script using your shell's completion directory.
+- Internal diagnostic logs: set `CUBI_LOG` to enable structured tracing on
+  stderr. Examples: `CUBI_LOG=cubi=debug cubi -p "hi"` for everything,
+  `CUBI_LOG=cubi::llm=debug,cubi::mcp=warn cubi` for targeted modules.
+  Output goes to stderr only — JSON output on stdout stays clean. With
+  `CUBI_LOG` unset, no subscriber is installed and the binary is quiet.
