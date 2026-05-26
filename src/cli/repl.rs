@@ -6,7 +6,9 @@ pub(super) fn repl_history_path() -> Option<PathBuf> {
 
 impl ChatCLI {
     pub async fn run(&mut self) -> Result<()> {
-        self.print_welcome();
+        if !self.no_banner {
+            self.print_welcome();
+        }
 
         // Fire SessionStart hooks.
         self.hooks.fire_session_start(self.executor.get_model());

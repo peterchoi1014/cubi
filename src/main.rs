@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            "--no-banner" => cli_flags.no_banner = true,
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
@@ -228,6 +229,13 @@ async fn main() -> Result<()> {
             }
         }
         i += 1;
+    }
+
+    if std::env::var("CUBI_NO_BANNER")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        cli_flags.no_banner = true;
     }
 
     if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
@@ -541,7 +549,7 @@ async fn main() -> Result<()> {
 
     // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
     // stay quiet under CI.
-    if !headless && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if !headless && !cli_flags.no_banner && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         if let Some(tip) = tips::tip_of_the_day() {
             println!("{} {}", "💡 tip:".bright_yellow(), tip);
         }
@@ -671,6 +679,8 @@ fn print_help() {
                                         each reply\n  \
          --system <file>                 Prepend file contents as a system\n  \
                                         message before chat starts\n  \
+         --no-banner                    Suppress the welcome banner and tip\n  \
+                                         of the day (also honors CUBI_NO_BANNER)\n  \
          --json                          Emit machine-readable output where\n  \
                                         supported (session arrays or headless\n  \
                                         line-delimited events)\n\n\
