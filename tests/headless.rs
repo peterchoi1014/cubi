@@ -175,3 +175,27 @@ fn unknown_completion_shell_exits_with_usage_error() {
             "cubi: completions requires one of: bash, zsh, fish.",
         ));
 }
+
+#[test]
+fn headless_json_outputs_line_delimited_events() {
+    let home = tempdir().unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "hello")
+        .args(["--json", "-p", "hi"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["type"], "token");
+    assert_eq!(events[0]["value"], "hello");
+    assert_eq!(events[1]["type"], "done");
+    assert!(events[1]["stats"].is_object());
+}

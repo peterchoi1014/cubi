@@ -131,7 +131,7 @@ pub struct ChatStreamChunk {
 /// Per-call inference statistics. Populated from whatever the provider
 /// returned (Ollama: `eval_count`/`prompt_eval_count`; OpenAI: `usage`). All
 /// fields default to zero so they can be summed without optionality noise.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
