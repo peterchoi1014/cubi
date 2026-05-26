@@ -50,10 +50,11 @@ jobs:
       - name: Package release assets
         run: |
           set -euo pipefail
-          mkdir -p dist/${{ matrix.target }}
+          mkdir -p dist/${{ matrix.target }}/share/man/man1
           cp target/${{ matrix.target }}/release/cubi dist/${{ matrix.target }}/cubi
+          cp docs/cubi.1 dist/${{ matrix.target }}/share/man/man1/cubi.1
           cp target/${{ matrix.target }}/release/cubi dist/cubi-${{ matrix.target }}
-          tar -C dist/${{ matrix.target }} -czf dist/cubi-${{ matrix.target }}.tar.gz cubi
+          tar -C dist/${{ matrix.target }} -czf dist/cubi-${{ matrix.target }}.tar.gz cubi share/man/man1/cubi.1
 
       - name: Upload GitHub Release assets
         uses: softprops/action-gh-release@v2

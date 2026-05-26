@@ -34,7 +34,7 @@ use crate::project_memory;
 
 /// Persistent user-level configuration. Lives next to the trust store at
 /// `~/.cubi/config.json`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Model selected during onboarding (or via a future `/config` command).
     /// `None` means "no preference, fall through to the baked-in default".
@@ -63,11 +63,40 @@ pub struct AppConfig {
     /// `~/.cubi/telemetry.log`. Off by default.
     #[serde(default)]
     pub telemetry: bool,
+    /// Default wall-clock timeout for model-requested tool execution.
+    ///
+    /// * `Some(n)` where `n > 0`: wrap each tool call in `n` seconds.
+    /// * `Some(0)` or `None`: no wall-clock timeout (tools run until they
+    ///   complete or the user cancels). `None` is the implicit default
+    ///   for configs written before this field existed; `Some(0)` is the
+    ///   explicit opt-out.
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: Option<u64>,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
     /// when a breaking change to this struct is introduced; older configs
     /// are migrated forward on load.
     #[serde(default)]
     pub config_version: u32,
+}
+
+fn default_tool_timeout_secs() -> Option<u64> {
+    Some(60)
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_model: None,
+            onboarded: false,
+            theme: None,
+            output_style: None,
+            color: None,
+            vim_mode: None,
+            telemetry: false,
+            tool_timeout_secs: default_tool_timeout_secs(),
+            config_version: 0,
+        }
+    }
 }
 
 impl AppConfig {

@@ -1,0 +1,154 @@
+.TH CUBI 1 "May 2026" "cubi 0.3.0" "User Commands"
+.SH NAME
+cubi \- a pocket-sized AI for your shell
+.SH SYNOPSIS
+.B cubi
+.br
+.B cubi
+.BR -p | --prompt
+.I prompt
+.RI [ options ]
+.br
+.B echo
+.I prompt
+.B | cubi
+.RI [ options ]
+.br
+.B cubi
+.BR --resume | -r
+.RI [ id ]
+.br
+.B cubi
+.B --list-sessions
+.RB [ --json ]
+.br
+.B cubi
+.B --delete-session
+.I id
+.br
+.B cubi
+.B --prune-sessions --older-than
+.I duration
+.RB [ --dry-run ]
+.br
+.B cubi
+.B plugins
+.BR list | reload
+.br
+.B cubi
+.B completions
+.BR bash | zsh | fish
+.SH DESCRIPTION
+.B cubi
+starts an interactive local-AI chat REPL with native tool calling, session checkpoints, plugins, and MCP support. In headless mode it runs one prompt and writes model output to standard output so it can be used in shell pipelines.
+.SH OPTIONS
+.TP
+.BR -p , " --prompt " \fIprompt\fR
+Run one inline prompt and exit. The prompt must be non-empty and is not read from standard input.
+.TP
+.BR --stream , " --no-stream"
+Stream tokens live or wait for the full reply. One-shot mode buffers by default unless
+.B --stream
+is passed.
+.TP
+.BR --markdown , " --no-markdown"
+Enable or disable markdown rendering. Markdown applies only with
+.B --no-stream
+and is disabled automatically for non-TTY output.
+.TP
+.B --show-stats-footer
+Print a token and timing footer after each reply.
+.TP
+.BI --system " file"
+Prepend the contents of
+.I file
+as a system message before chat starts.
+.TP
+.B --json
+Emit machine-readable output where supported. Session listing prints a JSON array; headless chat prints line-delimited events such as
+.BR token ,
+.BR tool_call ,
+.BR tool_result ,
+.BR tool_timeout ,
+and
+.BR done .
+.TP
+.BR --resume , " -r " [\fIid\fR]
+Resume a saved chat. With no id, cubi chooses the most recent session for the current directory, then falls back to the global latest session.
+.TP
+.B --list-sessions
+List saved sessions newest first.
+.TP
+.BI --delete-session " id"
+Delete a saved session by full id or unique prefix.
+.TP
+.BI --prune-sessions " --older-than " duration
+Delete old session files. Durations use suffixes such as
+.BR 30d ,
+.BR 2w ,
+.BR 6m ,
+or
+.BR 1y .
+.TP
+.B --dry-run
+Preview session pruning without deleting files.
+.TP
+.BI completions " shell"
+Print a completion script for
+.BR bash ,
+.BR zsh ,
+or
+.BR fish .
+.TP
+.BR --version , " -V" , " -v"
+Print the version and exit.
+.TP
+.BR --help , " -h"
+Print command-line help and exit.
+.SH SUBCOMMANDS
+.TP
+.B cubi plugins list
+List discovered plugin bundles.
+.TP
+.B cubi plugins reload
+Rediscover skills and plugin bundles.
+.SH HEADLESS EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 2
+Usage or configuration error.
+.TP
+.B 10
+Model or API error.
+.TP
+.B 11
+Tool execution failure.
+.TP
+.B 130
+Cancelled.
+.SH FILES
+.TP
+.I ~/.cubi/config.json
+User configuration, including model preference and default tool timeout.
+.TP
+.I ~/.cubi/sessions/index.json
+Session index used by session listing and resume.
+.TP
+.I ~/.cubi/plugins/
+Plugin discovery directory.
+.TP
+.I ~/.cubi/mcp.json
+MCP server configuration.
+.SH EXAMPLES
+.EX
+cubi
+cubi -p "summarize this repository"
+git diff | cubi -p "summarize"
+cubi --json --no-stream -p "run tests and report failures"
+cubi --list-sessions --json
+.EE
+.SH SEE ALSO
+.BR ollama (1),
+.BR groff_man (7)
