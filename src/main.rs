@@ -31,6 +31,7 @@ mod sessions;
 mod settings_sync;
 pub mod skills;
 mod spinner;
+mod style;
 mod telemetry;
 mod themes;
 mod tips;
@@ -248,6 +249,7 @@ async fn main() -> Result<()> {
     if let Some(v) = &config.vim_mode {
         unsafe { std::env::set_var("CUBI_VIM_MODE", v) };
     }
+    style::init_color_control();
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
     // shells, or when `CUBI_NO_ONBOARD=1` is set.
