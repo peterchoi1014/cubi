@@ -1,0 +1,20 @@
+---
+source: tests/completions_snapshots.rs
+expression: "completion_script(\"bash\")"
+---
+# cubi bash completions
+_cubi() {
+    local cur
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+
+    if [[ "${COMP_WORDS[1]}" == "completions" && ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
+        return 0
+    fi
+
+    if [[ ${COMP_CWORD} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --stream --no-stream --markdown --no-markdown --show-stats-footer completions" -- "$cur") )
+    fi
+}
+complete -F _cubi cubi
