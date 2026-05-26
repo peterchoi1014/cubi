@@ -760,25 +760,89 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
 ];
 
+/// Returns every registered command name in display order.
+pub fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|s| s.name)
+}
+
 /// Returns every registered command name that starts with `typed`.
 ///
 /// `typed` may include the leading slash or not — both `"/re"` and
-/// `"re"` are accepted. Used for both "did you mean?" hints on
-/// ambiguous prefixes and tab-completion in the REPL.
+/// `"re"` are accepted. Used by tab-completion in the REPL and as the
+/// first pass for "did you mean?" suggestions.
 pub fn prefix_matches(typed: &str) -> Vec<&'static str> {
-    let stripped = typed.strip_prefix('/').unwrap_or(typed);
+    let stripped = normalize_typed_command(typed);
     if stripped.is_empty() {
         return Vec::new();
     }
-    COMMANDS
-        .iter()
-        .filter_map(|s| {
-            s.name
-                .strip_prefix('/')
-                .filter(|n| n.starts_with(stripped))
-                .map(|_| s.name)
+    command_names()
+        .filter(|name| {
+            name.strip_prefix('/')
+                .is_some_and(|n| n.starts_with(&stripped))
         })
         .collect()
+}
+
+/// Suggest likely slash commands for an unknown command head.
+///
+/// Prefix matches win because they preserve muscle-memory shortcuts (`/re`
+/// should list all `/re…` commands). If there are no prefix matches, fall
+/// back to a small Levenshtein search so typos such as `/relase-notes` still
+/// get a useful hint without flooding unrelated commands.
+pub fn suggestions(typed: &str) -> Vec<&'static str> {
+    let typed = normalize_typed_command(typed);
+    if typed.is_empty() {
+        return Vec::new();
+    }
+
+    let prefix = prefix_matches(&typed);
+    if !prefix.is_empty() {
+        return prefix;
+    }
+
+    let threshold = levenshtein_threshold(typed.len());
+    let mut ranked: Vec<(usize, &'static str)> = command_names()
+        .filter_map(|name| {
+            let bare = name.strip_prefix('/').unwrap_or(name);
+            let distance = levenshtein(&typed, bare);
+            (distance <= threshold).then_some((distance, name))
+        })
+        .collect();
+    ranked.sort_by(|(a_dist, a_name), (b_dist, b_name)| {
+        a_dist.cmp(b_dist).then_with(|| a_name.cmp(b_name))
+    });
+    ranked.into_iter().map(|(_, name)| name).collect()
+}
+
+fn normalize_typed_command(typed: &str) -> String {
+    let head = typed.split_whitespace().next().unwrap_or(typed);
+    head.strip_prefix('/').unwrap_or(head).to_ascii_lowercase()
+}
+
+fn levenshtein_threshold(len: usize) -> usize {
+    match len {
+        0..=4 => 1,
+        5..=10 => 2,
+        _ => 3,
+    }
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let mut previous: Vec<usize> = (0..=b.chars().count()).collect();
+    let mut current = vec![0; previous.len()];
+
+    for (i, ca) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let substitution = previous[j] + usize::from(ca != cb);
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            current[j + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b.chars().count()]
 }
 
 /// Parses an input line that starts with `/` into a `(Cmd, args)` pair.
@@ -912,6 +976,45 @@ mod tests {
         // `/re` matches /release-notes, /reload-plugins, /reset-limits,
         // /resume, /review, /rewind — refuse to guess.
         assert!(parse("/re").is_none());
+    }
+
+    #[test]
+    fn command_inventory_exposes_registered_names() {
+        let names: Vec<_> = command_names().collect();
+        assert!(names.contains(&"/release-notes"));
+        assert!(names.contains(&"/reload-plugins"));
+        assert!(names.contains(&"/reset-limits"));
+        assert!(names.contains(&"/resume"));
+        assert!(names.contains(&"/review"));
+        assert!(names.contains(&"/rewind"));
+    }
+
+    #[test]
+    fn prefix_matches_returns_all_matching_commands() {
+        let matches = prefix_matches("/re");
+        assert!(matches.contains(&"/release-notes"));
+        assert!(matches.contains(&"/reload-plugins"));
+        assert!(matches.contains(&"/reset-limits"));
+        assert!(matches.contains(&"/resume"));
+        assert!(matches.contains(&"/review"));
+        assert!(matches.contains(&"/rewind"));
+    }
+
+    #[test]
+    fn suggestions_prefer_prefix_matches() {
+        let suggestions = suggestions("/re");
+        assert!(suggestions.contains(&"/release-notes"));
+        assert!(suggestions.contains(&"/reload-plugins"));
+        assert!(suggestions.contains(&"/reset-limits"));
+        assert!(suggestions.contains(&"/resume"));
+        assert!(suggestions.contains(&"/review"));
+        assert!(suggestions.contains(&"/rewind"));
+    }
+
+    #[test]
+    fn suggestions_fall_back_to_levenshtein_for_typos() {
+        assert_eq!(suggestions("/relase-notes"), vec!["/release-notes"]);
+        assert!(suggestions("/rewiew").contains(&"/review"));
     }
 
     #[test]
