@@ -31,10 +31,13 @@ fn prompt_and_resume_are_mutually_exclusive() {
     let home = tempdir().unwrap();
 
     cubi(home.path())
-        .args(["--prompt=", "--resume", "foo"])
+        .args(["--prompt=hello", "--resume", "foo"])
         .assert()
         .failure()
-        .code(2);
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cubi: --prompt cannot be combined with --resume, --list-sessions, or --delete-session.",
+        ));
 }
 
 #[test]
