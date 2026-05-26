@@ -94,6 +94,20 @@ async fn main() -> Result<()> {
             "--no-markdown" => cli_flags.markdown = false,
             "--markdown" => cli_flags.markdown = true,
             "--show-stats-footer" => cli_flags.stats_footer = true,
+            "--system" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --system requires a file path.");
+                    std::process::exit(2);
+                };
+                match std::fs::read_to_string(path) {
+                    Ok(prompt) => cli_flags.system_prompt = Some(prompt),
+                    Err(err) => {
+                        eprintln!("cubi: failed to read --system file '{}': {}", path, err);
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--version" | "-V" | "-v" | "version" => {
                 println!("cubi {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -522,7 +536,9 @@ fn print_help() {
                                          (markdown only applies in --no-stream\n  \
                                          mode; auto-disabled for non-TTY stdout)\n  \
          --show-stats-footer            Print a token/timing footer after\n  \
-                                         each reply\n\n\
+                                        each reply\n  \
+         --system <file>                 Prepend file contents as a system\n  \
+                                        message before chat starts\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

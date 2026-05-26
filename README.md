@@ -215,11 +215,13 @@ Output flags (combine with chat commands):
   --markdown / --no-markdown     Enable / disable markdown rendering. Markdown only
                                  applies with --no-stream; auto-disabled for non-TTY
   --show-stats-footer            Print a token/timing footer after each reply
+  --system <file>                 Prepend file contents as a system message
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,
 `/markdown on|off`, and `/stats-footer on|off`. `-p/--prompt` requires inline
 text and does not read stdin; without `-p`, piped stdin becomes the prompt.
+Use `--system <file>` to prepend a system instruction file before the prompt.
 One-shot mode buffers by default for predictable scripts; pass `--stream` to
 stream tokens. Headless exit codes are: `0` ok, `2` usage/config error, `10`
 model/API error, `11` tool failure, and `130` cancellation. Press **Ctrl-C**

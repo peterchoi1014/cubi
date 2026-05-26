@@ -99,11 +99,12 @@ pub struct ChatCLI {
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
 /// struct so the cli/main boundary stays explicit rather than threaded
 /// through positional bools.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CliFlags {
     pub stream: bool,
     pub markdown: bool,
     pub stats_footer: bool,
+    pub system_prompt: Option<String>,
 }
 
 impl Default for CliFlags {
@@ -114,6 +115,7 @@ impl Default for CliFlags {
             stream: true,
             markdown: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             stats_footer: false,
+            system_prompt: None,
         }
     }
 }
@@ -216,6 +218,10 @@ impl ChatCLI {
             session_stats: ChatStats::default(),
             headless_mode: false,
         };
+
+        if let Some(system_prompt) = flags.system_prompt {
+            cli.history.push(Message::text("system", system_prompt));
+        }
 
         // Auto-inject project memory (CUBI.md) into context, if present.
         cli.inject_project_memory();
