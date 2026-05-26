@@ -327,10 +327,10 @@ impl OpenAiClient {
             "stream": false,
         });
 
-        if let Some(tools) = &tools
-            && !tools.is_empty()
-        {
-            body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
+        if let Some(tools) = &tools {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
+            }
         }
 
         let response = self
@@ -396,10 +396,10 @@ impl OpenAiClient {
             "stream_options": { "include_usage": true },
         });
 
-        if let Some(tools) = &tools
-            && !tools.is_empty()
-        {
-            body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
+        if let Some(tools) = &tools {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
+            }
         }
 
         let response = self
@@ -442,11 +442,11 @@ impl OpenAiClient {
                     usage = Some(u);
                 }
                 for choice in chunk.choices {
-                    if let Some(text) = &choice.delta.content
-                        && !text.is_empty()
-                    {
-                        on_token(text);
-                        content.push_str(text);
+                    if let Some(text) = &choice.delta.content {
+                        if !text.is_empty() {
+                            on_token(text);
+                            content.push_str(text);
+                        }
                     }
                     if let Some(tcs) = &choice.delta.tool_calls {
                         for tc in tcs {

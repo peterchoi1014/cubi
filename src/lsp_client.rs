@@ -379,9 +379,10 @@ impl LspReader {
                     );
                 }
             };
-            if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64())
-                && resp_id == id
-            {
+            if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64()) {
+                if resp_id != id {
+                    continue;
+                }
                 if let Some(err) = msg.get("error") {
                     anyhow::bail!("LSP server returned error: {}", err);
                 }

@@ -106,15 +106,15 @@ impl AppConfig {
 ///   2. `config.default_model` from `~/.cubi/config.json`.
 ///   3. The baked-in `fallback` constant from `main`.
 pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
-    if let Ok(env) = std::env::var("CUBI_MODEL")
-        && !env.is_empty()
-    {
-        return env;
+    if let Ok(env) = std::env::var("CUBI_MODEL") {
+        if !env.is_empty() {
+            return env;
+        }
     }
-    if let Some(model) = &config.default_model
-        && !model.is_empty()
-    {
-        return model.clone();
+    if let Some(model) = &config.default_model {
+        if !model.is_empty() {
+            return model.clone();
+        }
     }
     fallback.to_string()
 }
@@ -134,12 +134,12 @@ pub fn is_known_non_tool_capable(model: &str) -> bool {
     let family = m.split(':').next().unwrap_or(&m);
     // Tiny llama3.2 variants (1b, 3b-without-tools-tuning) are the main
     // offender that triggered this check.
-    if family == "llama3.2"
-        && let Some(tag) = m.split(':').nth(1)
-    {
-        // The 1b tag is known-bad; 3b is borderline but works for
-        // simple cases — only flag 1b to avoid false positives.
-        return tag.starts_with("1b");
+    if family == "llama3.2" {
+        if let Some(tag) = m.split(':').nth(1) {
+            // The 1b tag is known-bad; 3b is borderline but works for
+            // simple cases — only flag 1b to avoid false positives.
+            return tag.starts_with("1b");
+        }
     }
     matches!(
         family,
