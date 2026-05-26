@@ -296,7 +296,6 @@ fn doctor_json_emits_check_array() {
     assert!(names.contains(&"plugins"));
 }
 
-#[cfg(unix)]
 #[test]
 fn print_config_outputs_valid_json_with_path() {
     let home = tempdir().unwrap();

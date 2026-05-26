@@ -101,10 +101,9 @@ fn check_config() -> CheckResult {
 }
 
 fn check_sessions_dir() -> CheckResult {
-    let Some(home) = dirs::home_dir() else {
+    let Some(dir) = crate::sessions::sessions_root() else {
         return CheckResult::warn("sessions_dir", "could not resolve home directory");
     };
-    let dir = home.join(".cubi").join("sessions");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return CheckResult::fail(
             "sessions_dir",
