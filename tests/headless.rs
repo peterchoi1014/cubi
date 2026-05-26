@@ -295,3 +295,36 @@ fn doctor_json_emits_check_array() {
     assert!(names.contains(&"sessions_dir"));
     assert!(names.contains(&"plugins"));
 }
+
+#[test]
+fn print_config_outputs_valid_json_with_path() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    // Plant a config with a key-like field to verify redaction; AppConfig
+    // ignores unknown fields, so we round-trip through the raw JSON only.
+    fs::write(
+        cubi_dir.join("config.json"),
+        r#"{"default_model":"qwen3:4b","onboarded":true,"api_token":"sk-very-secret","my_api_key":"abc123"}"#,
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .arg("--print-config")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--print-config should emit valid JSON");
+    assert!(parsed["_config_path"].is_string());
+    assert_eq!(parsed["default_model"], "qwen3:4b");
+    // AppConfig::load drops unknown fields, so the redacted keys must
+    // not survive — but ensure none of the canonical AppConfig fields
+    // accidentally carry a raw secret either.
+    let s = stdout.to_lowercase();
+    assert!(!s.contains("sk-very-secret"));
+    assert!(!s.contains("abc123"));
+}
