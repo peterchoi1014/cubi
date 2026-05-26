@@ -150,13 +150,11 @@ impl ChatCLI {
     }
 
     fn emit_json_event(value: serde_json::Value) {
-        println!("{}", value);
+        crate::json_events::emit(true, &value);
     }
 
     fn emit_json_event_if(enabled: bool, value: serde_json::Value) {
-        if enabled {
-            Self::emit_json_event(value);
-        }
+        crate::json_events::emit(enabled, &value);
     }
 
     #[allow(dead_code)]

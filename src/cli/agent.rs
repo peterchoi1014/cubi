@@ -123,11 +123,7 @@ impl ChatCLI {
                         {
                             Self::emit_json_event_if(
                                 self.json_enabled && self.headless_mode,
-                                serde_json::json!({
-                                    "type": "tool_timeout",
-                                    "name": timeout.name,
-                                    "secs": timeout.secs,
-                                }),
+                                crate::json_events::tool_timeout(&timeout.name, timeout.secs),
                             );
                             format!("[tool error] {timeout}")
                         } else {
@@ -225,9 +221,7 @@ impl ChatCLI {
                                 }
                             }
                             if json_enabled {
-                                Self::emit_json_event(
-                                    serde_json::json!({"type":"token","value": tok}),
-                                );
+                                Self::emit_json_event(crate::json_events::token(tok));
                             } else if headless_mode {
                                 print!("{}", tok);
                                 let _ = std::io::stdout().flush();
@@ -315,9 +309,7 @@ impl ChatCLI {
                 // print it here if the streaming callback saw no tokens.
                 if self.stream_enabled && !got_token && !msg_content.is_empty() {
                     if json_enabled {
-                        Self::emit_json_event(
-                            serde_json::json!({"type":"token","value": msg_content}),
-                        );
+                        Self::emit_json_event(crate::json_events::token(&msg_content));
                     } else if headless_mode {
                         println!("{msg_content}");
                     } else {
@@ -328,9 +320,7 @@ impl ChatCLI {
                 }
                 if !self.stream_enabled && !msg_content.is_empty() {
                     if json_enabled {
-                        Self::emit_json_event(
-                            serde_json::json!({"type":"token","value": msg_content}),
-                        );
+                        Self::emit_json_event(crate::json_events::token(&msg_content));
                     } else {
                         // Buffered mode: render the message now. Markdown if
                         // enabled, otherwise plain text.
@@ -338,10 +328,7 @@ impl ChatCLI {
                     }
                     any_output = true;
                 }
-                Self::emit_json_event_if(
-                    json_enabled,
-                    serde_json::json!({"type":"done","stats": turn_stats}),
-                );
+                Self::emit_json_event_if(json_enabled, crate::json_events::done(&turn_stats));
                 if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
@@ -366,11 +353,7 @@ impl ChatCLI {
             for (idx, call) in calls.iter().enumerate() {
                 Self::emit_json_event_if(
                     json_enabled,
-                    serde_json::json!({
-                        "type": "tool_call",
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
-                    }),
+                    crate::json_events::tool_call(&call.function.name, &call.function.arguments),
                 );
                 self.emit_status(format!(
                     "{} {} {}",
@@ -429,11 +412,7 @@ impl ChatCLI {
                 ));
                 Self::emit_json_event_if(
                     json_enabled,
-                    serde_json::json!({
-                        "type": "tool_result",
-                        "name": call.function.name,
-                        "content": result_text.clone(),
-                    }),
+                    crate::json_events::tool_result(&call.function.name, &result_text),
                 );
 
                 self.history

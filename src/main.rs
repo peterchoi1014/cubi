@@ -12,6 +12,7 @@ mod file_mentions;
 mod file_rollback;
 mod git_cmds;
 mod hooks;
+mod json_events;
 #[allow(dead_code)]
 mod llm;
 mod lsp_client;
@@ -585,20 +586,14 @@ async fn main() -> Result<()> {
     if let Err(err) = run_result {
         if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
             if json_output && headless {
-                println!(
-                    "{}",
-                    serde_json::json!({"type":"error","message": exit.message})
-                );
+                json_events::emit_error(true, &exit.message);
             } else if !exit.message.is_empty() {
                 eprintln!("{}", exit.message);
             }
             exit_code::exit(exit.code);
         }
         if json_output && headless {
-            println!(
-                "{}",
-                serde_json::json!({"type":"error","message": err.to_string()})
-            );
+            json_events::emit_error(true, &err.to_string());
         } else {
             eprintln!("{}", err);
         }
