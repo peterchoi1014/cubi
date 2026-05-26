@@ -328,3 +328,13 @@ fn print_config_outputs_valid_json_with_path() {
     assert!(!s.contains("sk-very-secret"));
     assert!(!s.contains("abc123"));
 }
+
+#[test]
+fn no_banner_flag_listed_in_help() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-banner"));
+}

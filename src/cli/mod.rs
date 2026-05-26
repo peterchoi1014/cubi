@@ -107,6 +107,8 @@ pub struct ChatCLI {
     json_enabled: bool,
     /// Precomputed MCP startup health summary shown in the welcome banner.
     mcp_health_line: Option<String>,
+    /// Suppresses the welcome banner and tip-of-the-day output.
+    no_banner: bool,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -120,6 +122,7 @@ pub struct CliFlags {
     pub system_prompt: Option<String>,
     pub json: bool,
     pub mcp_health_line: Option<String>,
+    pub no_banner: bool,
 }
 
 impl Default for CliFlags {
@@ -133,6 +136,7 @@ impl Default for CliFlags {
             system_prompt: None,
             json: false,
             mcp_health_line: None,
+            no_banner: false,
         }
     }
 }
@@ -205,6 +209,7 @@ impl ChatCLI {
             headless_mode: false,
             json_enabled: flags.json,
             mcp_health_line: flags.mcp_health_line,
+            no_banner: flags.no_banner,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
