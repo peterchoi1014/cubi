@@ -17,9 +17,13 @@ _cubi() {
         COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
         return 0
     fi
+    if [[ "${COMP_WORDS[1]}" == "plugins" && ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "list reload" -- "$cur") )
+        return 0
+    fi
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --stream --no-stream --markdown --no-markdown --show-stats-footer completions" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --stream --no-stream --markdown --no-markdown --show-stats-footer --system --json completions plugins" -- "$cur") )
     fi
 }
 complete -F _cubi cubi
@@ -46,6 +50,11 @@ _cubi() {
         '--no-markdown:disable markdown rendering'
         '--show-stats-footer:print token and timing stats'
         'completions:print a shell completion script'
+        'plugins:manage plugin bundles'
+    )
+    plugins=(
+        'list:list discovered plugin bundles'
+        'reload:rediscover plugin bundles'
     )
     shells=(
         'bash:Bash completion script'
@@ -57,6 +66,8 @@ _cubi() {
         _describe -t cubi-commands 'cubi command' top
     elif [[ ${words[2]} == completions && CURRENT -eq 3 ]]; then
         _describe -t shells 'shell' shells
+    elif [[ ${words[2]} == plugins && CURRENT -eq 3 ]]; then
+        _describe -t plugins 'plugin subcommand' plugins
     fi
 }
 _cubi "$@"
@@ -76,6 +87,10 @@ complete -c cubi -l no-stream -d 'Wait for the full reply'
 complete -c cubi -l markdown -d 'Enable markdown rendering'
 complete -c cubi -l no-markdown -d 'Disable markdown rendering'
 complete -c cubi -l show-stats-footer -d 'Print token and timing stats'
+complete -c cubi -l system -r -d 'Prepend a system prompt file'
+complete -c cubi -l json -d 'Emit machine-readable output where supported'
 complete -c cubi -n '__fish_use_subcommand' -a completions -d 'Print a shell completion script'
+complete -c cubi -n '__fish_use_subcommand' -a plugins -d 'Manage plugin bundles'
 complete -c cubi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
+complete -c cubi -n '__fish_seen_subcommand_from plugins' -a 'list reload'
 "#;

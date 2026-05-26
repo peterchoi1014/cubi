@@ -4607,9 +4607,10 @@ impl ChatCLI {
         }
         for p in &self.plugins {
             println!(
-                "  {} {} ({})",
+                "  {} {} v{} ({})",
                 "•".bright_cyan(),
                 p.name.bright_cyan(),
+                p.version.bright_magenta(),
                 p.root.display().to_string().bright_black()
             );
             if p.commands.is_empty() {
@@ -4631,14 +4632,10 @@ impl ChatCLI {
     fn reload_plugins(&mut self) {
         self.skills = skills::load_skills();
         self.plugins = plugins::load_plugins();
-        let cmd_count: usize = self.plugins.iter().map(|p| p.commands.len()).sum();
-        println!(
-            "{} Reloaded {} skill(s) + {} plugin(s) ({} command(s))",
-            "✓".bright_green(),
-            self.skills.len(),
-            self.plugins.len(),
-            cmd_count
-        );
+        let before = std::mem::take(&mut self.plugins);
+        self.plugins = plugins::load_plugins();
+        print!("{} ", "✓".bright_green());
+        plugins::print_reload_summary(&before, &self.plugins, self.skills.len());
     }
 
     fn show_cost(&self) {

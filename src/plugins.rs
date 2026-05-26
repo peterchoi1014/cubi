@@ -23,6 +23,7 @@ pub struct Plugin {
     /// Plugin directory name (no slashes), used as the slash-command
     /// namespace, e.g. `mytools` for `/mytools:review`.
     pub name: String,
+    pub version: String,
     pub root: PathBuf,
     pub commands: Vec<PluginCommand>,
 }
@@ -78,15 +79,75 @@ pub fn load_plugins() -> Vec<Plugin> {
         if name.is_empty() || name.contains(char::is_whitespace) || name.contains(':') {
             continue;
         }
+        let version = load_version(&path).unwrap_or_else(|| "-".to_string());
         let commands = load_commands(&path.join("commands"));
         plugins.push(Plugin {
             name,
+            version,
             root: path,
             commands,
         });
     }
     plugins.sort_by(|a, b| a.name.cmp(&b.name));
     plugins
+}
+
+fn load_version(root: &std::path::Path) -> Option<String> {
+    for file in ["plugin.json", "manifest.json", "package.json"] {
+        let Ok(raw) = fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
+            if !version.trim().is_empty() {
+                return Some(version.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn print_plugin_list(plugins: &[Plugin]) {
+    println!("{:<24} {:<12} PATH", "NAME", "VERSION");
+    if plugins.is_empty() {
+        println!("(no plugins discovered)");
+        return;
+    }
+    for plugin in plugins {
+        println!(
+            "{:<24} {:<12} {}",
+            plugin.name,
+            plugin.version,
+            plugin.root.display()
+        );
+    }
+}
+
+pub fn print_reload_summary(before: &[Plugin], after: &[Plugin], skill_count: usize) {
+    let before_names: std::collections::BTreeSet<_> =
+        before.iter().map(|p| p.name.as_str()).collect();
+    let after_names: std::collections::BTreeSet<_> =
+        after.iter().map(|p| p.name.as_str()).collect();
+    let added: Vec<_> = after_names.difference(&before_names).copied().collect();
+    let removed: Vec<_> = before_names.difference(&after_names).copied().collect();
+    let cmd_count: usize = after.iter().map(|p| p.commands.len()).sum();
+    println!(
+        "Reloaded {} skill(s) + {} plugin(s) ({} command(s))",
+        skill_count,
+        after.len(),
+        cmd_count
+    );
+    if !added.is_empty() {
+        println!("Added: {}", added.join(", "));
+    }
+    if !removed.is_empty() {
+        println!("Removed: {}", removed.join(", "));
+    }
+    if added.is_empty() && removed.is_empty() {
+        println!("No plugin bundle changes detected.");
+    }
 }
 
 fn load_commands(commands_dir: &std::path::Path) -> Vec<PluginCommand> {
@@ -181,6 +242,7 @@ mod tests {
             let commands = load_commands(&path.join("commands"));
             plugins.push(Plugin {
                 name,
+                version: "-".to_string(),
                 root: path,
                 commands,
             });

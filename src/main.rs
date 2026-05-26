@@ -133,6 +133,30 @@ async fn main() -> Result<()> {
                     arg.trim_start_matches("--prompt=").to_string(),
                 );
             }
+            "plugins" => {
+                let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: plugins requires one of: list, reload.");
+                    std::process::exit(2);
+                };
+                if argv.get(i + 2).is_some() {
+                    eprintln!("cubi: plugins {subcommand} does not accept extra arguments.");
+                    std::process::exit(2);
+                }
+                match subcommand {
+                    "list" => {
+                        set_primary(&mut primary, PrimaryCommand::PluginsList);
+                        i += 1;
+                    }
+                    "reload" => {
+                        set_primary(&mut primary, PrimaryCommand::PluginsReload);
+                        i += 1;
+                    }
+                    _ => {
+                        eprintln!("cubi: plugins requires one of: list, reload.");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
                     eprintln!(
@@ -210,6 +234,18 @@ async fn main() -> Result<()> {
         }
         PrimaryCommand::DeleteSession(id) => {
             delete_session(id)?;
+            return Ok(());
+        }
+        PrimaryCommand::PluginsList => {
+            let plugins = plugins::load_plugins();
+            plugins::print_plugin_list(&plugins);
+            return Ok(());
+        }
+        PrimaryCommand::PluginsReload => {
+            let before = plugins::load_plugins();
+            let skills = skills::load_skills();
+            let after = plugins::load_plugins();
+            plugins::print_reload_summary(&before, &after, skills.len());
             return Ok(());
         }
         PrimaryCommand::Interactive | PrimaryCommand::Resume(_) => {}
@@ -512,6 +548,8 @@ enum PrimaryCommand {
     Resume(String),
     ListSessions,
     DeleteSession(String),
+    PluginsList,
+    PluginsReload,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -550,6 +588,8 @@ fn print_help() {
          cubi --list-sessions         List saved sessions newest-first\n  \
          cubi --list-sessions --json  List saved sessions as a JSON array\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi plugins list            List discovered plugin bundles\n  \
+         cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\
