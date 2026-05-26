@@ -466,7 +466,11 @@ mod tests {
     fn path_to_file_uri_emits_absolute_form() {
         let cwd = std::env::current_dir().unwrap();
         let uri = path_to_file_uri(&cwd);
-        assert!(uri.starts_with("file:///"), "got: {uri}");
+        if cfg!(windows) {
+            assert!(uri.starts_with("file://"), "got: {uri}");
+        } else {
+            assert!(uri.starts_with("file:///"), "got: {uri}");
+        }
     }
 
     #[test]

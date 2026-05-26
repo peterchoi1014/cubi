@@ -14,16 +14,30 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: build · test · clippy · fmt
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85, with clippy and rustfmt)
+      - name: Install Rust toolchain (1.85, with rustfmt)
         uses: dtolnay/rust-toolchain@1.85
         with:
-          components: clippy,rustfmt
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85, with clippy)
+        uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: clippy
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -32,52 +46,84 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
             ${{ runner.os }}-cargo-
 
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85)
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
 
       - name: cargo build
         run: cargo build --all-targets --locked
 
       - name: smoke-test --version / --help / unknown flag
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $bin = if ($IsWindows) { "target/debug/cubi.exe" } else { "target/debug/cubi" }
+          $pkgVer = (cargo pkgid --offline) -replace '^.*[#@]', ''
+
+          $out = & $bin --version
+          Write-Output $out
+          if ($out -ne "cubi $pkgVer") {
+            Write-Error "expected: cubi $pkgVer"
+            exit 1
+          }
+
+          $help = & $bin --help
+          if (($help -join "`n") -notmatch "USAGE:") {
+            Write-Error "--help missing USAGE section"
+            exit 1
+          }
+
+          & $bin --definitely-not-a-flag
+          if ($LASTEXITCODE -ne 2) {
+            Write-Error "unknown flag should exit 2, got $LASTEXITCODE"
+            exit 1
+          }
+          exit 0
+
+      - name: smoke-test completions
+        if: runner.os != 'Windows'
         run: |
           set -e
           BIN=target/debug/cubi
-
-          # --version: must start with "cubi " followed by the Cargo
-          # version. We use grep -F so pre-release/build metadata (e.g.
-          # "0.3.0-alpha.1+build7") flows through unmodified.
-          pkg_ver="$(cargo pkgid --offline | awk -F'[#@]' '{print $NF}')"
-          out="$("$BIN" --version)"
-          echo "$out"
-          echo "$out" | grep -Fxq "cubi $pkg_ver" \
-            || { echo "expected: cubi $pkg_ver"; exit 1; }
-
-          "$BIN" --help | grep -q "USAGE:" || { echo "--help missing USAGE section"; exit 1; }
-
-          # Unknown flag must exit with status 2 specifically — not just
-          # any non-zero — so we don't silently regress to e.g. 1.
-          set +e
-          "$BIN" --definitely-not-a-flag
-          status=$?
-          set -e
-          if [ "$status" -ne 2 ]; then
-            echo "unknown flag should exit 2, got $status"; exit 1
-          fi
 
           # completions: each supported shell must exit 0 and emit a
           # non-empty script containing the binary name. An unknown shell
           # must exit with status 2.
           for shell in bash zsh fish; do
-            out="$("$BIN" completions "$shell")"
+            out="$($BIN completions "$shell")"
             if [ -z "$out" ]; then
               echo "completions $shell produced empty output"; exit 1
             fi
-            echo "$out" | grep -q "cubi" \
-              || { echo "completions $shell missing 'cubi' reference"; exit 1; }
+            echo "$out" | grep -q "cubi"               || { echo "completions $shell missing 'cubi' reference"; exit 1; }
           done
           set +e
           "$BIN" completions tcsh
@@ -89,6 +135,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets --locked
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
