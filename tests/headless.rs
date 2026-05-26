@@ -257,7 +257,8 @@ fn headless_json_reports_tool_timeout() {
         )
         .args(["--json", "--no-stream", "-p", "run slow shell"])
         .assert()
-        .success()
+        .failure()
+        .code(11)
         .get_output()
         .stdout
         .clone();

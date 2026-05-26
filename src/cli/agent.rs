@@ -129,7 +129,7 @@ impl ChatCLI {
                                     "secs": timeout.secs,
                                 }),
                             );
-                            format!("[{timeout}]")
+                            format!("[tool error] {timeout}")
                         } else {
                             format!("[tool error] {e}")
                         }

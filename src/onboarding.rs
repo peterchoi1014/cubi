@@ -64,6 +64,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub telemetry: bool,
     /// Default wall-clock timeout for model-requested tool execution.
+    ///
+    /// * `Some(n)` where `n > 0`: wrap each tool call in `n` seconds.
+    /// * `Some(0)` or `None`: no wall-clock timeout (tools run until they
+    ///   complete or the user cancels). `None` is the implicit default
+    ///   for configs written before this field existed; `Some(0)` is the
+    ///   explicit opt-out.
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: Option<u64>,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
