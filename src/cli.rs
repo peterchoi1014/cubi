@@ -9,7 +9,7 @@ use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
 use crate::oauth;
-use crate::ollama::{ChatStats, Message};
+use crate::ollama::{ChatStats, Message, ToolCall};
 use crate::onboarding::AppConfig;
 use crate::output_styles;
 use crate::permissions::Permissions;
@@ -91,6 +91,8 @@ pub struct ChatCLI {
     /// Cumulative provider-reported usage for *this run* (does not persist
     /// across `/resume`). Surfaced by `/stats`.
     session_stats: ChatStats,
+    /// Suppresses REPL-only decoration so one-shot output remains pipeable.
+    headless_mode: bool,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -163,6 +165,7 @@ impl ChatCLI {
             markdown_enabled: flags.markdown,
             stats_footer_enabled: flags.stats_footer,
             session_stats: ChatStats::default(),
+            headless_mode: false,
         };
 
         // Auto-inject project memory (CUBI.md) into context, if present.
@@ -331,6 +334,21 @@ impl ChatCLI {
         }
 
         Ok(())
+    }
+
+    /// Runs a single prompt without the welcome banner or rustyline REPL.
+    /// Human-facing progress stays on stderr; only model reply tokens/content
+    /// are written to stdout so callers can pipe the result.
+    pub async fn run_one_shot(&mut self, prompt: &str) -> Result<()> {
+        self.headless_mode = true;
+        self.hooks.fire_session_start(self.executor.get_model());
+        let expanded = file_mentions::expand_file_mentions(prompt);
+        let turn_start = self.history.len();
+        self.history.push(Message::text("user", expanded));
+        self.journal.start_turn();
+        let result = self.agent_turn(turn_start).await;
+        self.hooks.fire_stop();
+        result
     }
 
     /// Tries to match a `/command` against user-defined and plugin Markdown
@@ -2100,7 +2118,7 @@ impl ChatCLI {
         };
         let target = args.trim();
         let loaded = if target.is_empty() {
-            store.latest()
+            store.latest_for_current_dir_preferred()
         } else {
             store.load(target)
         };
@@ -3242,6 +3260,13 @@ impl ChatCLI {
         if trusted || self.approved_tools.contains(tool_name) {
             return true;
         }
+        if self.headless_mode {
+            eprintln!(
+                "⚠ Tool `{}` wants to run; denying in headless mode.",
+                tool_name
+            );
+            return false;
+        }
 
         use std::io::{self, Write};
         print!(
@@ -3260,6 +3285,107 @@ impl ChatCLI {
                 true
             }
             _ => false,
+        }
+    }
+
+    async fn execute_tool_call(&mut self, call: &ToolCall) -> String {
+        // Fire PreToolUse hook — may deny the call.
+        use crate::hooks::HookDecision;
+        let hook_decision = self
+            .hooks
+            .fire_pre_tool_use(&call.function.name, &call.function.arguments);
+
+        if let HookDecision::Deny(reason) = hook_decision {
+            let msg = format!(
+                "  {} {}",
+                "✗".bright_red(),
+                "denied by PreToolUse hook".bright_red()
+            );
+            if self.headless_mode {
+                eprintln!("{msg}");
+            } else {
+                println!("{msg}");
+            }
+            format!("[tool denied] {reason}")
+        } else if self.policy.is_denied(&call.function.name) {
+            format!(
+                "[tool denied] `{}` is blocked by admin policy",
+                call.function.name
+            )
+        } else if !self
+            .permissions
+            .lock()
+            .unwrap()
+            .check_tool_allowed(&call.function.name)
+        {
+            format!(
+                "[tool denied] `{}` is blocked by your tool permissions",
+                call.function.name
+            )
+        } else if !self.prompt_tool_approval(&call.function.name) {
+            format!(
+                "[tool denied] user declined approval for `{}`",
+                call.function.name
+            )
+        } else if call.function.name == AGENT_TOOL_NAME {
+            // Meta-tool: spawn a focused subagent with fresh context. Handled
+            // here (not in `McpManager`) because it needs the executor to
+            // drive its own inner loop.
+            let goal = call.function.arguments["goal"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let max_steps = call.function.arguments["max_steps"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(SUBAGENT_DEFAULT_STEPS);
+            if goal.is_empty() {
+                "[tool error] `agent_run` requires a non-empty `goal`".to_string()
+            } else {
+                let start_msg = format!(
+                    "  {} subagent goal: {}",
+                    "↳".bright_magenta(),
+                    goal.chars().take(120).collect::<String>().bright_white()
+                );
+                if self.headless_mode {
+                    eprintln!("{start_msg}");
+                } else {
+                    println!("{start_msg}");
+                }
+                match agent_loop::run_subagent(
+                    &self.executor,
+                    &mut self.mcp_manager,
+                    &goal,
+                    max_steps,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        let done_msg = format!("  {} subagent done", "↳".bright_magenta());
+                        if self.headless_mode {
+                            eprintln!("{done_msg}");
+                        } else {
+                            println!("{done_msg}");
+                        }
+                        report
+                    }
+                    Err(e) => format!("[tool error] subagent failed: {e}"),
+                }
+            }
+        } else {
+            match self.mcp_manager.as_mut() {
+                Some(mcp) => match mcp
+                    .call_tool(&call.function.name, call.function.arguments.clone())
+                    .await
+                {
+                    Ok(r) => agent_loop::render_tool_result(&r),
+                    Err(e) => format!("[tool error] {e}"),
+                },
+                None => format!(
+                    "[tool error] no MCP manager available to execute `{}`",
+                    call.function.name
+                ),
+            }
         }
     }
 
@@ -3295,6 +3421,7 @@ impl ChatCLI {
         // Per-turn provider-usage accumulator. Summed into `session_stats`
         // at the very end so cancelled or errored turns don't pollute totals.
         let mut turn_stats = ChatStats::default();
+        let headless_mode = self.headless_mode;
 
         // Snapshot the journal start so /rewind still works after Ctrl-C
         // cancel: we leave file edits in place but pop the history.
@@ -3328,8 +3455,8 @@ impl ChatCLI {
 
             // Either stream tokens (default) or run buffered chat_with_tools
             // when the user has /stream off (markdown mode is buffered-only).
-            // Cancellation: SIGINT (Ctrl-C) interrupts only the in-flight
-            // model call; in-flight tool execution is NOT yet interruptible.
+            // Cancellation: SIGINT (Ctrl-C) interrupts the in-flight model
+            // call; tool dispatch below is also cancellable between awaits.
             let outcome: Option<Result<(Message, ChatStats)>> = if self.stream_enabled {
                 let stream_fut =
                     self.executor
@@ -3337,12 +3464,16 @@ impl ChatCLI {
                             if !got_token {
                                 stop_flag.store(true, Ordering::SeqCst);
                                 spinner_ref.clear_line();
-                                if !printed_prefix {
+                                if !printed_prefix && !headless_mode {
                                     print!("{} ", "AI:".bright_blue().bold());
                                     printed_prefix = true;
                                 }
                             }
-                            print!("{}", tok.bright_white());
+                            if headless_mode {
+                                print!("{}", tok);
+                            } else {
+                                print!("{}", tok.bright_white());
+                            }
                             let _ = std::io::stdout().flush();
                             got_token = true;
                         });
@@ -3375,13 +3506,22 @@ impl ChatCLI {
                     // Move past any partial output.
                     println!();
                 }
-                println!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
+                if headless_mode {
+                    eprintln!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
+                } else {
+                    println!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
+                }
                 if step > 0 {
-                    println!(
+                    let msg = format!(
                         "  {} prior tool side-effects in this turn may have run; \
                          `/rewind` can undo file edits.",
                         "ℹ".bright_blue()
                     );
+                    if headless_mode {
+                        eprintln!("{msg}");
+                    } else {
+                        println!("{msg}");
+                    }
                 }
                 // Drop the journal bucket that `run()` opened for this
                 // turn if no tools have actually snapshotted anything yet,
@@ -3409,14 +3549,33 @@ impl ChatCLI {
             self.history.push(msg);
 
             if calls.is_empty() {
-                // Plain text response: we're done with this turn.
+                // Plain text response: we're done with this turn. Some
+                // providers put the completed message only in the final chunk;
+                // print it here if the streaming callback saw no tokens.
+                if self.stream_enabled && !got_token && !msg_content.is_empty() {
+                    if headless_mode {
+                        println!("{msg_content}");
+                    } else {
+                        print!("{} ", "AI:".bright_blue().bold());
+                        println!("{}", msg_content.bright_white());
+                    }
+                    any_output = true;
+                }
                 if !self.stream_enabled && !msg_content.is_empty() {
                     // Buffered mode: render the message now. Markdown if
                     // enabled, otherwise plain text.
                     self.render_final_reply(&msg_content);
                     any_output = true;
                 }
-                if any_output {
+                if any_output && headless_mode {
+                    // Streaming prints tokens via `print!` with no
+                    // trailing newline; emit exactly one for piping.
+                    // The buffered and stream-fallback paths above
+                    // already used `println!`, so don't double-up.
+                    if got_token {
+                        println!();
+                    }
+                } else if any_output {
                     println!("\n");
                 }
                 break;
@@ -3429,96 +3588,35 @@ impl ChatCLI {
                 println!();
             }
 
-            for call in calls {
-                println!(
-                    "{} {} {}",
-                    "⚙".bright_blue(),
-                    "tool:".bright_blue(),
-                    call.function.name.bright_cyan()
-                );
-
-                // Fire PreToolUse hook — may deny the call.
-                use crate::hooks::HookDecision;
-                let hook_decision = self
-                    .hooks
-                    .fire_pre_tool_use(&call.function.name, &call.function.arguments);
-
-                let result_text = if let HookDecision::Deny(reason) = hook_decision {
-                    println!(
-                        "  {} {}",
-                        "✗".bright_red(),
-                        "denied by PreToolUse hook".bright_red()
+            for (idx, call) in calls.iter().enumerate() {
+                if self.headless_mode {
+                    eprintln!(
+                        "{} {} {}",
+                        "⚙".bright_blue(),
+                        "tool:".bright_blue(),
+                        call.function.name.bright_cyan()
                     );
-                    format!("[tool denied] {reason}")
-                } else if self.policy.is_denied(&call.function.name) {
-                    format!(
-                        "[tool denied] `{}` is blocked by admin policy",
-                        call.function.name
-                    )
-                } else if !self
-                    .permissions
-                    .lock()
-                    .unwrap()
-                    .check_tool_allowed(&call.function.name)
-                {
-                    format!(
-                        "[tool denied] `{}` is blocked by your tool permissions",
-                        call.function.name
-                    )
-                } else if !self.prompt_tool_approval(&call.function.name) {
-                    format!(
-                        "[tool denied] user declined approval for `{}`",
-                        call.function.name
-                    )
-                } else if call.function.name == AGENT_TOOL_NAME {
-                    // Meta-tool: spawn a focused subagent with fresh
-                    // context. Handled here (not in `McpManager`) because
-                    // it needs the executor to drive its own inner loop.
-                    let goal = call.function.arguments["goal"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let max_steps = call.function.arguments["max_steps"]
-                        .as_u64()
-                        .map(|n| n as usize)
-                        .unwrap_or(SUBAGENT_DEFAULT_STEPS);
-                    if goal.is_empty() {
-                        "[tool error] `agent_run` requires a non-empty `goal`".to_string()
-                    } else {
-                        println!(
-                            "  {} subagent goal: {}",
-                            "↳".bright_magenta(),
-                            goal.chars().take(120).collect::<String>().bright_white()
-                        );
-                        match agent_loop::run_subagent(
-                            &self.executor,
-                            &mut self.mcp_manager,
-                            &goal,
-                            max_steps,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                println!("  {} subagent done", "↳".bright_magenta());
-                                report
-                            }
-                            Err(e) => format!("[tool error] subagent failed: {e}"),
-                        }
-                    }
                 } else {
-                    match self.mcp_manager.as_mut() {
-                        Some(mcp) => match mcp
-                            .call_tool(&call.function.name, call.function.arguments.clone())
-                            .await
-                        {
-                            Ok(r) => agent_loop::render_tool_result(&r),
-                            Err(e) => format!("[tool error] {e}"),
-                        },
-                        None => format!(
-                            "[tool error] no MCP manager available to execute `{}`",
-                            call.function.name
-                        ),
+                    println!(
+                        "{} {} {}",
+                        "⚙".bright_blue(),
+                        "tool:".bright_blue(),
+                        call.function.name.bright_cyan()
+                    );
+                }
+
+                let result_text = {
+                    let tool_fut = self.execute_tool_call(call);
+                    tokio::pin!(tool_fut);
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        r = &mut tool_fut => Some(r),
                     }
+                };
+                let Some(result_text) = result_text else {
+                    self.cancel_tool_calls(turn_start, &calls, idx);
+                    return Ok(());
                 };
 
                 // Fire PostToolUse hook.
@@ -3535,7 +3633,11 @@ impl ChatCLI {
                 } else {
                     ""
                 };
-                println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
+                if self.headless_mode {
+                    eprintln!("  {}{}", preview.bright_black(), ellipsis.bright_black());
+                } else {
+                    println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
+                }
 
                 self.history
                     .push(Message::tool_result(&call.function.name, result_text));
@@ -3576,10 +3678,51 @@ impl ChatCLI {
         Ok(())
     }
 
+    fn cancel_tool_calls(&mut self, turn_start: usize, _calls: &[ToolCall], current_idx: usize) {
+        let msg = format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
+        if self.headless_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+        // History is truncated back to `turn_start` to discard the in-flight
+        // turn, so we deliberately do not push "[tool cancelled]" markers —
+        // they would be dropped immediately by the truncate below.
+        self.history.truncate(turn_start);
+        self.journal.discard_last_turn_if_empty();
+        let caveat = format!(
+            "  {} tool future was dropped; subprocesses started by shell-out tools may keep running.",
+            "ℹ".bright_blue()
+        );
+        if self.headless_mode {
+            eprintln!("{caveat}");
+        } else {
+            println!("{caveat}");
+        }
+        // Mirror the model-cancel path: warn that earlier tools in this
+        // same turn may have already mutated state, and point at `/rewind`.
+        if current_idx > 0 {
+            let rewind = format!(
+                "  {} prior tool side-effects in this turn may have run; \
+                 `/rewind` can undo file edits.",
+                "ℹ".bright_blue()
+            );
+            if self.headless_mode {
+                eprintln!("{rewind}");
+            } else {
+                println!("{rewind}");
+            }
+        }
+    }
+
     /// Renders the model's final reply when streaming is off. Uses termimad
     /// for markdown when enabled and the terminal supports it; falls back to
     /// the same colored plain-text the streaming path produces.
     fn render_final_reply(&self, content: &str) {
+        if self.headless_mode {
+            println!("{content}");
+            return;
+        }
         print!("{} ", "AI:".bright_blue().bold());
         if self.markdown_enabled && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
             // termimad prints with its own trailing newline; we leave the
