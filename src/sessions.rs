@@ -322,23 +322,39 @@ impl SessionStore {
         load_from_path(&meta.path).map(Some)
     }
 
-    /// Deletes a session by full id or unique prefix. Returns matching
-    /// candidates when the prefix is missing or ambiguous.
-    pub fn delete_by_prefix(prefix: &str) -> Result<DeleteSessionResult> {
+    /// Resolves a session by full id or unique prefix without deleting it.
+    pub fn find_by_prefix(prefix: &str) -> Result<FindSessionResult> {
         let matches: Vec<SessionMeta> = Self::list_all()?
             .into_iter()
             .filter(|m| m.id == prefix || m.id.starts_with(prefix))
             .collect();
         match matches.as_slice() {
-            [] => Ok(DeleteSessionResult::NotFound),
-            [meta] => {
-                fs::remove_file(&meta.path)
-                    .with_context(|| format!("Failed to delete {}", meta.path.display()))?;
-                Ok(DeleteSessionResult::Deleted(meta.clone()))
-            }
-            _ => Ok(DeleteSessionResult::Ambiguous(matches)),
+            [] => Ok(FindSessionResult::NotFound),
+            [meta] => Ok(FindSessionResult::Found(meta.clone())),
+            _ => Ok(FindSessionResult::Ambiguous(matches)),
         }
     }
+
+    /// Deletes a session by full id or unique prefix. Returns matching
+    /// candidates when the prefix is missing or ambiguous.
+    pub fn delete_by_prefix(prefix: &str) -> Result<DeleteSessionResult> {
+        match Self::find_by_prefix(prefix)? {
+            FindSessionResult::Found(meta) => {
+                fs::remove_file(&meta.path)
+                    .with_context(|| format!("Failed to delete {}", meta.path.display()))?;
+                Ok(DeleteSessionResult::Deleted(meta))
+            }
+            FindSessionResult::NotFound => Ok(DeleteSessionResult::NotFound),
+            FindSessionResult::Ambiguous(matches) => Ok(DeleteSessionResult::Ambiguous(matches)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FindSessionResult {
+    Found(SessionMeta),
+    NotFound,
+    Ambiguous(Vec<SessionMeta>),
 }
 
 #[derive(Debug, Clone)]
