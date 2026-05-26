@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
             }
@@ -257,6 +258,10 @@ async fn main() -> Result<()> {
             if !ok {
                 std::process::exit(2);
             }
+            return Ok(());
+        }
+        PrimaryCommand::PrintConfig => {
+            print_config()?;
             return Ok(());
         }
         PrimaryCommand::ListSessions => {
@@ -607,6 +612,7 @@ enum PrimaryCommand {
     PluginsReload,
     PruneSessions,
     Doctor,
+    PrintConfig,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -651,6 +657,7 @@ fn print_help() {
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
          cubi doctor --json           Same, machine-readable JSON output\n  \
+         cubi --print-config          Print the resolved config as JSON and exit\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\
@@ -674,6 +681,45 @@ fn print_help() {
          Once inside the REPL, type /help to list slash commands.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn print_config() -> Result<()> {
+    let config = AppConfig::load();
+    let mut value = serde_json::to_value(&config)?;
+    redact_secrets(&mut value);
+    if let Some(obj) = value.as_object_mut() {
+        let path = AppConfig::storage_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        obj.insert("_config_path".to_string(), serde_json::Value::String(path));
+        obj.insert(
+            "_resolved_model".to_string(),
+            serde_json::Value::String(onboarding::resolve_model(&config, DEFAULT_MODEL)),
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn redact_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                let lower = k.to_ascii_lowercase();
+                if lower.contains("key") || lower.contains("token") || lower.contains("secret") {
+                    *v = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_secrets(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_secrets(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn print_sessions(json: bool) -> Result<()> {
@@ -811,4 +857,28 @@ fn format_mtime(secs: u64) -> String {
 fn format_session_time(secs: u64) -> String {
     let (y, m, d, hour, minute, _) = crate::sessions::civil_from_unix(secs);
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_secrets;
+    use serde_json::json;
+
+    #[test]
+    fn redact_replaces_key_token_secret_fields() {
+        let mut v = json!({
+            "default_model": "qwen3:4b",
+            "api_key": "abc",
+            "auth_token": "xyz",
+            "my_secret": "shh",
+            "nested": { "inner_key": "val", "ok": "fine" }
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["default_model"], "qwen3:4b");
+        assert_eq!(v["api_key"], "<redacted>");
+        assert_eq!(v["auth_token"], "<redacted>");
+        assert_eq!(v["my_secret"], "<redacted>");
+        assert_eq!(v["nested"]["inner_key"], "<redacted>");
+        assert_eq!(v["nested"]["ok"], "fine");
+    }
 }
