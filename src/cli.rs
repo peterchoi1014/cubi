@@ -431,23 +431,16 @@ impl ChatCLI {
 
     async fn handle_command(&mut self, input: &str) -> Result<bool> {
         let Some((cmd, args)) = commands::parse(input) else {
-            // Extract the typed `/foo` head so we can show useful
-            // candidates when the user typed an ambiguous prefix.
             let head = input.split_whitespace().next().unwrap_or(input);
-            let candidates = commands::prefix_matches(head);
-            if candidates.len() > 1 {
-                println!(
-                    "{} {} matches multiple commands:",
-                    "Ambiguous:".bright_yellow(),
-                    head.bright_cyan()
-                );
+            let candidates = commands::suggestions(head);
+            println!("{} {}", "Unknown command:".bright_red(), head);
+            if candidates.is_empty() {
+                println!("Type {} for available commands", "/help".bright_cyan());
+            } else {
+                println!("Did you mean?");
                 for name in &candidates {
                     println!("  {}", name.bright_cyan());
                 }
-                println!("Type more characters to disambiguate.");
-            } else {
-                println!("{} {}", "Unknown command:".bright_red(), input);
-                println!("Type {} for available commands", "/help".bright_cyan());
             }
             return Ok(true);
         };
