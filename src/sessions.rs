@@ -386,6 +386,19 @@ fn scan_all_sessions() -> Result<Vec<SessionMeta>> {
 impl SessionStore {
     /// Latest session in the current cwd, falling back to global newest.
     pub fn latest_for_current_dir_preferred(&self) -> Result<Option<SessionFile>> {
+        let cwd = self.cwd.display().to_string();
+        if let Ok(index) = load_or_rebuild_index() {
+            if let Some(id) = index.last_used_per_cwd.get(&cwd) {
+                if let Some(entry) = index
+                    .sessions
+                    .iter()
+                    .find(|entry| &entry.id == id && entry.path.exists())
+                {
+                    return load_from_path(&entry.path).map(Some);
+                }
+            }
+        }
+
         // Fast path: the per-cwd bucket already lives on disk under
         // `self.dir`, so `self.latest()` only reads checkpoints for the
         // current project. Avoid scanning every bucket under
@@ -849,10 +862,51 @@ mod tests {
         store.save(&session).unwrap();
         fs::write(store.dir.join(format!("{}.json", session.id)), "not json").unwrap();
 
+        let index = load_or_rebuild_index().unwrap();
+        assert_eq!(
+            index.last_used_per_cwd.get(&cwd.display().to_string()),
+            Some(&session.id)
+        );
+
         let list = store.list().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, session.id);
         assert_eq!(list[0].preview, "indexed preview");
+        restore_home(old_home, old_userprofile);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resume_prefers_last_used_session_for_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("last-used");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let store = SessionStore::for_cwd(&cwd).unwrap();
+
+        let mut first = store.new_session("m".into());
+        first.id = "20250101-000000-0001".into();
+        first.history.push(user("first"));
+        store.save(&first).unwrap();
+        let mut second = store.new_session("m".into());
+        second.id = "20250101-000001-0001".into();
+        second.history.push(user("second"));
+        store.save(&second).unwrap();
+
+        let mut index = load_or_rebuild_index().unwrap();
+        index
+            .last_used_per_cwd
+            .insert(cwd.display().to_string(), first.id.clone());
+        write_index(&index).unwrap();
+
+        let resumed = store.latest_for_current_dir_preferred().unwrap().unwrap();
+        assert_eq!(resumed.id, first.id);
         restore_home(old_home, old_userprofile);
         fs::remove_dir_all(&home).ok();
     }
