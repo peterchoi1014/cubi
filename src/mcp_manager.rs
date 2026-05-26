@@ -245,8 +245,12 @@ impl McpManager {
 
         let mut arguments = arguments;
         let override_timeout = strip_timeout_override(&mut arguments);
-        let timeout_secs = override_timeout.or(self.tool_timeout_secs).unwrap_or(60);
-        let timeout_duration = Duration::from_secs(timeout_secs);
+        // `None` (or `Some(0)`) explicitly disables the wall-clock timeout
+        // and lets the tool run to completion; anything > 0 wraps the
+        // call with `tokio::time::timeout` and surfaces ToolTimeoutError
+        // on expiry.
+        let configured = override_timeout.or(self.tool_timeout_secs);
+        let timeout_secs: Option<u64> = configured.filter(|&n| n > 0);
 
         // Time the call so the opt-in telemetry log has useful numbers.
         let started = std::time::Instant::now();
@@ -254,25 +258,28 @@ impl McpManager {
 
         // Handle built-in tools
         if server_name == "builtin" {
-            let result = tokio::time::timeout(
-                timeout_duration,
-                self.builtin_tools.execute(name, arguments),
-            )
-            .await;
-            let result = match result {
-                Ok(result) => result,
-                Err(_) => {
-                    crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
-                        tool: name,
-                        ok: false,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                    return Err(ToolTimeoutError {
-                        name: name.to_string(),
-                        secs: timeout_secs,
+            let result = match timeout_secs {
+                Some(secs) => match tokio::time::timeout(
+                    Duration::from_secs(secs),
+                    self.builtin_tools.execute(name, arguments),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+                            tool: name,
+                            ok: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        });
+                        return Err(ToolTimeoutError {
+                            name: name.to_string(),
+                            secs,
+                        }
+                        .into());
                     }
-                    .into());
-                }
+                },
+                None => self.builtin_tools.execute(name, arguments).await,
             };
             crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
                 tool: name,
@@ -302,22 +309,28 @@ impl McpManager {
             .get_mut(&server_name)
             .context(format!("Server '{}' not connected", server_name))?;
 
-        let result =
-            tokio::time::timeout(timeout_duration, client.call_tool(name, arguments)).await;
-        let result = match result {
-            Ok(result) => result,
-            Err(_) => {
-                crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
-                    tool: name,
-                    ok: false,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                });
-                return Err(ToolTimeoutError {
-                    name: name.to_string(),
-                    secs: timeout_secs,
+        let result = match timeout_secs {
+            Some(secs) => match tokio::time::timeout(
+                Duration::from_secs(secs),
+                client.call_tool(name, arguments),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+                        tool: name,
+                        ok: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
+                    return Err(ToolTimeoutError {
+                        name: name.to_string(),
+                        secs,
+                    }
+                    .into());
                 }
-                .into());
-            }
+            },
+            None => client.call_tool(name, arguments).await,
         };
         crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
             tool: name,
