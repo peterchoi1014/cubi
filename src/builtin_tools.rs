@@ -515,7 +515,7 @@ impl BuiltinToolRegistry {
         let mut result = String::new();
 
         if recursive {
-            self.list_files_recursive(Path::new(path), &mut result, 0)?;
+            Self::list_files_recursive(Path::new(path), &mut result, 0)?;
         } else {
             self.list_files_single(Path::new(path), &mut result)?;
         }
@@ -540,7 +540,7 @@ impl BuiltinToolRegistry {
         Ok(())
     }
 
-    fn list_files_recursive(&self, path: &Path, result: &mut String, depth: usize) -> Result<()> {
+    fn list_files_recursive(path: &Path, result: &mut String, depth: usize) -> Result<()> {
         let entries =
             fs::read_dir(path).context(format!("Failed to read directory: {:?}", path))?;
 
@@ -553,7 +553,7 @@ impl BuiltinToolRegistry {
 
             if metadata.is_dir() {
                 result.push_str(&format!("{}📁 {}/\n", indent, name));
-                self.list_files_recursive(&entry.path(), result, depth + 1)?;
+                Self::list_files_recursive(&entry.path(), result, depth + 1)?;
             } else {
                 let size = metadata.len();
                 result.push_str(&format!("{}📄 {} ({} bytes)\n", indent, name, size));
@@ -3189,6 +3189,7 @@ mod tests {
 
     // ---- REPL tool ----
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn repl_full_lifecycle_preserves_state_across_evals() {
         let registry = registry_trusting_cwd(false);
@@ -3266,6 +3267,7 @@ mod tests {
         assert!(r.content[0].text.contains("No REPL session"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn repl_eval_captures_stderr_in_band() {
         // Reviewer concern: stderr was being silently drained. After the
