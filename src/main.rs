@@ -5,6 +5,7 @@ mod commands;
 mod compat;
 mod completer;
 mod completions;
+mod doctor;
 mod executor;
 mod exit_code;
 mod file_mentions;
@@ -159,6 +160,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            "doctor" => {
+                set_primary(&mut primary, PrimaryCommand::Doctor);
+            }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
                     eprintln!(
@@ -248,6 +252,13 @@ async fn main() -> Result<()> {
     }
 
     match &primary {
+        PrimaryCommand::Doctor => {
+            let ok = doctor::run(cli_flags.json).await;
+            if !ok {
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
         PrimaryCommand::ListSessions => {
             print_sessions(cli_flags.json)?;
             return Ok(());
@@ -595,6 +606,7 @@ enum PrimaryCommand {
     PluginsList,
     PluginsReload,
     PruneSessions,
+    Doctor,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -637,6 +649,8 @@ fn print_help() {
                                      Delete old session files (30d, 2w, 6m, 1y)\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
+         cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
+         cubi doctor --json           Same, machine-readable JSON output\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\

@@ -267,3 +267,31 @@ fn headless_json_reports_tool_timeout() {
     assert!(stdout.contains(r#""name":"bash""#));
     assert!(stdout.contains(r#""secs":1"#));
 }
+
+#[test]
+fn doctor_json_emits_check_array() {
+    let home = tempdir().unwrap();
+    let output = cubi(home.path())
+        .args(["doctor", "--json"])
+        // Doctor still calls the model host check; let it fail fast on a
+        // bogus URL so the test never depends on network.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json should emit valid JSON");
+    assert!(parsed["checks"].is_array(), "checks should be an array");
+    assert!(parsed["ok"].is_boolean(), "ok should be a boolean");
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert!(names.contains(&"config"));
+    assert!(names.contains(&"sessions_dir"));
+    assert!(names.contains(&"plugins"));
+}
