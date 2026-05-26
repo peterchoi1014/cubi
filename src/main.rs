@@ -37,9 +37,9 @@ mod themes;
 mod tips;
 mod todos;
 
+use crate::style::CubiStyle;
 use anyhow::{Context, Result};
 use cli::ChatCLI;
-use colored::*;
 use executor::AIExecutor;
 use mcp_manager::McpManager;
 use onboarding::AppConfig;

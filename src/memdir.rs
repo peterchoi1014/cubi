@@ -133,7 +133,7 @@ impl Memdir {
 
     /// Renders the memory list to stdout.
     pub fn render(&self) {
-        use colored::*;
+        use crate::style::CubiStyle;
         if self.memories.is_empty() {
             println!(
                 "{}",

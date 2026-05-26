@@ -9,7 +9,7 @@
 //!
 //! No-ops when stderr is not a TTY (CI, piped output) so logs stay quiet.
 
-use colored::*;
+use crate::style::CubiStyle;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
