@@ -497,10 +497,10 @@ fn render_prompt_messages(result: &serde_json::Value) -> String {
             }
         }
     }
-    if out.is_empty()
-        && let Some(text) = result["description"].as_str()
-    {
-        out.push_str(text);
+    if out.is_empty() {
+        if let Some(text) = result["description"].as_str() {
+            out.push_str(text);
+        }
     }
     out
 }

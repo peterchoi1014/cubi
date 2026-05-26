@@ -379,9 +379,10 @@ impl LspReader {
                     );
                 }
             };
-            if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64())
-                && resp_id == id
-            {
+            if let Some(resp_id) = msg.get("id").and_then(|v| v.as_i64()) {
+                if resp_id != id {
+                    continue;
+                }
                 if let Some(err) = msg.get("error") {
                     anyhow::bail!("LSP server returned error: {}", err);
                 }
@@ -465,7 +466,11 @@ mod tests {
     fn path_to_file_uri_emits_absolute_form() {
         let cwd = std::env::current_dir().unwrap();
         let uri = path_to_file_uri(&cwd);
-        assert!(uri.starts_with("file:///"), "got: {uri}");
+        if cfg!(windows) {
+            assert!(uri.starts_with("file://"), "got: {uri}");
+        } else {
+            assert!(uri.starts_with("file:///"), "got: {uri}");
+        }
     }
 
     #[test]

@@ -172,21 +172,22 @@ impl McpManager {
         } else if config.is_http() {
             let url = config.http_url.clone().unwrap();
             let mut headers = config.headers.clone().unwrap_or_default();
-            if let Some(provider) = config.oauth_provider.as_deref()
-                && !headers
+            if let Some(provider) = config.oauth_provider.as_deref() {
+                let has_authorization = headers
                     .keys()
-                    .any(|k| k.eq_ignore_ascii_case("authorization"))
-            {
-                match oauth::bearer_header_for_provider(provider)? {
-                    Some(header) => {
-                        headers.insert("Authorization".to_string(), header);
-                    }
-                    None => {
-                        eprintln!(
-                            "{} No usable OAuth token for MCP provider '{}'; continuing without Authorization header.",
-                            "Warning:".bright_yellow(),
-                            provider
-                        );
+                    .any(|k| k.eq_ignore_ascii_case("authorization"));
+                if !has_authorization {
+                    match oauth::bearer_header_for_provider(provider)? {
+                        Some(header) => {
+                            headers.insert("Authorization".to_string(), header);
+                        }
+                        None => {
+                            eprintln!(
+                                "{} No usable OAuth token for MCP provider '{}'; continuing without Authorization header.",
+                                "Warning:".bright_yellow(),
+                                provider
+                            );
+                        }
                     }
                 }
             }

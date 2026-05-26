@@ -76,10 +76,10 @@ pub fn push(message: &str) -> Result<String> {
     run_git(&["add", "-A"])?;
     // `git commit` exits non-zero with "nothing to commit" when there's
     // no diff. Treat that as success instead of erroring.
-    if let Err(e) = run_git(&["commit", "-m", message])
-        && !format!("{e}").contains("nothing to commit")
-    {
-        return Err(e);
+    if let Err(e) = run_git(&["commit", "-m", message]) {
+        if !format!("{e}").contains("nothing to commit") {
+            return Err(e);
+        }
     }
     run_git(&["push", "-u", "origin", "main"])?;
     Ok("Pushed settings to origin/main".to_string())

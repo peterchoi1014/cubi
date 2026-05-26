@@ -1,0 +1,39 @@
+---
+source: tests/completions_snapshots.rs
+expression: "completion_script(\"zsh\")"
+---
+#compdef cubi
+# cubi zsh completions
+_cubi() {
+    local -a top shells
+    top=(
+        '--version:print version and exit'
+        '-V:print version and exit'
+        '-v:print version and exit'
+        'version:print version and exit'
+        '--help:print help and exit'
+        '-h:print help and exit'
+        'help:print help and exit'
+        '--resume:resume a prior chat'
+        '-r:resume a prior chat'
+        'resume:resume a prior chat'
+        '--stream:stream tokens live'
+        '--no-stream:wait for the full reply'
+        '--markdown:enable markdown rendering'
+        '--no-markdown:disable markdown rendering'
+        '--show-stats-footer:print token and timing stats'
+        'completions:print a shell completion script'
+    )
+    shells=(
+        'bash:Bash completion script'
+        'zsh:Zsh completion script'
+        'fish:Fish completion script'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t cubi-commands 'cubi command' top
+    elif [[ ${words[2]} == completions && CURRENT -eq 3 ]]; then
+        _describe -t shells 'shell' shells
+    fi
+}
+_cubi "$@"

@@ -30,21 +30,21 @@ path = "src/main.rs"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "signal"] }
 
 # HTTP client for Ollama API and MCP
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # JSON handling
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # CLI interaction
-colored = "2.1"
-rustyline = "14.0"
+colored = "3"
+rustyline = "14.0.0"
 
 # Error handling
 anyhow = "1.0"
 
 # For home directory resolution
-dirs = "5.0"
+dirs = "6"
 
 # UUID for request IDs
 uuid = { version = "1.0", features = ["v4", "serde"] }
@@ -54,4 +54,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Markdown renderer for AI replies (non-streaming mode).
 termimad = "0.30"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+insta = "1.47.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
 

@@ -396,9 +396,10 @@ impl ChatCLI {
         //   3. Nothing on disk at all → say nothing; a hint would just
         //      be noise.
         let resume_hint = self.session_store.as_ref().and_then(|store| {
-            if let Some(session) = self.current_session.as_ref()
-                && store.exists(&session.id)
-            {
+            if let Some(session) = self.current_session.as_ref() {
+                if !store.exists(&session.id) {
+                    return None;
+                }
                 Some(format!(
                     "\n{} To pick this chat back up, run {}",
                     "↩".bright_cyan(),
@@ -3151,27 +3152,27 @@ impl ChatCLI {
                     ),
                     Message::text("user", &summary),
                 ];
-                if let Ok(extracted) = self.executor.chat(extract_prompt).await
-                    && extracted.contains("- ")
-                {
-                    let bullets: Vec<_> = extracted
-                        .lines()
-                        .map(str::trim)
-                        .filter_map(|line| line.strip_prefix("- "))
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect();
-                    if !bullets.is_empty() {
-                        for bullet in &bullets {
-                            self.memdir.add(bullet, Some("auto-extracted"));
+                if let Ok(extracted) = self.executor.chat(extract_prompt).await {
+                    if extracted.contains("- ") {
+                        let bullets: Vec<_> = extracted
+                            .lines()
+                            .map(str::trim)
+                            .filter_map(|line| line.strip_prefix("- "))
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .collect();
+                        if !bullets.is_empty() {
+                            for bullet in &bullets {
+                                self.memdir.add(bullet, Some("auto-extracted"));
+                            }
+                            self.persist_memdir();
+                            self.inject_memdir();
+                            println!(
+                                "{} Extracted {} memories to memdir.",
+                                "ℹ".bright_blue(),
+                                bullets.len()
+                            );
                         }
-                        self.persist_memdir();
-                        self.inject_memdir();
-                        println!(
-                            "{} Extracted {} memories to memdir.",
-                            "ℹ".bright_blue(),
-                            bullets.len()
-                        );
                     }
                 }
                 self.checkpoint_session();
