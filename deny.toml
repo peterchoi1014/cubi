@@ -7,6 +7,7 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",
@@ -16,6 +17,7 @@ allow = [
 ]
 confidence-threshold = 0.8
 # TODO: Revisit the BSL-1.0 allowance if rustyline's clipboard dependency changes.
+# TODO: Revisit the CDLA-Permissive-2.0 allowance if reqwest's webpki roots change.
 # TODO: Revisit the Unicode-3.0 allowance if the ICU dependency tree changes.
 # TODO: Keep crate-specific license exceptions here if future dependencies need them.
 exceptions = []
