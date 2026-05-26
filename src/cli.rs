@@ -121,6 +121,46 @@ fn repl_history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".cubi").join("history"))
 }
 
+fn welcome_banner_rows(color: bool) -> Vec<String> {
+    let stylize = |name: &'static str| {
+        if color {
+            name.bright_cyan().to_string()
+        } else {
+            name.to_string()
+        }
+    };
+
+    let mut rows = vec![
+        String::new(),
+        format!(
+            "hi, i'm Cubi — {}",
+            if color {
+                "a pocket-sized AI".bright_white().to_string()
+            } else {
+                "a pocket-sized AI".to_string()
+            }
+        ),
+        format!(
+            "{} · {} to exit · Tab completes slash commands · Ctrl-R searches history",
+            stylize("/help"),
+            stylize("/quit")
+        ),
+        "Commands:".to_string(),
+    ];
+
+    for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
+        rows.push(
+            chunk
+                .iter()
+                .map(|name| stylize(name))
+                .collect::<Vec<_>>()
+                .join("  "),
+        );
+    }
+
+    rows
+}
+
 impl ChatCLI {
     #[allow(dead_code)]
     pub fn new(
@@ -1230,24 +1270,11 @@ impl ChatCLI {
             r#"  └───────┘  "#,
             r#"   ░░░░░░░   "#,
         ];
-        // Fold the essential commands into the mascot's right-hand
-        // column so first-run output fits on one screen. The full
-        // command list is one `/help` away.
-        let tagline = [
-            "".to_string(),
-            format!("hi, i'm Cubi — {}", "a pocket-sized AI".bright_white()),
-            format!(
-                "{} or {} · {} to exit · Tab to autocomplete",
-                "/help".bright_cyan(),
-                "/version".bright_cyan(),
-                "/quit".bright_cyan()
-            ),
-            format!("ask me anything ({} commands available)", COMMANDS.len()),
-            "".to_string(),
-        ];
+        let rows = welcome_banner_rows(true);
         println!();
-        for (m, t) in mascot.iter().zip(tagline.iter()) {
-            println!("{}  {}", m.bright_cyan(), t);
+        for (i, row) in rows.iter().enumerate() {
+            let m = mascot.get(i).copied().unwrap_or("             ");
+            println!("{}  {}", m.bright_cyan(), row);
         }
         println!();
     }
@@ -5060,6 +5087,15 @@ mod tests {
         if let Some(path) = repl_history_path() {
             assert!(path.ends_with(Path::new(".cubi").join("history")));
         }
+    }
+
+    #[test]
+    fn welcome_banner_rows_include_every_command_name() {
+        let banner = welcome_banner_rows(false).join("\n");
+        for name in commands::command_names() {
+            assert!(banner.contains(name), "welcome banner missing {name}");
+        }
+        assert!(!banner.contains("Available Commands:"));
     }
 
     // ---- parse_force_and_filename ----
