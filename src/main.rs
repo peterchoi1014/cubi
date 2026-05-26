@@ -21,6 +21,7 @@ mod migrations;
 mod oauth;
 mod ollama;
 mod onboarding;
+mod out;
 mod output_styles;
 mod permissions;
 pub mod plugins;
@@ -474,11 +475,7 @@ fn set_primary(slot: &mut PrimaryCommand, value: PrimaryCommand) {
 }
 
 fn status_line(headless: bool, msg: impl std::fmt::Display) {
-    if headless {
-        eprintln!("{msg}");
-    } else {
-        println!("{msg}");
-    }
+    out::status_line(headless, msg);
 }
 
 fn print_help() {
