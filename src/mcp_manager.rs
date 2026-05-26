@@ -355,7 +355,7 @@ impl McpManager {
                     Ok(new_client) => {
                         self.clients.insert(server_name.clone(), new_client);
                         let client = self.clients.get_mut(&server_name).expect("just inserted");
-                        match timeout_secs {
+                        let retry_result = match timeout_secs {
                             Some(secs) => match tokio::time::timeout(
                                 Duration::from_secs(secs),
                                 client.call_tool(name, retry_args),
@@ -379,6 +379,18 @@ impl McpManager {
                                 }
                             },
                             None => client.call_tool(name, retry_args).await,
+                        };
+                        match retry_result {
+                            Ok(ok) => Ok(ok),
+                            Err(retry_err) => {
+                                tracing::warn!(
+                                    target: "cubi::mcp",
+                                    server = %server_name,
+                                    retry_error = %retry_err,
+                                    "MCP retry after reconnect failed; surfacing original error"
+                                );
+                                Err(err)
+                            }
                         }
                     }
                     Err(reconnect_err) => {

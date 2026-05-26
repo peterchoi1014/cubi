@@ -501,7 +501,7 @@ pub enum DeleteSessionResult {
 /// the process environment. Checking the env vars first lets integration tests
 /// redirect session storage to a temporary directory by setting `HOME` /
 /// `USERPROFILE` on the child process.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HOME") {
         let path = PathBuf::from(p);
         if path.is_absolute() {
@@ -518,7 +518,7 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-fn sessions_root() -> Option<PathBuf> {
+pub(crate) fn sessions_root() -> Option<PathBuf> {
     Some(home_dir()?.join(".cubi").join("sessions"))
 }
 

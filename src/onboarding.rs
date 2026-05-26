@@ -111,7 +111,11 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn storage_path() -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".cubi").join("config.json"))
+        Some(
+            crate::sessions::home_dir()?
+                .join(".cubi")
+                .join("config.json"),
+        )
     }
 
     /// Loads the on-disk config. Missing or unreadable files yield a
