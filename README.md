@@ -83,6 +83,7 @@ A pocket-sized AI for your shell. Cubi is a Rust-based command-line AI chat appl
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+- [Documentation](#documentation)
   - [Basic Chat](#basic-chat)
   - [Commands](#commands)
   - [Batch Processing](#batch-processing)
@@ -241,6 +242,14 @@ tool future cannot always stop subprocesses already spawned by shell-out tools.
 Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
 or `cubi completions fish`, then install the printed script using your shell's
 normal completion setup.
+
+## Documentation
+
+- `docs/cubi.1` - roff man page for `man cubi`.
+- `docs/headless.md` - cookbook for scripts, pipelines, JSON output, and exit codes.
+- `docs/sessions.md` - saved session listing, resume, delete, and pruning.
+- `docs/plugins.md` - plugin discovery and command authoring.
+- `docs/troubleshooting.md` - common startup, MCP, color, and completion issues.
 
 ### Basic Chat
 

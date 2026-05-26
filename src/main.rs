@@ -465,6 +465,21 @@ async fn main() -> Result<()> {
     // `/rewind` can roll back any `edit_file`/`write_file` mutations
     // recorded by the built-in tool registry.
     let journal = file_rollback::FileJournal::default();
+    if !headless {
+        match McpManager::health_check_configured().await {
+            Ok(health) => {
+                if !health.is_empty() {
+                    cli_flags.mcp_health_line =
+                        Some(mcp_manager::format_health_line(&health, true));
+                }
+            }
+            Err(e) => eprintln!(
+                "{} Failed to check MCP server health: {}",
+                "Warning:".bright_yellow(),
+                e
+            ),
+        }
+    }
     let mcp_manager = match McpManager::new_with_journal_quiet(
         Arc::clone(&permissions),
         Arc::clone(&plan_mode),
@@ -473,7 +488,8 @@ async fn main() -> Result<()> {
     )
     .await
     {
-        Ok(manager) => {
+        Ok(mut manager) => {
+            manager.set_tool_timeout_secs(config.tool_timeout_secs);
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
                 status_line(

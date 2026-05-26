@@ -144,7 +144,12 @@ impl StdioClient {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            // The startup health check wraps connect calls in
+            // `tokio::time::timeout`; on timeout the connect future is
+            // dropped. `kill_on_drop` ensures any spawned MCP server
+            // child process is reaped instead of leaking.
+            .kill_on_drop(true);
 
         for (key, value) in env {
             cmd.env(key, value);

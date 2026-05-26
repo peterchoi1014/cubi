@@ -234,3 +234,36 @@ fn headless_json_outputs_line_delimited_events() {
     assert_eq!(events[1]["type"], "done");
     assert!(events[1]["stats"].is_object());
 }
+
+#[cfg(unix)]
+#[test]
+fn headless_json_reports_tool_timeout() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({"trusted_roots": [cwd]}).to_string(),
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"bash","arguments":{"command":"sleep 2","_timeout_secs":1}}}"#,
+        )
+        .args(["--json", "--no-stream", "-p", "run slow shell"])
+        .assert()
+        .failure()
+        .code(11)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains(r#""type":"tool_timeout""#));
+    assert!(stdout.contains(r#""name":"bash""#));
+    assert!(stdout.contains(r#""secs":1"#));
+}
