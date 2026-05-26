@@ -207,6 +207,8 @@ cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
 cubi --list-sessions         List all saved sessions newest-first
 cubi --list-sessions --json  List all saved sessions as a JSON array
 cubi --delete-session <id>   Delete by full id or unique prefix
+cubi --prune-sessions --older-than <duration> [--dry-run]
+                             Delete old sessions (duration: 30d, 2w, 6m, 1y)
 cubi plugins list            List discovered plugin bundles
 cubi plugins reload          Rediscover skills and plugin bundles
 cubi completions <shell>     Print a completion script (bash, zsh, fish)

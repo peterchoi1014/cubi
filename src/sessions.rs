@@ -158,6 +158,19 @@ pub struct SessionStore {
     cwd: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct PruneItem {
+    pub id: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PruneReport {
+    pub items: Vec<PruneItem>,
+    pub bytes: u64,
+}
+
 impl SessionStore {
     /// Returns a store rooted at `~/.cubi/sessions/<cwd-key>/`.
     /// `None` when neither the home directory nor the cwd can be read,
@@ -438,6 +451,31 @@ impl SessionStore {
             FindSessionResult::NotFound => Ok(DeleteSessionResult::NotFound),
             FindSessionResult::Ambiguous(matches) => Ok(DeleteSessionResult::Ambiguous(matches)),
         }
+    }
+
+    pub fn prune_older_than(cutoff_secs: u64, dry_run: bool) -> Result<PruneReport> {
+        let candidates: Vec<_> = Self::list_all()?
+            .into_iter()
+            .filter(|meta| meta.modified_at < cutoff_secs)
+            .collect();
+        let mut report = PruneReport::default();
+        for meta in candidates {
+            let bytes = meta.path.metadata().map(|m| m.len()).unwrap_or(0);
+            report.bytes = report.bytes.saturating_add(bytes);
+            report.items.push(PruneItem {
+                id: meta.id.clone(),
+                path: meta.path.clone(),
+                bytes,
+            });
+            if !dry_run {
+                fs::remove_file(&meta.path)
+                    .with_context(|| format!("Failed to delete {}", meta.path.display()))?;
+            }
+        }
+        if !dry_run && !report.items.is_empty() {
+            rebuild_index()?;
+        }
+        Ok(report)
     }
 }
 

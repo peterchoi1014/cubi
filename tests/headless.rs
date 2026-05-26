@@ -2,6 +2,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
+use std::process::Command as StdCommand;
 use tempfile::tempdir;
 
 fn cubi(home: &Path) -> Command {
@@ -136,6 +138,39 @@ fn list_sessions_json_outputs_session_shape() {
     assert_eq!(first["preview"], "hello json");
     assert!(first.get("modified_at").is_some());
     assert!(first.get("path").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_sessions_removes_old_session_files() {
+    let home = tempdir().unwrap();
+    let bucket = home.path().join(".cubi").join("sessions").join("bucket");
+    fs::create_dir_all(&bucket).unwrap();
+    let session_path = bucket.join("20200101-000000-abcd.json");
+    fs::write(
+        &session_path,
+        r#"{
+  "id": "20200101-000000-abcd",
+  "started_at": 1577836800,
+  "cwd": "/work/old",
+  "model": "qwen3:4b",
+  "history": [{"role":"user","content":"old"}]
+}"#,
+    )
+    .unwrap();
+    let status = StdCommand::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&session_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    cubi(home.path())
+        .args(["--prune-sessions", "--older-than", "1d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 session"));
+    assert!(!session_path.exists());
 }
 
 #[test]
