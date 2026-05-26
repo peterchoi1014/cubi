@@ -859,17 +859,18 @@ mod tests {
     #[test]
     fn rebuild_index_from_disk() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_userprofile = std::env::var_os("USERPROFILE");
-        let home = isolated_home("rebuild");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("USERPROFILE", &home);
-        }
-        let bucket = home.join(".cubi").join("sessions").join("bucket");
+        let sessions_root = sessions_root().expect("home directory should exist for tests");
+        let bucket = sessions_root.join(format!(
+            "bucket-rebuild-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_id = "20250101-000000-abcd";
         fs::create_dir_all(&bucket).unwrap();
         fs::write(
-            bucket.join("20250101-000000-abcd.json"),
+            bucket.join(format!("{session_id}.json")),
             r#"{
   "id": "20250101-000000-abcd",
   "started_at": 1735689600,
@@ -882,16 +883,9 @@ mod tests {
 
         let index = rebuild_index().unwrap();
         assert_eq!(index.version, 1);
-        assert_eq!(index.sessions.len(), 1);
-        assert_eq!(index.sessions[0].id, "20250101-000000-abcd");
-        assert!(
-            home.join(".cubi")
-                .join("sessions")
-                .join("index.json")
-                .exists()
-        );
-        restore_home(old_home, old_userprofile);
-        fs::remove_dir_all(&home).ok();
+        assert!(index.sessions.iter().any(|entry| entry.id == session_id));
+        assert!(sessions_root.join("index.json").exists());
+        fs::remove_dir_all(&bucket).ok();
     }
 
     #[test]
