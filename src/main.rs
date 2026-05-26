@@ -6,6 +6,7 @@ mod compat;
 mod completer;
 mod completions;
 mod executor;
+mod exit_code;
 mod file_mentions;
 mod file_rollback;
 mod git_cmds;
@@ -42,6 +43,7 @@ use crate::style::CubiStyle;
 use anyhow::{Context, Result};
 use cli::ChatCLI;
 use executor::AIExecutor;
+use exit_code::ExitCode;
 use mcp_manager::McpManager;
 use onboarding::AppConfig;
 use permissions::Permissions;
@@ -326,7 +328,11 @@ async fn main() -> Result<()> {
                         "\nInstall the model with: {}",
                         format!("ollama pull {}", model).bright_cyan()
                     );
-                    std::process::exit(1);
+                    exit_code::exit(if headless {
+                        ExitCode::Model
+                    } else {
+                        ExitCode::Usage
+                    });
                 }
 
                 status_line(
@@ -342,7 +348,11 @@ async fn main() -> Result<()> {
                 eprintln!("{} {}", "Error:".bright_red().bold(), e);
                 eprintln!("\n{}", "Make sure Ollama is running:".bright_yellow());
                 eprintln!("  {}", "ollama serve".bright_cyan());
-                std::process::exit(1);
+                exit_code::exit(if headless {
+                    ExitCode::Model
+                } else {
+                    ExitCode::Usage
+                });
             }
         }
     }
@@ -441,7 +451,20 @@ async fn main() -> Result<()> {
     // a nested runtime.
     cli.shutdown().await;
 
-    run_result?;
+    if let Err(err) = run_result {
+        if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
+            if !exit.message.is_empty() {
+                eprintln!("{}", exit.message);
+            }
+            exit_code::exit(exit.code);
+        }
+        eprintln!("{}", err);
+        exit_code::exit(if headless {
+            ExitCode::Model
+        } else {
+            ExitCode::Usage
+        });
+    }
 
     Ok(())
 }
@@ -500,6 +523,7 @@ fn print_help() {
                                          mode; auto-disabled for non-TTY stdout)\n  \
          --show-stats-footer            Print a token/timing footer after\n  \
                                          each reply\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n\n\
