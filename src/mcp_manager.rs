@@ -1,5 +1,5 @@
+use crate::style::CubiStyle;
 use anyhow::{Context, Result};
-use colored::*;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};

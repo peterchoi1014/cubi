@@ -1,3 +1,5 @@
+use colored::{ColoredString, Colorize};
+use std::fmt::Display;
 use std::io::IsTerminal;
 
 pub fn should_color() -> bool {
@@ -45,6 +47,50 @@ fn env_nonempty(value: Option<String>) -> bool {
 fn env_flag_enabled(value: Option<String>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
+
+pub trait CubiStyle: Display {
+    fn bright_cyan(&self) -> ColoredString {
+        Colorize::bright_cyan(self.to_string().as_str())
+    }
+
+    fn bright_yellow(&self) -> ColoredString {
+        Colorize::bright_yellow(self.to_string().as_str())
+    }
+
+    fn bright_green(&self) -> ColoredString {
+        Colorize::bright_green(self.to_string().as_str())
+    }
+
+    fn bright_red(&self) -> ColoredString {
+        Colorize::bright_red(self.to_string().as_str())
+    }
+
+    fn bright_blue(&self) -> ColoredString {
+        Colorize::bright_blue(self.to_string().as_str())
+    }
+
+    fn bright_black(&self) -> ColoredString {
+        Colorize::bright_black(self.to_string().as_str())
+    }
+
+    fn bright_white(&self) -> ColoredString {
+        Colorize::bright_white(self.to_string().as_str())
+    }
+
+    fn bright_magenta(&self) -> ColoredString {
+        Colorize::bright_magenta(self.to_string().as_str())
+    }
+
+    fn yellow(&self) -> ColoredString {
+        Colorize::yellow(self.to_string().as_str())
+    }
+
+    fn bold(&self) -> ColoredString {
+        Colorize::bold(self.to_string().as_str())
+    }
+}
+
+impl<T> CubiStyle for T where T: Display {}
 
 #[cfg(test)]
 mod tests {

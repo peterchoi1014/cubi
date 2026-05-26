@@ -5,8 +5,8 @@
 //! persisted to `~/.cubi/todos/<cwd-key>.json` so that `/todos`
 //! survives restarts within the same project.
 
+use crate::style::CubiStyle;
 use anyhow::{Context, Result};
-use colored::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
