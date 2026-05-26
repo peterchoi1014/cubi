@@ -205,6 +205,7 @@ echo <prompt> | cubi         Read a one-shot prompt from piped stdin
 cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
                              session from the current cwd, then global latest
 cubi --list-sessions         List all saved sessions newest-first
+cubi --list-sessions --json  List all saved sessions as a JSON array
 cubi --delete-session <id>   Delete by full id or unique prefix
 cubi completions <shell>     Print a completion script (bash, zsh, fish)
 cubi --version               Print version and exit
@@ -216,6 +217,8 @@ Output flags (combine with chat commands):
                                  applies with --no-stream; auto-disabled for non-TTY
   --show-stats-footer            Print a token/timing footer after each reply
   --system <file>                 Prepend file contents as a system message
+  --json                          Emit machine-readable output where supported
+                                  (currently --list-sessions; otherwise ignored)
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,

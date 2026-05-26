@@ -105,6 +105,7 @@ pub struct CliFlags {
     pub markdown: bool,
     pub stats_footer: bool,
     pub system_prompt: Option<String>,
+    pub json: bool,
 }
 
 impl Default for CliFlags {
@@ -116,6 +117,7 @@ impl Default for CliFlags {
             markdown: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             stats_footer: false,
             system_prompt: None,
+            json: false,
         }
     }
 }

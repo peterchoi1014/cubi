@@ -55,10 +55,11 @@ pub struct SessionFile {
 /// deserializes into [`SessionMetaFile`] (which only walks the `history`
 /// array's length, not its message bodies) rather than into the full
 /// [`SessionFile`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionMeta {
     pub id: String,
     pub model: String,
+    pub started_at: u64,
     pub message_count: usize,
     /// Unix seconds from the checkpoint file's modification time.
     pub modified_at: u64,
@@ -66,6 +67,7 @@ pub struct SessionMeta {
     /// bucket name for older checkpoints.
     pub cwd: String,
     /// Path on disk. Used for deletion and diagnostics.
+    #[serde(skip)]
     pub path: PathBuf,
     /// First user message, truncated to ~80 chars for the listing.
     pub preview: String,
@@ -214,6 +216,7 @@ impl SessionStore {
             out.push(SessionMeta {
                 id: file.id,
                 model: file.model,
+                started_at: file.started_at,
                 message_count: file.history.len(),
                 modified_at,
                 cwd,
@@ -287,6 +290,7 @@ impl SessionStore {
                 out.push(SessionMeta {
                     id: file.id,
                     model: file.model,
+                    started_at: file.started_at,
                     message_count: file.history.len(),
                     modified_at: modified_secs(&path).unwrap_or(file.started_at),
                     cwd: if file.cwd.is_empty() {
