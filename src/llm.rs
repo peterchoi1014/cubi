@@ -345,6 +345,13 @@ impl OpenAiClient {
             }
         }
 
+        tracing::debug!(
+            target: "cubi::llm",
+            model = %model,
+            base_url = %self.base_url,
+            "openai chat_with_tools request"
+        );
+
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
@@ -356,7 +363,13 @@ impl OpenAiClient {
             .context("Failed to send request to OpenAI-compatible API")?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                target: "cubi::llm",
+                status = status.as_u16(),
+                "openai non-success response"
+            );
             anyhow::bail!("OpenAI API error: {}", error_text);
         }
 
@@ -414,6 +427,13 @@ impl OpenAiClient {
             }
         }
 
+        tracing::debug!(
+            target: "cubi::llm",
+            model = %model,
+            base_url = %self.base_url,
+            "openai chat_stream request"
+        );
+
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
@@ -425,7 +445,13 @@ impl OpenAiClient {
             .context("Failed to send streaming request to OpenAI-compatible API")?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                target: "cubi::llm",
+                status = status.as_u16(),
+                "openai stream non-success response"
+            );
             anyhow::bail!("OpenAI API error: {}", error_text);
         }
 

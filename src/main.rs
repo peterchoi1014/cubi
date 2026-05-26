@@ -66,6 +66,8 @@ const DEFAULT_MODEL: &str = "qwen3:4b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     // Lightweight argv handling. We don't pull in clap because the chat
     // loop has no flags of its own; this just makes `cubi --version`,
     // `cubi --help`, and `cubi --resume [id]` Do What People Expect
@@ -807,6 +809,31 @@ fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Installs a tracing subscriber driven by the `CUBI_LOG` env var
+/// (e.g. `CUBI_LOG=cubi=debug`). When unset, no subscriber is installed
+/// so the binary stays quiet by default. Output is always stderr —
+/// never stdout — to avoid polluting machine-readable JSON output.
+fn init_tracing() {
+    let Ok(filter) = std::env::var("CUBI_LOG") else {
+        return;
+    };
+    if filter.is_empty() {
+        return;
+    }
+    let env_filter = match tracing_subscriber::EnvFilter::try_new(&filter) {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("cubi: ignoring invalid CUBI_LOG={filter:?}: {err}");
+            return;
+        }
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .try_init();
 }
 
 fn parse_duration_secs(input: &str) -> Option<u64> {

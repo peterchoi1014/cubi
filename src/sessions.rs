@@ -219,6 +219,7 @@ impl SessionStore {
         let path = self.dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
         fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        tracing::debug!(target: "cubi::sessions", id = %session.id, path = %path.display(), "session saved");
         if is_managed_session_dir(&self.dir) {
             upsert_index_entry(meta_from_session_file(session, path)?)?;
         }
