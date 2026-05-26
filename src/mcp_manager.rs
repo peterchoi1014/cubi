@@ -3,11 +3,83 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::builtin_tools::BuiltinToolRegistry;
 use crate::file_rollback::FileJournal;
 use crate::mcp_client::{McpClient, McpResource, McpResourceContent, Tool, ToolCallResult};
 use crate::mcp_config::{McpConfig, McpServerConfig};
+
+const MCP_STARTUP_TIMEOUT: Duration = Duration::from_millis(1500);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHealthState {
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpHealth {
+    pub name: String,
+    pub state: McpHealthState,
+}
+
+pub async fn with_mcp_startup_timeout<F, T>(future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(MCP_STARTUP_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("timed out after 1.5s"),
+    }
+}
+
+pub fn format_health_line(health: &[McpHealth], color: bool) -> String {
+    let ready = health
+        .iter()
+        .filter(|h| matches!(h.state, McpHealthState::Ready))
+        .count();
+    let failed: Vec<&str> = health
+        .iter()
+        .filter_map(|h| match &h.state {
+            McpHealthState::Failed(_) => Some(h.name.as_str()),
+            McpHealthState::Ready => None,
+        })
+        .collect();
+    let failed_label = if failed.is_empty() {
+        "".to_string()
+    } else if failed.len() == 1 {
+        format!("({})", failed[0])
+    } else {
+        format!("({}+{})", failed[0], failed.len() - 1)
+    };
+
+    let green = if color {
+        "●".bright_green().to_string()
+    } else {
+        "●".to_string()
+    };
+    let red = if color {
+        "●".bright_red().to_string()
+    } else {
+        "●".to_string()
+    };
+    let dim = if color {
+        "●".bright_black().to_string()
+    } else {
+        "●".to_string()
+    };
+    let disabled = if color {
+        "0(disabled)".bright_black().to_string()
+    } else {
+        "0(disabled)".to_string()
+    };
+
+    format!(
+        "MCP: {green}{ready}  {red}{}{failed_label}  {dim}{disabled}",
+        failed.len()
+    )
+}
 use crate::oauth;
 use crate::permissions::Permissions;
 
@@ -18,6 +90,40 @@ pub struct McpManager {
 }
 
 impl McpManager {
+    pub async fn health_check_configured() -> Result<Vec<McpHealth>> {
+        let config = McpConfig::load()?;
+        let mut handles = Vec::new();
+        for (name, server_config) in config.mcp_servers {
+            handles.push(tokio::spawn(async move {
+                let state = match with_mcp_startup_timeout(async {
+                    let mut client = Self::connect_client(&server_config).await?;
+                    client.list_tools().await?;
+                    let _ = client.shutdown().await;
+                    Ok(())
+                })
+                .await
+                {
+                    Ok(()) => McpHealthState::Ready,
+                    Err(err) => McpHealthState::Failed(err.to_string()),
+                };
+                McpHealth { name, state }
+            }));
+        }
+
+        let mut health = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(item) => health.push(item),
+                Err(err) => health.push(McpHealth {
+                    name: "unknown".to_string(),
+                    state: McpHealthState::Failed(err.to_string()),
+                }),
+            }
+        }
+        health.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(health)
+    }
+
     pub async fn new(
         permissions: Arc<Mutex<Permissions>>,
         plan_mode: Arc<AtomicBool>,
@@ -74,7 +180,9 @@ impl McpManager {
 
         // Connect to configured MCP servers
         for (name, server_config) in config.mcp_servers {
-            if let Err(e) = manager.connect_server(&name, &server_config).await {
+            if let Err(e) =
+                with_mcp_startup_timeout(manager.connect_server(&name, &server_config)).await
+            {
                 eprintln!(
                     "{} Failed to connect to MCP server '{}': {}",
                     "Warning:".bright_yellow(),
@@ -163,12 +271,18 @@ impl McpManager {
     }
 
     async fn connect_server(&mut self, name: &str, config: &McpServerConfig) -> Result<()> {
-        let client = if config.is_stdio() {
+        let client = Self::connect_client(config).await?;
+        self.clients.insert(name.to_string(), client);
+        Ok(())
+    }
+
+    async fn connect_client(config: &McpServerConfig) -> Result<McpClient> {
+        if config.is_stdio() {
             let command = config.command.clone().unwrap();
             let args = config.args.clone().unwrap_or_default();
             let env = config.env.clone().unwrap_or_default();
 
-            McpClient::connect_stdio(command, args, env).await?
+            McpClient::connect_stdio(command, args, env).await
         } else if config.is_http() {
             let url = config.http_url.clone().unwrap();
             let mut headers = config.headers.clone().unwrap_or_default();
@@ -192,13 +306,10 @@ impl McpManager {
                 }
             }
 
-            McpClient::connect_http(url, headers).await?
+            McpClient::connect_http(url, headers).await
         } else {
             anyhow::bail!("Server configuration must specify either command or httpUrl");
-        };
-
-        self.clients.insert(name.to_string(), client);
-        Ok(())
+        }
     }
 
     async fn discover_tools(&mut self) -> Result<()> {
@@ -308,5 +419,22 @@ impl McpManager {
                 eprintln!("Failed to shutdown MCP server '{}': {}", name, e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_timeout_fires_for_slow_future() {
+        let started = std::time::Instant::now();
+        let result = with_mcp_startup_timeout(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
