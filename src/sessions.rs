@@ -20,6 +20,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,6 +100,56 @@ struct PreviewMessage {
     content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIndex {
+    pub version: u32,
+    pub sessions: Vec<IndexSession>,
+    #[serde(default)]
+    pub last_used_per_cwd: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexSession {
+    pub id: String,
+    pub path: PathBuf,
+    pub cwd: String,
+    pub model: String,
+    pub started_at: u64,
+    pub modified_at: u64,
+    pub message_count: usize,
+    pub preview: String,
+}
+
+impl From<SessionMeta> for IndexSession {
+    fn from(meta: SessionMeta) -> Self {
+        Self {
+            id: meta.id,
+            path: meta.path,
+            cwd: meta.cwd,
+            model: meta.model,
+            started_at: meta.started_at,
+            modified_at: meta.modified_at,
+            message_count: meta.message_count,
+            preview: meta.preview,
+        }
+    }
+}
+
+impl From<IndexSession> for SessionMeta {
+    fn from(entry: IndexSession) -> Self {
+        Self {
+            id: entry.id,
+            model: entry.model,
+            started_at: entry.started_at,
+            message_count: entry.message_count,
+            modified_at: entry.modified_at,
+            cwd: entry.cwd,
+            path: entry.path,
+            preview: entry.preview,
+        }
+    }
+}
+
 /// Per-cwd session store. Cheap to clone — only carries the directory
 /// path, not any cached state.
 #[derive(Debug, Clone)]
@@ -155,6 +206,9 @@ impl SessionStore {
         let path = self.dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
         fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        if is_managed_session_dir(&self.dir) {
+            upsert_index_entry(meta_from_session_file(session, path)?)?;
+        }
         Ok(())
     }
 
@@ -183,55 +237,18 @@ impl SessionStore {
     /// Lists sessions newest-first. Unreadable individual files are
     /// skipped rather than failing the whole listing.
     pub fn list(&self) -> Result<Vec<SessionMeta>> {
-        if !self.dir.is_dir() {
-            return Ok(Vec::new());
+        if !is_managed_session_dir(&self.dir) {
+            return scan_session_dir(&self.dir, &self.cwd.display().to_string());
         }
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&self.dir)
-            .with_context(|| format!("Failed to read {}", self.dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
-                continue;
-            };
-            let modified_at = modified_secs(&path).unwrap_or(file.started_at);
-            let cwd = if file.cwd.is_empty() {
-                self.cwd.display().to_string()
-            } else {
-                file.cwd.clone()
-            };
-            let preview = file
-                .history
-                .iter()
-                .find(|m| m.role == "user")
-                .map(|m| truncate(&m.content, 80))
-                .unwrap_or_default();
-            out.push(SessionMeta {
-                id: file.id,
-                model: file.model,
-                started_at: file.started_at,
-                message_count: file.history.len(),
-                modified_at,
-                cwd,
-                path,
-                preview,
-            });
-        }
-        // Newest first. Tie-break on id so that bursts of checkpoints
-        // sharing the same mtime (coarse-resolution filesystems) still
-        // produce a deterministic ordering.
-        out.sort_by(|a, b| {
-            b.modified_at
-                .cmp(&a.modified_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+        let index = load_or_rebuild_index()?;
+        let mut out: Vec<SessionMeta> = index
+            .sessions
+            .into_iter()
+            .filter(|entry| entry.path.parent() == Some(self.dir.as_path()))
+            .filter(|entry| entry.path.exists())
+            .map(Into::into)
+            .collect();
+        sort_metas(&mut out);
         Ok(out)
     }
 
@@ -247,70 +264,126 @@ impl SessionStore {
 
     /// Lists every checkpoint under `~/.cubi/sessions`, newest first.
     pub fn list_all() -> Result<Vec<SessionMeta>> {
-        let Some(root) = sessions_root() else {
-            return Ok(Vec::new());
-        };
-        if !root.is_dir() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        for bucket in
-            fs::read_dir(&root).with_context(|| format!("Failed to read {}", root.display()))?
-        {
-            let bucket = bucket?;
-            let dir = bucket.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let bucket_name = dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            for entry in
-                fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(raw) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
-                    continue;
-                };
-                let preview = file
-                    .history
-                    .iter()
-                    .find(|m| m.role == "user")
-                    .map(|m| truncate(&m.content, 80))
-                    .unwrap_or_default();
-                out.push(SessionMeta {
-                    id: file.id,
-                    model: file.model,
-                    started_at: file.started_at,
-                    message_count: file.history.len(),
-                    modified_at: modified_secs(&path).unwrap_or(file.started_at),
-                    cwd: if file.cwd.is_empty() {
-                        bucket_name.clone()
-                    } else {
-                        file.cwd
-                    },
-                    path,
-                    preview,
-                });
-            }
-        }
-        out.sort_by(|a, b| {
-            b.modified_at
-                .cmp(&a.modified_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+        let index = load_or_rebuild_index()?;
+        let mut out: Vec<SessionMeta> = index
+            .sessions
+            .into_iter()
+            .filter(|entry| entry.path.exists())
+            .map(Into::into)
+            .collect();
+        sort_metas(&mut out);
         Ok(out)
     }
+}
 
+fn scan_session_dir(dir: &Path, fallback_cwd: &str) -> Result<Vec<SessionMeta>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
+            continue;
+        };
+        let preview = file
+            .history
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| truncate(&m.content, 80))
+            .unwrap_or_default();
+        out.push(SessionMeta {
+            id: file.id,
+            model: file.model,
+            started_at: file.started_at,
+            message_count: file.history.len(),
+            modified_at: modified_secs(&path).unwrap_or(file.started_at),
+            cwd: if file.cwd.is_empty() {
+                fallback_cwd.to_string()
+            } else {
+                file.cwd
+            },
+            path,
+            preview,
+        });
+    }
+    sort_metas(&mut out);
+    Ok(out)
+}
+
+fn scan_all_sessions() -> Result<Vec<SessionMeta>> {
+    let Some(root) = sessions_root() else {
+        return Ok(Vec::new());
+    };
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for bucket in
+        fs::read_dir(&root).with_context(|| format!("Failed to read {}", root.display()))?
+    {
+        let bucket = bucket?;
+        let dir = bucket.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let bucket_name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(file) = serde_json::from_str::<SessionMetaFile>(&raw) else {
+                continue;
+            };
+            let preview = file
+                .history
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| truncate(&m.content, 80))
+                .unwrap_or_default();
+            out.push(SessionMeta {
+                id: file.id,
+                model: file.model,
+                started_at: file.started_at,
+                message_count: file.history.len(),
+                modified_at: modified_secs(&path).unwrap_or(file.started_at),
+                cwd: if file.cwd.is_empty() {
+                    bucket_name.clone()
+                } else {
+                    file.cwd
+                },
+                path,
+                preview,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    Ok(out)
+}
+
+impl SessionStore {
     /// Latest session in the current cwd, falling back to global newest.
     pub fn latest_for_current_dir_preferred(&self) -> Result<Option<SessionFile>> {
         // Fast path: the per-cwd bucket already lives on disk under
@@ -346,6 +419,7 @@ impl SessionStore {
             FindSessionResult::Found(meta) => {
                 fs::remove_file(&meta.path)
                     .with_context(|| format!("Failed to delete {}", meta.path.display()))?;
+                remove_index_entry(&meta.id)?;
                 Ok(DeleteSessionResult::Deleted(meta))
             }
             FindSessionResult::NotFound => Ok(DeleteSessionResult::NotFound),
@@ -370,6 +444,166 @@ pub enum DeleteSessionResult {
 
 fn sessions_root() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".cubi").join("sessions"))
+}
+
+fn is_managed_session_dir(dir: &Path) -> bool {
+    sessions_root()
+        .map(|root| dir.starts_with(root))
+        .unwrap_or(false)
+}
+
+fn index_path() -> Option<PathBuf> {
+    Some(sessions_root()?.join("index.json"))
+}
+
+fn load_or_rebuild_index() -> Result<SessionIndex> {
+    let Some(path) = index_path() else {
+        return Ok(empty_index());
+    };
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if let Ok(index) = serde_json::from_str::<SessionIndex>(&raw) {
+            if index.version == 1 && !index_is_stale(&index)? {
+                return Ok(index);
+            }
+        }
+    }
+    rebuild_index()
+}
+
+fn rebuild_index() -> Result<SessionIndex> {
+    let mut sessions: Vec<IndexSession> =
+        scan_all_sessions()?.into_iter().map(Into::into).collect();
+    sort_index_sessions(&mut sessions);
+    let index = SessionIndex {
+        version: 1,
+        sessions,
+        last_used_per_cwd: BTreeMap::new(),
+    };
+    write_index(&index)?;
+    Ok(index)
+}
+
+fn upsert_index_entry(meta: SessionMeta) -> Result<()> {
+    let mut index = load_or_rebuild_index()?;
+    index.sessions.retain(|entry| entry.id != meta.id);
+    index
+        .last_used_per_cwd
+        .insert(meta.cwd.clone(), meta.id.clone());
+    index.sessions.push(meta.into());
+    sort_index_sessions(&mut index.sessions);
+    write_index(&index)
+}
+
+fn remove_index_entry(id: &str) -> Result<()> {
+    let mut index = load_or_rebuild_index()?;
+    index.sessions.retain(|entry| entry.id != id);
+    index
+        .last_used_per_cwd
+        .retain(|_, session_id| session_id != id);
+    write_index(&index)
+}
+
+fn write_index(index: &SessionIndex) -> Result<()> {
+    let Some(path) = index_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_file_name("index.json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(index)?)
+        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "Failed to replace {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn empty_index() -> SessionIndex {
+    SessionIndex {
+        version: 1,
+        sessions: Vec::new(),
+        last_used_per_cwd: BTreeMap::new(),
+    }
+}
+
+fn index_is_stale(index: &SessionIndex) -> Result<bool> {
+    let disk_count = count_session_files()?;
+    let indexed_count = index
+        .sessions
+        .iter()
+        .filter(|entry| entry.path.exists())
+        .count();
+    Ok(disk_count != indexed_count)
+}
+
+fn count_session_files() -> Result<usize> {
+    let Some(root) = sessions_root() else {
+        return Ok(0);
+    };
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for bucket in
+        fs::read_dir(&root).with_context(|| format!("Failed to read {}", root.display()))?
+    {
+        let bucket = bucket?;
+        let dir = bucket.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn sort_metas(metas: &mut [SessionMeta]) {
+    metas.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+fn sort_index_sessions(sessions: &mut [IndexSession]) {
+    sessions.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+fn meta_from_session_file(session: &SessionFile, path: PathBuf) -> Result<SessionMeta> {
+    let modified_at = modified_secs(&path).unwrap_or(session.started_at);
+    let preview = session
+        .history
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| truncate(&m.content, 80))
+        .unwrap_or_default();
+    Ok(SessionMeta {
+        id: session.id.clone(),
+        model: session.model.clone(),
+        started_at: session.started_at,
+        message_count: session.history.len(),
+        modified_at,
+        cwd: session.cwd.clone(),
+        path,
+        preview,
+    })
 }
 
 fn load_from_path(path: &Path) -> Result<SessionFile> {
@@ -438,6 +672,9 @@ pub(crate) fn civil_from_unix(secs: u64) -> (i64, u64, u64, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_store(label: &str) -> SessionStore {
         let nanos = SystemTime::now()
@@ -461,6 +698,34 @@ mod tests {
 
     fn assistant(text: &str) -> Message {
         Message::text("assistant", text)
+    }
+
+    fn restore_home(home: Option<std::ffi::OsString>, userprofile: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(value) = home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(value) = userprofile {
+                std::env::set_var("USERPROFILE", value);
+            } else {
+                std::env::remove_var("USERPROFILE");
+            }
+        }
+    }
+
+    fn isolated_home(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-home")
+            .join(format!("cubi-home-{label}-{nanos}"));
+        fs::create_dir_all(&home).unwrap();
+        home
     }
 
     #[test]
@@ -525,6 +790,71 @@ mod tests {
         let latest = store.latest().unwrap().expect("some");
         assert_eq!(latest.id, b.id);
         fs::remove_dir_all(&store.dir).ok();
+    }
+
+    #[test]
+    fn rebuild_index_from_disk() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("rebuild");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+        let bucket = home.join(".cubi").join("sessions").join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(
+            bucket.join("20250101-000000-abcd.json"),
+            r#"{
+  "id": "20250101-000000-abcd",
+  "started_at": 1735689600,
+  "cwd": "/work/rebuild",
+  "model": "m",
+  "history": [{"role":"user","content":"from disk"}]
+}"#,
+        )
+        .unwrap();
+
+        let index = rebuild_index().unwrap();
+        assert_eq!(index.version, 1);
+        assert_eq!(index.sessions.len(), 1);
+        assert_eq!(index.sessions[0].id, "20250101-000000-abcd");
+        assert!(
+            home.join(".cubi")
+                .join("sessions")
+                .join("index.json")
+                .exists()
+        );
+        restore_home(old_home, old_userprofile);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_then_list_uses_sidecar_index() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("sidecar");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+        let cwd = home.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let store = SessionStore::for_cwd(&cwd).unwrap();
+        let mut session = store.new_session("m".into());
+        session.id = "20250101-000000-abcd".into();
+        session.history.push(user("indexed preview"));
+        store.save(&session).unwrap();
+        fs::write(store.dir.join(format!("{}.json", session.id)), "not json").unwrap();
+
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, session.id);
+        assert_eq!(list[0].preview, "indexed preview");
+        restore_home(old_home, old_userprofile);
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
