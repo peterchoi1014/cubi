@@ -6,6 +6,7 @@ mod compat;
 mod completer;
 mod completions;
 mod executor;
+mod exit_code;
 mod file_mentions;
 mod file_rollback;
 mod git_cmds;
@@ -42,6 +43,7 @@ use crate::style::CubiStyle;
 use anyhow::{Context, Result};
 use cli::ChatCLI;
 use executor::AIExecutor;
+use exit_code::ExitCode;
 use mcp_manager::McpManager;
 use onboarding::AppConfig;
 use permissions::Permissions;
@@ -73,6 +75,8 @@ async fn main() -> Result<()> {
     let mut one_shot_prompt: Option<String> = None;
     let mut cli_flags = cli::CliFlags::default();
     let mut stream_explicit = false;
+    let mut prune_older_than: Option<u64> = None;
+    let mut dry_run = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -92,6 +96,21 @@ async fn main() -> Result<()> {
             "--no-markdown" => cli_flags.markdown = false,
             "--markdown" => cli_flags.markdown = true,
             "--show-stats-footer" => cli_flags.stats_footer = true,
+            "--json" => cli_flags.json = true,
+            "--system" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --system requires a file path.");
+                    std::process::exit(2);
+                };
+                match std::fs::read_to_string(path) {
+                    Ok(prompt) => cli_flags.system_prompt = Some(prompt),
+                    Err(err) => {
+                        eprintln!("cubi: failed to read --system file '{}': {}", path, err);
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--version" | "-V" | "-v" | "version" => {
                 println!("cubi {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -115,6 +134,30 @@ async fn main() -> Result<()> {
                     &mut one_shot_prompt,
                     arg.trim_start_matches("--prompt=").to_string(),
                 );
+            }
+            "plugins" => {
+                let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: plugins requires one of: list, reload.");
+                    std::process::exit(2);
+                };
+                if argv.get(i + 2).is_some() {
+                    eprintln!("cubi: plugins {subcommand} does not accept extra arguments.");
+                    std::process::exit(2);
+                }
+                match subcommand {
+                    "list" => {
+                        set_primary(&mut primary, PrimaryCommand::PluginsList);
+                        i += 1;
+                    }
+                    "reload" => {
+                        set_primary(&mut primary, PrimaryCommand::PluginsReload);
+                        i += 1;
+                    }
+                    _ => {
+                        eprintln!("cubi: plugins requires one of: list, reload.");
+                        std::process::exit(2);
+                    }
+                }
             }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
@@ -148,6 +191,24 @@ async fn main() -> Result<()> {
                 }
             }
             "--list-sessions" => set_primary(&mut primary, PrimaryCommand::ListSessions),
+            "--prune-sessions" => set_primary(&mut primary, PrimaryCommand::PruneSessions),
+            "--older-than" => {
+                i += 1;
+                let Some(value) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --older-than requires a duration like 30d, 2w, 6m, or 1y.");
+                    std::process::exit(2);
+                };
+                match parse_duration_secs(value) {
+                    Some(secs) => prune_older_than = Some(secs),
+                    None => {
+                        eprintln!(
+                            "cubi: invalid --older-than duration '{value}' (use 30d, 2w, 6m, or 1y)."
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--dry-run" => dry_run = true,
             "--delete-session" => {
                 i += 1;
                 let Some(id) = argv.get(i).and_then(|a| a.to_str()) else {
@@ -188,18 +249,41 @@ async fn main() -> Result<()> {
 
     match &primary {
         PrimaryCommand::ListSessions => {
-            print_sessions_table()?;
+            print_sessions(cli_flags.json)?;
             return Ok(());
         }
         PrimaryCommand::DeleteSession(id) => {
             delete_session(id)?;
             return Ok(());
         }
+        PrimaryCommand::PluginsList => {
+            let plugins = plugins::load_plugins();
+            plugins::print_plugin_list(&plugins);
+            return Ok(());
+        }
+        PrimaryCommand::PluginsReload => {
+            let before = plugins::load_plugins();
+            let skills = skills::load_skills();
+            let after = plugins::load_plugins();
+            plugins::print_reload_summary(&before, &after, skills.len());
+            return Ok(());
+        }
+        PrimaryCommand::PruneSessions => {
+            let Some(age_secs) = prune_older_than else {
+                eprintln!("cubi: --prune-sessions requires --older-than <duration>.");
+                std::process::exit(2);
+            };
+            prune_sessions(age_secs, dry_run)?;
+            return Ok(());
+        }
         PrimaryCommand::Interactive | PrimaryCommand::Resume(_) => {}
     }
     let headless = one_shot_prompt.is_some();
     if headless && !stream_explicit {
-        cli_flags.stream = false;
+        cli_flags.stream = cli_flags.json;
+    }
+    if cli_flags.json {
+        cli_flags.markdown = false;
     }
 
     // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
@@ -282,7 +366,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create AI executor")?;
 
-    if executor.provider_name() == "openai" {
+    if executor.provider_name() == "fake" {
+        status_line(
+            headless,
+            format!("{} Using fake test provider", "✓".bright_green()),
+        );
+    } else if executor.provider_name() == "openai" {
         let base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
             .or_else(|| std::env::var("CUBI_BASE_URL").ok())
@@ -326,7 +415,11 @@ async fn main() -> Result<()> {
                         "\nInstall the model with: {}",
                         format!("ollama pull {}", model).bright_cyan()
                     );
-                    std::process::exit(1);
+                    exit_code::exit(if headless {
+                        ExitCode::Model
+                    } else {
+                        ExitCode::Usage
+                    });
                 }
 
                 status_line(
@@ -342,7 +435,11 @@ async fn main() -> Result<()> {
                 eprintln!("{} {}", "Error:".bright_red().bold(), e);
                 eprintln!("\n{}", "Make sure Ollama is running:".bright_yellow());
                 eprintln!("  {}", "ollama serve".bright_cyan());
-                std::process::exit(1);
+                exit_code::exit(if headless {
+                    ExitCode::Model
+                } else {
+                    ExitCode::Usage
+                });
             }
         }
     }
@@ -418,6 +515,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let json_output = cli_flags.json;
+
     // Create and run CLI
     let mut cli = ChatCLI::new_with_flags(
         executor,
@@ -441,7 +540,32 @@ async fn main() -> Result<()> {
     // a nested runtime.
     cli.shutdown().await;
 
-    run_result?;
+    if let Err(err) = run_result {
+        if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
+            if json_output && headless {
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"error","message": exit.message})
+                );
+            } else if !exit.message.is_empty() {
+                eprintln!("{}", exit.message);
+            }
+            exit_code::exit(exit.code);
+        }
+        if json_output && headless {
+            println!(
+                "{}",
+                serde_json::json!({"type":"error","message": err.to_string()})
+            );
+        } else {
+            eprintln!("{}", err);
+        }
+        exit_code::exit(if headless {
+            ExitCode::Model
+        } else {
+            ExitCode::Usage
+        });
+    }
 
     Ok(())
 }
@@ -452,6 +576,9 @@ enum PrimaryCommand {
     Resume(String),
     ListSessions,
     DeleteSession(String),
+    PluginsList,
+    PluginsReload,
+    PruneSessions,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -488,7 +615,12 @@ fn print_help() {
                                       directory if no id is given; falls back to\n  \
                                       global latest)\n  \
          cubi --list-sessions         List saved sessions newest-first\n  \
+         cubi --list-sessions --json  List saved sessions as a JSON array\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi --prune-sessions --older-than <duration> [--dry-run]\n  \
+                                     Delete old session files (30d, 2w, 6m, 1y)\n  \
+         cubi plugins list            List discovered plugin bundles\n  \
+         cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\
@@ -499,7 +631,13 @@ fn print_help() {
                                          (markdown only applies in --no-stream\n  \
                                          mode; auto-disabled for non-TTY stdout)\n  \
          --show-stats-footer            Print a token/timing footer after\n  \
-                                         each reply\n\n\
+                                        each reply\n  \
+         --system <file>                 Prepend file contents as a system\n  \
+                                        message before chat starts\n  \
+         --json                          Emit machine-readable output where\n  \
+                                        supported (session arrays or headless\n  \
+                                        line-delimited events)\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n\n\
@@ -508,8 +646,12 @@ fn print_help() {
     );
 }
 
-fn print_sessions_table() -> Result<()> {
+fn print_sessions(json: bool) -> Result<()> {
     let sessions = SessionStore::list_all()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
     println!("{:<24} {:<12} {:>5} CWD", "ID", "MTIME", "MSGS");
     if sessions.is_empty() {
         println!("(no sessions saved yet)");
@@ -548,6 +690,53 @@ fn delete_session(id: &str) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(age_secs);
+    let report = SessionStore::prune_older_than(cutoff, dry_run)?;
+    if dry_run {
+        for item in &report.items {
+            println!(
+                "would prune {}  {} bytes  {}",
+                item.id,
+                item.bytes,
+                item.path.display()
+            );
+        }
+        println!(
+            "Would prune {} session(s), freeing {} bytes.",
+            report.items.len(),
+            report.bytes
+        );
+    } else {
+        println!(
+            "Pruned {} session(s), freeing {} bytes.",
+            report.items.len(),
+            report.bytes
+        );
+    }
+    Ok(())
+}
+
+fn parse_duration_secs(input: &str) -> Option<u64> {
+    let (number, unit) = input.split_at(input.len().saturating_sub(1));
+    let value = number.parse::<u64>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let days = match unit {
+        "d" => value,
+        "w" => value.checked_mul(7)?,
+        "m" => value.checked_mul(30)?,
+        "y" => value.checked_mul(365)?,
+        _ => return None,
+    };
+    days.checked_mul(86_400)
 }
 
 fn terminal_width() -> usize {

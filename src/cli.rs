@@ -2,6 +2,7 @@ use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::completer::SlashHelper;
 use crate::executor::AIExecutor;
+use crate::exit_code::{self, ExitCode};
 use crate::file_mentions::{self, UserCommand};
 use crate::file_rollback::FileJournal;
 use crate::git_cmds;
@@ -16,7 +17,7 @@ use crate::permissions::Permissions;
 use crate::plugins::{self, Plugin};
 use crate::policy::Policy;
 use crate::project_memory;
-use crate::sessions::{SessionFile, SessionStore};
+use crate::sessions::{DeleteSessionResult, FindSessionResult, SessionFile, SessionStore};
 use crate::settings_sync;
 use crate::skills::{self, Skill};
 use crate::style::CubiStyle;
@@ -93,16 +94,20 @@ pub struct ChatCLI {
     session_stats: ChatStats,
     /// Suppresses REPL-only decoration so one-shot output remains pipeable.
     headless_mode: bool,
+    /// Emits line-delimited JSON events in headless mode.
+    json_enabled: bool,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
 /// struct so the cli/main boundary stays explicit rather than threaded
 /// through positional bools.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CliFlags {
     pub stream: bool,
     pub markdown: bool,
     pub stats_footer: bool,
+    pub system_prompt: Option<String>,
+    pub json: bool,
 }
 
 impl Default for CliFlags {
@@ -113,6 +118,8 @@ impl Default for CliFlags {
             stream: true,
             markdown: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             stats_footer: false,
+            system_prompt: None,
+            json: false,
         }
     }
 }
@@ -163,7 +170,20 @@ fn welcome_banner_rows(color: bool) -> Vec<String> {
 
 impl ChatCLI {
     fn emit_status(&self, msg: impl std::fmt::Display) {
+        if self.json_enabled && self.headless_mode {
+            return;
+        }
         crate::out::status_line(self.headless_mode, msg);
+    }
+
+    fn emit_json_event(value: serde_json::Value) {
+        println!("{}", value);
+    }
+
+    fn emit_json_event_if(enabled: bool, value: serde_json::Value) {
+        if enabled {
+            Self::emit_json_event(value);
+        }
     }
 
     #[allow(dead_code)]
@@ -214,7 +234,12 @@ impl ChatCLI {
             stats_footer_enabled: flags.stats_footer,
             session_stats: ChatStats::default(),
             headless_mode: false,
+            json_enabled: flags.json,
         };
+
+        if let Some(system_prompt) = flags.system_prompt {
+            cli.history.push(Message::text("system", system_prompt));
+        }
 
         // Auto-inject project memory (CUBI.md) into context, if present.
         cli.inject_project_memory();
@@ -286,19 +311,20 @@ impl ChatCLI {
                     );
                 }
             }
-            if let Err(err) = rl.load_history(path)
-                && !matches!(
-                    err,
-                    ReadlineError::Io(ref io_err)
+            if let Err(err) = rl.load_history(path) {
+                let is_not_found = matches!(
+                    &err,
+                    ReadlineError::Io(io_err)
                         if io_err.kind() == std::io::ErrorKind::NotFound
-                )
-            {
-                eprintln!(
-                    "{} could not load REPL history '{}': {}",
-                    "Warn:".bright_yellow(),
-                    path.display(),
-                    err
                 );
+                if !is_not_found {
+                    eprintln!(
+                        "{} could not load REPL history '{}': {}",
+                        "Warn:".bright_yellow(),
+                        path.display(),
+                        err
+                    );
+                }
             }
         }
 
@@ -428,6 +454,9 @@ impl ChatCLI {
     /// are written to stdout so callers can pipe the result.
     pub async fn run_one_shot(&mut self, prompt: &str) -> Result<()> {
         self.headless_mode = true;
+        if self.json_enabled {
+            self.markdown_enabled = false;
+        }
         self.hooks.fire_session_start(self.executor.get_model());
         let expanded = file_mentions::expand_file_mentions(prompt);
         let turn_start = self.history.len();
@@ -958,7 +987,7 @@ impl ChatCLI {
                 }
             }
             Cmd::Sessions => {
-                self.show_sessions();
+                self.handle_sessions(args);
             }
             Cmd::Resume => {
                 self.resume_session(args);
@@ -2123,6 +2152,80 @@ impl ChatCLI {
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
+    }
+
+    fn handle_sessions(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("delete") {
+            let id = rest.trim();
+            if id.is_empty() {
+                println!(
+                    "{} Usage: /sessions delete <id-or-prefix>",
+                    "Info:".bright_yellow()
+                );
+                return;
+            }
+            self.delete_session_by_prefix(id);
+            return;
+        }
+        if !trimmed.is_empty() {
+            println!(
+                "{} Usage: /sessions [delete <id-or-prefix>]",
+                "Info:".bright_yellow()
+            );
+            return;
+        }
+        self.show_sessions();
+    }
+
+    fn delete_session_by_prefix(&mut self, id: &str) {
+        match SessionStore::find_by_prefix(id) {
+            Ok(FindSessionResult::Found(meta)) => {
+                if !self.confirm_session_delete(&meta.id) {
+                    println!("{} Delete cancelled.", "ℹ".bright_blue());
+                    return;
+                }
+                match SessionStore::delete_by_prefix(&meta.id) {
+                    Ok(DeleteSessionResult::Deleted(meta)) => {
+                        if self
+                            .current_session
+                            .as_ref()
+                            .map(|s| s.id == meta.id)
+                            .unwrap_or(false)
+                        {
+                            self.current_session = None;
+                        }
+                        println!("Deleted session {}", meta.id.bright_cyan());
+                    }
+                    Ok(DeleteSessionResult::NotFound) => {
+                        eprintln!("cubi: no session matches '{}'.", id);
+                    }
+                    Ok(DeleteSessionResult::Ambiguous(_)) => {
+                        eprintln!("cubi: session disappeared while deleting '{}'.", id);
+                    }
+                    Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+                }
+            }
+            Ok(FindSessionResult::NotFound) => eprintln!("cubi: no session matches '{}'.", id),
+            Ok(FindSessionResult::Ambiguous(candidates)) => {
+                eprintln!("cubi: session prefix '{}' is ambiguous. Candidates:", id);
+                for meta in candidates {
+                    eprintln!("  {}  {}", meta.id, meta.cwd);
+                }
+            }
+            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+
+    fn confirm_session_delete(&self, id: &str) -> bool {
+        use std::io::{self, Write};
+        print!("Delete session {}? [y/N] ", id.bright_cyan());
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map(|_| matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+            .unwrap_or(false)
     }
 
     /// Lists checkpointed sessions for the current project, newest first.
@@ -3477,6 +3580,7 @@ impl ChatCLI {
         // at the very end so cancelled or errored turns don't pollute totals.
         let mut turn_stats = ChatStats::default();
         let headless_mode = self.headless_mode;
+        let json_enabled = self.json_enabled && headless_mode;
 
         // Snapshot the journal start so /rewind still works after Ctrl-C
         // cancel: we leave file edits in place but pop the history.
@@ -3524,12 +3628,17 @@ impl ChatCLI {
                                     printed_prefix = true;
                                 }
                             }
-                            if headless_mode {
+                            if json_enabled {
+                                Self::emit_json_event(
+                                    serde_json::json!({"type":"token","value": tok}),
+                                );
+                            } else if headless_mode {
                                 print!("{}", tok);
+                                let _ = std::io::stdout().flush();
                             } else {
                                 print!("{}", tok.bright_white());
+                                let _ = std::io::stdout().flush();
                             }
-                            let _ = std::io::stdout().flush();
                             got_token = true;
                         });
                 tokio::select! {
@@ -3579,6 +3688,12 @@ impl ChatCLI {
                 // turn instead of an empty bucket.
                 self.journal.discard_last_turn_if_empty();
                 self.history.truncate(turn_start);
+                if headless_mode {
+                    return Err(exit_code::err(
+                        ExitCode::Cancelled,
+                        "cubi: cancelled (Ctrl-C)",
+                    ));
+                }
                 return Ok(());
             };
             let (msg, stats) = stream_result?;
@@ -3603,7 +3718,11 @@ impl ChatCLI {
                 // providers put the completed message only in the final chunk;
                 // print it here if the streaming callback saw no tokens.
                 if self.stream_enabled && !got_token && !msg_content.is_empty() {
-                    if headless_mode {
+                    if json_enabled {
+                        Self::emit_json_event(
+                            serde_json::json!({"type":"token","value": msg_content}),
+                        );
+                    } else if headless_mode {
                         println!("{msg_content}");
                     } else {
                         print!("{} ", "AI:".bright_blue().bold());
@@ -3612,12 +3731,22 @@ impl ChatCLI {
                     any_output = true;
                 }
                 if !self.stream_enabled && !msg_content.is_empty() {
-                    // Buffered mode: render the message now. Markdown if
-                    // enabled, otherwise plain text.
-                    self.render_final_reply(&msg_content);
+                    if json_enabled {
+                        Self::emit_json_event(
+                            serde_json::json!({"type":"token","value": msg_content}),
+                        );
+                    } else {
+                        // Buffered mode: render the message now. Markdown if
+                        // enabled, otherwise plain text.
+                        self.render_final_reply(&msg_content);
+                    }
                     any_output = true;
                 }
-                if any_output && headless_mode {
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({"type":"done","stats": turn_stats}),
+                );
+                if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
                     // The buffered and stream-fallback paths above
@@ -3625,7 +3754,7 @@ impl ChatCLI {
                     if got_token {
                         println!();
                     }
-                } else if any_output {
+                } else if any_output && !json_enabled {
                     println!("\n");
                 }
                 break;
@@ -3639,6 +3768,14 @@ impl ChatCLI {
             }
 
             for (idx, call) in calls.iter().enumerate() {
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({
+                        "type": "tool_call",
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }),
+                );
                 self.emit_status(format!(
                     "{} {} {}",
                     "⚙".bright_blue(),
@@ -3657,6 +3794,12 @@ impl ChatCLI {
                 };
                 let Some(result_text) = result_text else {
                     self.cancel_tool_calls(turn_start, &calls, idx);
+                    if headless_mode {
+                        return Err(exit_code::err(
+                            ExitCode::Cancelled,
+                            "cubi: cancelled (Ctrl-C)",
+                        ));
+                    }
                     return Ok(());
                 };
 
@@ -3665,6 +3808,15 @@ impl ChatCLI {
                     || result_text.starts_with("[tool denied]");
                 self.hooks
                     .fire_post_tool_use(&call.function.name, &result_text, is_error);
+                if headless_mode && result_text.starts_with("[tool error]") {
+                    return Err(exit_code::err(
+                        ExitCode::Tool,
+                        format!(
+                            "cubi: tool '{}' failed: {}",
+                            call.function.name, result_text
+                        ),
+                    ));
+                }
 
                 // Print a short preview so the user can see what came back
                 // without us dumping a 10 KB log into the terminal.
@@ -3679,6 +3831,14 @@ impl ChatCLI {
                     preview.bright_black(),
                     ellipsis.bright_black()
                 ));
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "name": call.function.name,
+                        "content": result_text.clone(),
+                    }),
+                );
 
                 self.history
                     .push(Message::tool_result(&call.function.name, result_text));
@@ -4448,9 +4608,10 @@ impl ChatCLI {
         }
         for p in &self.plugins {
             println!(
-                "  {} {} ({})",
+                "  {} {} v{} ({})",
                 "•".bright_cyan(),
                 p.name.bright_cyan(),
+                p.version.bright_magenta(),
                 p.root.display().to_string().bright_black()
             );
             if p.commands.is_empty() {
@@ -4471,15 +4632,10 @@ impl ChatCLI {
 
     fn reload_plugins(&mut self) {
         self.skills = skills::load_skills();
+        let before = std::mem::take(&mut self.plugins);
         self.plugins = plugins::load_plugins();
-        let cmd_count: usize = self.plugins.iter().map(|p| p.commands.len()).sum();
-        println!(
-            "{} Reloaded {} skill(s) + {} plugin(s) ({} command(s))",
-            "✓".bright_green(),
-            self.skills.len(),
-            self.plugins.len(),
-            cmd_count
-        );
+        print!("{} ", "✓".bright_green());
+        plugins::print_reload_summary(&before, &self.plugins, self.skills.len());
     }
 
     fn show_cost(&self) {

@@ -205,7 +205,12 @@ echo <prompt> | cubi         Read a one-shot prompt from piped stdin
 cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
                              session from the current cwd, then global latest
 cubi --list-sessions         List all saved sessions newest-first
+cubi --list-sessions --json  List all saved sessions as a JSON array
 cubi --delete-session <id>   Delete by full id or unique prefix
+cubi --prune-sessions --older-than <duration> [--dry-run]
+                             Delete old sessions (duration: 30d, 2w, 6m, 1y)
+cubi plugins list            List discovered plugin bundles
+cubi plugins reload          Rediscover skills and plugin bundles
 cubi completions <shell>     Print a completion script (bash, zsh, fish)
 cubi --version               Print version and exit
 cubi --help                  Print help and exit
@@ -215,16 +220,23 @@ Output flags (combine with chat commands):
   --markdown / --no-markdown     Enable / disable markdown rendering. Markdown only
                                  applies with --no-stream; auto-disabled for non-TTY
   --show-stats-footer            Print a token/timing footer after each reply
+  --system <file>                 Prepend file contents as a system message
+  --json                          Emit machine-readable output where supported
+                                  (`--list-sessions` JSON arrays; headless chat
+                                  line-delimited JSON events)
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,
 `/markdown on|off`, and `/stats-footer on|off`. `-p/--prompt` requires inline
 text and does not read stdin; without `-p`, piped stdin becomes the prompt.
-One-shot mode buffers by default for predictable scripts; pass `--stream` to
-stream tokens. Press **Ctrl-C** during an in-flight reply or tool call to cancel
-it and return to the prompt; the unanswered user message is rolled back so
-history stays clean. Dropping a tool future cannot always stop subprocesses
-already spawned by shell-out tools.
+Use `--system <file>` to prepend a system instruction file before the prompt.
+Use `--json -p "..."` to stream line-delimited events such as `token`,
+`tool_call`, `tool_result`, `done`, and `error`. One-shot mode buffers by
+default for predictable scripts; pass `--stream` to stream tokens. Headless exit codes are: `0` ok, `2` usage/config error, `10`
+model/API error, `11` tool failure, and `130` cancellation. Press **Ctrl-C**
+during an in-flight reply or tool call to cancel it and return to the prompt;
+the unanswered user message is rolled back so history stays clean. Dropping a
+tool future cannot always stop subprocesses already spawned by shell-out tools.
 
 Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
 or `cubi completions fish`, then install the printed script using your shell's

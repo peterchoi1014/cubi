@@ -102,6 +102,13 @@ jobs:
             exit 1
           }
 
+          $plugins = & $bin plugins list
+          Write-Output $plugins
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "plugins list should exit 0"
+            exit 1
+          }
+
           & $bin --definitely-not-a-flag
           if ($LASTEXITCODE -ne 2) {
             Write-Error "unknown flag should exit 2, got $LASTEXITCODE"

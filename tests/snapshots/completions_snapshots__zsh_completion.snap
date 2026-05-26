@@ -1,5 +1,6 @@
 ---
 source: tests/completions_snapshots.rs
+assertion_line: 36
 expression: "completion_script(\"zsh\")"
 ---
 #compdef cubi
@@ -16,6 +17,11 @@ _cubi() {
         'help:print help and exit'
         '--resume:resume a prior chat'
         '-r:resume a prior chat'
+        '--list-sessions:list saved sessions'
+        '--delete-session:delete a saved session'
+        '--prune-sessions:delete old sessions'
+        '--older-than:duration for pruning'
+        '--dry-run:show prune candidates without deleting'
         'resume:resume a prior chat'
         '--stream:stream tokens live'
         '--no-stream:wait for the full reply'
@@ -23,6 +29,11 @@ _cubi() {
         '--no-markdown:disable markdown rendering'
         '--show-stats-footer:print token and timing stats'
         'completions:print a shell completion script'
+        'plugins:manage plugin bundles'
+    )
+    plugins=(
+        'list:list discovered plugin bundles'
+        'reload:rediscover plugin bundles'
     )
     shells=(
         'bash:Bash completion script'
@@ -34,6 +45,8 @@ _cubi() {
         _describe -t cubi-commands 'cubi command' top
     elif [[ ${words[2]} == completions && CURRENT -eq 3 ]]; then
         _describe -t shells 'shell' shells
+    elif [[ ${words[2]} == plugins && CURRENT -eq 3 ]]; then
+        _describe -t plugins 'plugin subcommand' plugins
     fi
 }
 _cubi "$@"

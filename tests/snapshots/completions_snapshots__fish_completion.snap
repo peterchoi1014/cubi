@@ -1,5 +1,6 @@
 ---
 source: tests/completions_snapshots.rs
+assertion_line: 41
 expression: "completion_script(\"fish\")"
 ---
 # cubi fish completions
@@ -8,6 +9,11 @@ complete -c cubi -l version -s V -d 'Print version and exit'
 complete -c cubi -s v -d 'Print version and exit'
 complete -c cubi -l help -s h -d 'Print help and exit'
 complete -c cubi -l resume -s r -d 'Resume a prior chat'
+complete -c cubi -l list-sessions -d 'List saved sessions'
+complete -c cubi -l delete-session -r -d 'Delete a saved session'
+complete -c cubi -l prune-sessions -d 'Delete old sessions'
+complete -c cubi -l older-than -r -d 'Duration for pruning'
+complete -c cubi -l dry-run -d 'Show prune candidates without deleting'
 complete -c cubi -n '__fish_use_subcommand' -a version -d 'Print version and exit'
 complete -c cubi -n '__fish_use_subcommand' -a help -d 'Print help and exit'
 complete -c cubi -n '__fish_use_subcommand' -a resume -d 'Resume a prior chat'
@@ -16,5 +22,9 @@ complete -c cubi -l no-stream -d 'Wait for the full reply'
 complete -c cubi -l markdown -d 'Enable markdown rendering'
 complete -c cubi -l no-markdown -d 'Disable markdown rendering'
 complete -c cubi -l show-stats-footer -d 'Print token and timing stats'
+complete -c cubi -l system -r -d 'Prepend a system prompt file'
+complete -c cubi -l json -d 'Emit machine-readable output where supported'
 complete -c cubi -n '__fish_use_subcommand' -a completions -d 'Print a shell completion script'
+complete -c cubi -n '__fish_use_subcommand' -a plugins -d 'Manage plugin bundles'
 complete -c cubi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
+complete -c cubi -n '__fish_seen_subcommand_from plugins' -a 'list reload'
