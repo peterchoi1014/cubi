@@ -149,10 +149,12 @@ impl HookRegistry {
         }
 
         // Global: ~/.cubi/hooks.json (only used when no local config exists)
-        if !found_local && let Some(home) = dirs::home_dir() {
-            let global_path = home.join(".cubi").join("hooks.json");
-            if let Some(cfg) = Self::load_file(&global_path) {
-                hooks.extend(cfg.hooks);
+        if !found_local {
+            if let Some(home) = dirs::home_dir() {
+                let global_path = home.join(".cubi").join("hooks.json");
+                if let Some(cfg) = Self::load_file(&global_path) {
+                    hooks.extend(cfg.hooks);
+                }
             }
         }
 

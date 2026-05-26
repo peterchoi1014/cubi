@@ -1355,14 +1355,15 @@ impl BuiltinToolRegistry {
         if is_write && self.plan_mode.load(Ordering::SeqCst) {
             return Ok(ToolResult::error(Self::plan_mode_refusal("notebook")));
         }
-        if is_write
-            && let Err(e) = self
+        if is_write {
+            if let Err(e) = self
                 .permissions
                 .lock()
                 .unwrap()
                 .check_write(Path::new(path))
-        {
-            return Ok(ToolResult::error(format!("{}", e)));
+            {
+                return Ok(ToolResult::error(format!("{}", e)));
+            }
         }
 
         let raw = match fs::read_to_string(path) {

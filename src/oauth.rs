@@ -43,10 +43,10 @@ impl OAuthToken {
 
 impl OAuthStore {
     pub fn storage_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("CUBI_OAUTH_FILE")
-            && !p.trim().is_empty()
-        {
-            return Some(PathBuf::from(p));
+        if let Ok(p) = std::env::var("CUBI_OAUTH_FILE") {
+            if !p.trim().is_empty() {
+                return Some(PathBuf::from(p));
+            }
         }
         Some(dirs::home_dir()?.join(".cubi").join("oauth.json"))
     }

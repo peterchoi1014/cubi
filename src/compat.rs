@@ -63,10 +63,10 @@ pub fn promote_legacy_env() {
     let keys: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
         .filter_map(|(k, v)| {
             let key = k.to_str()?;
-            if let Some(rest) = key.strip_prefix("AICHAT_")
-                && rest.ends_with("_API_KEY")
-            {
-                return Some((format!("CUBI_{rest}"), v));
+            if let Some(rest) = key.strip_prefix("AICHAT_") {
+                if rest.ends_with("_API_KEY") {
+                    return Some((format!("CUBI_{rest}"), v));
+                }
             }
             None
         })

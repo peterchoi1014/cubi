@@ -36,19 +36,19 @@ pub fn tips_dir() -> Option<PathBuf> {
 /// invocations also see variety.
 pub fn tip_of_the_day() -> Option<String> {
     let mut all: Vec<String> = BUILTIN_TIPS.iter().map(|s| s.to_string()).collect();
-    if let Some(dir) = tips_dir()
-        && let Ok(entries) = fs::read_dir(&dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("txt") {
-                continue;
-            }
-            let Ok(body) = fs::read_to_string(&path) else {
-                continue;
-            };
-            for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                all.push(line.to_string());
+    if let Some(dir) = tips_dir() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("txt") {
+                    continue;
+                }
+                let Ok(body) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    all.push(line.to_string());
+                }
             }
         }
     }
