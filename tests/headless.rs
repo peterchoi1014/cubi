@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -96,6 +97,45 @@ fn list_sessions_succeeds_with_clean_home() {
         .stdout(
             predicate::str::contains("ID").and(predicate::str::contains("(no sessions saved yet)")),
         );
+}
+
+#[test]
+fn list_sessions_json_outputs_session_shape() {
+    let home = tempdir().unwrap();
+    let bucket = home.path().join(".cubi").join("sessions").join("bucket");
+    fs::create_dir_all(&bucket).unwrap();
+    fs::write(
+        bucket.join("20250101-000000-abcd.json"),
+        r#"{
+  "id": "20250101-000000-abcd",
+  "started_at": 1735689600,
+  "cwd": "/work/project",
+  "model": "qwen3:4b",
+  "history": [
+    {"role":"user","content":"hello json"},
+    {"role":"assistant","content":"hi"}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .args(["--list-sessions", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let first = &value.as_array().unwrap()[0];
+    assert_eq!(first["id"], "20250101-000000-abcd");
+    assert_eq!(first["model"], "qwen3:4b");
+    assert_eq!(first["started_at"], 1735689600);
+    assert_eq!(first["message_count"], 2);
+    assert_eq!(first["cwd"], "/work/project");
+    assert_eq!(first["preview"], "hello json");
+    assert!(first.get("modified_at").is_some());
+    assert!(first.get("path").is_none());
 }
 
 #[test]

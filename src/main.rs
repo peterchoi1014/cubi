@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
             "--no-markdown" => cli_flags.markdown = false,
             "--markdown" => cli_flags.markdown = true,
             "--show-stats-footer" => cli_flags.stats_footer = true,
+            "--json" => cli_flags.json = true,
             "--system" => {
                 i += 1;
                 let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
@@ -204,7 +205,7 @@ async fn main() -> Result<()> {
 
     match &primary {
         PrimaryCommand::ListSessions => {
-            print_sessions_table()?;
+            print_sessions(cli_flags.json)?;
             return Ok(());
         }
         PrimaryCommand::DeleteSession(id) => {
@@ -525,6 +526,7 @@ fn print_help() {
                                       directory if no id is given; falls back to\n  \
                                       global latest)\n  \
          cubi --list-sessions         List saved sessions newest-first\n  \
+         cubi --list-sessions --json  List saved sessions as a JSON array\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
@@ -538,7 +540,9 @@ fn print_help() {
          --show-stats-footer            Print a token/timing footer after\n  \
                                         each reply\n  \
          --system <file>                 Prepend file contents as a system\n  \
-                                        message before chat starts\n\n\
+                                        message before chat starts\n  \
+         --json                          Emit machine-readable output where\n  \
+                                        supported (currently --list-sessions)\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
@@ -548,8 +552,12 @@ fn print_help() {
     );
 }
 
-fn print_sessions_table() -> Result<()> {
+fn print_sessions(json: bool) -> Result<()> {
     let sessions = SessionStore::list_all()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
     println!("{:<24} {:<12} {:>5} CWD", "ID", "MTIME", "MSGS");
     if sessions.is_empty() {
         println!("(no sessions saved yet)");
