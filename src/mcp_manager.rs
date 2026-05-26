@@ -344,8 +344,10 @@ impl McpManager {
     }
 
     async fn connect_server(&mut self, name: &str, config: &McpServerConfig) -> Result<()> {
+        tracing::debug!(target: "cubi::mcp", server = %name, "connecting to MCP server");
         let client = Self::connect_client(config).await?;
         self.clients.insert(name.to_string(), client);
+        tracing::debug!(target: "cubi::mcp", server = %name, "MCP server connected");
         Ok(())
     }
 
@@ -489,7 +491,7 @@ impl McpManager {
     pub async fn shutdown(&mut self) {
         for (name, client) in &mut self.clients {
             if let Err(e) = client.shutdown().await {
-                eprintln!("Failed to shutdown MCP server '{}': {}", name, e);
+                tracing::warn!(target: "cubi::mcp", server = %name, error = %e, "failed to shutdown MCP server");
             }
         }
     }

@@ -58,6 +58,7 @@ pub fn load_plugins() -> Vec<Plugin> {
         return Vec::new();
     };
     let Ok(entries) = fs::read_dir(&dir) else {
+        tracing::debug!(target: "cubi::plugins", dir = %dir.display(), "plugins dir not readable");
         return Vec::new();
     };
 
@@ -77,10 +78,18 @@ pub fn load_plugins() -> Vec<Plugin> {
         // Reject anything that would be ambiguous as a slash-command
         // namespace. We never want `/foo bar:baz`.
         if name.is_empty() || name.contains(char::is_whitespace) || name.contains(':') {
+            tracing::warn!(target: "cubi::plugins", name = %name, "skipping plugin with invalid name");
             continue;
         }
         let version = load_version(&path).unwrap_or_else(|| "-".to_string());
         let commands = load_commands(&path.join("commands"));
+        tracing::debug!(
+            target: "cubi::plugins",
+            name = %name,
+            version = %version,
+            command_count = commands.len(),
+            "loaded plugin"
+        );
         plugins.push(Plugin {
             name,
             version,
