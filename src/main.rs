@@ -21,6 +21,7 @@ mod migrations;
 mod oauth;
 mod ollama;
 mod onboarding;
+mod out;
 mod output_styles;
 mod permissions;
 pub mod plugins;
@@ -31,14 +32,15 @@ mod sessions;
 mod settings_sync;
 pub mod skills;
 mod spinner;
+mod style;
 mod telemetry;
 mod themes;
 mod tips;
 mod todos;
 
+use crate::style::CubiStyle;
 use anyhow::{Context, Result};
 use cli::ChatCLI;
-use colored::*;
 use executor::AIExecutor;
 use mcp_manager::McpManager;
 use onboarding::AppConfig;
@@ -248,6 +250,7 @@ async fn main() -> Result<()> {
     if let Some(v) = &config.vim_mode {
         unsafe { std::env::set_var("CUBI_VIM_MODE", v) };
     }
+    style::init_color_control();
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
     // shells, or when `CUBI_NO_ONBOARD=1` is set.
@@ -472,11 +475,7 @@ fn set_primary(slot: &mut PrimaryCommand, value: PrimaryCommand) {
 }
 
 fn status_line(headless: bool, msg: impl std::fmt::Display) {
-    if headless {
-        eprintln!("{msg}");
-    } else {
-        println!("{msg}");
-    }
+    out::status_line(headless, msg);
 }
 
 fn print_help() {

@@ -43,10 +43,7 @@ impl Completer for SlashHelper {
             return Ok((pos, Vec::new()));
         }
 
-        // Reuse the single source of truth for prefix → command name
-        // matching so completion can never drift from the
-        // "did-you-mean?" hint surfaced by the REPL on unknown input.
-        let candidates: Vec<Pair> = commands::prefix_matches(head)
+        let candidates: Vec<Pair> = slash_command_candidates(head)
             .into_iter()
             .map(|name| Pair {
                 display: name.to_string(),
@@ -62,6 +59,14 @@ impl Completer for SlashHelper {
     }
 }
 
+fn slash_command_candidates(head: &str) -> Vec<&'static str> {
+    if head == "/" {
+        commands::command_names().collect()
+    } else {
+        commands::prefix_matches(head)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +78,14 @@ mod tests {
         let ctx = rustyline::Context::new(&history);
         let (_, pairs) = helper.complete(line, pos, &ctx).expect("complete ok");
         pairs.into_iter().map(|p| p.display).collect()
+    }
+
+    #[test]
+    fn completes_bare_slash_with_all_commands() {
+        let out = complete("/", 1);
+        assert!(out.contains(&"/help".to_string()));
+        assert!(out.contains(&"/quit".to_string()));
+        assert_eq!(out.len(), commands::COMMANDS.len());
     }
 
     #[test]
