@@ -277,9 +277,29 @@ impl ChatCLI {
         let readline_history_path = repl_history_path();
         if let Some(path) = &readline_history_path {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).ok();
+                if let Err(err) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "{} could not create REPL history directory '{}': {}",
+                        "Warn:".bright_yellow(),
+                        parent.display(),
+                        err
+                    );
+                }
             }
-            rl.load_history(path).ok();
+            if let Err(err) = rl.load_history(path)
+                && !matches!(
+                    err,
+                    ReadlineError::Io(ref io_err)
+                        if io_err.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                eprintln!(
+                    "{} could not load REPL history '{}': {}",
+                    "Warn:".bright_yellow(),
+                    path.display(),
+                    err
+                );
+            }
         }
 
         loop {
@@ -354,7 +374,14 @@ impl ChatCLI {
         }
 
         if let Some(path) = &readline_history_path {
-            rl.save_history(path).ok();
+            if let Err(err) = rl.save_history(path) {
+                eprintln!(
+                    "{} could not save REPL history '{}': {}",
+                    "Warn:".bright_yellow(),
+                    path.display(),
+                    err
+                );
+            }
         }
 
         // Fire Stop hooks.
