@@ -62,7 +62,7 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.chat_with_tools(model, messages, tools).await,
             Self::OpenAi(c) => c.chat_with_tools(model, messages, tools).await,
-            Self::Fake => Ok((Message::text("assistant", fake_content()), fake_stats())),
+            Self::Fake => Ok((fake_message(&messages), fake_stats())),
         }
     }
 
@@ -81,9 +81,11 @@ impl LlmBackend {
             Self::Ollama(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::OpenAi(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::Fake => {
-                let content = fake_content();
-                on_token(&content);
-                Ok((Message::text("assistant", content), fake_stats()))
+                let message = fake_message(&messages);
+                if message.tool_calls.is_none() {
+                    on_token(&message.content);
+                }
+                Ok((message, fake_stats()))
             }
         }
     }
@@ -551,6 +553,22 @@ impl OpenAiClient {
 
 fn fake_content() -> String {
     std::env::var("CUBI_FAKE_LLM_RESPONSE").unwrap_or_else(|_| "hi".to_string())
+}
+
+fn fake_message(messages: &[Message]) -> Message {
+    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_TOOL_CALL") {
+        if !messages.iter().any(|message| message.role == "tool") {
+            if let Ok(call) = serde_json::from_str::<ToolCall>(&raw) {
+                return Message {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![call]),
+                    tool_name: None,
+                };
+            }
+        }
+    }
+    Message::text("assistant", fake_content())
 }
 
 fn fake_stats() -> ChatStats {

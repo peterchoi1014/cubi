@@ -117,7 +117,23 @@ impl ChatCLI {
                     .await
                 {
                     Ok(r) => agent_loop::render_tool_result(&r),
-                    Err(e) => format!("[tool error] {e}"),
+                    Err(e) => {
+                        if let Some(timeout) =
+                            e.downcast_ref::<crate::mcp_manager::ToolTimeoutError>()
+                        {
+                            Self::emit_json_event_if(
+                                self.json_enabled && self.headless_mode,
+                                serde_json::json!({
+                                    "type": "tool_timeout",
+                                    "name": timeout.name,
+                                    "secs": timeout.secs,
+                                }),
+                            );
+                            format!("[{timeout}]")
+                        } else {
+                            format!("[tool error] {e}")
+                        }
+                    }
                 },
                 None => format!(
                     "[tool error] no MCP manager available to execute `{}`",

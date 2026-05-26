@@ -447,10 +447,12 @@ impl BuiltinToolRegistry {
         }
 
         let execution = async {
-            let output = Command::new("sh")
+            let output = TokioCommand::new("sh")
                 .arg("-c")
                 .arg(command)
+                .kill_on_drop(true)
                 .output()
+                .await
                 .context("Failed to execute command")?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
