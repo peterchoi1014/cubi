@@ -182,7 +182,7 @@ impl SessionStore {
     }
 
     pub fn for_cwd(cwd: &Path) -> Option<Self> {
-        let home = dirs::home_dir()?;
+        let home = home_dir()?;
         Some(Self {
             dir: home.join(".cubi").join("sessions").join(cwd_key(cwd)),
             cwd: cwd.to_path_buf(),
@@ -493,8 +493,32 @@ pub enum DeleteSessionResult {
     Ambiguous(Vec<SessionMeta>),
 }
 
+/// Returns the home directory, preferring the `HOME` environment variable
+/// (and `USERPROFILE` on Windows) over the platform lookup.
+///
+/// On Windows, `dirs::home_dir()` uses `SHGetKnownFolderPath`, which ignores
+/// the process environment. Checking the env vars first lets integration tests
+/// redirect session storage to a temporary directory by setting `HOME` /
+/// `USERPROFILE` on the child process.
+fn home_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HOME") {
+        let path = PathBuf::from(p);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(p) = std::env::var("USERPROFILE") {
+        let path = PathBuf::from(p);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir()
+}
+
 fn sessions_root() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cubi").join("sessions"))
+    Some(home_dir()?.join(".cubi").join("sessions"))
 }
 
 fn is_managed_session_dir(dir: &Path) -> bool {
