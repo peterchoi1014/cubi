@@ -19,10 +19,10 @@ use crate::project_memory;
 use crate::sessions::{SessionFile, SessionStore};
 use crate::settings_sync;
 use crate::skills::{self, Skill};
+use crate::style::CubiStyle;
 use crate::themes;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
-use colored::*;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -117,7 +117,55 @@ impl Default for CliFlags {
     }
 }
 
+fn repl_history_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cubi").join("history"))
+}
+
+fn welcome_banner_rows(color: bool) -> Vec<String> {
+    let stylize = |name: &'static str| {
+        if color {
+            name.bright_cyan().to_string()
+        } else {
+            name.to_string()
+        }
+    };
+
+    let mut rows = vec![
+        String::new(),
+        format!(
+            "hi, i'm Cubi — {}",
+            if color {
+                "a pocket-sized AI".bright_white().to_string()
+            } else {
+                "a pocket-sized AI".to_string()
+            }
+        ),
+        format!(
+            "{} · {} to exit · Tab completes slash commands · Ctrl-R searches history",
+            stylize("/help"),
+            stylize("/quit")
+        ),
+        "Commands:".to_string(),
+    ];
+
+    for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
+        rows.push(
+            chunk
+                .iter()
+                .map(|name| stylize(name))
+                .collect::<Vec<_>>()
+                .join("  "),
+        );
+    }
+
+    rows
+}
+
 impl ChatCLI {
+    fn emit_status(&self, msg: impl std::fmt::Display) {
+        crate::out::status_line(self.headless_mode, msg);
+    }
+
     #[allow(dead_code)]
     pub fn new(
         executor: AIExecutor,
@@ -226,6 +274,33 @@ impl ChatCLI {
 
         let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::new()?;
         rl.set_helper(Some(SlashHelper));
+        let readline_history_path = repl_history_path();
+        if let Some(path) = &readline_history_path {
+            if let Some(parent) = path.parent() {
+                if let Err(err) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "{} could not create REPL history directory '{}': {}",
+                        "Warn:".bright_yellow(),
+                        parent.display(),
+                        err
+                    );
+                }
+            }
+            if let Err(err) = rl.load_history(path)
+                && !matches!(
+                    err,
+                    ReadlineError::Io(ref io_err)
+                        if io_err.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                eprintln!(
+                    "{} could not load REPL history '{}': {}",
+                    "Warn:".bright_yellow(),
+                    path.display(),
+                    err
+                );
+            }
+        }
 
         loop {
             let prompt = if self.plan_mode.load(Ordering::SeqCst) {
@@ -295,6 +370,17 @@ impl ChatCLI {
                     eprintln!("Error: {:?}", err);
                     break;
                 }
+            }
+        }
+
+        if let Some(path) = &readline_history_path {
+            if let Err(err) = rl.save_history(path) {
+                eprintln!(
+                    "{} could not save REPL history '{}': {}",
+                    "Warn:".bright_yellow(),
+                    path.display(),
+                    err
+                );
             }
         }
 
@@ -431,23 +517,16 @@ impl ChatCLI {
 
     async fn handle_command(&mut self, input: &str) -> Result<bool> {
         let Some((cmd, args)) = commands::parse(input) else {
-            // Extract the typed `/foo` head so we can show useful
-            // candidates when the user typed an ambiguous prefix.
             let head = input.split_whitespace().next().unwrap_or(input);
-            let candidates = commands::prefix_matches(head);
-            if candidates.len() > 1 {
-                println!(
-                    "{} {} matches multiple commands:",
-                    "Ambiguous:".bright_yellow(),
-                    head.bright_cyan()
-                );
+            let candidates = commands::suggestions(head);
+            println!("{} {}", "Unknown command:".bright_red(), head);
+            if candidates.is_empty() {
+                println!("Type {} for available commands", "/help".bright_cyan());
+            } else {
+                println!("Did you mean?");
                 for name in &candidates {
                     println!("  {}", name.bright_cyan());
                 }
-                println!("Type more characters to disambiguate.");
-            } else {
-                println!("{} {}", "Unknown command:".bright_red(), input);
-                println!("Type {} for available commands", "/help".bright_cyan());
             }
             return Ok(true);
         };
@@ -1222,24 +1301,11 @@ impl ChatCLI {
             r#"  └───────┘  "#,
             r#"   ░░░░░░░   "#,
         ];
-        // Fold the essential commands into the mascot's right-hand
-        // column so first-run output fits on one screen. The full
-        // command list is one `/help` away.
-        let tagline = [
-            "".to_string(),
-            format!("hi, i'm Cubi — {}", "a pocket-sized AI".bright_white()),
-            format!(
-                "{} or {} · {} to exit · Tab to autocomplete",
-                "/help".bright_cyan(),
-                "/version".bright_cyan(),
-                "/quit".bright_cyan()
-            ),
-            format!("ask me anything ({} commands available)", COMMANDS.len()),
-            "".to_string(),
-        ];
+        let rows = welcome_banner_rows(true);
         println!();
-        for (m, t) in mascot.iter().zip(tagline.iter()) {
-            println!("{}  {}", m.bright_cyan(), t);
+        for (i, row) in rows.iter().enumerate() {
+            let m = mascot.get(i).copied().unwrap_or("             ");
+            println!("{}  {}", m.bright_cyan(), row);
         }
         println!();
     }
@@ -3261,10 +3327,10 @@ impl ChatCLI {
             return true;
         }
         if self.headless_mode {
-            eprintln!(
+            self.emit_status(format!(
                 "⚠ Tool `{}` wants to run; denying in headless mode.",
                 tool_name
-            );
+            ));
             return false;
         }
 
@@ -3301,11 +3367,7 @@ impl ChatCLI {
                 "✗".bright_red(),
                 "denied by PreToolUse hook".bright_red()
             );
-            if self.headless_mode {
-                eprintln!("{msg}");
-            } else {
-                println!("{msg}");
-            }
+            self.emit_status(msg);
             format!("[tool denied] {reason}")
         } else if self.policy.is_denied(&call.function.name) {
             format!(
@@ -3347,11 +3409,7 @@ impl ChatCLI {
                     "↳".bright_magenta(),
                     goal.chars().take(120).collect::<String>().bright_white()
                 );
-                if self.headless_mode {
-                    eprintln!("{start_msg}");
-                } else {
-                    println!("{start_msg}");
-                }
+                self.emit_status(start_msg);
                 match agent_loop::run_subagent(
                     &self.executor,
                     &mut self.mcp_manager,
@@ -3362,11 +3420,7 @@ impl ChatCLI {
                 {
                     Ok(report) => {
                         let done_msg = format!("  {} subagent done", "↳".bright_magenta());
-                        if self.headless_mode {
-                            eprintln!("{done_msg}");
-                        } else {
-                            println!("{done_msg}");
-                        }
+                        self.emit_status(done_msg);
                         report
                     }
                     Err(e) => format!("[tool error] subagent failed: {e}"),
@@ -3506,22 +3560,17 @@ impl ChatCLI {
                     // Move past any partial output.
                     println!();
                 }
-                if headless_mode {
-                    eprintln!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-                } else {
-                    println!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-                }
+                crate::out::status_line(
+                    headless_mode,
+                    format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red()),
+                );
                 if step > 0 {
                     let msg = format!(
                         "  {} prior tool side-effects in this turn may have run; \
                          `/rewind` can undo file edits.",
                         "ℹ".bright_blue()
                     );
-                    if headless_mode {
-                        eprintln!("{msg}");
-                    } else {
-                        println!("{msg}");
-                    }
+                    crate::out::status_line(headless_mode, msg);
                 }
                 // Drop the journal bucket that `run()` opened for this
                 // turn if no tools have actually snapshotted anything yet,
@@ -3589,21 +3638,12 @@ impl ChatCLI {
             }
 
             for (idx, call) in calls.iter().enumerate() {
-                if self.headless_mode {
-                    eprintln!(
-                        "{} {} {}",
-                        "⚙".bright_blue(),
-                        "tool:".bright_blue(),
-                        call.function.name.bright_cyan()
-                    );
-                } else {
-                    println!(
-                        "{} {} {}",
-                        "⚙".bright_blue(),
-                        "tool:".bright_blue(),
-                        call.function.name.bright_cyan()
-                    );
-                }
+                self.emit_status(format!(
+                    "{} {} {}",
+                    "⚙".bright_blue(),
+                    "tool:".bright_blue(),
+                    call.function.name.bright_cyan()
+                ));
 
                 let result_text = {
                     let tool_fut = self.execute_tool_call(call);
@@ -3633,11 +3673,11 @@ impl ChatCLI {
                 } else {
                     ""
                 };
-                if self.headless_mode {
-                    eprintln!("  {}{}", preview.bright_black(), ellipsis.bright_black());
-                } else {
-                    println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
-                }
+                self.emit_status(format!(
+                    "  {}{}",
+                    preview.bright_black(),
+                    ellipsis.bright_black()
+                ));
 
                 self.history
                     .push(Message::tool_result(&call.function.name, result_text));
@@ -3680,11 +3720,7 @@ impl ChatCLI {
 
     fn cancel_tool_calls(&mut self, turn_start: usize, _calls: &[ToolCall], current_idx: usize) {
         let msg = format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-        if self.headless_mode {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
+        self.emit_status(msg);
         // History is truncated back to `turn_start` to discard the in-flight
         // turn, so we deliberately do not push "[tool cancelled]" markers —
         // they would be dropped immediately by the truncate below.
@@ -3694,11 +3730,7 @@ impl ChatCLI {
             "  {} tool future was dropped; subprocesses started by shell-out tools may keep running.",
             "ℹ".bright_blue()
         );
-        if self.headless_mode {
-            eprintln!("{caveat}");
-        } else {
-            println!("{caveat}");
-        }
+        self.emit_status(caveat);
         // Mirror the model-cancel path: warn that earlier tools in this
         // same turn may have already mutated state, and point at `/rewind`.
         if current_idx > 0 {
@@ -3707,11 +3739,7 @@ impl ChatCLI {
                  `/rewind` can undo file edits.",
                 "ℹ".bright_blue()
             );
-            if self.headless_mode {
-                eprintln!("{rewind}");
-            } else {
-                println!("{rewind}");
-            }
+            self.emit_status(rewind);
         }
     }
 
@@ -4109,14 +4137,14 @@ impl ChatCLI {
                 }
             ),
             "on" => {
-                colored::control::set_override(true);
+                crate::style::set_color_override(true);
                 if let Err(e) = self.update_config(|c| c.color = Some("on".to_string())) {
                     eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
                 }
                 println!("{} colored output ON", "✓".bright_green());
             }
             "off" => {
-                colored::control::set_override(false);
+                crate::style::set_color_override(false);
                 if let Err(e) = self.update_config(|c| c.color = Some("off".to_string())) {
                     eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
                 }
@@ -4188,7 +4216,10 @@ impl ChatCLI {
     fn show_keybindings(&self) {
         println!("\n{}", "Keybindings:".bright_yellow().bold());
         let pairs: &[(&str, &str)] = &[
-            ("Up / Down", "history navigation"),
+            (
+                "Up / Down",
+                "history navigation (persisted in ~/.cubi/history)",
+            ),
             ("Ctrl-A / Ctrl-E", "beginning / end of line (emacs)"),
             ("Ctrl-W", "delete previous word"),
             ("Ctrl-U", "kill to start of line"),
@@ -5042,6 +5073,22 @@ mod tests {
 
     fn system(s: &str) -> Message {
         Message::text("system", s)
+    }
+
+    #[test]
+    fn repl_history_path_lives_under_cubi_home() {
+        if let Some(path) = repl_history_path() {
+            assert!(path.ends_with(Path::new(".cubi").join("history")));
+        }
+    }
+
+    #[test]
+    fn welcome_banner_rows_include_every_command_name() {
+        let banner = welcome_banner_rows(false).join("\n");
+        for name in commands::command_names() {
+            assert!(banner.contains(name), "welcome banner missing {name}");
+        }
+        assert!(!banner.contains("Available Commands:"));
     }
 
     // ---- parse_force_and_filename ----

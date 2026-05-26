@@ -20,8 +20,8 @@
 //! Resolution order is deliberate: the env var still wins so CI / shell
 //! aliases that pre-date this module keep working.
 
+use crate::style::CubiStyle;
 use anyhow::{Context, Result};
-use colored::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
