@@ -117,6 +117,10 @@ impl Default for CliFlags {
     }
 }
 
+fn repl_history_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cubi").join("history"))
+}
+
 impl ChatCLI {
     #[allow(dead_code)]
     pub fn new(
@@ -226,6 +230,13 @@ impl ChatCLI {
 
         let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::new()?;
         rl.set_helper(Some(SlashHelper));
+        let readline_history_path = repl_history_path();
+        if let Some(path) = &readline_history_path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            rl.load_history(path).ok();
+        }
 
         loop {
             let prompt = if self.plan_mode.load(Ordering::SeqCst) {
@@ -296,6 +307,10 @@ impl ChatCLI {
                     break;
                 }
             }
+        }
+
+        if let Some(path) = &readline_history_path {
+            rl.save_history(path).ok();
         }
 
         // Fire Stop hooks.
@@ -4181,7 +4196,10 @@ impl ChatCLI {
     fn show_keybindings(&self) {
         println!("\n{}", "Keybindings:".bright_yellow().bold());
         let pairs: &[(&str, &str)] = &[
-            ("Up / Down", "history navigation"),
+            (
+                "Up / Down",
+                "history navigation (persisted in ~/.cubi/history)",
+            ),
             ("Ctrl-A / Ctrl-E", "beginning / end of line (emacs)"),
             ("Ctrl-W", "delete previous word"),
             ("Ctrl-U", "kill to start of line"),
@@ -5035,6 +5053,13 @@ mod tests {
 
     fn system(s: &str) -> Message {
         Message::text("system", s)
+    }
+
+    #[test]
+    fn repl_history_path_lives_under_cubi_home() {
+        if let Some(path) = repl_history_path() {
+            assert!(path.ends_with(Path::new(".cubi").join("history")));
+        }
     }
 
     // ---- parse_force_and_filename ----
