@@ -2,6 +2,7 @@ use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::completer::SlashHelper;
 use crate::executor::AIExecutor;
+use crate::exit_code::{self, ExitCode};
 use crate::file_mentions::{self, UserCommand};
 use crate::file_rollback::FileJournal;
 use crate::git_cmds;
@@ -3653,6 +3654,12 @@ impl ChatCLI {
                 // turn instead of an empty bucket.
                 self.journal.discard_last_turn_if_empty();
                 self.history.truncate(turn_start);
+                if headless_mode {
+                    return Err(exit_code::err(
+                        ExitCode::Cancelled,
+                        "cubi: cancelled (Ctrl-C)",
+                    ));
+                }
                 return Ok(());
             };
             let (msg, stats) = stream_result?;
@@ -3731,6 +3738,12 @@ impl ChatCLI {
                 };
                 let Some(result_text) = result_text else {
                     self.cancel_tool_calls(turn_start, &calls, idx);
+                    if headless_mode {
+                        return Err(exit_code::err(
+                            ExitCode::Cancelled,
+                            "cubi: cancelled (Ctrl-C)",
+                        ));
+                    }
                     return Ok(());
                 };
 
@@ -3739,6 +3752,15 @@ impl ChatCLI {
                     || result_text.starts_with("[tool denied]");
                 self.hooks
                     .fire_post_tool_use(&call.function.name, &result_text, is_error);
+                if headless_mode && result_text.starts_with("[tool error]") {
+                    return Err(exit_code::err(
+                        ExitCode::Tool,
+                        format!(
+                            "cubi: tool '{}' failed: {}",
+                            call.function.name, result_text
+                        ),
+                    ));
+                }
 
                 // Print a short preview so the user can see what came back
                 // without us dumping a 10 KB log into the terminal.
