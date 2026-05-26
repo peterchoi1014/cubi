@@ -4144,14 +4144,14 @@ impl ChatCLI {
                 }
             ),
             "on" => {
-                colored::control::set_override(true);
+                crate::style::set_color_override(true);
                 if let Err(e) = self.update_config(|c| c.color = Some("on".to_string())) {
                     eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
                 }
                 println!("{} colored output ON", "✓".bright_green());
             }
             "off" => {
-                colored::control::set_override(false);
+                crate::style::set_color_override(false);
                 if let Err(e) = self.update_config(|c| c.color = Some("off".to_string())) {
                     eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
                 }
