@@ -36,6 +36,7 @@ use crate::ollama::{ChatStats, Message, OllamaClient, ToolCall, ToolCallFunction
 pub enum LlmBackend {
     Ollama(OllamaClient),
     OpenAi(OpenAiClient),
+    Fake,
 }
 
 impl LlmBackend {
@@ -47,6 +48,7 @@ impl LlmBackend {
                 let (msg, _) = c.chat_with_tools(model, messages, None).await?;
                 Ok(msg.content)
             }
+            Self::Fake => Ok(fake_content()),
         }
     }
 
@@ -60,6 +62,7 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.chat_with_tools(model, messages, tools).await,
             Self::OpenAi(c) => c.chat_with_tools(model, messages, tools).await,
+            Self::Fake => Ok((Message::text("assistant", fake_content()), fake_stats())),
         }
     }
 
@@ -69,7 +72,7 @@ impl LlmBackend {
         model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
-        on_token: F,
+        mut on_token: F,
     ) -> Result<(Message, ChatStats)>
     where
         F: FnMut(&str),
@@ -77,6 +80,11 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::OpenAi(c) => c.chat_stream(model, messages, tools, on_token).await,
+            Self::Fake => {
+                let content = fake_content();
+                on_token(&content);
+                Ok((Message::text("assistant", content), fake_stats()))
+            }
         }
     }
 
@@ -85,6 +93,7 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.list_models().await,
             Self::OpenAi(c) => c.list_models().await,
+            Self::Fake => Ok(vec!["qwen3:4b".to_string()]),
         }
     }
 
@@ -93,6 +102,7 @@ impl LlmBackend {
         match self {
             Self::Ollama(_) => "ollama",
             Self::OpenAi(_) => "openai",
+            Self::Fake => "fake",
         }
     }
 }
@@ -539,10 +549,25 @@ impl OpenAiClient {
     }
 }
 
+fn fake_content() -> String {
+    std::env::var("CUBI_FAKE_LLM_RESPONSE").unwrap_or_else(|_| "hi".to_string())
+}
+
+fn fake_stats() -> ChatStats {
+    ChatStats {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        elapsed_ms: 1,
+    }
+}
+
 // ─── Provider factory ───────────────────────────────────────────────────────
 
 /// Creates the appropriate LLM provider based on environment configuration.
 pub fn create_provider() -> LlmBackend {
+    if std::env::var("CUBI_FAKE_LLM").is_ok() {
+        return LlmBackend::Fake;
+    }
     if let Some(client) = OpenAiClient::from_env() {
         return LlmBackend::OpenAi(client);
     }

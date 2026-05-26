@@ -216,7 +216,10 @@ async fn main() -> Result<()> {
     }
     let headless = one_shot_prompt.is_some();
     if headless && !stream_explicit {
-        cli_flags.stream = false;
+        cli_flags.stream = cli_flags.json;
+    }
+    if cli_flags.json {
+        cli_flags.markdown = false;
     }
 
     // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
@@ -299,7 +302,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create AI executor")?;
 
-    if executor.provider_name() == "openai" {
+    if executor.provider_name() == "fake" {
+        status_line(
+            headless,
+            format!("{} Using fake test provider", "✓".bright_green()),
+        );
+    } else if executor.provider_name() == "openai" {
         let base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
             .or_else(|| std::env::var("CUBI_BASE_URL").ok())
@@ -443,6 +451,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let json_output = cli_flags.json;
+
     // Create and run CLI
     let mut cli = ChatCLI::new_with_flags(
         executor,
@@ -468,12 +478,24 @@ async fn main() -> Result<()> {
 
     if let Err(err) = run_result {
         if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
-            if !exit.message.is_empty() {
+            if json_output && headless {
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"error","message": exit.message})
+                );
+            } else if !exit.message.is_empty() {
                 eprintln!("{}", exit.message);
             }
             exit_code::exit(exit.code);
         }
-        eprintln!("{}", err);
+        if json_output && headless {
+            println!(
+                "{}",
+                serde_json::json!({"type":"error","message": err.to_string()})
+            );
+        } else {
+            eprintln!("{}", err);
+        }
         exit_code::exit(if headless {
             ExitCode::Model
         } else {
@@ -542,7 +564,8 @@ fn print_help() {
          --system <file>                 Prepend file contents as a system\n  \
                                         message before chat starts\n  \
          --json                          Emit machine-readable output where\n  \
-                                        supported (currently --list-sessions)\n\n\
+                                        supported (session arrays or headless\n  \
+                                        line-delimited events)\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

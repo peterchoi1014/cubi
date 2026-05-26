@@ -94,6 +94,8 @@ pub struct ChatCLI {
     session_stats: ChatStats,
     /// Suppresses REPL-only decoration so one-shot output remains pipeable.
     headless_mode: bool,
+    /// Emits line-delimited JSON events in headless mode.
+    json_enabled: bool,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -168,7 +170,20 @@ fn welcome_banner_rows(color: bool) -> Vec<String> {
 
 impl ChatCLI {
     fn emit_status(&self, msg: impl std::fmt::Display) {
+        if self.json_enabled && self.headless_mode {
+            return;
+        }
         crate::out::status_line(self.headless_mode, msg);
+    }
+
+    fn emit_json_event(value: serde_json::Value) {
+        println!("{}", value);
+    }
+
+    fn emit_json_event_if(enabled: bool, value: serde_json::Value) {
+        if enabled {
+            Self::emit_json_event(value);
+        }
     }
 
     #[allow(dead_code)]
@@ -219,6 +234,7 @@ impl ChatCLI {
             stats_footer_enabled: flags.stats_footer,
             session_stats: ChatStats::default(),
             headless_mode: false,
+            json_enabled: flags.json,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -437,6 +453,9 @@ impl ChatCLI {
     /// are written to stdout so callers can pipe the result.
     pub async fn run_one_shot(&mut self, prompt: &str) -> Result<()> {
         self.headless_mode = true;
+        if self.json_enabled {
+            self.markdown_enabled = false;
+        }
         self.hooks.fire_session_start(self.executor.get_model());
         let expanded = file_mentions::expand_file_mentions(prompt);
         let turn_start = self.history.len();
@@ -3560,6 +3579,7 @@ impl ChatCLI {
         // at the very end so cancelled or errored turns don't pollute totals.
         let mut turn_stats = ChatStats::default();
         let headless_mode = self.headless_mode;
+        let json_enabled = self.json_enabled && headless_mode;
 
         // Snapshot the journal start so /rewind still works after Ctrl-C
         // cancel: we leave file edits in place but pop the history.
@@ -3607,12 +3627,17 @@ impl ChatCLI {
                                     printed_prefix = true;
                                 }
                             }
-                            if headless_mode {
+                            if json_enabled {
+                                Self::emit_json_event(
+                                    serde_json::json!({"type":"token","value": tok}),
+                                );
+                            } else if headless_mode {
                                 print!("{}", tok);
+                                let _ = std::io::stdout().flush();
                             } else {
                                 print!("{}", tok.bright_white());
+                                let _ = std::io::stdout().flush();
                             }
-                            let _ = std::io::stdout().flush();
                             got_token = true;
                         });
                 tokio::select! {
@@ -3692,7 +3717,11 @@ impl ChatCLI {
                 // providers put the completed message only in the final chunk;
                 // print it here if the streaming callback saw no tokens.
                 if self.stream_enabled && !got_token && !msg_content.is_empty() {
-                    if headless_mode {
+                    if json_enabled {
+                        Self::emit_json_event(
+                            serde_json::json!({"type":"token","value": msg_content}),
+                        );
+                    } else if headless_mode {
                         println!("{msg_content}");
                     } else {
                         print!("{} ", "AI:".bright_blue().bold());
@@ -3701,12 +3730,22 @@ impl ChatCLI {
                     any_output = true;
                 }
                 if !self.stream_enabled && !msg_content.is_empty() {
-                    // Buffered mode: render the message now. Markdown if
-                    // enabled, otherwise plain text.
-                    self.render_final_reply(&msg_content);
+                    if json_enabled {
+                        Self::emit_json_event(
+                            serde_json::json!({"type":"token","value": msg_content}),
+                        );
+                    } else {
+                        // Buffered mode: render the message now. Markdown if
+                        // enabled, otherwise plain text.
+                        self.render_final_reply(&msg_content);
+                    }
                     any_output = true;
                 }
-                if any_output && headless_mode {
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({"type":"done","stats": turn_stats}),
+                );
+                if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
                     // The buffered and stream-fallback paths above
@@ -3714,7 +3753,7 @@ impl ChatCLI {
                     if got_token {
                         println!();
                     }
-                } else if any_output {
+                } else if any_output && !json_enabled {
                     println!("\n");
                 }
                 break;
@@ -3728,6 +3767,14 @@ impl ChatCLI {
             }
 
             for (idx, call) in calls.iter().enumerate() {
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({
+                        "type": "tool_call",
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }),
+                );
                 self.emit_status(format!(
                     "{} {} {}",
                     "⚙".bright_blue(),
@@ -3783,6 +3830,14 @@ impl ChatCLI {
                     preview.bright_black(),
                     ellipsis.bright_black()
                 ));
+                Self::emit_json_event_if(
+                    json_enabled,
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "name": call.function.name,
+                        "content": result_text.clone(),
+                    }),
+                );
 
                 self.history
                     .push(Message::tool_result(&call.function.name, result_text));
