@@ -218,7 +218,8 @@ impl SessionStore {
             .with_context(|| format!("Failed to create {}", self.dir.display()))?;
         let path = self.dir.join(format!("{}.json", session.id));
         let json = serde_json::to_string_pretty(session)?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        atomic_write(&path, json.as_bytes())?;
+        tracing::debug!(target: "cubi::sessions", id = %session.id, path = %path.display(), "session saved");
         if is_managed_session_dir(&self.dir) {
             upsert_index_entry(meta_from_session_file(session, path)?)?;
         }
@@ -500,7 +501,7 @@ pub enum DeleteSessionResult {
 /// the process environment. Checking the env vars first lets integration tests
 /// redirect session storage to a temporary directory by setting `HOME` /
 /// `USERPROFILE` on the child process.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HOME") {
         let path = PathBuf::from(p);
         if path.is_absolute() {
@@ -517,7 +518,7 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-fn sessions_root() -> Option<PathBuf> {
+pub(crate) fn sessions_root() -> Option<PathBuf> {
     Some(home_dir()?.join(".cubi").join("sessions"))
 }
 
@@ -586,29 +587,43 @@ fn write_index(index: &SessionIndex) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    let tmp_name = format!(
-        ".index.json.tmp-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    let bytes = serde_json::to_string_pretty(index)?;
+    atomic_write(&path, bytes.as_bytes())
+        .with_context(|| format!("Failed to atomically write {}", path.display()))?;
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `path` by writing into a unique temp
+/// file in the same directory and renaming over the target. The unique
+/// `.{filename}.tmp-{pid}-{nanos}` suffix avoids collisions with
+/// concurrent writers (other cubi processes or other sessions sharing
+/// the directory). On Windows, `rename` won't replace an existing file
+/// so the destination is removed first.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_name = format!(".{}.tmp-{}-{}", filename, std::process::id(), nanos);
     let tmp = path.with_file_name(tmp_name);
-    fs::write(&tmp, serde_json::to_string_pretty(index)?)
-        .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    fs::write(&tmp, bytes).with_context(|| format!("Failed to write {}", tmp.display()))?;
     #[cfg(windows)]
     if path.exists() {
-        fs::remove_file(&path)
+        fs::remove_file(path)
             .with_context(|| format!("Failed to remove stale {}", path.display()))?;
     }
-    fs::rename(&tmp, &path).with_context(|| {
-        format!(
-            "Failed to replace {} with {}",
-            path.display(),
-            tmp.display()
-        )
-    })?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        // Best-effort cleanup so a failed rename doesn't leak the tmp file.
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "Failed to replace {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -814,6 +829,40 @@ mod tests {
             .join(format!("cubi-home-{label}-{nanos}"));
         fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_file() {
+        let store = tmp_store("atomic-overwrite");
+        fs::create_dir_all(&store.dir).unwrap();
+        let path = store.dir.join("data.json");
+        super::atomic_write(&path, b"v1").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"v1");
+        super::atomic_write(&path, b"v2-longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"v2-longer");
+        fs::remove_dir_all(&store.dir).ok();
+    }
+
+    #[test]
+    fn save_does_not_leak_tmp_files() {
+        let store = tmp_store("no-tmp-leak");
+        let mut session = store.new_session("m".into());
+        session.history.push(user("a"));
+        store.save(&session).unwrap();
+        session.history.push(assistant("b"));
+        store.save(&session).unwrap();
+
+        let leaked: Vec<_> = fs::read_dir(&store.dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "expected no .tmp- files after atomic save, found: {leaked:?}"
+        );
+        fs::remove_dir_all(&store.dir).ok();
     }
 
     #[test]

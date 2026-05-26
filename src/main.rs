@@ -5,12 +5,14 @@ mod commands;
 mod compat;
 mod completer;
 mod completions;
+mod doctor;
 mod executor;
 mod exit_code;
 mod file_mentions;
 mod file_rollback;
 mod git_cmds;
 mod hooks;
+mod json_events;
 #[allow(dead_code)]
 mod llm;
 mod lsp_client;
@@ -65,6 +67,8 @@ const DEFAULT_MODEL: &str = "qwen3:4b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     // Lightweight argv handling. We don't pull in clap because the chat
     // loop has no flags of its own; this just makes `cubi --version`,
     // `cubi --help`, and `cubi --resume [id]` Do What People Expect
@@ -159,6 +163,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            "--no-banner" => cli_flags.no_banner = true,
+            "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
+            "doctor" => {
+                set_primary(&mut primary, PrimaryCommand::Doctor);
+            }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
                     eprintln!(
@@ -225,6 +234,13 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
+    if std::env::var("CUBI_NO_BANNER")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        cli_flags.no_banner = true;
+    }
+
     if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
         eprintln!(
             "cubi: --prompt cannot be combined with --resume, --list-sessions, or --delete-session."
@@ -248,6 +264,17 @@ async fn main() -> Result<()> {
     }
 
     match &primary {
+        PrimaryCommand::Doctor => {
+            let ok = doctor::run(cli_flags.json).await;
+            if !ok {
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
+        PrimaryCommand::PrintConfig => {
+            print_config()?;
+            return Ok(());
+        }
         PrimaryCommand::ListSessions => {
             print_sessions(cli_flags.json)?;
             return Ok(());
@@ -525,7 +552,7 @@ async fn main() -> Result<()> {
 
     // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
     // stay quiet under CI.
-    if !headless && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if !headless && !cli_flags.no_banner && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         if let Some(tip) = tips::tip_of_the_day() {
             println!("{} {}", "💡 tip:".bright_yellow(), tip);
         }
@@ -559,20 +586,14 @@ async fn main() -> Result<()> {
     if let Err(err) = run_result {
         if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
             if json_output && headless {
-                println!(
-                    "{}",
-                    serde_json::json!({"type":"error","message": exit.message})
-                );
+                json_events::emit_error(true, &exit.message);
             } else if !exit.message.is_empty() {
                 eprintln!("{}", exit.message);
             }
             exit_code::exit(exit.code);
         }
         if json_output && headless {
-            println!(
-                "{}",
-                serde_json::json!({"type":"error","message": err.to_string()})
-            );
+            json_events::emit_error(true, &err.to_string());
         } else {
             eprintln!("{}", err);
         }
@@ -595,6 +616,8 @@ enum PrimaryCommand {
     PluginsList,
     PluginsReload,
     PruneSessions,
+    Doctor,
+    PrintConfig,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -637,6 +660,9 @@ fn print_help() {
                                      Delete old session files (30d, 2w, 6m, 1y)\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
+         cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
+         cubi doctor --json           Same, machine-readable JSON output\n  \
+         cubi --print-config          Print the resolved config as JSON and exit\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
          cubi --version               Print version and exit\n  \
          cubi --help                  Print this help and exit\n\n\
@@ -650,6 +676,8 @@ fn print_help() {
                                         each reply\n  \
          --system <file>                 Prepend file contents as a system\n  \
                                         message before chat starts\n  \
+         --no-banner                    Suppress the welcome banner and tip\n  \
+                                         of the day (also honors CUBI_NO_BANNER)\n  \
          --json                          Emit machine-readable output where\n  \
                                         supported (session arrays or headless\n  \
                                         line-delimited events)\n\n\
@@ -660,6 +688,45 @@ fn print_help() {
          Once inside the REPL, type /help to list slash commands.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn print_config() -> Result<()> {
+    let config = AppConfig::load();
+    let mut value = serde_json::to_value(&config)?;
+    redact_secrets(&mut value);
+    if let Some(obj) = value.as_object_mut() {
+        let path = AppConfig::storage_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        obj.insert("_config_path".to_string(), serde_json::Value::String(path));
+        obj.insert(
+            "_resolved_model".to_string(),
+            serde_json::Value::String(onboarding::resolve_model(&config, DEFAULT_MODEL)),
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn redact_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                let lower = k.to_ascii_lowercase();
+                if lower.contains("key") || lower.contains("token") || lower.contains("secret") {
+                    *v = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_secrets(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_secrets(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn print_sessions(json: bool) -> Result<()> {
@@ -739,6 +806,31 @@ fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Installs a tracing subscriber driven by the `CUBI_LOG` env var
+/// (e.g. `CUBI_LOG=cubi=debug`). When unset, no subscriber is installed
+/// so the binary stays quiet by default. Output is always stderr —
+/// never stdout — to avoid polluting machine-readable JSON output.
+fn init_tracing() {
+    let Ok(filter) = std::env::var("CUBI_LOG") else {
+        return;
+    };
+    if filter.is_empty() {
+        return;
+    }
+    let env_filter = match tracing_subscriber::EnvFilter::try_new(&filter) {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!("cubi: ignoring invalid CUBI_LOG={filter:?}: {err}");
+            return;
+        }
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .try_init();
+}
+
 fn parse_duration_secs(input: &str) -> Option<u64> {
     let (number, unit) = input.split_at(input.len().saturating_sub(1));
     let value = number.parse::<u64>().ok()?;
@@ -797,4 +889,28 @@ fn format_mtime(secs: u64) -> String {
 fn format_session_time(secs: u64) -> String {
     let (y, m, d, hour, minute, _) = crate::sessions::civil_from_unix(secs);
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_secrets;
+    use serde_json::json;
+
+    #[test]
+    fn redact_replaces_key_token_secret_fields() {
+        let mut v = json!({
+            "default_model": "qwen3:4b",
+            "api_key": "abc",
+            "auth_token": "xyz",
+            "my_secret": "shh",
+            "nested": { "inner_key": "val", "ok": "fine" }
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["default_model"], "qwen3:4b");
+        assert_eq!(v["api_key"], "<redacted>");
+        assert_eq!(v["auth_token"], "<redacted>");
+        assert_eq!(v["my_secret"], "<redacted>");
+        assert_eq!(v["nested"]["inner_key"], "<redacted>");
+        assert_eq!(v["nested"]["ok"], "fine");
+    }
 }

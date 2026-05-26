@@ -267,3 +267,74 @@ fn headless_json_reports_tool_timeout() {
     assert!(stdout.contains(r#""name":"bash""#));
     assert!(stdout.contains(r#""secs":1"#));
 }
+
+#[test]
+fn doctor_json_emits_check_array() {
+    let home = tempdir().unwrap();
+    let output = cubi(home.path())
+        .args(["doctor", "--json"])
+        // Doctor still calls the model host check; let it fail fast on a
+        // bogus URL so the test never depends on network.
+        .env("OLLAMA_BASE_URL", "http://127.0.0.1:1")
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json should emit valid JSON");
+    assert!(parsed["checks"].is_array(), "checks should be an array");
+    assert!(parsed["ok"].is_boolean(), "ok should be a boolean");
+    let names: Vec<&str> = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert!(names.contains(&"config"));
+    assert!(names.contains(&"sessions_dir"));
+    assert!(names.contains(&"plugins"));
+}
+
+#[test]
+fn print_config_outputs_valid_json_with_path() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    // Plant a config with a key-like field to verify redaction; AppConfig
+    // ignores unknown fields, so we round-trip through the raw JSON only.
+    fs::write(
+        cubi_dir.join("config.json"),
+        r#"{"default_model":"qwen3:4b","onboarded":true,"api_token":"sk-very-secret","my_api_key":"abc123"}"#,
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .arg("--print-config")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--print-config should emit valid JSON");
+    assert!(parsed["_config_path"].is_string());
+    assert_eq!(parsed["default_model"], "qwen3:4b");
+    // AppConfig::load drops unknown fields, so the redacted keys must
+    // not survive — but ensure none of the canonical AppConfig fields
+    // accidentally carry a raw secret either.
+    let s = stdout.to_lowercase();
+    assert!(!s.contains("sk-very-secret"));
+    assert!(!s.contains("abc123"));
+}
+
+#[test]
+fn no_banner_flag_listed_in_help() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-banner"));
+}
