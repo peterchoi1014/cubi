@@ -105,6 +105,8 @@ pub struct ChatCLI {
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
     json_enabled: bool,
+    /// Precomputed MCP startup health summary shown in the welcome banner.
+    mcp_health_line: Option<String>,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -117,6 +119,7 @@ pub struct CliFlags {
     pub stats_footer: bool,
     pub system_prompt: Option<String>,
     pub json: bool,
+    pub mcp_health_line: Option<String>,
 }
 
 impl Default for CliFlags {
@@ -129,6 +132,7 @@ impl Default for CliFlags {
             stats_footer: false,
             system_prompt: None,
             json: false,
+            mcp_health_line: None,
         }
     }
 }
@@ -200,6 +204,7 @@ impl ChatCLI {
             session_stats: ChatStats::default(),
             headless_mode: false,
             json_enabled: flags.json,
+            mcp_health_line: flags.mcp_health_line,
         };
 
         if let Some(system_prompt) = flags.system_prompt {

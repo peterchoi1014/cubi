@@ -52,7 +52,10 @@ impl ChatCLI {
             r#"  └───────┘  "#,
             r#"   ░░░░░░░   "#,
         ];
-        let rows = welcome_banner_rows(true);
+        let mut rows = welcome_banner_rows(true);
+        if let Some(line) = &self.mcp_health_line {
+            rows.insert(3, line.clone());
+        }
         println!();
         for (i, row) in rows.iter().enumerate() {
             let m = mascot.get(i).copied().unwrap_or("             ");
