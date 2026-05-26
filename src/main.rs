@@ -140,11 +140,11 @@ async fn main() -> Result<()> {
             }
             "--resume" | "-r" | "resume" => {
                 set_primary(&mut primary, PrimaryCommand::Resume(String::new()));
-                if let Some(next) = argv.get(i + 1).and_then(|a| a.to_str())
-                    && (!next.starts_with('-') || next.is_empty())
-                {
-                    primary = PrimaryCommand::Resume(next.to_string());
-                    i += 1;
+                if let Some(next) = argv.get(i + 1).and_then(|a| a.to_str()) {
+                    if !next.starts_with('-') || next.is_empty() {
+                        primary = PrimaryCommand::Resume(next.to_string());
+                        i += 1;
+                    }
                 }
             }
             "--list-sessions" => set_primary(&mut primary, PrimaryCommand::ListSessions),
@@ -217,14 +217,14 @@ async fn main() -> Result<()> {
 
     // Apply forward-only config migrations and persist if anything
     // changed (e.g. first time this binary saw the file).
-    if migrations::migrate_config(&mut config)
-        && let Err(e) = config.save()
-    {
-        eprintln!(
-            "{} could not persist migrated config: {}",
-            "Warn:".bright_yellow(),
-            e
-        );
+    if migrations::migrate_config(&mut config) {
+        if let Err(e) = config.save() {
+            eprintln!(
+                "{} could not persist migrated config: {}",
+                "Warn:".bright_yellow(),
+                e
+            );
+        }
     }
 
     // Initialise telemetry early so onboarding events can be recorded.
@@ -412,11 +412,10 @@ async fn main() -> Result<()> {
 
     // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
     // stay quiet under CI.
-    if !headless
-        && std::io::IsTerminal::is_terminal(&std::io::stdout())
-        && let Some(tip) = tips::tip_of_the_day()
-    {
-        println!("{} {}", "💡 tip:".bright_yellow(), tip);
+    if !headless && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        if let Some(tip) = tips::tip_of_the_day() {
+            println!("{} {}", "💡 tip:".bright_yellow(), tip);
+        }
     }
 
     // Create and run CLI
