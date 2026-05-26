@@ -75,6 +75,8 @@ async fn main() -> Result<()> {
     let mut one_shot_prompt: Option<String> = None;
     let mut cli_flags = cli::CliFlags::default();
     let mut stream_explicit = false;
+    let mut prune_older_than: Option<u64> = None;
+    let mut dry_run = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -189,6 +191,24 @@ async fn main() -> Result<()> {
                 }
             }
             "--list-sessions" => set_primary(&mut primary, PrimaryCommand::ListSessions),
+            "--prune-sessions" => set_primary(&mut primary, PrimaryCommand::PruneSessions),
+            "--older-than" => {
+                i += 1;
+                let Some(value) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --older-than requires a duration like 30d, 2w, 6m, or 1y.");
+                    std::process::exit(2);
+                };
+                match parse_duration_secs(value) {
+                    Some(secs) => prune_older_than = Some(secs),
+                    None => {
+                        eprintln!(
+                            "cubi: invalid --older-than duration '{value}' (use 30d, 2w, 6m, or 1y)."
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--dry-run" => dry_run = true,
             "--delete-session" => {
                 i += 1;
                 let Some(id) = argv.get(i).and_then(|a| a.to_str()) else {
@@ -246,6 +266,14 @@ async fn main() -> Result<()> {
             let skills = skills::load_skills();
             let after = plugins::load_plugins();
             plugins::print_reload_summary(&before, &after, skills.len());
+            return Ok(());
+        }
+        PrimaryCommand::PruneSessions => {
+            let Some(age_secs) = prune_older_than else {
+                eprintln!("cubi: --prune-sessions requires --older-than <duration>.");
+                std::process::exit(2);
+            };
+            prune_sessions(age_secs, dry_run)?;
             return Ok(());
         }
         PrimaryCommand::Interactive | PrimaryCommand::Resume(_) => {}
@@ -550,6 +578,7 @@ enum PrimaryCommand {
     DeleteSession(String),
     PluginsList,
     PluginsReload,
+    PruneSessions,
 }
 
 fn set_prompt(slot: &mut Option<String>, value: String) {
@@ -588,6 +617,8 @@ fn print_help() {
          cubi --list-sessions         List saved sessions newest-first\n  \
          cubi --list-sessions --json  List saved sessions as a JSON array\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi --prune-sessions --older-than <duration> [--dry-run]\n  \
+                                     Delete old session files (30d, 2w, 6m, 1y)\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
@@ -659,6 +690,53 @@ fn delete_session(id: &str) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(age_secs);
+    let report = SessionStore::prune_older_than(cutoff, dry_run)?;
+    if dry_run {
+        for item in &report.items {
+            println!(
+                "would prune {}  {} bytes  {}",
+                item.id,
+                item.bytes,
+                item.path.display()
+            );
+        }
+        println!(
+            "Would prune {} session(s), freeing {} bytes.",
+            report.items.len(),
+            report.bytes
+        );
+    } else {
+        println!(
+            "Pruned {} session(s), freeing {} bytes.",
+            report.items.len(),
+            report.bytes
+        );
+    }
+    Ok(())
+}
+
+fn parse_duration_secs(input: &str) -> Option<u64> {
+    let (number, unit) = input.split_at(input.len().saturating_sub(1));
+    let value = number.parse::<u64>().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let days = match unit {
+        "d" => value,
+        "w" => value.checked_mul(7)?,
+        "m" => value.checked_mul(30)?,
+        "y" => value.checked_mul(365)?,
+        _ => return None,
+    };
+    days.checked_mul(86_400)
 }
 
 fn terminal_width() -> usize {

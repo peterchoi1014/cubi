@@ -1,5 +1,6 @@
 ---
 source: tests/completions_snapshots.rs
+assertion_line: 31
 expression: "completion_script(\"bash\")"
 ---
 # cubi bash completions
@@ -12,9 +13,13 @@ _cubi() {
         COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
         return 0
     fi
+    if [[ "${COMP_WORDS[1]}" == "plugins" && ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "list reload" -- "$cur") )
+        return 0
+    fi
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --stream --no-stream --markdown --no-markdown --show-stats-footer completions" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --list-sessions --delete-session --prune-sessions --older-than --dry-run --stream --no-stream --markdown --no-markdown --show-stats-footer --system --json completions plugins" -- "$cur") )
     fi
 }
 complete -F _cubi cubi
