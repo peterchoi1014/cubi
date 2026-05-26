@@ -55,3 +55,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Markdown renderer for AI replies (non-streaming mode).
 termimad = "0.30"
 
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
