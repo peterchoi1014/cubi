@@ -43,6 +43,8 @@ use executor::AIExecutor;
 use mcp_manager::McpManager;
 use onboarding::AppConfig;
 use permissions::Permissions;
+use sessions::{DeleteSessionResult, SessionStore};
+use std::io::{IsTerminal, Read};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -65,89 +67,137 @@ async fn main() -> Result<()> {
     // instead of dropping them straight into the REPL. Use `args_os()`
     // so non-UTF-8 argv can't panic the binary.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let mut resume_request: Option<String> = None;
+    let mut primary = PrimaryCommand::Interactive;
+    let mut one_shot_prompt: Option<String> = None;
     let mut cli_flags = cli::CliFlags::default();
+    let mut stream_explicit = false;
 
-    // Pre-scan for flags that may appear in any position alongside the
-    // primary command. Strip them out and operate on the residual argv.
-    let mut residual: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
-    for a in &argv {
-        match a.to_str() {
-            Some("--no-stream") => cli_flags.stream = false,
-            Some("--stream") => cli_flags.stream = true,
-            Some("--no-markdown") => cli_flags.markdown = false,
-            Some("--markdown") => cli_flags.markdown = true,
-            Some("--show-stats-footer") => cli_flags.stats_footer = true,
-            _ => residual.push(a.clone()),
-        }
-    }
-
-    match residual.first().and_then(|a| a.to_str()) {
-        None => {}
-        Some("--version") | Some("-V") | Some("-v") | Some("version") => {
-            println!("cubi {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        Some("--help") | Some("-h") | Some("help") => {
-            println!(
-                "cubi {} — a pocket-sized AI for your shell\n\n\
-                 USAGE:\n  cubi                    Start the interactive chat REPL\n  \
-                 cubi --resume [<id>]    Resume a prior chat (most recent in this\n  \
-                                         directory if no id is given)\n  \
-                 cubi completions <shell> Print a completion script (bash, zsh, fish)\n  \
-                 cubi --version          Print version and exit\n  \
-                 cubi --help             Print this help and exit\n\n\
-                 OUTPUT FLAGS (can be combined with any command):\n  \
-                 --stream / --no-stream         Stream tokens live (default) or wait\n  \
-                                                for the full reply\n  \
-                 --markdown / --no-markdown     Enable / disable markdown rendering\n  \
-                                                (markdown only applies in --no-stream\n  \
-                                                mode; auto-disabled for non-TTY stdout)\n  \
-                 --show-stats-footer            Print a token/timing footer after\n  \
-                                                each reply\n\n\
-                 Once inside the REPL, type /help to list slash commands.",
-                env!("CARGO_PKG_VERSION")
-            );
-            return Ok(());
-        }
-        Some("completions") => {
-            match residual.get(1).and_then(|a| a.to_str()) {
-                Some(shell) if residual.len() == 2 => {
-                    if let Some(script) = completions::script(shell) {
-                        print!("{script}");
-                        return Ok(());
-                    }
-                }
-                _ => {}
-            }
-            eprintln!(
-                "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
-            );
+    let mut i = 0;
+    while i < argv.len() {
+        let Some(arg) = argv[i].to_str() else {
+            eprintln!("cubi: arguments must be valid UTF-8. Run `cubi --help` for usage.");
             std::process::exit(2);
-        }
-        Some("--resume") | Some("-r") | Some("resume") => {
-            // Empty string means "latest"; an explicit id selects it.
-            resume_request = Some(
-                residual
-                    .get(1)
-                    .and_then(|a| a.to_str())
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            if residual.len() > 2 {
+        };
+        match arg {
+            "--no-stream" => {
+                cli_flags.stream = false;
+                stream_explicit = true;
+            }
+            "--stream" => {
+                cli_flags.stream = true;
+                stream_explicit = true;
+            }
+            "--no-markdown" => cli_flags.markdown = false,
+            "--markdown" => cli_flags.markdown = true,
+            "--show-stats-footer" => cli_flags.stats_footer = true,
+            "--version" | "-V" | "-v" | "version" => {
+                println!("cubi {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" | "help" => {
+                print_help();
+                return Ok(());
+            }
+            "--prompt" | "-p" => {
+                i += 1;
+                let Some(value) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: {arg} requires inline prompt text. Use stdin without -p for piped prompts."
+                    );
+                    std::process::exit(2);
+                };
+                set_prompt(&mut one_shot_prompt, value.to_string());
+            }
+            _ if arg.starts_with("--prompt=") => {
+                set_prompt(
+                    &mut one_shot_prompt,
+                    arg.trim_start_matches("--prompt=").to_string(),
+                );
+            }
+            "completions" => {
+                let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
+                    );
+                    std::process::exit(2);
+                };
+                if argv.get(i + 2).is_some() {
+                    eprintln!(
+                        "cubi: completions requires exactly one shell argument (bash, zsh, fish)."
+                    );
+                    std::process::exit(2);
+                }
+                if let Some(script) = completions::script(shell) {
+                    print!("{script}");
+                    return Ok(());
+                }
                 eprintln!(
-                    "cubi: --resume takes at most one argument. Run `cubi --help` for usage."
+                    "cubi: completions requires one of: bash, zsh, fish. Run `cubi --help` for usage."
                 );
                 std::process::exit(2);
             }
+            "--resume" | "-r" | "resume" => {
+                set_primary(&mut primary, PrimaryCommand::Resume(String::new()));
+                if let Some(next) = argv.get(i + 1).and_then(|a| a.to_str())
+                    && (!next.starts_with('-') || next.is_empty())
+                {
+                    primary = PrimaryCommand::Resume(next.to_string());
+                    i += 1;
+                }
+            }
+            "--list-sessions" => set_primary(&mut primary, PrimaryCommand::ListSessions),
+            "--delete-session" => {
+                i += 1;
+                let Some(id) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --delete-session requires a session id or unique prefix.");
+                    std::process::exit(2);
+                };
+                set_primary(&mut primary, PrimaryCommand::DeleteSession(id.to_string()));
+            }
+            _ => {
+                eprintln!("cubi: unrecognized argument {arg:?}. Run `cubi --help` for usage.");
+                std::process::exit(2);
+            }
         }
-        Some(_) => {
-            eprintln!(
-                "cubi: unrecognized argument {:?}. Run `cubi --help` for usage.",
-                residual[0]
-            );
+        i += 1;
+    }
+
+    if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
+        eprintln!(
+            "cubi: --prompt cannot be combined with --resume, --list-sessions, or --delete-session."
+        );
+        std::process::exit(2);
+    }
+
+    if matches!(primary, PrimaryCommand::Interactive)
+        && one_shot_prompt.is_none()
+        && !std::io::stdin().is_terminal()
+    {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("Failed to read prompt from stdin")?;
+        if input.trim().is_empty() {
+            eprintln!("cubi: stdin prompt was empty.");
             std::process::exit(2);
         }
+        one_shot_prompt = Some(input);
+    }
+
+    match &primary {
+        PrimaryCommand::ListSessions => {
+            print_sessions_table()?;
+            return Ok(());
+        }
+        PrimaryCommand::DeleteSession(id) => {
+            delete_session(id)?;
+            return Ok(());
+        }
+        PrimaryCommand::Interactive | PrimaryCommand::Resume(_) => {}
+    }
+    let headless = one_shot_prompt.is_some();
+    if headless && !stream_explicit {
+        cli_flags.stream = false;
     }
 
     // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
@@ -216,7 +266,10 @@ async fn main() -> Result<()> {
     let model: &str = &model_owned;
     let cpu_workers = 6;
 
-    println!("{}", "Initializing Cubi...".bright_cyan());
+    status_line(
+        headless,
+        format!("{}", "Initializing Cubi...".bright_cyan()),
+    );
 
     // Shared plan-mode flag, observed by built-in write/exec tools.
     let plan_mode = Arc::new(AtomicBool::new(false));
@@ -231,23 +284,32 @@ async fn main() -> Result<()> {
             .ok()
             .or_else(|| std::env::var("CUBI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        println!(
-            "{} Using OpenAI-compatible provider at {}",
-            "✓".bright_green(),
-            base_url.bright_cyan()
+        status_line(
+            headless,
+            format!(
+                "{} Using OpenAI-compatible provider at {}",
+                "✓".bright_green(),
+                base_url.bright_cyan()
+            ),
         );
-        println!(
-            "{} Using model: {}",
-            "✓".bright_green(),
-            model.bright_cyan()
+        status_line(
+            headless,
+            format!(
+                "{} Using model: {}",
+                "✓".bright_green(),
+                model.bright_cyan()
+            ),
         );
     } else {
         match ollama_client.list_models().await {
             Ok(models) => {
-                println!(
-                    "{} {}",
-                    "✓".bright_green(),
-                    "Connected to Ollama".bright_white()
+                status_line(
+                    headless,
+                    format!(
+                        "{} {}",
+                        "✓".bright_green(),
+                        "Connected to Ollama".bright_white()
+                    ),
                 );
 
                 if !models.iter().any(|m| m.starts_with(model)) {
@@ -264,10 +326,13 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
 
-                println!(
-                    "{} Using model: {}",
-                    "✓".bright_green(),
-                    model.bright_cyan()
+                status_line(
+                    headless,
+                    format!(
+                        "{} Using model: {}",
+                        "✓".bright_green(),
+                        model.bright_cyan()
+                    ),
                 );
             }
             Err(e) => {
@@ -300,22 +365,29 @@ async fn main() -> Result<()> {
     // `/rewind` can roll back any `edit_file`/`write_file` mutations
     // recorded by the built-in tool registry.
     let journal = file_rollback::FileJournal::default();
-    let mcp_manager = match McpManager::new_with_journal(
+    let mcp_manager = match McpManager::new_with_journal_quiet(
         Arc::clone(&permissions),
         Arc::clone(&plan_mode),
         journal.clone(),
+        headless,
     )
     .await
     {
         Ok(manager) => {
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
-                println!("{} Loaded {} MCP tool(s)", "✓".bright_green(), tool_count);
+                status_line(
+                    headless,
+                    format!("{} Loaded {} MCP tool(s)", "✓".bright_green(), tool_count),
+                );
                 Some(manager)
             } else {
-                println!(
-                    "{} No MCP tools configured (create ~/.cubi/mcp.json)",
-                    "ℹ".bright_blue()
+                status_line(
+                    headless,
+                    format!(
+                        "{} No MCP tools configured (create ~/.cubi/mcp.json)",
+                        "ℹ".bright_blue()
+                    ),
                 );
                 None
             }
@@ -330,11 +402,15 @@ async fn main() -> Result<()> {
         }
     };
 
-    println!("{} AI executor ready", "✓".bright_green());
+    status_line(
+        headless,
+        format!("{} AI executor ready", "✓".bright_green()),
+    );
 
     // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
     // stay quiet under CI.
-    if std::io::IsTerminal::is_terminal(&std::io::stdout())
+    if !headless
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
         && let Some(tip) = tips::tip_of_the_day()
     {
         println!("{} {}", "💡 tip:".bright_yellow(), tip);
@@ -349,10 +425,14 @@ async fn main() -> Result<()> {
         journal,
         cli_flags,
     );
-    if let Some(target) = resume_request {
-        cli.resume_session(&target);
+    if let PrimaryCommand::Resume(target) = &primary {
+        cli.resume_session(target);
     }
-    let run_result = cli.run().await;
+    let run_result = if let Some(prompt) = one_shot_prompt {
+        cli.run_one_shot(&prompt).await
+    } else {
+        cli.run().await
+    };
 
     // Shut down MCP cleanly while we still have an async context. The Drop
     // impl is only a best-effort fallback and intentionally does not spin up
@@ -362,4 +442,156 @@ async fn main() -> Result<()> {
     run_result?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+enum PrimaryCommand {
+    Interactive,
+    Resume(String),
+    ListSessions,
+    DeleteSession(String),
+}
+
+fn set_prompt(slot: &mut Option<String>, value: String) {
+    if value.trim().is_empty() {
+        eprintln!("cubi: --prompt/-p requires non-empty inline prompt text.");
+        std::process::exit(2);
+    }
+    if slot.replace(value).is_some() {
+        eprintln!("cubi: --prompt/-p may only be provided once.");
+        std::process::exit(2);
+    }
+}
+
+fn set_primary(slot: &mut PrimaryCommand, value: PrimaryCommand) {
+    if !matches!(slot, PrimaryCommand::Interactive) {
+        eprintln!("cubi: only one command may be provided. Run `cubi --help` for usage.");
+        std::process::exit(2);
+    }
+    *slot = value;
+}
+
+fn status_line(headless: bool, msg: impl std::fmt::Display) {
+    if headless {
+        eprintln!("{msg}");
+    } else {
+        println!("{msg}");
+    }
+}
+
+fn print_help() {
+    println!(
+        "cubi {} — a pocket-sized AI for your shell\n\n\
+         USAGE:\n  cubi                         Start the interactive chat REPL\n  \
+         cubi -p <prompt>             Run one prompt, print the reply, and exit\n  \
+         cubi --prompt <prompt>       Same as -p\n  \
+         echo <prompt> | cubi         Read a one-shot prompt from stdin\n  \
+         cubi --resume [<id>]         Resume a prior chat (most recent in this\n  \
+                                      directory if no id is given; falls back to\n  \
+                                      global latest)\n  \
+         cubi --list-sessions         List saved sessions newest-first\n  \
+         cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
+         cubi --version               Print version and exit\n  \
+         cubi --help                  Print this help and exit\n\n\
+         OUTPUT FLAGS (can be combined with chat commands):\n  \
+         --stream / --no-stream         Stream tokens live (default) or wait\n  \
+                                         for the full reply\n  \
+         --markdown / --no-markdown     Enable / disable markdown rendering\n  \
+                                         (markdown only applies in --no-stream\n  \
+                                         mode; auto-disabled for non-TTY stdout)\n  \
+         --show-stats-footer            Print a token/timing footer after\n  \
+                                         each reply\n\n\
+         Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
+         piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
+         pass --stream to stream tokens.\n\n\
+         Once inside the REPL, type /help to list slash commands.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_sessions_table() -> Result<()> {
+    let sessions = SessionStore::list_all()?;
+    println!("{:<24} {:<12} {:>5} CWD", "ID", "MTIME", "MSGS");
+    if sessions.is_empty() {
+        println!("(no sessions saved yet)");
+        return Ok(());
+    }
+    let width = terminal_width();
+    for meta in sessions {
+        let fixed = 24 + 1 + 12 + 1 + 5 + 1;
+        let cwd_width = width.saturating_sub(fixed).max(20);
+        println!(
+            "{:<24} {:<12} {:>5} {}",
+            meta.id,
+            format_mtime(meta.modified_at),
+            meta.message_count,
+            truncate_display(&meta.cwd, cwd_width)
+        );
+    }
+    Ok(())
+}
+
+fn delete_session(id: &str) -> Result<()> {
+    match SessionStore::delete_by_prefix(id)? {
+        DeleteSessionResult::Deleted(meta) => {
+            println!("Deleted session {}", meta.id);
+            Ok(())
+        }
+        DeleteSessionResult::NotFound => {
+            eprintln!("cubi: no session matches '{id}'.");
+            std::process::exit(2);
+        }
+        DeleteSessionResult::Ambiguous(candidates) => {
+            eprintln!("cubi: session prefix '{id}' is ambiguous. Candidates:");
+            for meta in candidates {
+                eprintln!("  {}  {}", meta.id, meta.cwd);
+            }
+            std::process::exit(2);
+        }
+    }
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|w| *w >= 40)
+        .unwrap_or(100)
+}
+
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+fn format_mtime(secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let age = now.saturating_sub(secs);
+    if age < 60 {
+        return "now".to_string();
+    }
+    if age < 3_600 {
+        return format!("{}m ago", age / 60);
+    }
+    if age < 86_400 {
+        return format!("{}h ago", age / 3_600);
+    }
+    if age < 7 * 86_400 {
+        return format!("{}d ago", age / 86_400);
+    }
+    format_session_time(secs)
+}
+
+fn format_session_time(secs: u64) -> String {
+    let (y, m, d, hour, minute, _) = crate::sessions::civil_from_unix(secs);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
 }

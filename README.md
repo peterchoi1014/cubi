@@ -198,13 +198,19 @@ You:
 ### Command-line flags
 
 ```
-cubi                    Start the interactive chat REPL
-cubi --resume [<id>]    Resume a prior chat (latest in cwd if no id given)
-cubi completions <shell> Print a completion script (bash, zsh, fish)
-cubi --version          Print version and exit
-cubi --help             Print help and exit
+cubi                         Start the interactive chat REPL
+cubi -p <prompt>             Run one prompt, print the reply to stdout, and exit
+cubi --prompt <prompt>       Same as -p
+echo <prompt> | cubi         Read a one-shot prompt from piped stdin
+cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
+                             session from the current cwd, then global latest
+cubi --list-sessions         List all saved sessions newest-first
+cubi --delete-session <id>   Delete by full id or unique prefix
+cubi completions <shell>     Print a completion script (bash, zsh, fish)
+cubi --version               Print version and exit
+cubi --help                  Print help and exit
 
-Output flags (combine with any command):
+Output flags (combine with chat commands):
   --stream / --no-stream         Stream tokens live (default) or wait for the full reply
   --markdown / --no-markdown     Enable / disable markdown rendering. Markdown only
                                  applies with --no-stream; auto-disabled for non-TTY
@@ -212,9 +218,13 @@ Output flags (combine with any command):
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,
-`/markdown on|off`, and `/stats-footer on|off`. Press **Ctrl-C** during an
-in-flight reply to cancel it and return to the prompt; the unanswered user
-message is rolled back so history stays clean.
+`/markdown on|off`, and `/stats-footer on|off`. `-p/--prompt` requires inline
+text and does not read stdin; without `-p`, piped stdin becomes the prompt.
+One-shot mode buffers by default for predictable scripts; pass `--stream` to
+stream tokens. Press **Ctrl-C** during an in-flight reply or tool call to cancel
+it and return to the prompt; the unanswered user message is rolled back so
+history stays clean. Dropping a tool future cannot always stop subprocesses
+already spawned by shell-out tools.
 
 Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
 or `cubi completions fish`, then install the printed script using your shell's

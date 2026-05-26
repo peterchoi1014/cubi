@@ -33,6 +33,15 @@ impl McpManager {
         plan_mode: Arc<AtomicBool>,
         journal: FileJournal,
     ) -> Result<Self> {
+        Self::new_with_journal_quiet(permissions, plan_mode, journal, false).await
+    }
+
+    pub async fn new_with_journal_quiet(
+        permissions: Arc<Mutex<Permissions>>,
+        plan_mode: Arc<AtomicBool>,
+        journal: FileJournal,
+        quiet_stdout: bool,
+    ) -> Result<Self> {
         let config = McpConfig::load()?;
         let mut manager = Self {
             clients: HashMap::new(),
@@ -52,11 +61,16 @@ impl McpManager {
                 .insert(tool.name.clone(), ("builtin".to_string(), mcp_tool));
         }
 
-        println!(
+        let builtins_msg = format!(
             "{} Loaded {} built-in tools",
             "✓".bright_green(),
             manager.builtin_tools.list_tools().len()
         );
+        if quiet_stdout {
+            eprintln!("{builtins_msg}");
+        } else {
+            println!("{builtins_msg}");
+        }
 
         // Connect to configured MCP servers
         for (name, server_config) in config.mcp_servers {
@@ -69,11 +83,16 @@ impl McpManager {
                 );
                 continue;
             }
-            println!(
+            let server_msg = format!(
                 "{} Connected to MCP server: {}",
                 "✓".bright_green(),
                 name.bright_cyan()
             );
+            if quiet_stdout {
+                eprintln!("{server_msg}");
+            } else {
+                println!("{server_msg}");
+            }
         }
 
         // Discover tools from external servers
