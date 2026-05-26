@@ -162,6 +162,10 @@ fn welcome_banner_rows(color: bool) -> Vec<String> {
 }
 
 impl ChatCLI {
+    fn emit_status(&self, msg: impl std::fmt::Display) {
+        crate::out::status_line(self.headless_mode, msg);
+    }
+
     #[allow(dead_code)]
     pub fn new(
         executor: AIExecutor,
@@ -3296,10 +3300,10 @@ impl ChatCLI {
             return true;
         }
         if self.headless_mode {
-            eprintln!(
+            self.emit_status(format!(
                 "⚠ Tool `{}` wants to run; denying in headless mode.",
                 tool_name
-            );
+            ));
             return false;
         }
 
@@ -3336,11 +3340,7 @@ impl ChatCLI {
                 "✗".bright_red(),
                 "denied by PreToolUse hook".bright_red()
             );
-            if self.headless_mode {
-                eprintln!("{msg}");
-            } else {
-                println!("{msg}");
-            }
+            self.emit_status(msg);
             format!("[tool denied] {reason}")
         } else if self.policy.is_denied(&call.function.name) {
             format!(
@@ -3382,11 +3382,7 @@ impl ChatCLI {
                     "↳".bright_magenta(),
                     goal.chars().take(120).collect::<String>().bright_white()
                 );
-                if self.headless_mode {
-                    eprintln!("{start_msg}");
-                } else {
-                    println!("{start_msg}");
-                }
+                self.emit_status(start_msg);
                 match agent_loop::run_subagent(
                     &self.executor,
                     &mut self.mcp_manager,
@@ -3397,11 +3393,7 @@ impl ChatCLI {
                 {
                     Ok(report) => {
                         let done_msg = format!("  {} subagent done", "↳".bright_magenta());
-                        if self.headless_mode {
-                            eprintln!("{done_msg}");
-                        } else {
-                            println!("{done_msg}");
-                        }
+                        self.emit_status(done_msg);
                         report
                     }
                     Err(e) => format!("[tool error] subagent failed: {e}"),
@@ -3541,22 +3533,17 @@ impl ChatCLI {
                     // Move past any partial output.
                     println!();
                 }
-                if headless_mode {
-                    eprintln!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-                } else {
-                    println!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-                }
+                crate::out::status_line(
+                    headless_mode,
+                    format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red()),
+                );
                 if step > 0 {
                     let msg = format!(
                         "  {} prior tool side-effects in this turn may have run; \
                          `/rewind` can undo file edits.",
                         "ℹ".bright_blue()
                     );
-                    if headless_mode {
-                        eprintln!("{msg}");
-                    } else {
-                        println!("{msg}");
-                    }
+                    crate::out::status_line(headless_mode, msg);
                 }
                 // Drop the journal bucket that `run()` opened for this
                 // turn if no tools have actually snapshotted anything yet,
@@ -3624,21 +3611,12 @@ impl ChatCLI {
             }
 
             for (idx, call) in calls.iter().enumerate() {
-                if self.headless_mode {
-                    eprintln!(
-                        "{} {} {}",
-                        "⚙".bright_blue(),
-                        "tool:".bright_blue(),
-                        call.function.name.bright_cyan()
-                    );
-                } else {
-                    println!(
-                        "{} {} {}",
-                        "⚙".bright_blue(),
-                        "tool:".bright_blue(),
-                        call.function.name.bright_cyan()
-                    );
-                }
+                self.emit_status(format!(
+                    "{} {} {}",
+                    "⚙".bright_blue(),
+                    "tool:".bright_blue(),
+                    call.function.name.bright_cyan()
+                ));
 
                 let result_text = {
                     let tool_fut = self.execute_tool_call(call);
@@ -3668,11 +3646,11 @@ impl ChatCLI {
                 } else {
                     ""
                 };
-                if self.headless_mode {
-                    eprintln!("  {}{}", preview.bright_black(), ellipsis.bright_black());
-                } else {
-                    println!("  {}{}", preview.bright_black(), ellipsis.bright_black());
-                }
+                self.emit_status(format!(
+                    "  {}{}",
+                    preview.bright_black(),
+                    ellipsis.bright_black()
+                ));
 
                 self.history
                     .push(Message::tool_result(&call.function.name, result_text));
@@ -3715,11 +3693,7 @@ impl ChatCLI {
 
     fn cancel_tool_calls(&mut self, turn_start: usize, _calls: &[ToolCall], current_idx: usize) {
         let msg = format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red());
-        if self.headless_mode {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
+        self.emit_status(msg);
         // History is truncated back to `turn_start` to discard the in-flight
         // turn, so we deliberately do not push "[tool cancelled]" markers —
         // they would be dropped immediately by the truncate below.
@@ -3729,11 +3703,7 @@ impl ChatCLI {
             "  {} tool future was dropped; subprocesses started by shell-out tools may keep running.",
             "ℹ".bright_blue()
         );
-        if self.headless_mode {
-            eprintln!("{caveat}");
-        } else {
-            println!("{caveat}");
-        }
+        self.emit_status(caveat);
         // Mirror the model-cancel path: warn that earlier tools in this
         // same turn may have already mutated state, and point at `/rewind`.
         if current_idx > 0 {
@@ -3742,11 +3712,7 @@ impl ChatCLI {
                  `/rewind` can undo file edits.",
                 "ℹ".bright_blue()
             );
-            if self.headless_mode {
-                eprintln!("{rewind}");
-            } else {
-                println!("{rewind}");
-            }
+            self.emit_status(rewind);
         }
     }
 
