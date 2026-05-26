@@ -1,8 +1,17 @@
 use colored::{ColoredString, Colorize};
 use std::fmt::Display;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+const COLOR_OVERRIDE_AUTO: u8 = 0;
+const COLOR_OVERRIDE_OFF: u8 = 1;
+const COLOR_OVERRIDE_ON: u8 = 2;
+static COLOR_OVERRIDE: AtomicU8 = AtomicU8::new(COLOR_OVERRIDE_AUTO);
 
 pub fn should_color() -> bool {
+    if let Some(enabled) = color_override() {
+        return enabled;
+    }
     should_color_with(
         |key| std::env::var_os(key).and_then(|v| v.into_string().ok()),
         std::io::stdout().is_terminal(),
@@ -14,8 +23,14 @@ pub fn init_color_control() {
 }
 
 pub fn set_color_override(enabled: bool) {
-    // SAFETY: this is called from the single-threaded REPL command path.
-    unsafe { std::env::set_var("CUBI_COLOR", if enabled { "on" } else { "off" }) };
+    COLOR_OVERRIDE.store(
+        if enabled {
+            COLOR_OVERRIDE_ON
+        } else {
+            COLOR_OVERRIDE_OFF
+        },
+        Ordering::SeqCst,
+    );
     colored::control::set_override(enabled);
 }
 
@@ -26,7 +41,7 @@ where
     if env_flag_enabled(env("CLICOLOR_FORCE")) {
         return true;
     }
-    if env_nonempty(env("NO_COLOR")) {
+    if env("NO_COLOR").is_some() {
         return false;
     }
     match env("CUBI_COLOR").as_deref() {
@@ -40,8 +55,12 @@ where
     stdout_is_tty
 }
 
-fn env_nonempty(value: Option<String>) -> bool {
-    value.is_some_and(|v| !v.is_empty())
+fn color_override() -> Option<bool> {
+    match COLOR_OVERRIDE.load(Ordering::SeqCst) {
+        COLOR_OVERRIDE_OFF => Some(false),
+        COLOR_OVERRIDE_ON => Some(true),
+        _ => None,
+    }
 }
 
 fn env_flag_enabled(value: Option<String>) -> bool {
@@ -111,6 +130,11 @@ mod tests {
     #[test]
     fn no_color_disables_color() {
         assert!(!should_color_with(env(&[("NO_COLOR", "1")]), true));
+    }
+
+    #[test]
+    fn no_color_empty_still_disables_color() {
+        assert!(!should_color_with(env(&[("NO_COLOR", "")]), true));
     }
 
     #[test]
