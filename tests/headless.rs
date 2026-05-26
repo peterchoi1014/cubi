@@ -235,6 +235,7 @@ fn headless_json_outputs_line_delimited_events() {
     assert!(events[1]["stats"].is_object());
 }
 
+#[cfg(unix)]
 #[test]
 fn headless_json_reports_tool_timeout() {
     let home = tempdir().unwrap();
