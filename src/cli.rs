@@ -311,19 +311,20 @@ impl ChatCLI {
                     );
                 }
             }
-            if let Err(err) = rl.load_history(path)
-                && !matches!(
-                    err,
-                    ReadlineError::Io(ref io_err)
+            if let Err(err) = rl.load_history(path) {
+                let is_not_found = matches!(
+                    &err,
+                    ReadlineError::Io(io_err)
                         if io_err.kind() == std::io::ErrorKind::NotFound
-                )
-            {
-                eprintln!(
-                    "{} could not load REPL history '{}': {}",
-                    "Warn:".bright_yellow(),
-                    path.display(),
-                    err
                 );
+                if !is_not_found {
+                    eprintln!(
+                        "{} could not load REPL history '{}': {}",
+                        "Warn:".bright_yellow(),
+                        path.display(),
+                        err
+                    );
+                }
             }
         }
 
@@ -4631,7 +4632,6 @@ impl ChatCLI {
 
     fn reload_plugins(&mut self) {
         self.skills = skills::load_skills();
-        self.plugins = plugins::load_plugins();
         let before = std::mem::take(&mut self.plugins);
         self.plugins = plugins::load_plugins();
         print!("{} ", "✓".bright_green());

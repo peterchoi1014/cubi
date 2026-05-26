@@ -562,9 +562,22 @@ fn write_index(index: &SessionIndex) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    let tmp = path.with_file_name("index.json.tmp");
+    let tmp_name = format!(
+        ".index.json.tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp = path.with_file_name(tmp_name);
     fs::write(&tmp, serde_json::to_string_pretty(index)?)
         .with_context(|| format!("Failed to write {}", tmp.display()))?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove stale {}", path.display()))?;
+    }
     fs::rename(&tmp, &path).with_context(|| {
         format!(
             "Failed to replace {} with {}",
