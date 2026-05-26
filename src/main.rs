@@ -488,7 +488,8 @@ async fn main() -> Result<()> {
     )
     .await
     {
-        Ok(manager) => {
+        Ok(mut manager) => {
+            manager.set_tool_timeout_secs(config.tool_timeout_secs);
             if manager.has_tools() {
                 let tool_count = manager.list_tools().len();
                 status_line(

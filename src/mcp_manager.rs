@@ -83,10 +83,25 @@ pub fn format_health_line(health: &[McpHealth], color: bool) -> String {
 use crate::oauth;
 use crate::permissions::Permissions;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolTimeoutError {
+    pub name: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for ToolTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tool '{}' timed out after {}s", self.name, self.secs)
+    }
+}
+
+impl std::error::Error for ToolTimeoutError {}
+
 pub struct McpManager {
     clients: HashMap<String, McpClient>,
     tools: HashMap<String, (String, Tool)>, // tool_name -> (server_name, tool)
     builtin_tools: BuiltinToolRegistry,
+    tool_timeout_secs: Option<u64>,
 }
 
 impl McpManager {
@@ -153,6 +168,7 @@ impl McpManager {
             clients: HashMap::new(),
             tools: HashMap::new(),
             builtin_tools: BuiltinToolRegistry::with_journal(permissions, plan_mode, journal),
+            tool_timeout_secs: Some(60),
         };
 
         // Add built-in tools first
@@ -213,6 +229,10 @@ impl McpManager {
         &self.tools
     }
 
+    pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
+        self.tool_timeout_secs = timeout_secs;
+    }
+
     pub async fn call_tool(
         &mut self,
         name: &str,
@@ -223,13 +243,37 @@ impl McpManager {
             .get(name)
             .context(format!("Tool '{}' not found", name))?;
 
+        let mut arguments = arguments;
+        let override_timeout = strip_timeout_override(&mut arguments);
+        let timeout_secs = override_timeout.or(self.tool_timeout_secs).unwrap_or(60);
+        let timeout_duration = Duration::from_secs(timeout_secs);
+
         // Time the call so the opt-in telemetry log has useful numbers.
         let started = std::time::Instant::now();
         let server_name = server_name.clone();
 
         // Handle built-in tools
         if server_name == "builtin" {
-            let result = self.builtin_tools.execute(name, arguments).await;
+            let result = tokio::time::timeout(
+                timeout_duration,
+                self.builtin_tools.execute(name, arguments),
+            )
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+                        tool: name,
+                        ok: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
+                    return Err(ToolTimeoutError {
+                        name: name.to_string(),
+                        secs: timeout_secs,
+                    }
+                    .into());
+                }
+            };
             crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
                 tool: name,
                 ok: result
@@ -258,7 +302,23 @@ impl McpManager {
             .get_mut(&server_name)
             .context(format!("Server '{}' not connected", server_name))?;
 
-        let result = client.call_tool(name, arguments).await;
+        let result =
+            tokio::time::timeout(timeout_duration, client.call_tool(name, arguments)).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
+                    tool: name,
+                    ok: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                });
+                return Err(ToolTimeoutError {
+                    name: name.to_string(),
+                    secs: timeout_secs,
+                }
+                .into());
+            }
+        };
         crate::telemetry::record_tool_call(crate::telemetry::ToolCallEvent {
             tool: name,
             ok: result
@@ -422,6 +482,13 @@ impl McpManager {
     }
 }
 
+fn strip_timeout_override(arguments: &mut serde_json::Value) -> Option<u64> {
+    let object = arguments.as_object_mut()?;
+    object
+        .remove("_timeout_secs")
+        .and_then(|value| value.as_u64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +503,12 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn strips_timeout_override_from_arguments() {
+        let mut args = serde_json::json!({"command": "echo ok", "_timeout_secs": 2});
+        assert_eq!(strip_timeout_override(&mut args), Some(2));
+        assert_eq!(args, serde_json::json!({"command": "echo ok"}));
     }
 }
