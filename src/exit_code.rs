@@ -13,6 +13,10 @@ pub enum ExitCode {
     /// scripts can branch on it (e.g. retry with a smaller system prompt
     /// or `/pin` fewer items).
     Budget = 12,
+    /// Network-class failure (connect refused, DNS, TLS). Distinct from
+    /// `Model = 10` so headless scripts can branch on connectivity
+    /// problems separately from provider/model errors.
+    Network = 13,
     Cancelled = 130,
 }
 
