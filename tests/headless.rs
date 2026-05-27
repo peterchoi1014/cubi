@@ -450,3 +450,83 @@ fn run_subcommand_missing_path_exits_with_usage_error() {
             "cubi: run requires a markdown script path",
         ));
 }
+
+#[cfg(unix)]
+#[test]
+fn trace_tools_writes_jsonl_pair_per_tool_call() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({"trusted_roots": [cwd]}).to_string(),
+    )
+    .unwrap();
+    let trace_path = home.path().join("trace.jsonl");
+
+    cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"bash","arguments":{"command":"true"}}}"#,
+        )
+        .args([
+            "--trace-tools",
+            trace_path.to_str().unwrap(),
+            "--json",
+            "--no-stream",
+            "-p",
+            "run a tool",
+        ])
+        .assert()
+        .success();
+
+    let raw = fs::read_to_string(&trace_path).expect("trace file written");
+    let lines: Vec<&str> = raw.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "expected at least two JSONL lines, got: {raw}"
+    );
+    let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v0["event"], "tool_start");
+    assert_eq!(v0["tool"], "bash");
+    let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(v1["event"], "tool_complete");
+    assert_eq!(v1["tool"], "bash");
+    assert_eq!(v1["call_id"], v0["call_id"]);
+}
+
+#[test]
+fn plugins_new_scaffolds_manifest_and_handler() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scaffolded plugin 'demo'"));
+
+    let manifest_path = dest.path().join("demo").join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["name"], "demo");
+    assert_eq!(manifest["version"], "0.1.0");
+}
+
+#[test]
+fn plugins_new_refuses_duplicate_directory() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    fs::create_dir_all(dest.path().join("dup")).unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "dup"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("already exists"));
+}

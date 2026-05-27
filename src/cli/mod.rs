@@ -122,6 +122,10 @@ pub struct ChatCLI {
     /// `history` so the LLM sees it on every turn; `/compact` is aware
     /// of the tag and preserves these messages verbatim.
     pinned: Vec<String>,
+    /// Optional `--trace-tools` JSONL audit log. When `Some`, every
+    /// tool dispatch in `agent_turn` writes a tool_start + tool_complete
+    /// pair to the configured path.
+    tool_tracer: Option<Arc<crate::trace_tools::ToolTracer>>,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -223,6 +227,7 @@ impl ChatCLI {
             no_banner: flags.no_banner,
             app_config: AppConfig::load(),
             pinned: Vec::new(),
+            tool_tracer: None,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -285,6 +290,13 @@ impl ChatCLI {
     /// (no `agent_turn`, no checkpoint) — pure history mutation.
     pub fn preload_history(&mut self, msgs: Vec<Message>) {
         self.history.extend(msgs);
+    }
+
+    /// Wires a tool tracer into the agent loop. `None` disables
+    /// tracing; passing a fresh `ToolTracer` enables the JSONL audit
+    /// log for subsequent tool dispatches.
+    pub fn set_tool_tracer(&mut self, tracer: Option<Arc<crate::trace_tools::ToolTracer>>) {
+        self.tool_tracer = tracer;
     }
 
     /// Runs a single prompt without the welcome banner or rustyline REPL.
