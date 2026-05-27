@@ -122,16 +122,16 @@ pub fn load(path_arg: &str) -> Result<RunScript> {
 /// closing fence (with one trailing newline stripped for tidiness).
 /// When no frontmatter is detected the entire input is the body.
 fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
-    // Accept BOM and leading whitespace-only lines? Keep it strict so
-    // accidental indentation doesn't silently disable overrides.
+    // Strip an optional UTF-8 BOM up front so callers never see it
+    // leak into the body or frontmatter slice.
     let trimmed_start = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = trimmed_start.split_inclusive('\n');
     let first = match lines.next() {
         Some(l) => l,
-        None => return (None, text),
+        None => return (None, trimmed_start),
     };
     if first.trim_end() != "---" {
-        return (None, text);
+        return (None, trimmed_start);
     }
     let after_first = &trimmed_start[first.len()..];
     // Find next `---` line.
@@ -145,7 +145,7 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
         }
         acc += line.len();
     }
-    (None, text)
+    (None, trimmed_start)
 }
 
 fn parse_frontmatter(fm: &str) -> Result<(Option<String>, Option<String>, Option<bool>)> {

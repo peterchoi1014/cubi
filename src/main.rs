@@ -840,24 +840,9 @@ fn print_config() -> Result<()> {
 }
 
 fn redact_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                let lower = k.to_ascii_lowercase();
-                if lower.contains("key") || lower.contains("token") || lower.contains("secret") {
-                    *v = serde_json::Value::String("<redacted>".to_string());
-                } else {
-                    redact_secrets(v);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_secrets(item);
-            }
-        }
-        _ => {}
-    }
+    // Single source of truth lives in `trace_tools` so `--print-config`
+    // and `--trace-tools` apply identical redaction rules.
+    crate::trace_tools::redact_secrets(value);
 }
 
 fn print_sessions(json: bool) -> Result<()> {
@@ -1034,6 +1019,7 @@ mod redact_tests {
             "api_key": "abc",
             "auth_token": "xyz",
             "my_secret": "shh",
+            "user_password": "hunter2",
             "nested": { "inner_key": "val", "ok": "fine" }
         });
         redact_secrets(&mut v);
@@ -1041,6 +1027,7 @@ mod redact_tests {
         assert_eq!(v["api_key"], "<redacted>");
         assert_eq!(v["auth_token"], "<redacted>");
         assert_eq!(v["my_secret"], "<redacted>");
+        assert_eq!(v["user_password"], "<redacted>");
         assert_eq!(v["nested"]["inner_key"], "<redacted>");
         assert_eq!(v["nested"]["ok"], "fine");
     }
