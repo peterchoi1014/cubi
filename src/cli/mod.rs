@@ -131,6 +131,26 @@ pub struct ChatCLI {
     /// tool dispatch in `agent_turn` writes a tool_start + tool_complete
     /// pair to the configured path.
     tool_tracer: Option<Arc<crate::trace_tools::ToolTracer>>,
+    /// Per-turn provider-reported usage, retained so `/usage` can render a
+    /// table without re-querying the LLM. Each entry is the stats for one
+    /// assistant turn (a full `agent_turn` call, including tool round-trips).
+    pub(crate) usage_history: Vec<ChatStats>,
+    /// When `true`, the REPL appends a one-line dim usage footer after each
+    /// assistant turn (token counts + cumulative + cost). Suppressed in
+    /// headless / JSON mode. Toggled via `/usage footer on|off`.
+    pub(crate) usage_footer_enabled: bool,
+    /// Optional structured event tap (`--events <path>`). Writes every
+    /// internal event (turn boundaries, tool calls, rationales, MCP
+    /// transitions, errors) as JSONL. `None` when the flag is unset.
+    pub(crate) event_sink: Option<Arc<crate::event_sink::EventSink>>,
+    /// When `true`, print one dim `↳ {tool}: {rationale}` line on stderr
+    /// just before each tool call (or emit a `tool_rationale` JSON event
+    /// in headless mode). Set by `--explain-tools` / `CUBI_EXPLAIN_TOOLS=1`.
+    pub(crate) explain_tools_enabled: bool,
+    /// `/history` pagination cursor (page index, page size). Page size is
+    /// resolved once from `CUBI_HISTORY_PAGE` at startup.
+    pub(crate) history_cursor: usize,
+    pub(crate) history_page_size: usize,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -145,6 +165,8 @@ pub struct CliFlags {
     pub json: bool,
     pub mcp_counts: (usize, usize),
     pub no_banner: bool,
+    pub usage_footer: bool,
+    pub explain_tools: bool,
 }
 
 impl Default for CliFlags {
@@ -159,6 +181,8 @@ impl Default for CliFlags {
             json: false,
             mcp_counts: (0, 0),
             no_banner: false,
+            usage_footer: false,
+            explain_tools: false,
         }
     }
 }
@@ -233,6 +257,12 @@ impl ChatCLI {
             app_config: AppConfig::load(),
             pinned: Vec::new(),
             tool_tracer: None,
+            usage_history: Vec::new(),
+            usage_footer_enabled: flags.usage_footer,
+            event_sink: None,
+            explain_tools_enabled: flags.explain_tools,
+            history_cursor: 0,
+            history_page_size: resolve_history_page_size(),
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -302,6 +332,12 @@ impl ChatCLI {
     /// log for subsequent tool dispatches.
     pub fn set_tool_tracer(&mut self, tracer: Option<Arc<crate::trace_tools::ToolTracer>>) {
         self.tool_tracer = tracer;
+    }
+
+    /// Attaches the optional structured-event tap (`--events <path>`).
+    /// `None` disables the tap.
+    pub fn set_event_sink(&mut self, sink: Option<Arc<crate::event_sink::EventSink>>) {
+        self.event_sink = sink;
     }
 
     /// Runs a single prompt without the welcome banner or rustyline REPL.
@@ -437,7 +473,7 @@ impl ChatCLI {
                 println!("{}", "Conversation history cleared.".yellow());
             }
             Cmd::History => {
-                self.show_history();
+                self.history_command(args);
             }
             Cmd::Help => {
                 self.show_help();
@@ -624,8 +660,11 @@ impl ChatCLI {
             Cmd::Status => {
                 self.show_status();
             }
-            Cmd::Stats | Cmd::Usage => {
+            Cmd::Stats => {
                 self.show_stats();
+            }
+            Cmd::Usage => {
+                self.usage_command(args);
             }
             Cmd::Stream => {
                 let Some(next) = parse_toggle(args, self.stream_enabled) else {
@@ -1289,25 +1328,187 @@ impl ChatCLI {
         println!();
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn show_history(&self) {
+        // Retained for compatibility with the legacy single-shot listing
+        // used in tests; the live REPL surface uses `history_command`.
+        if self.history.is_empty() {
+            return;
+        }
+        for (i, msg) in self.history.iter().enumerate() {
+            println!("[{}] {}: {}", i, msg.role, msg.content);
+        }
+    }
+    /// `/history [next|prev|<N>]` dispatcher.
+    ///
+    /// - no args: print one page starting at the current cursor
+    /// - `next` / `prev`: page through; refuses to walk past either edge
+    /// - `<N>`: positive integer trims the history to the last N user
+    ///   turns after a `y/N` confirmation (skipped in headless mode).
+    fn history_command(&mut self, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            self.print_history_page();
+            return;
+        }
+        match arg.to_ascii_lowercase().as_str() {
+            "next" => {
+                let pages = self.history.len().div_ceil(self.history_page_size).max(1);
+                if self.history_cursor + 1 < pages {
+                    self.history_cursor += 1;
+                } else {
+                    println!("{} Already at the last page.", "ℹ".bright_blue());
+                }
+                self.print_history_page();
+                return;
+            }
+            "prev" => {
+                if self.history_cursor > 0 {
+                    self.history_cursor -= 1;
+                } else {
+                    println!("{} Already at the first page.", "ℹ".bright_blue());
+                }
+                self.print_history_page();
+                return;
+            }
+            _ => {}
+        }
+        if let Ok(n) = arg.parse::<usize>() {
+            self.history_trim_interactive(n);
+            return;
+        }
+        eprintln!(
+            "{} Usage: /history [next|prev|<N>] (got {:?})",
+            "Error:".bright_red(),
+            args
+        );
+    }
+
+    fn print_history_page(&self) {
         if self.history.is_empty() {
             println!("{}", "No conversation history yet.".yellow());
             return;
         }
-
-        println!("\n{}", "Conversation History:".bright_yellow().bold());
-        println!("{}", "-".repeat(60).bright_black());
-
-        for (i, msg) in self.history.iter().enumerate() {
-            let role = if msg.role == "user" {
-                "You".bright_green().bold()
-            } else {
-                "AI".bright_blue().bold()
-            };
-
-            println!("{} [{}]: {}", role, i + 1, msg.content);
+        let total = self.history.len();
+        let (start, end) = history_page_slice(total, self.history_page_size, self.history_cursor);
+        let pages = total.div_ceil(self.history_page_size).max(1);
+        println!(
+            "\n{} page {}/{} (size {}, total {})",
+            "Conversation History:".bright_yellow().bold(),
+            self.history_cursor + 1,
+            pages,
+            self.history_page_size,
+            total
+        );
+        for (offset, msg) in self.history[start..end].iter().enumerate() {
+            let idx = start + offset;
+            let len = msg.content.chars().count();
+            let preview: String = msg.content.chars().take(80).collect();
+            let preview = preview.replace('\n', "↵");
+            println!(
+                "  [{idx}] {role} len={len} chars=\"{preview}\"",
+                idx = idx,
+                role = msg.role,
+                len = len,
+                preview = preview,
+            );
         }
-        println!("{}\n", "-".repeat(60).bright_black());
+        println!(
+            "  {} Use {} or {} to page; {} <N> to trim.",
+            "ℹ".bright_blue(),
+            "/history next".bright_cyan(),
+            "/history prev".bright_cyan(),
+            "/history".bright_cyan()
+        );
+    }
+
+    fn history_trim_interactive(&mut self, n: usize) {
+        let before_len = self.history.len();
+        if !self.headless_mode {
+            use std::io::{self, Write};
+            print!(
+                "Trim history to the last {} user turn{}? [y/N] ",
+                n,
+                if n == 1 { "" } else { "s" }
+            );
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                eprintln!("{} Aborted.", "Info:".bright_yellow());
+                return;
+            }
+            if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("{} Aborted.", "ℹ".bright_blue());
+                return;
+            }
+        }
+        self.history = trim_history_keep_last_n(&self.history, n);
+        // Reset pager cursor to the first page.
+        self.history_cursor = 0;
+        // Persist the new history through the existing checkpoint path.
+        self.checkpoint_session();
+        println!(
+            "{} Trimmed history: {} → {} messages (kept last {} user turn{}).",
+            "✓".bright_green(),
+            before_len,
+            self.history.len(),
+            n,
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
+    /// `/usage [footer on|off]` — pretty per-turn usage table, plus a
+    /// live footer toggle. Without arguments, prints the table.
+    fn usage_command(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("footer") {
+            let toggle_arg = rest.trim();
+            let Some(next) = parse_toggle(toggle_arg, self.usage_footer_enabled) else {
+                eprintln!(
+                    "{} Usage: /usage footer [on|off] (got {:?})",
+                    "Error:".bright_red(),
+                    toggle_arg
+                );
+                return;
+            };
+            self.usage_footer_enabled = next;
+            println!(
+                "{} Usage footer is now {}",
+                "✓".bright_green(),
+                if self.usage_footer_enabled {
+                    "on".bright_green()
+                } else {
+                    "off".bright_yellow()
+                }
+            );
+            return;
+        }
+        if !trimmed.is_empty() {
+            eprintln!(
+                "{} Usage: /usage [footer on|off] (got {:?})",
+                "Error:".bright_red(),
+                args
+            );
+            return;
+        }
+        let pricing = crate::pricing::lookup(self.executor.get_model());
+        let rows = build_usage_rows(&self.usage_history, pricing);
+        if rows.is_empty() || (rows.len() == 1 && rows[0].prompt == 0 && rows[0].completion == 0) {
+            println!("{} No usage recorded yet.", "ℹ".bright_blue());
+            return;
+        }
+        println!("\n{}", "Session usage:".bright_yellow().bold());
+        print!("{}", format_usage_table(&rows));
+        println!(
+            "  model: {} · footer: {}",
+            self.executor.get_model().bright_cyan(),
+            if self.usage_footer_enabled {
+                "on".bright_green()
+            } else {
+                "off".bright_black()
+            }
+        );
     }
 
     fn show_status(&self) {
@@ -4720,6 +4921,137 @@ fn parse_toggle(arg: &str, current: bool) -> Option<bool> {
     }
 }
 
+/// Reads `CUBI_HISTORY_PAGE` (clamped to a sane range) to size the
+/// `/history` pager. Falls back to 10 when unset or unparsable.
+pub(crate) fn resolve_history_page_size() -> usize {
+    std::env::var("CUBI_HISTORY_PAGE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (1..=500).contains(n))
+        .unwrap_or(10)
+}
+
+/// Builds a one-line dim usage-footer string. Pure formatter so callers
+/// can `println!` it (TTY) or unit-test the output.
+pub(crate) fn format_usage_footer_line(
+    turn: &crate::ollama::ChatStats,
+    cumulative: &crate::ollama::ChatStats,
+    cost_label: &str,
+) -> String {
+    let total = turn.prompt_tokens + turn.completion_tokens;
+    let cum = cumulative.prompt_tokens + cumulative.completion_tokens;
+    format!(
+        "usage: prompt={p} completion={c} total={t} • session {cum} • {cost}",
+        p = turn.prompt_tokens,
+        c = turn.completion_tokens,
+        t = total,
+        cum = cum,
+        cost = cost_label,
+    )
+}
+
+/// One row in the `/usage` table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UsageRow {
+    pub label: String,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cost: String,
+}
+
+/// Builds the rows for the `/usage` table from per-turn history + a
+/// pricing entry. Last row is the cumulative total.
+pub(crate) fn build_usage_rows(
+    per_turn: &[crate::ollama::ChatStats],
+    pricing: Option<crate::pricing::ModelPricing>,
+) -> Vec<UsageRow> {
+    let mut rows = Vec::with_capacity(per_turn.len() + 1);
+    let mut cum_p: u64 = 0;
+    let mut cum_c: u64 = 0;
+    for (idx, s) in per_turn.iter().enumerate() {
+        rows.push(UsageRow {
+            label: format!("turn {}", idx + 1),
+            prompt: s.prompt_tokens,
+            completion: s.completion_tokens,
+            cost: crate::pricing::format_cost(pricing, s.prompt_tokens, s.completion_tokens),
+        });
+        cum_p += s.prompt_tokens;
+        cum_c += s.completion_tokens;
+    }
+    rows.push(UsageRow {
+        label: "session".to_string(),
+        prompt: cum_p,
+        completion: cum_c,
+        cost: crate::pricing::format_cost(pricing, cum_p, cum_c),
+    });
+    rows
+}
+
+/// Renders [`build_usage_rows`] output as a plain-text table.
+pub(crate) fn format_usage_table(rows: &[UsageRow]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<10} {:>8} {:>10} {:>8} {}\n",
+        "turn", "prompt", "completion", "total", "cost"
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:<10} {:>8} {:>10} {:>8} {}\n",
+            r.label,
+            r.prompt,
+            r.completion,
+            r.prompt + r.completion,
+            r.cost,
+        ));
+    }
+    out
+}
+
+/// Page slicing used by `/history` (no args). Returns the `(start, end)`
+/// half-open interval into `messages` for the given zero-based page.
+pub(crate) fn history_page_slice(total: usize, page_size: usize, page: usize) -> (usize, usize) {
+    let page_size = page_size.max(1);
+    let pages = total.div_ceil(page_size).max(1);
+    let page = page.min(pages - 1);
+    let start = page * page_size;
+    let end = (start + page_size).min(total);
+    (start, end)
+}
+
+/// `/history N` trim helper. Drops everything before the last `n` user
+/// turns (system messages — including `SYSTEM[pinned]:` — are always
+/// preserved). Pure: returns the rebuilt vector so it can be unit-
+/// tested without touching session state.
+pub(crate) fn trim_history_keep_last_n(history: &[crate::ollama::Message], n: usize) -> Vec<crate::ollama::Message> {
+    if n == 0 {
+        return history
+            .iter()
+            .filter(|m| m.role == "system")
+            .cloned()
+            .collect();
+    }
+    // Indices of user messages (each "user" message marks a new turn).
+    let user_idx: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+    let cutoff_user = if user_idx.len() <= n {
+        // Keep everything.
+        return history.to_vec();
+    } else {
+        user_idx[user_idx.len() - n]
+    };
+    let mut out: Vec<crate::ollama::Message> = history[..cutoff_user]
+        .iter()
+        .filter(|m| m.role == "system")
+        .cloned()
+        .collect();
+    out.extend(history[cutoff_user..].iter().cloned());
+    out
+}
+
 /// Prints a one-line dim footer summarizing token usage and wall time for
 /// the just-completed turn. Only the fields the provider actually returned
 /// are shown; missing fields are skipped to avoid printing "0 in / 0 out".
@@ -4822,6 +5154,144 @@ mod tests {
     fn system(s: &str) -> Message {
         Message::text("system", s)
     }
+
+    // ---- B1: pricing + usage helpers ----
+
+    #[test]
+    fn usage_footer_line_includes_session_cumulative_and_cost() {
+        let turn = crate::ollama::ChatStats {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            elapsed_ms: 200,
+        };
+        let cum = crate::ollama::ChatStats {
+            prompt_tokens: 300,
+            completion_tokens: 150,
+            elapsed_ms: 600,
+        };
+        let line = format_usage_footer_line(&turn, &cum, "$0.01");
+        assert!(line.contains("prompt=100"));
+        assert!(line.contains("completion=50"));
+        assert!(line.contains("total=150"));
+        assert!(line.contains("session 450"));
+        assert!(line.contains("$0.01"));
+    }
+
+    #[test]
+    fn build_usage_rows_includes_cumulative_session_row() {
+        let per_turn = vec![
+            crate::ollama::ChatStats {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                elapsed_ms: 1,
+            },
+            crate::ollama::ChatStats {
+                prompt_tokens: 30,
+                completion_tokens: 40,
+                elapsed_ms: 1,
+            },
+        ];
+        let rows = build_usage_rows(&per_turn, None);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].label, "turn 1");
+        assert_eq!(rows[1].label, "turn 2");
+        assert_eq!(rows[2].label, "session");
+        assert_eq!(rows[2].prompt, 40);
+        assert_eq!(rows[2].completion, 60);
+        // No pricing → cost should be em-dash for all rows.
+        for r in &rows {
+            assert_eq!(r.cost, "—");
+        }
+    }
+
+    #[test]
+    fn format_usage_table_has_header_row() {
+        let rows = build_usage_rows(&[], Some(crate::pricing::ModelPricing::local()));
+        let s = format_usage_table(&rows);
+        assert!(s.starts_with("turn"));
+        assert!(s.contains("prompt"));
+        assert!(s.contains("completion"));
+        assert!(s.contains("cost"));
+    }
+
+    // ---- B2: /history helpers ----
+
+    #[test]
+    fn history_page_slice_handles_partial_last_page() {
+        // 7 items, page size 3 → pages [0..3], [3..6], [6..7]
+        assert_eq!(history_page_slice(7, 3, 0), (0, 3));
+        assert_eq!(history_page_slice(7, 3, 1), (3, 6));
+        assert_eq!(history_page_slice(7, 3, 2), (6, 7));
+        // Out-of-range page snaps to the last page.
+        assert_eq!(history_page_slice(7, 3, 99), (6, 7));
+    }
+
+    #[test]
+    fn history_page_slice_empty_returns_empty() {
+        assert_eq!(history_page_slice(0, 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn trim_history_keeps_system_messages_and_last_n_user_turns() {
+        let h = vec![
+            system("S1"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            system("S2 SYSTEM[pinned]: keep"),
+            user("u3"),
+            assistant("a3"),
+        ];
+        // Keep last 1 user turn → both system messages survive, plus u3+a3.
+        let trimmed = trim_history_keep_last_n(&h, 1);
+        let roles: Vec<&str> = trimmed.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "system", "user", "assistant"]);
+        assert_eq!(trimmed[2].content, "u3");
+    }
+
+    #[test]
+    fn trim_history_keep_all_when_n_exceeds_user_count() {
+        let h = vec![user("u1"), assistant("a1")];
+        let trimmed = trim_history_keep_last_n(&h, 5);
+        assert_eq!(trimmed.len(), 2);
+    }
+
+    #[test]
+    fn trim_history_n_zero_keeps_only_system() {
+        let h = vec![system("S"), user("u"), assistant("a")];
+        let trimmed = trim_history_keep_last_n(&h, 0);
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].role, "system");
+    }
+
+    #[test]
+    fn resolve_history_page_size_uses_default_when_unset() {
+        let prev = std::env::var("CUBI_HISTORY_PAGE").ok();
+        // SAFETY: serialized via a guard below.
+        unsafe { std::env::remove_var("CUBI_HISTORY_PAGE") };
+        let size = resolve_history_page_size();
+        assert_eq!(size, 10);
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("CUBI_HISTORY_PAGE", v) };
+        }
+    }
+
+    // ---- B3: explain-tools rationale resolver ----
+
+    #[test]
+    fn rationale_prefers_non_empty_assistant_text() {
+        // No MCP manager available → only assistant text source.
+        let r = super::agent::resolve_tool_rationale("call bash to list files", "bash", None);
+        assert_eq!(r, "call bash to list files");
+    }
+
+    #[test]
+    fn rationale_falls_back_to_no_description_when_all_empty() {
+        let r = super::agent::resolve_tool_rationale("   ", "bash", None);
+        assert_eq!(r, "(no description)");
+    }
+
 
     #[test]
     fn repl_history_path_lives_under_cubi_home() {
