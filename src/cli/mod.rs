@@ -5309,8 +5309,9 @@ mod tests {
 
     #[test]
     fn resolve_history_page_size_uses_default_when_unset() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
         let prev = std::env::var("CUBI_HISTORY_PAGE").ok();
-        // SAFETY: serialized via a guard below.
+        // SAFETY: serialized via the env lock above.
         unsafe { std::env::remove_var("CUBI_HISTORY_PAGE") };
         let size = resolve_history_page_size();
         assert_eq!(size, 10);

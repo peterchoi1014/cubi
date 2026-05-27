@@ -127,7 +127,13 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -170,10 +176,10 @@ mod tests {
 
     #[test]
     fn from_args_prefers_flag_over_env() {
-        // Save & clear env so we don't leak between tests.
+        // Serialize against any other test in this module that touches env.
+        let _guard = env_lock().lock().expect("env lock not poisoned");
         let prev = std::env::var("CUBI_EVENTS").ok();
-        // SAFETY: tests in this module run serially because they
-        // already touch the global env one at a time.
+        // SAFETY: env mutation is serialized by `env_lock()` above.
         unsafe { std::env::set_var("CUBI_EVENTS", "/env/path") };
         let sink = EventSink::from_args(Some("/flag/path")).unwrap();
         assert_eq!(sink.path(), std::path::Path::new("/flag/path"));
