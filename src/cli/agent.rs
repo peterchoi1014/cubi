@@ -1,5 +1,29 @@
 use super::*;
 
+/// Returns the rationale text for an explain-tools surface, in order:
+///   1. the assistant message that accompanied the tool call (if non-empty)
+///   2. the tool's manifest `description` from MCP
+///   3. `(no description)` as a final fallback
+pub(crate) fn resolve_tool_rationale(
+    assistant_text: &str,
+    tool_name: &str,
+    mcp: Option<&McpManager>,
+) -> String {
+    let trimmed = assistant_text.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if let Some(mgr) = mcp {
+        if let Some(tool) = mgr.list_tools().into_iter().find(|t| t.name == tool_name) {
+            let desc = tool.description.trim();
+            if !desc.is_empty() {
+                return desc.to_string();
+            }
+        }
+    }
+    "(no description)".to_string()
+}
+
 impl ChatCLI {
     fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
         let cwd = std::env::current_dir().ok();
@@ -188,6 +212,16 @@ impl ChatCLI {
         let mut turn_stats = ChatStats::default();
         let headless_mode = self.headless_mode;
         let json_enabled = self.json_enabled && headless_mode;
+
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit(
+                "turn_start",
+                serde_json::json!({
+                    "turn": self.usage_history.len() + 1,
+                    "model": self.executor.get_model(),
+                }),
+            );
+        }
 
         // Snapshot the journal start so /rewind still works after Ctrl-C
         // cancel: we leave file edits in place but pop the history.
@@ -381,6 +415,53 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 ));
 
+                // `--explain-tools` (or CUBI_EXPLAIN_TOOLS=1): surface the
+                // rationale for invoking this tool. In headless+JSON mode
+                // emit a `tool_rationale` event; otherwise print one dim
+                // line on stderr so prose output stays clean.
+                if self.explain_tools_enabled {
+                    let rationale = resolve_tool_rationale(
+                        &msg_content,
+                        &call.function.name,
+                        self.mcp_manager.as_ref(),
+                    );
+                    if json_enabled {
+                        Self::emit_json_event(serde_json::json!({
+                            "type": "tool_rationale",
+                            "tool": call.function.name,
+                            "rationale": rationale,
+                        }));
+                    } else if !headless_mode {
+                        eprintln!(
+                            "{} {}: {}",
+                            "↳".bright_black(),
+                            call.function.name.bright_black(),
+                            rationale.bright_black()
+                        );
+                    }
+                    if let Some(sink) = self.event_sink.as_ref() {
+                        sink.emit(
+                            "tool_rationale",
+                            serde_json::json!({
+                                "tool": call.function.name,
+                                "rationale": rationale,
+                            }),
+                        );
+                    }
+                }
+
+                if let Some(sink) = self.event_sink.as_ref() {
+                    let mut args = call.function.arguments.clone();
+                    crate::trace_tools::redact_secrets(&mut args);
+                    sink.emit(
+                        "tool_call_start",
+                        serde_json::json!({
+                            "tool": call.function.name,
+                            "args": args,
+                        }),
+                    );
+                }
+
                 // --trace-tools: record tool_start / tool_complete
                 // pairs around the dispatch. Best-effort: tracer write
                 // failures only log a warning.
@@ -438,6 +519,19 @@ impl ChatCLI {
                         !is_err,
                         started.elapsed().as_millis(),
                         result_text.chars().count(),
+                    );
+                }
+
+                if let Some(sink) = self.event_sink.as_ref() {
+                    let is_err = result_text.starts_with("[tool error]")
+                        || result_text.starts_with("[tool denied]");
+                    sink.emit(
+                        "tool_call_complete",
+                        serde_json::json!({
+                            "tool": call.function.name,
+                            "ok": !is_err,
+                            "result_chars": result_text.chars().count(),
+                        }),
                     );
                 }
 
@@ -503,6 +597,63 @@ impl ChatCLI {
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
         self.session_stats.add(&turn_stats);
+        // Retain a copy of the per-turn stats so `/usage` and the optional
+        // usage footer can render without re-querying the provider.
+        self.usage_history.push(turn_stats.clone());
+        // Optional one-line usage footer (suppressed in headless/JSON).
+        if self.usage_footer_enabled
+            && !self.headless_mode
+            && !self.json_enabled
+            && !turn_stats.is_empty()
+        {
+            let pricing = crate::pricing::lookup(self.executor.get_model());
+            let cost = crate::pricing::format_cost(
+                pricing,
+                turn_stats.prompt_tokens,
+                turn_stats.completion_tokens,
+            );
+            let line = super::format_usage_footer_line(&turn_stats, &self.session_stats, &cost);
+            println!("{}", line.bright_black());
+        }
+        // Emit the turn-end event to the configured `--events` sink, if any.
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit(
+                "turn_end",
+                serde_json::json!({
+                    "usage": {
+                        "prompt_tokens": turn_stats.prompt_tokens,
+                        "completion_tokens": turn_stats.completion_tokens,
+                        "elapsed_ms": turn_stats.elapsed_ms,
+                    },
+                    "model": self.executor.get_model(),
+                }),
+            );
+        }
+
+        let pre_counts = self.mcp_counts;
+        // Refresh the cached MCP health triple shown in the banner so
+        // any Ok↔Failed transitions during tool dispatch are visible
+        // on the next prompt redraw.
+        self.refresh_mcp_counts();
+        if self.mcp_counts != pre_counts {
+            if let Some(sink) = self.event_sink.as_ref() {
+                sink.emit(
+                    "mcp_status_change",
+                    serde_json::json!({
+                        "before": {
+                            "ok": pre_counts.0,
+                            "failed": pre_counts.1,
+                            "not_loaded": pre_counts.2,
+                        },
+                        "after": {
+                            "ok": self.mcp_counts.0,
+                            "failed": self.mcp_counts.1,
+                            "not_loaded": self.mcp_counts.2,
+                        },
+                    }),
+                );
+            }
+        }
 
         // Drop any system messages tagged as single-turn (e.g. from `/ask`)
         // so they don't keep nudging every subsequent turn.

@@ -196,16 +196,20 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
 /// Pure formatter for the concise startup banner. Kept free of any
 /// process state (env, config, IO) so it can be unit-tested directly.
 ///
-/// Shape: `cubi v{ver} • {model} ({provider}) • mcp {loaded}/{configured} • sessions {label}`.
+/// Shape: `cubi v{ver} • {model} ({provider}) • mcp: ok=N failed=M not_loaded=K • sessions {label}`.
+/// Zero-valued segments of the MCP triple are omitted so a clean
+/// "everything green" run shows just `mcp: ok=N`.
 ///
 /// `color=false` returns a plain-text line suitable for `NO_COLOR` /
 /// piped runs; `color=true` paints the prefix and separators dim.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn format_banner(
     version: &str,
     model: &str,
     provider: &str,
-    mcp_loaded: usize,
-    mcp_configured: usize,
+    mcp_ok: usize,
+    mcp_failed: usize,
+    mcp_not_loaded: usize,
     sessions: crate::sessions::SessionStoreStatus,
     color: bool,
 ) -> String {
@@ -219,14 +223,34 @@ pub(super) fn format_banner(
     } else {
         format!("cubi v{}", version)
     };
+    let mcp_segment = format_mcp_health_segment(mcp_ok, mcp_failed, mcp_not_loaded);
     format!(
-        "{head} {sep} {model} ({provider}) {sep} mcp {loaded}/{configured} {sep} sessions {label}",
+        "{head} {sep} {model} ({provider}) {sep} {mcp} {sep} sessions {label}",
         model = model,
         provider = provider,
-        loaded = mcp_loaded,
-        configured = mcp_configured,
+        mcp = mcp_segment,
         label = sessions.label(),
     )
+}
+
+/// Returns the `mcp: ok=N failed=M not_loaded=K` segment of the banner.
+/// Zero-valued components are omitted so a healthy run reads as
+/// `mcp: ok=N`; the all-zero state collapses to `mcp: none`.
+pub(crate) fn format_mcp_health_segment(ok: usize, failed: usize, not_loaded: usize) -> String {
+    if ok == 0 && failed == 0 && not_loaded == 0 {
+        return "mcp: none".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if ok > 0 {
+        parts.push(format!("ok={ok}"));
+    }
+    if failed > 0 {
+        parts.push(format!("failed={failed}"));
+    }
+    if not_loaded > 0 {
+        parts.push(format!("not_loaded={not_loaded}"));
+    }
+    format!("mcp: {}", parts.join(" "))
 }
 
 impl ChatCLI {
@@ -245,13 +269,14 @@ impl ChatCLI {
             .as_ref()
             .map(|s| s.status())
             .unwrap_or(crate::sessions::SessionStoreStatus::Missing);
-        let (mcp_loaded, mcp_configured) = self.mcp_counts;
+        let (mcp_ok, mcp_failed, mcp_not_loaded) = self.mcp_counts;
         let line = format_banner(
             env!("CARGO_PKG_VERSION"),
             model,
             provider,
-            mcp_loaded,
-            mcp_configured,
+            mcp_ok,
+            mcp_failed,
+            mcp_not_loaded,
             sessions,
             color,
         );
@@ -334,6 +359,7 @@ mod tests {
     }
 
     use super::format_banner;
+    use super::format_mcp_health_segment;
     use crate::sessions::SessionStoreStatus;
 
     #[test]
@@ -343,13 +369,14 @@ mod tests {
             "llama3",
             "ollama",
             2,
-            3,
+            1,
+            0,
             SessionStoreStatus::Ok,
             false,
         );
         assert!(line.contains("cubi v9.9.9"), "version: {}", line);
         assert!(line.contains("llama3 (ollama)"), "model/provider: {}", line);
-        assert!(line.contains("mcp 2/3"), "mcp: {}", line);
+        assert!(line.contains("mcp: ok=2 failed=1"), "mcp: {}", line);
         assert!(line.contains("sessions ok"), "sessions: {}", line);
         // Plain (no color) must contain no ANSI escape sequences.
         assert!(
@@ -366,15 +393,37 @@ mod tests {
             (SessionStoreStatus::ReadOnly, "ro"),
             (SessionStoreStatus::Missing, "missing"),
         ] {
-            let line = format_banner("1.0.0", "m", "p", 0, 0, status, false);
+            let line = format_banner("1.0.0", "m", "p", 0, 0, 0, status, false);
             assert!(line.ends_with(&format!("sessions {}", label)), "{}", line);
         }
     }
 
     #[test]
-    fn banner_zero_mcp_renders_zero_slash_zero() {
-        let line = format_banner("0.1.0", "m", "p", 0, 0, SessionStoreStatus::Missing, false);
-        assert!(line.contains("mcp 0/0"), "{}", line);
+    fn banner_all_zero_mcp_renders_none() {
+        let line = format_banner(
+            "0.1.0",
+            "m",
+            "p",
+            0,
+            0,
+            0,
+            SessionStoreStatus::Missing,
+            false,
+        );
+        assert!(line.contains("mcp: none"), "{}", line);
+    }
+
+    #[test]
+    fn mcp_health_segment_omits_zero_components() {
+        assert_eq!(format_mcp_health_segment(2, 0, 0), "mcp: ok=2");
+        assert_eq!(format_mcp_health_segment(0, 1, 0), "mcp: failed=1");
+        assert_eq!(format_mcp_health_segment(0, 0, 3), "mcp: not_loaded=3");
+        assert_eq!(
+            format_mcp_health_segment(2, 1, 3),
+            "mcp: ok=2 failed=1 not_loaded=3"
+        );
+        // All-zero collapses to a single "none" token.
+        assert_eq!(format_mcp_health_segment(0, 0, 0), "mcp: none");
     }
 
     use super::polish_markdown;

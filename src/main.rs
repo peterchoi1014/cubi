@@ -6,6 +6,7 @@ mod compat;
 mod completer;
 mod completions;
 mod doctor;
+mod event_sink;
 mod executor;
 mod exit_code;
 mod file_mentions;
@@ -29,6 +30,7 @@ mod output_styles;
 mod permissions;
 pub mod plugins;
 mod policy;
+mod pricing;
 mod project_memory;
 mod schemas;
 mod script;
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
     // log target. Stored as a String so we can hand it to ToolTracer
     // once everything else is parsed.
     let mut trace_tools_path: Option<String> = None;
+    let mut events_path: Option<String> = None;
     let mut doctor_fix = false;
 
     let mut i = 0;
@@ -154,17 +157,36 @@ async fn main() -> Result<()> {
             }
             "plugins" => {
                 let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
-                    eprintln!("cubi: plugins requires one of: list, reload, new.");
+                    eprintln!(
+                        "cubi: plugins requires one of: list, reload, new, show, remove, run."
+                    );
                     std::process::exit(2);
                 };
                 match subcommand {
                     "list" => {
-                        if argv.get(i + 2).is_some() {
-                            eprintln!("cubi: plugins list does not accept extra arguments.");
-                            std::process::exit(2);
+                        // Optional `--json`.
+                        let mut json = false;
+                        let mut consumed = 1usize;
+                        if let Some(next) = argv.get(i + 2).and_then(|a| a.to_str()) {
+                            if next == "--json" {
+                                json = true;
+                                consumed = 2;
+                            } else {
+                                eprintln!(
+                                    "cubi: plugins list takes no positional arguments (only --json)."
+                                );
+                                std::process::exit(2);
+                            }
                         }
-                        set_primary(&mut primary, PrimaryCommand::PluginsList);
-                        i += 1;
+                        set_primary(
+                            &mut primary,
+                            if json {
+                                PrimaryCommand::PluginsListJson
+                            } else {
+                                PrimaryCommand::PluginsList
+                            },
+                        );
+                        i += consumed;
                     }
                     "reload" => {
                         if argv.get(i + 2).is_some() {
@@ -188,8 +210,150 @@ async fn main() -> Result<()> {
                         set_primary(&mut primary, PrimaryCommand::PluginsNew(name.to_string()));
                         i += 2;
                     }
+                    "show" => {
+                        let Some(name) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: plugins show requires a plugin name.");
+                            std::process::exit(2);
+                        };
+                        let mut json = false;
+                        let mut consumed = 2usize;
+                        if let Some(extra) = argv.get(i + 3).and_then(|a| a.to_str()) {
+                            if extra == "--json" {
+                                json = true;
+                                consumed = 3;
+                            } else {
+                                eprintln!(
+                                    "cubi: plugins show takes a plugin name (and optional --json)."
+                                );
+                                std::process::exit(2);
+                            }
+                        }
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::PluginsShow(name.to_string(), json),
+                        );
+                        i += consumed;
+                    }
+                    "remove" | "rm" => {
+                        // Accept flags in any order between the
+                        // subcommand and the plugin name. We accept at
+                        // most one name.
+                        let mut name: Option<String> = None;
+                        let mut force = false;
+                        let mut yes = false;
+                        let mut j = i + 2;
+                        while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                            match arg {
+                                "--force" => force = true,
+                                "--yes" => yes = true,
+                                _ if arg.starts_with('-') => {
+                                    eprintln!("cubi: plugins remove: unknown flag {arg:?}");
+                                    std::process::exit(2);
+                                }
+                                _ => {
+                                    if name.is_some() {
+                                        eprintln!(
+                                            "cubi: plugins remove takes exactly one plugin name."
+                                        );
+                                        std::process::exit(2);
+                                    }
+                                    name = Some(arg.to_string());
+                                }
+                            }
+                            j += 1;
+                        }
+                        let Some(name) = name else {
+                            eprintln!("cubi: plugins remove requires a plugin name.");
+                            std::process::exit(2);
+                        };
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::PluginsRemove { name, force, yes },
+                        );
+                        i = j - 1;
+                    }
+                    "run" => {
+                        let Some(name) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: plugins run requires a plugin name.");
+                            std::process::exit(2);
+                        };
+                        let mut run_args: Vec<String> = Vec::new();
+                        let mut json = false;
+                        let mut j = i + 3;
+                        while let Some(arg) = argv.get(j) {
+                            let s = arg.to_string_lossy().into_owned();
+                            if s == "--json" {
+                                json = true;
+                            } else {
+                                run_args.push(s);
+                            }
+                            j += 1;
+                        }
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::PluginsRun {
+                                name: name.to_string(),
+                                args: run_args,
+                                json,
+                            },
+                        );
+                        i = j - 1;
+                    }
                     _ => {
-                        eprintln!("cubi: plugins requires one of: list, reload, new.");
+                        eprintln!(
+                            "cubi: plugins requires one of: list, reload, new, show, remove, run."
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "mcp" => {
+                let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: mcp requires one of: test.");
+                    std::process::exit(2);
+                };
+                match subcommand {
+                    "test" => {
+                        let Some(server) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: mcp test requires a server name.");
+                            std::process::exit(2);
+                        };
+                        let mut tool: Option<String> = None;
+                        let mut json = false;
+                        let mut j = i + 3;
+                        while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                            match arg {
+                                "--json" => json = true,
+                                "--tool" => {
+                                    j += 1;
+                                    let Some(t) = argv.get(j).and_then(|a| a.to_str()) else {
+                                        eprintln!("cubi: mcp test --tool requires a tool name.");
+                                        std::process::exit(2);
+                                    };
+                                    tool = Some(t.to_string());
+                                }
+                                _ if arg.starts_with("--tool=") => {
+                                    tool = Some(arg.trim_start_matches("--tool=").to_string());
+                                }
+                                _ => {
+                                    eprintln!("cubi: mcp test: unexpected argument {arg:?}");
+                                    std::process::exit(2);
+                                }
+                            }
+                            j += 1;
+                        }
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::McpTest {
+                                server: server.to_string(),
+                                tool,
+                                json,
+                            },
+                        );
+                        i = j - 1;
+                    }
+                    _ => {
+                        eprintln!("cubi: mcp requires one of: test.");
                         std::process::exit(2);
                     }
                 }
@@ -208,6 +372,23 @@ async fn main() -> Result<()> {
             }
             _ if arg.starts_with("--trace-tools=") => {
                 trace_tools_path = Some(arg.trim_start_matches("--trace-tools=").to_string());
+            }
+            "--events" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --events requires a file path.");
+                    std::process::exit(2);
+                };
+                events_path = Some(path.to_string());
+            }
+            _ if arg.starts_with("--events=") => {
+                events_path = Some(arg.trim_start_matches("--events=").to_string());
+            }
+            "--explain-tools" => {
+                cli_flags.explain_tools = true;
+            }
+            "--usage-footer" => {
+                cli_flags.usage_footer = true;
             }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
@@ -341,6 +522,12 @@ async fn main() -> Result<()> {
     {
         cli_flags.no_banner = true;
     }
+    if std::env::var("CUBI_EXPLAIN_TOOLS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        cli_flags.explain_tools = true;
+    }
 
     if doctor_fix && !matches!(primary, PrimaryCommand::Doctor) {
         eprintln!("cubi: --fix is only valid with the `doctor` subcommand.");
@@ -393,6 +580,66 @@ async fn main() -> Result<()> {
             let plugins = plugins::load_plugins();
             plugins::print_plugin_list(&plugins);
             return Ok(());
+        }
+        PrimaryCommand::PluginsListJson => {
+            let plugins = plugins::load_plugins();
+            println!("{}", plugins::plugin_list_json(&plugins));
+            return Ok(());
+        }
+        PrimaryCommand::PluginsShow(name, json) => {
+            let plugins = plugins::load_plugins();
+            if !plugins::show_plugin(&plugins, name, *json) {
+                eprintln!("cubi: no plugin named '{}'.", name);
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
+        PrimaryCommand::PluginsRemove { name, force, yes } => {
+            let parent = plugins::plugins_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not resolve plugins directory"))?;
+            match plugins::resolve_remove_target(&parent, name, *force) {
+                Ok(root) => {
+                    if !*yes && !confirm_yn(&format!("Remove plugin {}?", root.display())) {
+                        eprintln!("cubi: aborted.");
+                        return Ok(());
+                    }
+                    if let Err(e) = std::fs::remove_dir_all(&root) {
+                        eprintln!("cubi: failed to remove {}: {}", root.display(), e);
+                        std::process::exit(2);
+                    }
+                    println!("+ removed {}", root.display());
+                    return Ok(());
+                }
+                Err(plugins::RemoveError::NotFound) => {
+                    eprintln!("cubi: no plugin named '{}'.", name);
+                    std::process::exit(2);
+                }
+                Err(plugins::RemoveError::PathEscape) => {
+                    eprintln!(
+                        "cubi: refusing to remove '{}': path is not a child of {}.",
+                        name,
+                        parent.display()
+                    );
+                    std::process::exit(2);
+                }
+                Err(plugins::RemoveError::HasExtraFiles(items)) => {
+                    eprintln!(
+                        "cubi: refusing to remove '{}': contains unexpected files: {}. \
+                         Re-run with --force.",
+                        name,
+                        items.join(", ")
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        PrimaryCommand::PluginsRun { name, args, json } => {
+            let exit_code = run_plugin(name, args, *json).await;
+            std::process::exit(exit_code);
+        }
+        PrimaryCommand::McpTest { server, tool, json } => {
+            let code = run_mcp_test(server, tool.as_deref(), *json).await;
+            std::process::exit(code);
         }
         PrimaryCommand::PluginsReload => {
             let before = plugins::load_plugins();
@@ -615,12 +862,21 @@ async fn main() -> Result<()> {
     if !headless {
         match McpManager::health_check_configured().await {
             Ok(health) => {
-                let loaded = health
+                let ok = health
                     .iter()
                     .filter(|h| matches!(h.state, mcp_manager::McpHealthState::Ready))
                     .count();
-                let configured = health.len();
-                cli_flags.mcp_counts = (loaded, configured);
+                let failed = health
+                    .iter()
+                    .filter(|h| matches!(h.state, mcp_manager::McpHealthState::Failed(_)))
+                    .count();
+                // `health_check_configured` returns one entry per
+                // configured server, so anything not Ok or Failed
+                // (currently nothing in the state machine, but future-
+                // proofing) is counted as "not loaded".
+                let total = health.len();
+                let not_loaded = total.saturating_sub(ok + failed);
+                cli_flags.mcp_counts = (ok, failed, not_loaded);
             }
             Err(e) => eprintln!(
                 "{} Failed to check MCP server health: {}",
@@ -708,6 +964,23 @@ async fn main() -> Result<()> {
     if let Some(tracer) = trace_tools::ToolTracer::from_args(trace_tools_path.as_deref()) {
         cli.set_tool_tracer(Some(Arc::new(tracer)));
     }
+    if let Some(sink) = event_sink::EventSink::from_args(events_path.as_deref()) {
+        match sink.probe() {
+            Ok(()) => cli.set_event_sink(Some(Arc::new(sink))),
+            Err(err) => {
+                let summary = format!(
+                    "cubi: failed to open --events path {:?}: {}",
+                    sink.path(),
+                    err
+                );
+                user_error::print_user_warning(
+                    &summary,
+                    Some("structured event tap disabled for this session"),
+                    json_output && headless,
+                );
+            }
+        }
+    }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
     } else {
@@ -772,8 +1045,25 @@ enum PrimaryCommand {
     ListSessions,
     DeleteSession(String),
     PluginsList,
+    PluginsListJson,
     PluginsReload,
     PluginsNew(String),
+    PluginsShow(String, bool),
+    PluginsRemove {
+        name: String,
+        force: bool,
+        yes: bool,
+    },
+    PluginsRun {
+        name: String,
+        args: Vec<String>,
+        json: bool,
+    },
+    McpTest {
+        server: String,
+        tool: Option<String>,
+        json: bool,
+    },
     PruneSessions,
     Doctor,
     PrintConfig,
@@ -817,6 +1107,212 @@ fn status_line(headless: bool, msg: impl std::fmt::Display) {
     out::status_line(headless, msg);
 }
 
+/// Read a single y/N answer from stdin; defaults to `false` on any
+/// non-`y` reply or read failure. Skips the prompt entirely (auto-
+/// confirms with `false`) when stdin is not a terminal so headless
+/// invocations don't deadlock.
+fn confirm_yn(question: &str) -> bool {
+    use std::io::{self, IsTerminal, Write};
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{} [y/N] ", question);
+    let _ = io::stdout().flush();
+    let mut buf = String::new();
+    if io::stdin().read_line(&mut buf).is_err() {
+        return false;
+    }
+    matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Generates stub arguments for an MCP tool call from a JSON schema.
+/// Used by `cubi mcp test` so users can ping every tool without
+/// constructing request bodies by hand.
+fn synthetic_args_from_schema(schema: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let kind = schema
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("object");
+    match kind {
+        "object" => {
+            let mut obj = Map::new();
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let required: std::collections::HashSet<&str> = schema
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|i| i.as_str()).collect())
+                    .unwrap_or_default();
+                for (key, prop_schema) in props {
+                    // Populate required keys eagerly; skip optionals to keep the
+                    // synthetic payload minimal.
+                    if required.contains(key.as_str()) || required.is_empty() {
+                        obj.insert(key.clone(), synthetic_args_from_schema(prop_schema));
+                    }
+                }
+            }
+            Value::Object(obj)
+        }
+        "string" => Value::String(String::new()),
+        "number" | "integer" => Value::from(0),
+        "boolean" => Value::Bool(false),
+        "array" => Value::Array(Vec::new()),
+        "null" => Value::Null,
+        _ => Value::Object(Map::new()),
+    }
+}
+
+/// Implements `cubi plugins run <name> [args...]`. Returns the process
+/// exit code so the caller can pass it to `std::process::exit`.
+async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
+    let plugins = plugins::load_plugins();
+    let Some(plugin) = plugins.iter().find(|p| p.name == name) else {
+        eprintln!("cubi: no plugin named '{}'.", name);
+        return 2;
+    };
+    let manifest = plugins::PluginManifest::load(&plugin.root);
+    let entry = manifest
+        .as_ref()
+        .and_then(|m| m.entry.clone())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "handler.cmd".to_string()
+            } else {
+                "handler.sh".to_string()
+            }
+        });
+    let handler = plugin.root.join(&entry);
+    if !handler.exists() {
+        eprintln!(
+            "cubi: plugin '{}' has no handler at {}.",
+            name,
+            handler.display()
+        );
+        return 2;
+    }
+    // Confirm shell execution unless the manifest explicitly opts in.
+    let perms = manifest.as_ref().map(|m| m.permissions).unwrap_or_default();
+    if !perms.shell {
+        if json {
+            // Headless/JSON callers cannot answer an interactive prompt; refuse
+            // rather than silently bypassing the shell-permission check.
+            eprintln!(
+                "cubi: plugin '{}' requires permissions.shell=true to run in --json mode.",
+                name
+            );
+            return 2;
+        }
+        if !confirm_yn(&format!(
+            "Plugin '{}' wants to execute {}. Allow?",
+            name,
+            handler.display()
+        )) {
+            eprintln!("cubi: aborted.");
+            return 2;
+        }
+    }
+    let mut cmd = std::process::Command::new(&handler);
+    for a in args {
+        cmd.arg(a);
+    }
+    match cmd.status() {
+        Ok(status) => status.code().unwrap_or(0),
+        Err(e) => {
+            eprintln!("cubi: failed to exec {}: {}", handler.display(), e);
+            2
+        }
+    }
+}
+
+/// Implements `cubi mcp test <server> [--tool NAME] [--json]`.
+async fn run_mcp_test(server: &str, only_tool: Option<&str>, json: bool) -> i32 {
+    use crate::mcp_config::McpConfig;
+    let config = match McpConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cubi: could not load MCP config: {e}");
+            return 2;
+        }
+    };
+    let Some(server_config) = config.mcp_servers.get(server) else {
+        eprintln!("cubi: no MCP server named '{}'.", server);
+        return 2;
+    };
+    let mut client = match McpManager::connect_for_test(server_config).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cubi: failed to connect to '{}': {:#}", server, e);
+            return 2;
+        }
+    };
+    let tools = match client.list_tools().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cubi: failed to list tools on '{}': {:#}", server, e);
+            let _ = client.shutdown().await;
+            return 2;
+        }
+    };
+    let candidates: Vec<_> = if let Some(filter) = only_tool {
+        tools.into_iter().filter(|t| t.name == filter).collect()
+    } else {
+        tools
+    };
+    if candidates.is_empty() {
+        eprintln!("cubi: no tools matched on '{}'.", server);
+        let _ = client.shutdown().await;
+        return 2;
+    }
+    let mut exit = 0i32;
+    for tool in &candidates {
+        let request = synthetic_args_from_schema(&tool.input_schema);
+        let started = std::time::Instant::now();
+        let result = client.call_tool(&tool.name, request.clone()).await;
+        let elapsed = started.elapsed().as_millis();
+        match result {
+            Ok(r) => {
+                let resp = mcp_client::tool_result_to_json(&r);
+                if json {
+                    let env = serde_json::json!({
+                        "tool": tool.name.as_str(),
+                        "request": request,
+                        "response": resp,
+                        "elapsed_ms": elapsed,
+                    });
+                    println!("{}", env);
+                } else {
+                    println!("─ tool: {}", tool.name);
+                    println!("  request:  {}", request);
+                    println!("  response: {}", resp);
+                    println!("  elapsed:  {} ms", elapsed);
+                }
+            }
+            Err(e) => {
+                exit = 11;
+                let ue = user_error::UserError::new(
+                    user_error::ErrorKind::Tool,
+                    format!("tool '{}' failed: {:#}", tool.name, e),
+                );
+                if json {
+                    let env = serde_json::json!({
+                        "tool": tool.name.as_str(),
+                        "request": request,
+                        "error": ue.summary,
+                        "elapsed_ms": elapsed,
+                    });
+                    println!("{}", env);
+                } else {
+                    eprintln!("─ tool: {}", tool.name);
+                    eprintln!("  error:    {}", ue.summary);
+                    eprintln!("  elapsed:  {} ms", elapsed);
+                }
+            }
+        }
+    }
+    let _ = client.shutdown().await;
+    exit
+}
+
 fn print_help() {
     println!(
         "cubi {} — a pocket-sized AI for your shell\n\n\
@@ -837,10 +1333,18 @@ fn print_help() {
          cubi run <file.md>           Run a Markdown script (optional YAML\n  \
                                       frontmatter: model, system, tools); uses\n  \
                                       headless --json output\n  \
-         cubi plugins list            List discovered plugin bundles\n  \
+         cubi plugins list [--json]   List discovered plugin bundles\n  \
+         cubi plugins show <name> [--json]\n  \
+                                      Show a plugin's manifest, handler, and permissions\n  \
+         cubi plugins remove <name> [--force] [--yes]\n  \
+                                      Remove a scaffolded plugin (refuses extras unless --force)\n  \
+         cubi plugins run <name> [args...] [--json]\n  \
+                                      Execute a plugin handler with extra arguments\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi plugins new <name>      Scaffold ~/.cubi/plugins/<name>/ with a\n  \
                                       manifest, handler stub, and README\n  \
+         cubi mcp test <server> [--tool <name>] [--json]\n  \
+                                      Connect, list tools, and call each with stub args\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
          cubi doctor --fix            Run checks and apply safe automated fixes\n  \
                                       (create missing sessions dir, write a\n  \
@@ -870,7 +1374,19 @@ fn print_help() {
                                         line-delimited events)\n  \
          --trace-tools <path>           Append a JSONL audit line per tool\n  \
                                         start/complete (also honors\n  \
-                                        CUBI_TRACE_TOOLS env)\n\n\
+                                        CUBI_TRACE_TOOLS env). Superset is\n  \
+                                        now `--events`.\n  \
+         --events <path>                Append every internal event (turn\n  \
+                                        boundaries, tool calls, rationales,\n  \
+                                        MCP transitions) as JSONL. Also\n  \
+                                        honors CUBI_EVENTS env.\n  \
+         --explain-tools                Surface a one-line rationale before\n  \
+                                        each tool call (or `tool_rationale`\n  \
+                                        event in headless JSON mode). Also\n  \
+                                        honors CUBI_EXPLAIN_TOOLS=1.\n  \
+         --usage-footer                 Append a one-line usage footer\n  \
+                                        after each REPL turn (also\n  \
+                                        togglable via /usage footer).\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
@@ -1064,6 +1580,79 @@ fn format_mtime(secs: u64) -> String {
 fn format_session_time(secs: u64) -> String {
     let (y, m, d, hour, minute, _) = crate::sessions::civil_from_unix(secs);
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
+}
+
+#[cfg(test)]
+mod synthetic_args_tests {
+    use super::synthetic_args_from_schema;
+    use serde_json::json;
+
+    #[test]
+    fn object_with_required_keys_populates_them() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"},
+                "force": {"type": "boolean"}
+            },
+            "required": ["command"]
+        });
+        let v = synthetic_args_from_schema(&schema);
+        assert_eq!(v["command"], "");
+        // Optional keys are intentionally skipped when `required` is non-empty.
+        assert!(v.get("timeout").is_none());
+        assert!(v.get("force").is_none());
+    }
+
+    #[test]
+    fn object_without_required_includes_all_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "number"}
+            }
+        });
+        let v = synthetic_args_from_schema(&schema);
+        assert_eq!(v["a"], "");
+        assert_eq!(v["b"], 0);
+    }
+
+    #[test]
+    fn scalar_branches_have_distinct_zero_values() {
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "string"})),
+            json!("")
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "number"})),
+            json!(0)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "integer"})),
+            json!(0)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "boolean"})),
+            json!(false)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "array"})),
+            json!([])
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "null"})),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn missing_type_defaults_to_object() {
+        let v = synthetic_args_from_schema(&json!({}));
+        assert!(v.is_object());
+        assert_eq!(v.as_object().unwrap().len(), 0);
+    }
 }
 
 #[cfg(test)]

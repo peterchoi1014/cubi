@@ -425,6 +425,14 @@ impl McpManager {
         Ok(())
     }
 
+    /// Connect a one-shot client to a single configured server. Used by
+    /// `cubi mcp test` to talk to a server without standing up the full
+    /// manager (which would also load every other configured server and
+    /// the built-in tool set).
+    pub async fn connect_for_test(config: &McpServerConfig) -> Result<McpClient> {
+        with_mcp_startup_timeout(Self::connect_client(config)).await
+    }
+
     async fn connect_client(config: &McpServerConfig) -> Result<McpClient> {
         if config.is_stdio() {
             let command = config.command.clone().unwrap();

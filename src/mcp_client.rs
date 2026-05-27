@@ -41,6 +41,14 @@ pub struct McpPrompt {
     pub description: Option<String>,
 }
 
+/// Renders a [`ToolCallResult`] as a `serde_json::Value` for the
+/// `cubi mcp test` envelope output. Equivalent to
+/// `serde_json::to_value` but kept as an explicit helper so the
+/// envelope schema is grep-able from one place.
+pub fn tool_result_to_json(r: &ToolCallResult) -> serde_json::Value {
+    serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
