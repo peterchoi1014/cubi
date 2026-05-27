@@ -13,6 +13,7 @@ pub(crate) fn utilization_pct(prompt_tokens: u64, window: usize) -> u32 {
     u32::try_from(pct).unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
         if color {
@@ -53,28 +54,69 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     rows
 }
 
+/// Pure formatter for the concise startup banner. Kept free of any
+/// process state (env, config, IO) so it can be unit-tested directly.
+///
+/// Shape: `cubi v{ver} • {model} ({provider}) • mcp {loaded}/{configured} • sessions {label}`.
+///
+/// `color=false` returns a plain-text line suitable for `NO_COLOR` /
+/// piped runs; `color=true` paints the prefix and separators dim.
+pub(super) fn format_banner(
+    version: &str,
+    model: &str,
+    provider: &str,
+    mcp_loaded: usize,
+    mcp_configured: usize,
+    sessions: crate::sessions::SessionStoreStatus,
+    color: bool,
+) -> String {
+    let sep = if color {
+        "•".bright_black().to_string()
+    } else {
+        "•".to_string()
+    };
+    let head = if color {
+        format!("cubi v{}", version).bright_cyan().to_string()
+    } else {
+        format!("cubi v{}", version)
+    };
+    format!(
+        "{head} {sep} {model} ({provider}) {sep} mcp {loaded}/{configured} {sep} sessions {label}",
+        model = model,
+        provider = provider,
+        loaded = mcp_loaded,
+        configured = mcp_configured,
+        label = sessions.label(),
+    )
+}
+
 impl ChatCLI {
     pub(super) fn print_welcome(&self) {
-        // "Cubi" mascot — a tiny isometric cube with pixel-block eyes
-        // and a smile. Box-drawing characters keep the silhouette crisp
-        // on any monospace font; the small offset shadow sells the 3D.
-        let mascot = [
-            r#"  ┌───────┐  "#,
-            r#"  │ ▣   ▣ │  "#,
-            r#"  │   ◡   │  "#,
-            r#"  └───────┘  "#,
-            r#"   ░░░░░░░   "#,
-        ];
-        let mut rows = welcome_banner_rows(true);
-        if let Some(line) = &self.mcp_health_line {
-            rows.insert(3, line.clone());
-        }
-        println!();
-        for (i, row) in rows.iter().enumerate() {
-            let m = mascot.get(i).copied().unwrap_or("             ");
-            println!("{}  {}", m.bright_cyan(), row);
-        }
-        println!();
+        // Concise one-line banner. We deliberately drop the multi-row
+        // mascot / command grid here — `/help` still shows the full
+        // command grid for users who want it. The single line keeps
+        // startup quiet for power users and lines up with how the rest
+        // of the CLI surfaces information.
+        let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var("NO_COLOR").is_err();
+        let model = self.executor.get_model();
+        let provider = self.executor.provider_name();
+        let sessions = self
+            .session_store
+            .as_ref()
+            .map(|s| s.status())
+            .unwrap_or(crate::sessions::SessionStoreStatus::Missing);
+        let (mcp_loaded, mcp_configured) = self.mcp_counts;
+        let line = format_banner(
+            env!("CARGO_PKG_VERSION"),
+            model,
+            provider,
+            mcp_loaded,
+            mcp_configured,
+            sessions,
+            color,
+        );
+        println!("{}", line);
     }
 
     /// Renders the model's final reply when streaming is off. Uses termimad
@@ -148,5 +190,49 @@ mod tests {
     #[test]
     fn utilization_pct_zero_window_is_safe() {
         assert_eq!(utilization_pct(42, 0), 0);
+    }
+
+    use super::format_banner;
+    use crate::sessions::SessionStoreStatus;
+
+    #[test]
+    fn banner_plain_contains_all_segments() {
+        let line = format_banner(
+            "9.9.9",
+            "llama3",
+            "ollama",
+            2,
+            3,
+            SessionStoreStatus::Ok,
+            false,
+        );
+        assert!(line.contains("cubi v9.9.9"), "version: {}", line);
+        assert!(line.contains("llama3 (ollama)"), "model/provider: {}", line);
+        assert!(line.contains("mcp 2/3"), "mcp: {}", line);
+        assert!(line.contains("sessions ok"), "sessions: {}", line);
+        // Plain (no color) must contain no ANSI escape sequences.
+        assert!(
+            !line.contains('\u{1b}'),
+            "should not contain ANSI: {:?}",
+            line
+        );
+    }
+
+    #[test]
+    fn banner_session_status_labels() {
+        for (status, label) in [
+            (SessionStoreStatus::Ok, "ok"),
+            (SessionStoreStatus::ReadOnly, "ro"),
+            (SessionStoreStatus::Missing, "missing"),
+        ] {
+            let line = format_banner("1.0.0", "m", "p", 0, 0, status, false);
+            assert!(line.ends_with(&format!("sessions {}", label)), "{}", line);
+        }
+    }
+
+    #[test]
+    fn banner_zero_mcp_renders_zero_slash_zero() {
+        let line = format_banner("0.1.0", "m", "p", 0, 0, SessionStoreStatus::Missing, false);
+        assert!(line.contains("mcp 0/0"), "{}", line);
     }
 }

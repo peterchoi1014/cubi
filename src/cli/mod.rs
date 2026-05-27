@@ -54,6 +54,7 @@ mod render;
 mod repl;
 
 #[cfg(test)]
+#[cfg(test)]
 use render::welcome_banner_rows;
 #[cfg(test)]
 use repl::repl_history_path;
@@ -111,8 +112,9 @@ pub struct ChatCLI {
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
     json_enabled: bool,
-    /// Precomputed MCP startup health summary shown in the welcome banner.
-    mcp_health_line: Option<String>,
+    /// (loaded, configured) MCP server counts shown in the one-line
+    /// startup banner. Both are 0 when MCP is fully disabled.
+    mcp_counts: (usize, usize),
     /// Suppresses the welcome banner and tip-of-the-day output.
     no_banner: bool,
     /// Persistent user config. Read at startup so the agent loop can
@@ -140,7 +142,7 @@ pub struct CliFlags {
     pub stats_footer: bool,
     pub system_prompt: Option<String>,
     pub json: bool,
-    pub mcp_health_line: Option<String>,
+    pub mcp_counts: (usize, usize),
     pub no_banner: bool,
 }
 
@@ -154,7 +156,7 @@ impl Default for CliFlags {
             stats_footer: false,
             system_prompt: None,
             json: false,
-            mcp_health_line: None,
+            mcp_counts: (0, 0),
             no_banner: false,
         }
     }
@@ -225,7 +227,7 @@ impl ChatCLI {
             session_stats: ChatStats::default(),
             headless_mode: false,
             json_enabled: flags.json,
-            mcp_health_line: flags.mcp_health_line,
+            mcp_counts: flags.mcp_counts,
             no_banner: flags.no_banner,
             app_config: AppConfig::load(),
             pinned: Vec::new(),
