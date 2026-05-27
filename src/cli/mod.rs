@@ -98,8 +98,9 @@ pub struct ChatCLI {
     /// response is buffered until complete and then printed in one shot —
     /// which is also the only mode that triggers markdown rendering.
     stream_enabled: bool,
-    /// Whether to render the assistant's final reply as markdown via
-    /// termimad. Only takes effect when `stream_enabled == false`. Auto-
+    /// Whether to apply the in-house markdown polish (fenced code-block
+    /// labels + line numbers, link styling) to the assistant's final
+    /// reply. Only takes effect when `stream_enabled == false`. Auto-
     /// disabled when stdout is not a TTY.
     markdown_enabled: bool,
     /// Whether to print a one-line usage footer (tokens, ms, tok/s) after
