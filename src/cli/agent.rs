@@ -381,6 +381,15 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 ));
 
+                // --trace-tools: record tool_start / tool_complete
+                // pairs around the dispatch. Best-effort: tracer write
+                // failures only log a warning.
+                let trace_ctx = self.tool_tracer.as_ref().map(|t| {
+                    let id = t.next_call_id();
+                    t.log_start(&call.function.name, &id, &call.function.arguments);
+                    (Arc::clone(t), id, std::time::Instant::now())
+                });
+
                 let result_text = {
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
@@ -391,6 +400,15 @@ impl ChatCLI {
                     }
                 };
                 let Some(result_text) = result_text else {
+                    if let Some((tracer, id, started)) = trace_ctx {
+                        tracer.log_complete(
+                            &call.function.name,
+                            &id,
+                            false,
+                            started.elapsed().as_millis(),
+                            0,
+                        );
+                    }
                     self.cancel_tool_calls(turn_start, &calls, idx);
                     if headless_mode {
                         return Err(exit_code::err(
@@ -400,6 +418,18 @@ impl ChatCLI {
                     }
                     return Ok(());
                 };
+
+                if let Some((tracer, id, started)) = trace_ctx {
+                    let is_err = result_text.starts_with("[tool error]")
+                        || result_text.starts_with("[tool denied]");
+                    tracer.log_complete(
+                        &call.function.name,
+                        &id,
+                        !is_err,
+                        started.elapsed().as_millis(),
+                        result_text.chars().count(),
+                    );
+                }
 
                 // Fire PostToolUse hook.
                 let is_error = result_text.starts_with("[tool error]")

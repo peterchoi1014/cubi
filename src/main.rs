@@ -41,6 +41,7 @@ mod telemetry;
 mod themes;
 mod tips;
 mod todos;
+mod trace_tools;
 
 use crate::style::CubiStyle;
 use anyhow::{Context, Result};
@@ -86,6 +87,10 @@ async fn main() -> Result<()> {
     // stashed here and applied (prefill history, tools toggle) after
     // ChatCLI is constructed but before the final prompt is sent.
     let mut run_script: Option<script::RunScript> = None;
+    // `--trace-tools <path>` (or CUBI_TRACE_TOOLS env var) JSONL audit
+    // log target. Stored as a String so we can hand it to ToolTracer
+    // once everything else is parsed.
+    let mut trace_tools_path: Option<String> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -146,29 +151,58 @@ async fn main() -> Result<()> {
             }
             "plugins" => {
                 let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
-                    eprintln!("cubi: plugins requires one of: list, reload.");
+                    eprintln!("cubi: plugins requires one of: list, reload, new.");
                     std::process::exit(2);
                 };
-                if argv.get(i + 2).is_some() {
-                    eprintln!("cubi: plugins {subcommand} does not accept extra arguments.");
-                    std::process::exit(2);
-                }
                 match subcommand {
                     "list" => {
+                        if argv.get(i + 2).is_some() {
+                            eprintln!("cubi: plugins list does not accept extra arguments.");
+                            std::process::exit(2);
+                        }
                         set_primary(&mut primary, PrimaryCommand::PluginsList);
                         i += 1;
                     }
                     "reload" => {
+                        if argv.get(i + 2).is_some() {
+                            eprintln!("cubi: plugins reload does not accept extra arguments.");
+                            std::process::exit(2);
+                        }
                         set_primary(&mut primary, PrimaryCommand::PluginsReload);
                         i += 1;
                     }
+                    "new" => {
+                        let Some(name) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: plugins new requires a plugin name.");
+                            std::process::exit(2);
+                        };
+                        if argv.get(i + 3).is_some() {
+                            eprintln!(
+                                "cubi: plugins new takes exactly one argument (the plugin name)."
+                            );
+                            std::process::exit(2);
+                        }
+                        set_primary(&mut primary, PrimaryCommand::PluginsNew(name.to_string()));
+                        i += 2;
+                    }
                     _ => {
-                        eprintln!("cubi: plugins requires one of: list, reload.");
+                        eprintln!("cubi: plugins requires one of: list, reload, new.");
                         std::process::exit(2);
                     }
                 }
             }
             "--no-banner" => cli_flags.no_banner = true,
+            "--trace-tools" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --trace-tools requires a file path.");
+                    std::process::exit(2);
+                };
+                trace_tools_path = Some(path.to_string());
+            }
+            _ if arg.starts_with("--trace-tools=") => {
+                trace_tools_path = Some(arg.trim_start_matches("--trace-tools=").to_string());
+            }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
                 i += 1;
@@ -353,6 +387,20 @@ async fn main() -> Result<()> {
             plugins::print_reload_summary(&before, &after, skills.len());
             return Ok(());
         }
+        PrimaryCommand::PluginsNew(name) => match plugins::scaffold_new(name) {
+            Ok(root) => {
+                println!("✓ Scaffolded plugin '{}' at {}", name, root.display());
+                println!("  Next steps:");
+                println!("    1. Edit handler script in {}", root.display());
+                println!("    2. Run `cubi plugins reload` to pick it up");
+                println!("    3. Invoke `/{}:<command>` from the REPL", name);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("cubi: failed to scaffold plugin '{}': {:#}", name, e);
+                std::process::exit(2);
+            }
+        },
         PrimaryCommand::PruneSessions => {
             let Some(age_secs) = prune_older_than else {
                 eprintln!("cubi: --prune-sessions requires --older-than <duration>.");
@@ -641,6 +689,9 @@ async fn main() -> Result<()> {
     if let Some(script) = run_script.take() {
         cli.preload_history(script.prefill);
     }
+    if let Some(tracer) = trace_tools::ToolTracer::from_args(trace_tools_path.as_deref()) {
+        cli.set_tool_tracer(Some(Arc::new(tracer)));
+    }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
     } else {
@@ -684,6 +735,7 @@ enum PrimaryCommand {
     DeleteSession(String),
     PluginsList,
     PluginsReload,
+    PluginsNew(String),
     PruneSessions,
     Doctor,
     PrintConfig,
@@ -734,6 +786,8 @@ fn print_help() {
                                       headless --json output\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
+         cubi plugins new <name>      Scaffold ~/.cubi/plugins/<name>/ with a\n  \
+                                      manifest, handler stub, and README\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
          cubi doctor --json           Same, machine-readable JSON output\n  \
          cubi --print-config          Print the resolved config as JSON and exit\n  \
@@ -754,7 +808,10 @@ fn print_help() {
                                          of the day (also honors CUBI_NO_BANNER)\n  \
          --json                          Emit machine-readable output where\n  \
                                         supported (session arrays or headless\n  \
-                                        line-delimited events)\n\n\
+                                        line-delimited events)\n  \
+         --trace-tools <path>           Append a JSONL audit line per tool\n  \
+                                        start/complete (also honors\n  \
+                                        CUBI_TRACE_TOOLS env)\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

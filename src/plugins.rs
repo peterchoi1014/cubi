@@ -214,6 +214,108 @@ pub fn resolve<'a>(plugins: &'a [Plugin], trigger: &str) -> Option<&'a PluginCom
         .find(|c| c.name == cmd)
 }
 
+/// Returns `true` when `name` is a syntactically valid plugin
+/// directory name: ASCII alphanumeric plus `-` / `_`, length 1..=64.
+pub fn is_valid_plugin_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Scaffolds a fresh plugin bundle at `~/.cubi/plugins/<name>/` with a
+/// minimal manifest, an executable handler stub, and a README. Returns
+/// the plugin root on success.
+pub fn scaffold_new(name: &str) -> anyhow::Result<PathBuf> {
+    use anyhow::{Context, anyhow};
+
+    if !is_valid_plugin_name(name) {
+        return Err(anyhow!(
+            "invalid plugin name '{}': use ASCII alphanumeric plus '-' or '_' (≤ 64 chars)",
+            name
+        ));
+    }
+    let parent = scaffold_root().ok_or_else(|| anyhow!("could not resolve plugins directory"))?;
+    let root = parent.join(name);
+    if root.exists() {
+        return Err(anyhow!(
+            "{} already exists; refusing to overwrite",
+            root.display()
+        ));
+    }
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+
+    // 1) manifest.json — mirrors what load_version expects.
+    let entry = if cfg!(windows) {
+        "handler.cmd"
+    } else {
+        "handler.sh"
+    };
+    let manifest = serde_json::json!({
+        "name": name,
+        "version": "0.1.0",
+        "description": format!("Plugin '{}' scaffolded by `cubi plugins new`", name),
+        "entry": entry,
+    });
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| "failed to write manifest.json")?;
+
+    // 2) handler stub. Echoes its argv so the user sees something the
+    //    first time they invoke it from the REPL.
+    #[cfg(unix)]
+    {
+        let body = "#!/usr/bin/env bash\nset -euo pipefail\necho \"hello from $0: $*\"\n";
+        let handler = root.join("handler.sh");
+        fs::write(&handler, body).with_context(|| "failed to write handler.sh")?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&handler)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&handler, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        let body = "@echo off\r\necho hello from %~nx0: %*\r\n";
+        fs::write(root.join("handler.cmd"), body).with_context(|| "failed to write handler.cmd")?;
+    }
+
+    // 3) README quickstart.
+    let readme = format!(
+        "# {name} plugin\n\n\
+         Scaffolded by `cubi plugins new`.\n\n\
+         ## How cubi loads this plugin\n\n\
+         - Directory: `~/.cubi/plugins/{name}/`\n\
+         - `manifest.json` declares the plugin name, version, and entry script.\n\
+         - Drop Markdown command files into `commands/<name>.md` to expose them\n  \
+           as `/{name}:<command>` slash commands in the REPL.\n\
+         - Run `cubi plugins reload` to pick up changes without restarting.\n\n\
+         ## Next steps\n\n\
+         1. Edit `{entry}` to wire your plugin to whatever it needs to do.\n\
+         2. Create `commands/hello.md` with the prompt body for `/{name}:hello`.\n\
+         3. Reload and try it from the REPL.\n",
+        name = name,
+        entry = entry,
+    );
+    fs::write(root.join("README.md"), readme).with_context(|| "failed to write README.md")?;
+
+    Ok(root)
+}
+
+/// Resolves the plugins root for scaffolding. Honors the explicit
+/// `CUBI_PLUGINS_DIR` env var (used by tests) before falling back to
+/// `~/.cubi/plugins/`.
+fn scaffold_root() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CUBI_PLUGINS_DIR") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    plugins_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +426,83 @@ mod tests {
         write_plugin(&root, "p", "noop", "");
         let plugins = load_from(&root);
         assert_eq!(plugins[0].commands[0].description, "noop");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn is_valid_plugin_name_rules() {
+        for ok in ["a", "tools", "my-plugin", "my_plugin", "Plugin1"] {
+            assert!(is_valid_plugin_name(ok), "expected ok: {ok}");
+        }
+        for bad in ["", "spaces here", "colon:bad", "slash/bad", "dot.bad"] {
+            assert!(!is_valid_plugin_name(bad), "expected bad: {bad}");
+        }
+        // 64 chars ok, 65 not.
+        let s64 = "a".repeat(64);
+        let s65 = "a".repeat(65);
+        assert!(is_valid_plugin_name(&s64));
+        assert!(!is_valid_plugin_name(&s65));
+    }
+
+    #[test]
+    fn scaffold_new_creates_manifest_handler_and_readme() {
+        let root = temp_root("scaffold");
+        // SAFETY: tests in this module are not strictly serialized but
+        // each gets a unique nanos-suffixed root, so the env var is
+        // only used to redirect this one call. Reset after to avoid
+        // leaking into sibling tests.
+        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
+        let path = scaffold_new("myplug").expect("scaffold ok");
+        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["name"], "myplug");
+        assert_eq!(manifest["version"], "0.1.0");
+        assert!(manifest["description"].is_string());
+        let entry = if cfg!(windows) {
+            "handler.cmd"
+        } else {
+            "handler.sh"
+        };
+        assert_eq!(manifest["entry"], entry);
+        assert!(path.join(entry).exists());
+        assert!(path.join("README.md").exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_new_makes_unix_handler_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("scaffold-mode");
+        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
+        let path = scaffold_new("modeplug").expect("scaffold ok");
+        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
+        let perms = fs::metadata(path.join("handler.sh")).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o755);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scaffold_new_refuses_to_overwrite_existing_directory() {
+        let root = temp_root("dup");
+        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
+        scaffold_new("dup").expect("first scaffold ok");
+        let err = scaffold_new("dup").expect_err("second scaffold must fail");
+        assert!(format!("{err:#}").contains("already exists"));
+        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scaffold_new_rejects_invalid_names() {
+        let root = temp_root("badname");
+        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
+        let err = scaffold_new("bad name").expect_err("invalid name must fail");
+        assert!(format!("{err:#}").contains("invalid plugin name"));
+        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
         fs::remove_dir_all(&root).ok();
     }
 }
