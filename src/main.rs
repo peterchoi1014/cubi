@@ -6,6 +6,7 @@ mod compat;
 mod completer;
 mod completions;
 mod doctor;
+mod event_sink;
 mod executor;
 mod exit_code;
 mod file_mentions;
@@ -29,6 +30,7 @@ mod output_styles;
 mod permissions;
 pub mod plugins;
 mod policy;
+mod pricing;
 mod project_memory;
 mod schemas;
 mod script;
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
     // log target. Stored as a String so we can hand it to ToolTracer
     // once everything else is parsed.
     let mut trace_tools_path: Option<String> = None;
+    let mut events_path: Option<String> = None;
     let mut doctor_fix = false;
 
     let mut i = 0;
@@ -208,6 +211,23 @@ async fn main() -> Result<()> {
             }
             _ if arg.starts_with("--trace-tools=") => {
                 trace_tools_path = Some(arg.trim_start_matches("--trace-tools=").to_string());
+            }
+            "--events" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --events requires a file path.");
+                    std::process::exit(2);
+                };
+                events_path = Some(path.to_string());
+            }
+            _ if arg.starts_with("--events=") => {
+                events_path = Some(arg.trim_start_matches("--events=").to_string());
+            }
+            "--explain-tools" => {
+                cli_flags.explain_tools = true;
+            }
+            "--usage-footer" => {
+                cli_flags.usage_footer = true;
             }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
@@ -340,6 +360,12 @@ async fn main() -> Result<()> {
         .unwrap_or(false)
     {
         cli_flags.no_banner = true;
+    }
+    if std::env::var("CUBI_EXPLAIN_TOOLS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        cli_flags.explain_tools = true;
     }
 
     if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
@@ -703,6 +729,23 @@ async fn main() -> Result<()> {
     if let Some(tracer) = trace_tools::ToolTracer::from_args(trace_tools_path.as_deref()) {
         cli.set_tool_tracer(Some(Arc::new(tracer)));
     }
+    if let Some(sink) = event_sink::EventSink::from_args(events_path.as_deref()) {
+        match sink.probe() {
+            Ok(()) => cli.set_event_sink(Some(Arc::new(sink))),
+            Err(err) => {
+                let summary = format!(
+                    "cubi: failed to open --events path {:?}: {}",
+                    sink.path(),
+                    err
+                );
+                user_error::print_user_warning(
+                    &summary,
+                    Some("structured event tap disabled for this session"),
+                    json_output && headless,
+                );
+            }
+        }
+    }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
     } else {
@@ -865,7 +908,19 @@ fn print_help() {
                                         line-delimited events)\n  \
          --trace-tools <path>           Append a JSONL audit line per tool\n  \
                                         start/complete (also honors\n  \
-                                        CUBI_TRACE_TOOLS env)\n\n\
+                                        CUBI_TRACE_TOOLS env). Superset is\n  \
+                                        now `--events`.\n  \
+         --events <path>                Append every internal event (turn\n  \
+                                        boundaries, tool calls, rationales,\n  \
+                                        MCP transitions) as JSONL. Also\n  \
+                                        honors CUBI_EVENTS env.\n  \
+         --explain-tools                Surface a one-line rationale before\n  \
+                                        each tool call (or `tool_rationale`\n  \
+                                        event in headless JSON mode). Also\n  \
+                                        honors CUBI_EXPLAIN_TOOLS=1.\n  \
+         --usage-footer                 Append a one-line usage footer\n  \
+                                        after each REPL turn (also\n  \
+                                        togglable via /usage footer).\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

@@ -530,3 +530,55 @@ fn plugins_new_refuses_duplicate_directory() {
         .code(2)
         .stderr(predicate::str::contains("already exists"));
 }
+
+#[cfg(unix)]
+#[test]
+fn events_flag_writes_jsonl_for_a_single_turn() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({"trusted_roots": [cwd]}).to_string(),
+    )
+    .unwrap();
+    let events_path = home.path().join("events.jsonl");
+
+    cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"bash","arguments":{"command":"true"}}}"#,
+        )
+        .args([
+            "--events",
+            events_path.to_str().unwrap(),
+            "--explain-tools",
+            "--json",
+            "--no-stream",
+            "--no-banner",
+            "-p",
+            "events smoke",
+        ])
+        .assert()
+        .success();
+
+    let raw = fs::read_to_string(&events_path).expect("events file should exist");
+    let lines: Vec<&str> = raw.lines().collect();
+    assert!(!lines.is_empty(), "events file empty");
+    let mut types: Vec<String> = Vec::new();
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|_| panic!("invalid JSONL line: {line}"));
+        types.push(v["type"].as_str().unwrap_or("").to_string());
+    }
+    // Must observe a full turn lifecycle and the tool round-trip.
+    assert!(types.iter().any(|t| t == "turn_start"));
+    assert!(types.iter().any(|t| t == "tool_call_start"));
+    assert!(types.iter().any(|t| t == "tool_call_complete"));
+    assert!(types.iter().any(|t| t == "tool_rationale"));
+    assert!(types.iter().any(|t| t == "turn_end"));
+}
+
