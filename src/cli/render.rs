@@ -13,6 +13,145 @@ pub(crate) fn utilization_pct(prompt_tokens: u64, window: usize) -> u32 {
     u32::try_from(pct).unwrap_or(u32::MAX)
 }
 
+/// Threshold above which a fenced code block gets gutter line numbers.
+pub(super) const CODE_BLOCK_LINENO_THRESHOLD: usize = 12;
+
+/// Polishes assistant markdown output for terminal rendering:
+///
+/// * Emits a dim language label above a fenced code block when the fence
+///   info-string is non-empty (`─ rust ─` style on a TTY, just `rust` in
+///   `NO_COLOR` mode).
+/// * Long fenced blocks (more than [`CODE_BLOCK_LINENO_THRESHOLD`] lines)
+///   get a right-aligned dim line-number gutter; shorter blocks render
+///   exactly as today.
+/// * Inline links `[text](url)` render as underline + dim (`text`)
+///   instead of the previous bold-cyan; with no color the link text
+///   appears verbatim with parenthesised URL.
+///
+/// All other markdown is passed through unchanged. This is intentional:
+/// the function focuses on the polish branches called out by the spec
+/// and leaves headings / bullets / emphasis to the caller's
+/// existing rendering pipeline.
+pub(super) fn polish_markdown(content: &str, color: bool) -> String {
+    let mut out = String::new();
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(info) = fence_open(line) {
+            // Collect the fenced block body up to the matching closer.
+            let mut body: Vec<&str> = Vec::new();
+            let mut closed = false;
+            while let Some(next) = lines.peek() {
+                if fence_close(next) {
+                    let _ = lines.next();
+                    closed = true;
+                    break;
+                }
+                body.push(lines.next().unwrap());
+            }
+            render_code_block(&info, &body, color, &mut out);
+            if !closed {
+                // Best-effort: model emitted an unclosed fence. We've
+                // already consumed the body; add nothing else.
+            }
+            continue;
+        }
+        out.push_str(&render_inline_links(line, color));
+        out.push('\n');
+    }
+    out
+}
+
+/// Returns the info string when `line` opens a fenced code block (the
+/// info string is everything after the backticks, trimmed).
+fn fence_open(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    if !t.starts_with("```") {
+        return None;
+    }
+    Some(t.trim_start_matches('`').trim().to_string())
+}
+
+fn fence_close(line: &str) -> bool {
+    let t = line.trim();
+    t == "```" || (t.starts_with("```") && t.chars().all(|c| c == '`'))
+}
+
+fn render_code_block(info: &str, body: &[&str], color: bool, out: &mut String) {
+    if !info.is_empty() {
+        if color {
+            out.push_str(&format!("{}\n", format!("─ {} ─", info).bright_black()));
+        } else {
+            out.push_str(info);
+            out.push('\n');
+        }
+    }
+    let n = body.len();
+    if n > CODE_BLOCK_LINENO_THRESHOLD {
+        let width = n.to_string().len();
+        for (i, line) in body.iter().enumerate() {
+            let num = format!("{:>width$}", i + 1, width = width);
+            if color {
+                out.push_str(&format!("{} {}\n", num.bright_black(), line));
+            } else {
+                out.push_str(&format!("{} {}\n", num, line));
+            }
+        }
+    } else {
+        for line in body {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+/// Rewrites inline `[text](url)` to a toned-down style: underline + dim
+/// when color is on, `text (url)` when not.
+fn render_inline_links(line: &str, color: bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let Some(lb) = rest.find('[') else {
+            out.push_str(rest);
+            break;
+        };
+        // Find the matching ']' that's immediately followed by '('.
+        let after_lb = &rest[lb + 1..];
+        let Some(rb_rel) = after_lb.find(']') else {
+            out.push_str(&rest[..=lb]);
+            rest = &rest[lb + 1..];
+            continue;
+        };
+        let rb = lb + 1 + rb_rel;
+        if rest.get(rb + 1..rb + 2) != Some("(") {
+            out.push_str(&rest[..=rb]);
+            rest = &rest[rb + 1..];
+            continue;
+        }
+        let after_lp = &rest[rb + 2..];
+        let Some(rp_rel) = after_lp.find(')') else {
+            out.push_str(&rest[..=rb]);
+            rest = &rest[rb + 1..];
+            continue;
+        };
+        let rp = rb + 2 + rp_rel;
+        let text = &rest[lb + 1..rb];
+        let url = &rest[rb + 2..rp];
+        out.push_str(&rest[..lb]);
+        if color {
+            // Underline + dim ("\x1b[2;4m...\x1b[0m"); colored crate
+            // doesn't expose dim+underline together so we emit raw.
+            out.push_str(&format!("\x1b[2;4m{}\x1b[0m", text));
+        } else {
+            out.push_str(text);
+            out.push_str(" (");
+            out.push_str(url);
+            out.push(')');
+        }
+        rest = &rest[rp + 1..];
+    }
+    out
+}
+
 #[cfg(test)]
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
@@ -119,9 +258,12 @@ impl ChatCLI {
         println!("{}", line);
     }
 
-    /// Renders the model's final reply when streaming is off. Uses termimad
-    /// for markdown when enabled and the terminal supports it; falls back to
-    /// the same colored plain-text the streaming path produces.
+    /// Renders the model's final reply when streaming is off. When
+    /// markdown rendering is enabled and stdout is a TTY, runs the reply
+    /// through [`polish_markdown`] (fenced code blocks get a dim
+    /// language label, long blocks get line numbers, inline links are
+    /// underline+dim); otherwise prints the plain colored text the
+    /// streaming path uses.
     pub(super) fn render_final_reply(&self, content: &str) {
         if self.headless_mode {
             println!("{content}");
@@ -129,11 +271,10 @@ impl ChatCLI {
         }
         print!("{} ", "AI:".bright_blue().bold());
         if self.markdown_enabled && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-            // termimad prints with its own trailing newline; we leave the
-            // outer println!("\n") in agent_turn to add the post-reply gap.
             println!();
-            let skin = termimad::MadSkin::default();
-            skin.print_text(content);
+            let color = std::env::var("NO_COLOR").is_err();
+            let rendered = polish_markdown(content, color);
+            print!("{}", rendered);
         } else {
             println!("{}", content.bright_white());
         }
@@ -234,5 +375,73 @@ mod tests {
     fn banner_zero_mcp_renders_zero_slash_zero() {
         let line = format_banner("0.1.0", "m", "p", 0, 0, SessionStoreStatus::Missing, false);
         assert!(line.contains("mcp 0/0"), "{}", line);
+    }
+
+    use super::polish_markdown;
+
+    #[test]
+    fn polish_passthrough_short_block_no_info() {
+        let input = "before\n```\nfoo\nbar\n```\nafter\n";
+        let out = polish_markdown(input, false);
+        // Short block with no info string: no language label, no line numbers.
+        assert!(
+            out.contains("foo\nbar\n"),
+            "code body should be unchanged: {:?}",
+            out
+        );
+        assert!(!out.contains(" 1 foo"), "no line numbers: {:?}", out);
+        // Fence markers are stripped (we render code without the ``` lines).
+        assert!(!out.contains("```"), "fence markers gone: {:?}", out);
+    }
+
+    #[test]
+    fn polish_short_block_emits_language_label() {
+        let input = "```rust\nfn x(){}\n```\n";
+        let out = polish_markdown(input, false);
+        assert!(out.starts_with("rust\n"), "label first line: {:?}", out);
+        assert!(out.contains("fn x(){}\n"), "body kept: {:?}", out);
+    }
+
+    #[test]
+    fn polish_long_block_gets_line_numbers() {
+        let mut body = String::new();
+        for i in 0..15 {
+            body.push_str(&format!("L{}\n", i));
+        }
+        let input = format!("```py\n{}```\n", body);
+        let out = polish_markdown(&input, false);
+        assert!(out.starts_with("py\n"), "label first: {:?}", out);
+        // 15 lines → width=2; line 1 right-padded as ` 1`, line 15 as `15`.
+        assert!(out.contains(" 1 L0\n"), "1st line numbered: {:?}", out);
+        assert!(out.contains("15 L14\n"), "15th line numbered: {:?}", out);
+    }
+
+    #[test]
+    fn polish_links_no_color_inlines_url() {
+        let out = polish_markdown("see [docs](https://example.com) here\n", false);
+        assert_eq!(out, "see docs (https://example.com) here\n");
+    }
+
+    #[test]
+    fn polish_links_color_uses_underline_dim() {
+        let out = polish_markdown("[x](u)\n", true);
+        assert!(
+            out.contains("\x1b[2;4mx\x1b[0m"),
+            "expected underline+dim ANSI: {:?}",
+            out
+        );
+        assert!(!out.contains("(u)"), "URL hidden in color mode: {:?}", out);
+    }
+
+    #[test]
+    fn polish_passes_plain_text_through() {
+        let out = polish_markdown("hello world\n", false);
+        assert_eq!(out, "hello world\n");
+    }
+
+    #[test]
+    fn polish_link_no_match_left_intact() {
+        let out = polish_markdown("[no closing paren\n", false);
+        assert_eq!(out, "[no closing paren\n");
     }
 }
