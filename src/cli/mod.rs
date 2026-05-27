@@ -52,6 +52,7 @@ mod edit_cmd;
 mod multiline;
 mod render;
 mod repl;
+mod spinner;
 
 #[cfg(test)]
 #[cfg(test)]
