@@ -343,7 +343,11 @@ impl ChatCLI {
                     }
                     any_output = true;
                 }
-                Self::emit_json_event_if(json_enabled, crate::json_events::done(&turn_stats));
+                let window = crate::llm::context_window_for_model(self.executor.get_model());
+                Self::emit_json_event_if(
+                    json_enabled,
+                    crate::json_events::done_with_window(&turn_stats, window),
+                );
                 if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
@@ -453,7 +457,8 @@ impl ChatCLI {
         // Per-turn footer (opt-in via `/stats-footer on`). Skipped when the
         // provider returned nothing useful.
         if self.stats_footer_enabled && !turn_stats.is_empty() {
-            super::render::print_stats_footer(&turn_stats);
+            let window = crate::llm::context_window_for_model(self.executor.get_model());
+            super::render::print_stats_footer(&turn_stats, window);
         }
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
