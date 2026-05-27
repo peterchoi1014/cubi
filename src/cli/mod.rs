@@ -3102,7 +3102,10 @@ impl ChatCLI {
                 // summary. Messages at/after cutoff are preserved as-is.
                 let mut new_history: Vec<Message> = Vec::new();
 
-                // Keep system messages that appeared before the cutoff.
+                // Keep system messages that appeared before the cutoff
+                // (this includes PINNED_SYSTEM_TAG entries, which must
+                // survive compaction so the user's pinned context isn't
+                // silently dropped along with the summarized turns).
                 for msg in &self.history[..cutoff_idx] {
                     if msg.role == "system" {
                         new_history.push(msg.clone());
@@ -3214,23 +3217,35 @@ impl ChatCLI {
             model.bright_cyan()
         );
         eprintln!(
-            "  {} run {} to summarize older turns, or {} to drop pinned context, then resend.",
+            "  {} run {} to summarize older turns, or {} / {} to drop pinned context, then resend.",
             "↳".bright_black(),
             "/compact".bright_cyan(),
-            "/pins".bright_cyan()
+            "/pins".bright_cyan(),
+            "/unpin <idx>".bright_cyan()
         );
         Ok(true)
     }
 
     /// Adds `text` as a persistent pinned context item. Returns the
-    /// new item's 1-based index (matching `/pins` output).
+    /// new item's 1-based index (matching `/pins` output). The tagged
+    /// system message is inserted near the head of `history` (after
+    /// any pre-existing system preamble) so the LLM sees pins before
+    /// the conversation transcript on every turn.
     fn pin(&mut self, text: &str) -> usize {
         let text = text.trim().to_string();
         self.pinned.push(text.clone());
-        self.history.push(Message::text(
-            "system",
-            format!("{} {}", PINNED_SYSTEM_TAG, text),
-        ));
+        let msg = Message::text("system", format!("{} {}", PINNED_SYSTEM_TAG, text));
+        // Insert right after the leading run of system messages so
+        // pins live with the preamble rather than at the tail.
+        let mut insert_at = 0usize;
+        for (i, m) in self.history.iter().enumerate() {
+            if m.role == "system" {
+                insert_at = i + 1;
+            } else {
+                break;
+            }
+        }
+        self.history.insert(insert_at, msg);
         self.checkpoint_session();
         self.pinned.len()
     }
@@ -4929,17 +4944,33 @@ mod tests {
     }
 
     #[test]
-    fn pin_appends_tagged_system_message_and_returns_1based_index() {
+    fn pin_inserts_tagged_system_message_and_returns_1based_index() {
         let mut cli = new_test_cli();
         let history_before = cli.history.len();
         let idx = cli.pin("remember Project X spec");
         assert_eq!(idx, 1);
         assert_eq!(cli.pinned.len(), 1);
         assert_eq!(cli.history.len(), history_before + 1);
-        let last = cli.history.last().unwrap();
-        assert_eq!(last.role, "system");
-        assert!(last.content.starts_with(PINNED_SYSTEM_TAG));
-        assert!(last.content.contains("Project X"));
+        let pinned = cli
+            .history
+            .iter()
+            .find(|m| m.role == "system" && m.content.starts_with(PINNED_SYSTEM_TAG))
+            .expect("pinned tagged system message must be present");
+        assert!(pinned.content.contains("Project X"));
+        // Pinned items live in the leading system-preamble band, never
+        // after a non-system message.
+        let pinned_pos = cli
+            .history
+            .iter()
+            .position(|m| m.role == "system" && m.content.starts_with(PINNED_SYSTEM_TAG))
+            .unwrap();
+        let first_non_system = cli.history.iter().position(|m| m.role != "system");
+        if let Some(p) = first_non_system {
+            assert!(
+                pinned_pos < p,
+                "pin should sit before any user/assistant turn"
+            );
+        }
 
         let idx2 = cli.pin("second pin");
         assert_eq!(idx2, 2);

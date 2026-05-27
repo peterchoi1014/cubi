@@ -22,8 +22,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Holds the configured trace-log path and an atomic call-id counter.
-/// Cheap to clone (the counter and path live behind `Arc`-like
-/// indirection inside `Mutex`).
+/// Cheap to share across tasks: wrap in `Arc` and `clone` the `Arc`
+/// when fanning out — the inner state (atomic counter + mutex)
+/// already supports concurrent access by reference.
 #[derive(Debug)]
 pub struct ToolTracer {
     path: PathBuf,
@@ -122,8 +123,10 @@ impl ToolTracer {
 }
 
 /// Recursively replace string values under keys that look like
-/// secrets. Mirrors [`crate::main::redact_secrets`] so the trace log
-/// honors the same redaction rules as `--print-config`.
+/// secrets. Single source of truth shared by `--print-config`
+/// emission in `main` and `--trace-tools` logging here; redacts any
+/// key whose lowercased name contains `key`, `token`, `secret`, or
+/// `password`.
 pub fn redact_secrets(value: &mut Value) {
     match value {
         Value::Object(map) => {
