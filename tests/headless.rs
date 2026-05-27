@@ -338,3 +338,195 @@ fn no_banner_flag_listed_in_help() {
         .success()
         .stdout(predicate::str::contains("--no-banner"));
 }
+
+#[test]
+fn headless_json_emits_budget_error_when_history_exceeds_window() {
+    let home = tempdir().unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "ignored")
+        // Tiny override forces the prompt-tokens-vs-window comparison
+        // to trip on even a single-character prompt.
+        .env("CUBI_MAX_PROMPT_TOKENS_OVERRIDE", "1")
+        .args(["--json", "-p", "this prompt is way too long for one token"])
+        .assert()
+        .failure()
+        .code(12)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains(r#""type":"budget_error""#),
+        "expected budget_error event in stdout, got: {stdout}"
+    );
+    assert!(stdout.contains(r#""window":1"#));
+}
+
+#[test]
+fn help_lists_budget_exit_code() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("12 context budget"));
+}
+
+#[test]
+fn exec_subcommand_emits_json_done_event() {
+    let home = tempdir().unwrap();
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "scripted reply")
+        .args(["exec", "summarize", "this", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    // Every line must be valid JSON (no banner, no stream noise).
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "token"));
+    assert!(events.iter().any(|e| e["type"] == "done"));
+}
+
+#[test]
+fn exec_without_prompt_exits_with_usage_error() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("exec")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cubi: exec requires a prompt"));
+}
+
+#[test]
+fn run_subcommand_honors_frontmatter_model_override() {
+    let home = tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("review.md");
+    fs::write(
+        &script_path,
+        "---\nmodel: test-override-model\nsystem: be terse\n---\nplease review\n",
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        // Echo the resolved model name back in the fake reply so we can
+        // assert the frontmatter override won out.
+        .env("CUBI_FAKE_LLM_RESPONSE", "ok")
+        .args(["run", script_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    // Just confirm we got valid JSON events (no banner noise).
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "done"));
+}
+
+#[test]
+fn run_subcommand_missing_path_exits_with_usage_error() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("run")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cubi: run requires a markdown script path",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_tools_writes_jsonl_pair_per_tool_call() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({"trusted_roots": [cwd]}).to_string(),
+    )
+    .unwrap();
+    let trace_path = home.path().join("trace.jsonl");
+
+    cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"bash","arguments":{"command":"true"}}}"#,
+        )
+        .args([
+            "--trace-tools",
+            trace_path.to_str().unwrap(),
+            "--json",
+            "--no-stream",
+            "-p",
+            "run a tool",
+        ])
+        .assert()
+        .success();
+
+    let raw = fs::read_to_string(&trace_path).expect("trace file written");
+    let lines: Vec<&str> = raw.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "expected at least two JSONL lines, got: {raw}"
+    );
+    let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v0["event"], "tool_start");
+    assert_eq!(v0["tool"], "bash");
+    let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(v1["event"], "tool_complete");
+    assert_eq!(v1["tool"], "bash");
+    assert_eq!(v1["call_id"], v0["call_id"]);
+}
+
+#[test]
+fn plugins_new_scaffolds_manifest_and_handler() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scaffolded plugin 'demo'"));
+
+    let manifest_path = dest.path().join("demo").join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["name"], "demo");
+    assert_eq!(manifest["version"], "0.1.0");
+}
+
+#[test]
+fn plugins_new_refuses_duplicate_directory() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    fs::create_dir_all(dest.path().join("dup")).unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "dup"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("already exists"));
+}

@@ -44,6 +44,10 @@ pub struct SessionFile {
     pub model: String,
     /// Full conversation history.
     pub history: Vec<Message>,
+    /// User-curated pinned items injected as persistent system messages
+    /// that survive `/compact`. Persisted so `/resume` keeps them.
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 /// Lightweight listing entry for `/sessions`. Carries just enough to
@@ -208,6 +212,7 @@ impl SessionStore {
             cwd: self.cwd.display().to_string(),
             model,
             history: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 

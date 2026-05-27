@@ -1,5 +1,18 @@
 use super::*;
 
+/// Computes context-window utilization as a percentage (0..=100, but
+/// may exceed 100 when the provider's reported prompt tokens overflow
+/// the heuristic window — we still surface it rather than clamp so
+/// users see something is wrong).
+pub(crate) fn utilization_pct(prompt_tokens: u64, window: usize) -> u32 {
+    if window == 0 {
+        return 0;
+    }
+    let w = window as u64;
+    let pct = prompt_tokens.saturating_mul(100) / w;
+    u32::try_from(pct).unwrap_or(u32::MAX)
+}
+
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
         if color {
@@ -88,7 +101,11 @@ impl ChatCLI {
 /// Prints a one-line dim footer summarizing token usage and wall time for
 /// the just-completed turn. Only the fields the provider actually returned
 /// are shown; missing fields are skipped to avoid printing "0 in / 0 out".
-pub(super) fn print_stats_footer(stats: &ChatStats) {
+///
+/// When `window` is known and `prompt_tokens > 0`, appends a
+/// `(N% of M-token window)` suffix so users can eyeball how close
+/// they are to /compact territory.
+pub(super) fn print_stats_footer(stats: &ChatStats, window: Option<usize>) {
     let mut parts: Vec<String> = Vec::new();
     if stats.prompt_tokens > 0 || stats.completion_tokens > 0 {
         parts.push(format!(
@@ -106,9 +123,30 @@ pub(super) fn print_stats_footer(stats: &ChatStats) {
     if parts.is_empty() {
         return;
     }
-    println!(
-        "{} {}",
-        "↳".bright_black(),
-        parts.join(" · ").bright_black()
-    );
+    let mut line = parts.join(" · ");
+    if let Some(w) = window {
+        if stats.prompt_tokens > 0 && w > 0 {
+            let pct = utilization_pct(stats.prompt_tokens, w);
+            line.push_str(&format!(" ({}% of {}-token window)", pct, w));
+        }
+    }
+    println!("{} {}", "↳".bright_black(), line.bright_black());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utilization_pct;
+
+    #[test]
+    fn utilization_pct_basic_ratios() {
+        assert_eq!(utilization_pct(0, 1000), 0);
+        assert_eq!(utilization_pct(250, 1000), 25);
+        assert_eq!(utilization_pct(1000, 1000), 100);
+        assert_eq!(utilization_pct(1500, 1000), 150);
+    }
+
+    #[test]
+    fn utilization_pct_zero_window_is_safe() {
+        assert_eq!(utilization_pct(42, 0), 0);
+    }
 }

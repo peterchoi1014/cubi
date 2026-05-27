@@ -158,6 +158,21 @@ impl ChatCLI {
         use std::io::Write;
         use std::sync::atomic::Ordering;
 
+        // Auto-compact: when the prompt token estimate crosses
+        // `compact_threshold_pct` of the active model's context window,
+        // summarize older turns before sending. Best-effort; failures
+        // are logged but never abort the turn — we'd rather attempt the
+        // request than refuse silently.
+        self.maybe_auto_compact().await;
+
+        // Hard stop: refuse to send when the estimated prompt would
+        // still exceed the model's context window. Keeps the user's
+        // last turn in history so they can /compact, /pin less, or
+        // switch model and retry from the same state.
+        if self.check_token_budget(turn_start)? {
+            return Ok(());
+        }
+
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
         let tools = self
@@ -328,7 +343,11 @@ impl ChatCLI {
                     }
                     any_output = true;
                 }
-                Self::emit_json_event_if(json_enabled, crate::json_events::done(&turn_stats));
+                let window = crate::llm::context_window_for_model(self.executor.get_model());
+                Self::emit_json_event_if(
+                    json_enabled,
+                    crate::json_events::done_with_window(&turn_stats, window),
+                );
                 if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
@@ -362,6 +381,15 @@ impl ChatCLI {
                     call.function.name.bright_cyan()
                 ));
 
+                // --trace-tools: record tool_start / tool_complete
+                // pairs around the dispatch. Best-effort: tracer write
+                // failures only log a warning.
+                let trace_ctx = self.tool_tracer.as_ref().map(|t| {
+                    let id = t.next_call_id();
+                    t.log_start(&call.function.name, &id, &call.function.arguments);
+                    (Arc::clone(t), id, std::time::Instant::now())
+                });
+
                 let result_text = {
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
@@ -372,6 +400,15 @@ impl ChatCLI {
                     }
                 };
                 let Some(result_text) = result_text else {
+                    if let Some((tracer, id, started)) = trace_ctx {
+                        tracer.log_complete(
+                            &call.function.name,
+                            &id,
+                            false,
+                            started.elapsed().as_millis(),
+                            0,
+                        );
+                    }
                     self.cancel_tool_calls(turn_start, &calls, idx);
                     if headless_mode {
                         return Err(exit_code::err(
@@ -381,6 +418,18 @@ impl ChatCLI {
                     }
                     return Ok(());
                 };
+
+                if let Some((tracer, id, started)) = trace_ctx {
+                    let is_err = result_text.starts_with("[tool error]")
+                        || result_text.starts_with("[tool denied]");
+                    tracer.log_complete(
+                        &call.function.name,
+                        &id,
+                        !is_err,
+                        started.elapsed().as_millis(),
+                        result_text.chars().count(),
+                    );
+                }
 
                 // Fire PostToolUse hook.
                 let is_error = result_text.starts_with("[tool error]")
@@ -438,7 +487,8 @@ impl ChatCLI {
         // Per-turn footer (opt-in via `/stats-footer on`). Skipped when the
         // provider returned nothing useful.
         if self.stats_footer_enabled && !turn_stats.is_empty() {
-            super::render::print_stats_footer(&turn_stats);
+            let window = crate::llm::context_window_for_model(self.executor.get_model());
+            super::render::print_stats_footer(&turn_stats, window);
         }
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
