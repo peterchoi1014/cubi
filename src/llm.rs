@@ -395,7 +395,13 @@ impl OpenAiClient {
                                 status = status.as_u16(),
                                 "openai non-success response"
                             );
-                            anyhow::bail!("OpenAI API error: {}", error_text);
+                            let ue = crate::user_error::classify_http_status(
+                                status.as_u16(),
+                                retry_after.map(|d| d.as_secs()),
+                                &url,
+                                &error_text,
+                            );
+                            return Err(anyhow::Error::new(ue));
                         }
                     }
                 }
@@ -413,8 +419,9 @@ impl OpenAiClient {
                         continue;
                     }
                     RetryAction::Stop => {
-                        return Err(anyhow::Error::new(err))
-                            .context("Failed to send request to OpenAI-compatible API");
+                        let mut ue = crate::user_error::classify_send_error(&err, &url);
+                        ue.cause = Some(anyhow::Error::new(err));
+                        return Err(anyhow::Error::new(ue));
                     }
                 },
             }
@@ -526,7 +533,13 @@ impl OpenAiClient {
                                 status = status.as_u16(),
                                 "openai stream non-success response"
                             );
-                            anyhow::bail!("OpenAI API error: {}", error_text);
+                            let ue = crate::user_error::classify_http_status(
+                                status.as_u16(),
+                                retry_after.map(|d| d.as_secs()),
+                                &url,
+                                &error_text,
+                            );
+                            return Err(anyhow::Error::new(ue));
                         }
                     }
                 }
@@ -544,8 +557,9 @@ impl OpenAiClient {
                         continue;
                     }
                     RetryAction::Stop => {
-                        return Err(anyhow::Error::new(err))
-                            .context("Failed to send streaming request to OpenAI-compatible API");
+                        let mut ue = crate::user_error::classify_send_error(&err, &url);
+                        ue.cause = Some(anyhow::Error::new(err));
+                        return Err(anyhow::Error::new(ue));
                     }
                 },
             }

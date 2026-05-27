@@ -31,6 +31,9 @@ pub struct CheckResult {
     pub name: &'static str,
     pub status: CheckStatus,
     pub message: String,
+    /// Set when `doctor --fix` applied (or attempted) a safe remedy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
 }
 
 impl CheckResult {
@@ -39,6 +42,7 @@ impl CheckResult {
             name,
             status: CheckStatus::Ok,
             message: message.into(),
+            fix: None,
         }
     }
     fn warn(name: &'static str, message: impl Into<String>) -> Self {
@@ -46,6 +50,7 @@ impl CheckResult {
             name,
             status: CheckStatus::Warn,
             message: message.into(),
+            fix: None,
         }
     }
     fn fail(name: &'static str, message: impl Into<String>) -> Self {
@@ -53,14 +58,22 @@ impl CheckResult {
             name,
             status: CheckStatus::Fail,
             message: message.into(),
+            fix: None,
         }
+    }
+    fn with_fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
     }
 }
 
 /// Public entry point. Runs all checks, prints output, returns
-/// `true` when there were no failures.
-pub async fn run(json: bool) -> bool {
-    let results = run_checks().await;
+/// `true` when there were no failures. When `fix` is true, safe
+/// automated remedies are applied for failing checks; the remedy line
+/// is prefixed with `+` in human output (and is reflected in the
+/// machine-readable `fix` field on the JSON payload).
+pub async fn run(json: bool, fix: bool) -> bool {
+    let results = run_checks(fix).await;
     if json {
         print_json(&results);
     } else {
@@ -69,18 +82,19 @@ pub async fn run(json: bool) -> bool {
     !results.iter().any(|r| r.status == CheckStatus::Fail)
 }
 
-async fn run_checks() -> Vec<CheckResult> {
+async fn run_checks(fix: bool) -> Vec<CheckResult> {
     let mut results = Vec::new();
-    results.push(check_config());
-    results.push(check_sessions_dir());
+    results.push(check_config(fix));
+    results.push(check_sessions_dir(fix));
     results.push(check_model_host().await);
     results.push(check_ollama_binary());
     results.extend(check_mcp_servers());
     results.push(check_plugins_dir());
+    results.push(check_completions_installed(fix));
     results
 }
 
-fn check_config() -> CheckResult {
+fn check_config(fix: bool) -> CheckResult {
     match AppConfig::storage_path() {
         Some(path) if path.exists() => match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
@@ -95,15 +109,73 @@ fn check_config() -> CheckResult {
                 format!("failed to read {}: {}", path.display(), e),
             ),
         },
-        Some(path) => CheckResult::ok("config", format!("no config yet at {}", path.display())),
+        Some(path) => {
+            // Config file doesn't exist yet — this is normally an
+            // informational "ok" state, but with --fix we can drop a
+            // minimal stub so the next run has somewhere to grow from.
+            if fix {
+                match maybe_write_stub_config(&path) {
+                    StubWriteResult::Wrote => {
+                        return CheckResult::ok(
+                            "config",
+                            format!("created stub config at {}", path.display()),
+                        )
+                        .with_fix(format!("wrote stub config to {}", path.display()));
+                    }
+                    StubWriteResult::Skipped(reason) => {
+                        return CheckResult::ok(
+                            "config",
+                            format!("no config yet at {} ({})", path.display(), reason),
+                        );
+                    }
+                    StubWriteResult::Err(e) => {
+                        return CheckResult::warn(
+                            "config",
+                            format!("could not write stub config: {}", e),
+                        );
+                    }
+                }
+            }
+            CheckResult::ok("config", format!("no config yet at {}", path.display()))
+        }
         None => CheckResult::warn("config", "could not resolve home directory"),
     }
 }
 
-fn check_sessions_dir() -> CheckResult {
+enum StubWriteResult {
+    Wrote,
+    Skipped(&'static str),
+    Err(std::io::Error),
+}
+
+fn maybe_write_stub_config(path: &std::path::Path) -> StubWriteResult {
+    if path.exists() {
+        return StubWriteResult::Skipped("already exists, skipping");
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return StubWriteResult::Err(e);
+        }
+    }
+    let model = std::env::var("CUBI_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "qwen3:4b".to_string());
+    let stub = format!(
+        "{{\n  \"default_model\": {}\n}}\n",
+        serde_json::to_string(&model).unwrap_or_else(|_| "\"qwen3:4b\"".to_string())
+    );
+    match std::fs::write(path, stub) {
+        Ok(()) => StubWriteResult::Wrote,
+        Err(e) => StubWriteResult::Err(e),
+    }
+}
+
+fn check_sessions_dir(fix: bool) -> CheckResult {
     let Some(dir) = crate::sessions::sessions_root() else {
         return CheckResult::warn("sessions_dir", "could not resolve home directory");
     };
+    let existed = dir.exists();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return CheckResult::fail(
             "sessions_dir",
@@ -118,12 +190,126 @@ fn check_sessions_dir() -> CheckResult {
     match std::fs::write(&probe, b"ok") {
         Ok(()) => {
             let _ = std::fs::remove_file(&probe);
-            CheckResult::ok("sessions_dir", format!("writable: {}", dir.display()))
+            let r = CheckResult::ok("sessions_dir", format!("writable: {}", dir.display()));
+            if fix && !existed {
+                r.with_fix(format!("created {}", dir.display()))
+            } else {
+                r
+            }
         }
         Err(e) => CheckResult::fail(
             "sessions_dir",
             format!("not writable ({}): {}", dir.display(), e),
         ),
+    }
+}
+
+/// Optional check: ensure per-user shell completion scripts exist on
+/// disk. We never edit shell rc files; we only write to
+/// `~/.cubi/completions/` and print the rc-file snippet the user
+/// should add. With `--fix` (and `CUBI_SHELL` / `$SHELL` indicating a
+/// supported shell) we drop the file and prefix the line with `+`.
+fn check_completions_installed(fix: bool) -> CheckResult {
+    let Some(home) = crate::sessions::home_dir() else {
+        return CheckResult::warn("completions", "could not resolve home directory");
+    };
+    let shell = detect_shell();
+    completions_check_in_home(&home, shell.as_deref(), fix)
+}
+
+/// Inner logic for [`check_completions_installed`], factored out so
+/// tests can drive it against a [`tempfile::TempDir`] without
+/// mutating the process environment.
+fn completions_check_in_home(
+    home: &std::path::Path,
+    shell: Option<&str>,
+    fix: bool,
+) -> CheckResult {
+    let comp_dir = home.join(".cubi").join("completions");
+    let (shell_name, file_name) = match shell {
+        Some("zsh") => ("zsh", "_cubi"),
+        Some("bash") => ("bash", "cubi.bash"),
+        Some("fish") => ("fish", "cubi.fish"),
+        Some(other) => {
+            return CheckResult::ok(
+                "completions",
+                format!("unsupported shell '{}' (no completions)", other),
+            );
+        }
+        None => {
+            return CheckResult::ok(
+                "completions",
+                "shell not detected (set $SHELL or CUBI_SHELL to install)",
+            );
+        }
+    };
+    let target = comp_dir.join(file_name);
+    if target.exists() {
+        return CheckResult::ok(
+            "completions",
+            format!("{} completions present at {}", shell_name, target.display()),
+        );
+    }
+    if !fix {
+        return CheckResult::ok(
+            "completions",
+            format!(
+                "{} completions not installed (run `cubi doctor --fix` to install)",
+                shell_name
+            ),
+        );
+    }
+    let Some(script) = crate::completions::script(shell_name) else {
+        return CheckResult::warn("completions", "no completion script for this shell");
+    };
+    if let Err(e) = std::fs::create_dir_all(&comp_dir) {
+        return CheckResult::warn(
+            "completions",
+            format!("could not create {}: {}", comp_dir.display(), e),
+        );
+    }
+    match std::fs::write(&target, script) {
+        Ok(()) => CheckResult::ok(
+            "completions",
+            format!(
+                "installed {} completions to {}",
+                shell_name,
+                target.display()
+            ),
+        )
+        .with_fix(format!(
+            "installed {} completions to {} — add `{}` to your shell rc",
+            shell_name,
+            target.display(),
+            rc_snippet_for(shell_name, &comp_dir)
+        )),
+        Err(e) => CheckResult::warn(
+            "completions",
+            format!("could not write {}: {}", target.display(), e),
+        ),
+    }
+}
+
+fn detect_shell() -> Option<String> {
+    if let Ok(s) = std::env::var("CUBI_SHELL") {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let shell_path = std::env::var("SHELL").ok()?;
+    let name = std::path::Path::new(&shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    Some(name)
+}
+
+fn rc_snippet_for(shell: &str, dir: &std::path::Path) -> String {
+    match shell {
+        "zsh" => format!("fpath=({} $fpath)", dir.display()),
+        "bash" => format!("source {}/cubi.bash", dir.display()),
+        "fish" => format!("source {}/cubi.fish", dir.display()),
+        _ => String::new(),
     }
 }
 
@@ -286,6 +472,9 @@ fn print_human(results: &[CheckResult]) {
             CheckStatus::Fail => "✗".bright_red().to_string(),
         };
         println!("  {} [{}] {}", glyph, r.name, r.message);
+        if let Some(fix) = &r.fix {
+            println!("    {} {}", "+".bright_green(), fix);
+        }
     }
     let failed = results
         .iter()
@@ -347,5 +536,104 @@ mod tests {
     #[test]
     fn which_returns_none_for_missing_command() {
         assert!(which_on_path("definitely-not-a-real-binary-zzz-cubi").is_none());
+    }
+
+    #[test]
+    fn stub_config_is_written_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("config.json");
+        let r = maybe_write_stub_config(&path);
+        assert!(matches!(r, StubWriteResult::Wrote));
+        assert!(path.exists());
+        // Parsed back as JSON with a default_model field.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v.get("default_model").is_some());
+    }
+
+    #[test]
+    fn stub_config_refuses_to_overwrite_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{\"keep\": true}").unwrap();
+        let r = maybe_write_stub_config(&path);
+        assert!(matches!(r, StubWriteResult::Skipped(_)));
+        // Untouched.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("keep"));
+    }
+
+    #[test]
+    fn completions_check_with_no_shell_returns_ok_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = completions_check_in_home(tmp.path(), None, true);
+        assert_eq!(r.status, CheckStatus::Ok);
+        assert!(r.fix.is_none());
+        assert!(!tmp.path().join(".cubi/completions").exists());
+    }
+
+    #[test]
+    fn completions_check_without_fix_does_not_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = completions_check_in_home(tmp.path(), Some("zsh"), false);
+        assert_eq!(r.status, CheckStatus::Ok);
+        assert!(r.fix.is_none());
+        assert!(!tmp.path().join(".cubi/completions/_cubi").exists());
+    }
+
+    #[test]
+    fn completions_check_with_fix_writes_zsh_script() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = completions_check_in_home(tmp.path(), Some("zsh"), true);
+        assert_eq!(r.status, CheckStatus::Ok);
+        let fix = r.fix.expect("fix line should be set");
+        assert!(fix.contains("installed zsh completions"));
+        assert!(fix.contains("fpath="));
+        let written = tmp.path().join(".cubi/completions/_cubi");
+        assert!(written.exists());
+        let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("#compdef cubi"));
+    }
+
+    #[test]
+    fn completions_check_does_not_overwrite_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".cubi/completions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("_cubi");
+        std::fs::write(&path, "preserved").unwrap();
+        let r = completions_check_in_home(tmp.path(), Some("zsh"), true);
+        assert_eq!(r.status, CheckStatus::Ok);
+        assert!(r.fix.is_none(), "should not claim to have installed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "preserved");
+    }
+
+    #[test]
+    fn completions_check_with_unsupported_shell_is_ok_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = completions_check_in_home(tmp.path(), Some("tcsh"), true);
+        assert_eq!(r.status, CheckStatus::Ok);
+        assert!(r.fix.is_none());
+        assert!(r.message.contains("unsupported shell"));
+    }
+
+    #[test]
+    fn rc_snippet_zsh_uses_fpath() {
+        let s = rc_snippet_for("zsh", std::path::Path::new("/x/y"));
+        assert_eq!(s, "fpath=(/x/y $fpath)");
+    }
+
+    #[test]
+    fn check_result_serialization_omits_fix_when_none() {
+        let r = CheckResult::ok("x", "ok");
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(!s.contains("\"fix\""));
+    }
+
+    #[test]
+    fn check_result_serialization_includes_fix_when_set() {
+        let r = CheckResult::ok("x", "ok").with_fix("did the thing");
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"fix\":\"did the thing\""));
     }
 }
