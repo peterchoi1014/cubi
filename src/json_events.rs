@@ -124,6 +124,15 @@ pub fn emit_compacted(enabled: bool, summarized_messages: usize, window: usize) 
     v
 }
 
+pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
+    json!({
+        "type": "budget_error",
+        "needed": needed,
+        "window": window,
+        "model": model,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
