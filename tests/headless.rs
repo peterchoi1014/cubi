@@ -338,3 +338,38 @@ fn no_banner_flag_listed_in_help() {
         .success()
         .stdout(predicate::str::contains("--no-banner"));
 }
+
+#[test]
+fn headless_json_emits_budget_error_when_history_exceeds_window() {
+    let home = tempdir().unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "ignored")
+        // Tiny override forces the prompt-tokens-vs-window comparison
+        // to trip on even a single-character prompt.
+        .env("CUBI_MAX_PROMPT_TOKENS_OVERRIDE", "1")
+        .args(["--json", "-p", "this prompt is way too long for one token"])
+        .assert()
+        .failure()
+        .code(12)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains(r#""type":"budget_error""#),
+        "expected budget_error event in stdout, got: {stdout}"
+    );
+    assert!(stdout.contains(r#""window":1"#));
+}
+
+#[test]
+fn help_lists_budget_exit_code() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("12 context budget"));
+}

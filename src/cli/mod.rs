@@ -3093,6 +3093,62 @@ impl ChatCLI {
         }
     }
 
+    /// Pre-flight check: if the estimated prompt tokens would exceed
+    /// the active model's context window, refuse the LLM request.
+    ///
+    /// Returns `Ok(true)` when the caller should stop the turn (the
+    /// REPL path keeps the user's input in history so they can
+    /// `/compact`/`/pin` and retry; headless returns an `AppExit`
+    /// error). Returns `Ok(false)` when the request is within budget
+    /// or the model's window is unknown (in which case we can't make
+    /// an informed decision and let the request through — the provider
+    /// will return its own error).
+    pub(super) fn check_token_budget(&self, _turn_start: usize) -> Result<bool> {
+        let model = self.executor.get_model().to_string();
+        let Some(window) = crate::llm::context_window_for_model(&model) else {
+            return Ok(false);
+        };
+        let needed = crate::llm::estimate_conversation_tokens(&self.history);
+        if needed <= window {
+            return Ok(false);
+        }
+        let json_enabled = self.json_enabled && self.headless_mode;
+        if json_enabled {
+            Self::emit_json_event(crate::json_events::budget_error(needed, window, &model));
+            return Err(exit_code::err(
+                ExitCode::Budget,
+                format!(
+                    "cubi: would exceed context window ({} tokens estimated, model window is {})",
+                    needed, window
+                ),
+            ));
+        }
+        if self.headless_mode {
+            return Err(exit_code::err(
+                ExitCode::Budget,
+                format!(
+                    "cubi: refusing — prompt ({} est. tokens) exceeds {} window of {} tokens. \
+                     Run /compact or shorten the prompt and retry.",
+                    needed, model, window
+                ),
+            ));
+        }
+        eprintln!(
+            "{} prompt would exceed the model's context window ({} estimated tokens > {} window for {}).",
+            "[budget]".bright_red(),
+            needed,
+            window,
+            model.bright_cyan()
+        );
+        eprintln!(
+            "  {} run {} to summarize older turns, or {} to drop pinned context, then resend.",
+            "↳".bright_black(),
+            "/compact".bright_cyan(),
+            "/pins".bright_cyan()
+        );
+        Ok(true)
+    }
+
     /// Inspects the current history against the active model's context
     /// window. If `auto_compact` is enabled and the estimated prompt
     /// tokens cross `compact_threshold_pct`, invoke [`compact`] before

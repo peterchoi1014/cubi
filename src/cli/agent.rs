@@ -165,6 +165,14 @@ impl ChatCLI {
         // request than refuse silently.
         self.maybe_auto_compact().await;
 
+        // Hard stop: refuse to send when the estimated prompt would
+        // still exceed the model's context window. Keeps the user's
+        // last turn in history so they can /compact, /pin less, or
+        // switch model and retry from the same state.
+        if self.check_token_budget(turn_start)? {
+            return Ok(());
+        }
+
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
         let tools = self
