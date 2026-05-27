@@ -247,9 +247,7 @@ async fn main() -> Result<()> {
                                 "--force" => force = true,
                                 "--yes" => yes = true,
                                 _ if arg.starts_with('-') => {
-                                    eprintln!(
-                                        "cubi: plugins remove: unknown flag {arg:?}"
-                                    );
+                                    eprintln!("cubi: plugins remove: unknown flag {arg:?}");
                                     std::process::exit(2);
                                 }
                                 _ => {
@@ -329,9 +327,7 @@ async fn main() -> Result<()> {
                                 "--tool" => {
                                     j += 1;
                                     let Some(t) = argv.get(j).and_then(|a| a.to_str()) else {
-                                        eprintln!(
-                                            "cubi: mcp test --tool requires a tool name."
-                                        );
+                                        eprintln!("cubi: mcp test --tool requires a tool name.");
                                         std::process::exit(2);
                                     };
                                     tool = Some(t.to_string());
@@ -340,9 +336,7 @@ async fn main() -> Result<()> {
                                     tool = Some(arg.trim_start_matches("--tool=").to_string());
                                 }
                                 _ => {
-                                    eprintln!(
-                                        "cubi: mcp test: unexpected argument {arg:?}"
-                                    );
+                                    eprintln!("cubi: mcp test: unexpected argument {arg:?}");
                                     std::process::exit(2);
                                 }
                             }
@@ -596,9 +590,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         PrimaryCommand::PluginsRemove { name, force, yes } => {
-            let parent = plugins::plugins_dir().ok_or_else(|| {
-                anyhow::anyhow!("could not resolve plugins directory")
-            })?;
+            let parent = plugins::plugins_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not resolve plugins directory"))?;
             match plugins::resolve_remove_target(&parent, name, *force) {
                 Ok(root) => {
                     if !*yes && !confirm_yn(&format!("Remove plugin {}?", root.display())) {
@@ -1132,7 +1125,10 @@ fn confirm_yn(question: &str) -> bool {
 /// constructing request bodies by hand.
 fn synthetic_args_from_schema(schema: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
-    let kind = schema.get("type").and_then(|t| t.as_str()).unwrap_or("object");
+    let kind = schema
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("object");
     match kind {
         "object" => {
             let mut obj = Map::new();
@@ -1190,10 +1186,7 @@ async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
         return 2;
     }
     // Confirm shell execution unless the manifest explicitly opts in.
-    let perms = manifest
-        .as_ref()
-        .map(|m| m.permissions)
-        .unwrap_or_default();
+    let perms = manifest.as_ref().map(|m| m.permissions).unwrap_or_default();
     if !perms.shell
         && !json
         && !confirm_yn(&format!(
@@ -1615,12 +1608,30 @@ mod synthetic_args_tests {
 
     #[test]
     fn scalar_branches_have_distinct_zero_values() {
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "string"})), json!(""));
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "number"})), json!(0));
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "integer"})), json!(0));
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "boolean"})), json!(false));
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "array"})), json!([]));
-        assert_eq!(synthetic_args_from_schema(&json!({"type": "null"})), json!(null));
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "string"})),
+            json!("")
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "number"})),
+            json!(0)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "integer"})),
+            json!(0)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "boolean"})),
+            json!(false)
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "array"})),
+            json!([])
+        );
+        assert_eq!(
+            synthetic_args_from_schema(&json!({"type": "null"})),
+            json!(null)
+        );
     }
 
     #[test]
