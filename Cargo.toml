@@ -52,19 +52,16 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # Streaming responses from Ollama
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
-# Markdown renderer for AI replies (non-streaming mode).
-termimad = "0.30"
-
 # Structured logging for internal diagnostics. Filter via the `CUBI_LOG`
 # env var (e.g. `CUBI_LOG=cubi=debug`). User-facing output stays on
 # `eprintln!`; tracing is reserved for breadcrumbs that maintainers
 # enable when reproducing a bug.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 insta = "1.47.2"
 predicates = "3.1.4"
-tempfile = "3.27.0"
 

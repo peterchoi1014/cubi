@@ -162,6 +162,29 @@ pub struct SessionStore {
     cwd: PathBuf,
 }
 
+/// Filesystem state of the per-cwd session directory, used by the
+/// startup banner to surface `sessions ok|ro|missing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStoreStatus {
+    /// Directory exists and is writable by the current process.
+    Ok,
+    /// Directory exists but a write probe failed.
+    ReadOnly,
+    /// Directory does not exist yet.
+    Missing,
+}
+
+impl SessionStoreStatus {
+    /// Short label used in the one-line startup banner.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::ReadOnly => "ro",
+            Self::Missing => "missing",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PruneItem {
     pub id: String,
@@ -191,6 +214,39 @@ impl SessionStore {
             dir: home.join(".cubi").join("sessions").join(cwd_key(cwd)),
             cwd: cwd.to_path_buf(),
         })
+    }
+
+    /// Returns the on-disk status of the session directory for surfacing
+    /// in the startup banner. Three states:
+    ///
+    /// * `Missing` — the directory does not exist yet (first run, or the
+    ///   user has never saved a session in this cwd).
+    /// * `ReadOnly` — the directory exists but creating a probe file
+    ///   inside it fails (permissions, full disk, etc.).
+    /// * `Ok` — writable.
+    pub fn status(&self) -> SessionStoreStatus {
+        // Use try_exists so a permission-denied stat doesn't masquerade
+        // as "Missing"; an inaccessible-but-present directory should be
+        // surfaced to the user as ReadOnly (unwritable) instead.
+        match self.dir.try_exists() {
+            Ok(false) => return SessionStoreStatus::Missing,
+            Err(_) => return SessionStoreStatus::ReadOnly,
+            Ok(true) => {}
+        }
+        // Cheap writability probe: try to create + remove a sentinel.
+        let probe = self.dir.join(".cubi-write-probe");
+        match fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = fs::remove_file(&probe);
+                SessionStoreStatus::Ok
+            }
+            Err(_) => SessionStoreStatus::ReadOnly,
+        }
     }
 
     /// Allocates a new session checkpoint with a fresh id and empty

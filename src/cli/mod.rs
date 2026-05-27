@@ -48,8 +48,11 @@ const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
+mod edit_cmd;
+mod multiline;
 mod render;
 mod repl;
+mod spinner;
 
 #[cfg(test)]
 use render::welcome_banner_rows;
@@ -94,8 +97,9 @@ pub struct ChatCLI {
     /// response is buffered until complete and then printed in one shot —
     /// which is also the only mode that triggers markdown rendering.
     stream_enabled: bool,
-    /// Whether to render the assistant's final reply as markdown via
-    /// termimad. Only takes effect when `stream_enabled == false`. Auto-
+    /// Whether to apply the in-house markdown polish (fenced code-block
+    /// labels + line numbers, link styling) to the assistant's final
+    /// reply. Only takes effect when `stream_enabled == false`. Auto-
     /// disabled when stdout is not a TTY.
     markdown_enabled: bool,
     /// Whether to print a one-line usage footer (tokens, ms, tok/s) after
@@ -109,8 +113,9 @@ pub struct ChatCLI {
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
     json_enabled: bool,
-    /// Precomputed MCP startup health summary shown in the welcome banner.
-    mcp_health_line: Option<String>,
+    /// (loaded, configured) MCP server counts shown in the one-line
+    /// startup banner. Both are 0 when MCP is fully disabled.
+    mcp_counts: (usize, usize),
     /// Suppresses the welcome banner and tip-of-the-day output.
     no_banner: bool,
     /// Persistent user config. Read at startup so the agent loop can
@@ -138,7 +143,7 @@ pub struct CliFlags {
     pub stats_footer: bool,
     pub system_prompt: Option<String>,
     pub json: bool,
-    pub mcp_health_line: Option<String>,
+    pub mcp_counts: (usize, usize),
     pub no_banner: bool,
 }
 
@@ -152,7 +157,7 @@ impl Default for CliFlags {
             stats_footer: false,
             system_prompt: None,
             json: false,
-            mcp_health_line: None,
+            mcp_counts: (0, 0),
             no_banner: false,
         }
     }
@@ -223,7 +228,7 @@ impl ChatCLI {
             session_stats: ChatStats::default(),
             headless_mode: false,
             json_enabled: flags.json,
-            mcp_health_line: flags.mcp_health_line,
+            mcp_counts: flags.mcp_counts,
             no_banner: flags.no_banner,
             app_config: AppConfig::load(),
             pinned: Vec::new(),
@@ -862,6 +867,56 @@ impl ChatCLI {
                             "Error:".bright_red(),
                             args
                         ),
+                    }
+                }
+            }
+            Cmd::Edit => {
+                let seed = if args.is_empty() {
+                    // Fall back to the last assistant message so the
+                    // user can refine a prior answer. If there is none,
+                    // open an empty buffer.
+                    self.history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant")
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default()
+                } else {
+                    args.to_string()
+                };
+                let editor = edit_cmd::resolve_editor();
+                let outcome = edit_cmd::run_editor_session(&seed, |path| {
+                    edit_cmd::spawn_editor_blocking(&editor, path)
+                });
+                match outcome {
+                    Ok(edit_cmd::EditOutcome::Submit(body)) => {
+                        let expanded = file_mentions::expand_file_mentions(&body);
+                        let turn_start = self.history.len();
+                        self.history.push(Message::text("user", &expanded));
+                        self.journal.start_turn();
+                        if let Err(e) = self.agent_turn(turn_start).await {
+                            eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
+                        }
+                    }
+                    Ok(edit_cmd::EditOutcome::Empty) => {
+                        println!(
+                            "{} editor returned empty buffer — nothing submitted",
+                            "ℹ".bright_blue()
+                        );
+                    }
+                    Ok(edit_cmd::EditOutcome::Unchanged) => {
+                        println!(
+                            "{} editor buffer unchanged — nothing submitted",
+                            "ℹ".bright_blue()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{} could not run editor ({}): {}",
+                            "Error:".bright_red(),
+                            editor,
+                            e
+                        );
                     }
                 }
             }

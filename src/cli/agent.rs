@@ -391,13 +391,23 @@ impl ChatCLI {
                 });
 
                 let result_text = {
+                    // Tool spinner: gives users a visible heartbeat
+                    // (with elapsed seconds) while a slow tool runs.
+                    // Suppressed in JSON mode so machine-parsed event
+                    // streams stay clean.
+                    let sp = super::spinner::ToolSpinner::start_with_mode(
+                        call.function.name.clone(),
+                        json_enabled,
+                    );
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
-                    tokio::select! {
+                    let r = tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
                         r = &mut tool_fut => Some(r),
-                    }
+                    };
+                    sp.finish().await;
+                    r
                 };
                 let Some(result_text) = result_text else {
                     if let Some((tracer, id, started)) = trace_ctx {

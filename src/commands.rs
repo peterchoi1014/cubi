@@ -133,6 +133,8 @@ pub enum Cmd {
     Pin,
     Pins,
     Unpin,
+    // -- Phase 9C: UX polish --
+    Edit,
     Quit,
 }
 
@@ -773,6 +775,12 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/stats-footer [on|off]",
         help: "Toggle per-turn usage footer (default: off)",
         cmd: Cmd::StatsFooter,
+    },
+    SlashCommandSpec {
+        name: "/edit",
+        usage: "/edit [seed text]",
+        help: "Open $EDITOR to compose the next prompt",
+        cmd: Cmd::Edit,
     },
     SlashCommandSpec {
         name: "/quit",
