@@ -29,10 +29,12 @@ pub struct Spinner {
 impl Spinner {
     /// Starts a spinner with `label` (e.g. "thinking"). If stderr is not a
     /// TTY the spinner is a no-op so CI / piped runs don't get garbled.
+    /// Also a no-op when `CUBI_NO_SPINNER` is set (used by `--quiet`).
     pub fn start(label: impl Into<String>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let cleared = Arc::new(AtomicBool::new(false));
-        let active = std::io::stderr().is_terminal();
+        let suppress_env = std::env::var("CUBI_NO_SPINNER").is_ok();
+        let active = !suppress_env && std::io::stderr().is_terminal();
         if !active {
             return Self {
                 stop,

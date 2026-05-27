@@ -4,6 +4,30 @@ pub(super) fn repl_history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".cubi").join("history"))
 }
 
+/// Drops cached session / plugin / MCP suggestion lists when the user
+/// runs a slash command that could change them, so the next Tab press
+/// re-reads from disk.
+fn invalidate_completer_caches_if_mutating(rl: &Editor<SlashHelper, DefaultHistory>, input: &str) {
+    let head = input.split_whitespace().next().unwrap_or("");
+    let mutates = matches!(
+        head,
+        "/save"
+            | "/load"
+            | "/resume"
+            | "/sessions"
+            | "/plugin"
+            | "/reload-plugins"
+            | "/mcp"
+            | "/mcp-reload"
+    );
+    if !mutates {
+        return;
+    }
+    if let Some(helper) = rl.helper() {
+        helper.invalidate_caches();
+    }
+}
+
 impl ChatCLI {
     pub async fn run(&mut self) -> Result<()> {
         if !self.no_banner {
@@ -14,7 +38,7 @@ impl ChatCLI {
         self.hooks.fire_session_start(self.executor.get_model());
 
         let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::new()?;
-        rl.set_helper(Some(SlashHelper));
+        rl.set_helper(Some(SlashHelper::new()));
         let readline_history_path = repl_history_path();
         if let Some(path) = &readline_history_path {
             if let Some(parent) = path.parent() {
@@ -138,11 +162,13 @@ impl ChatCLI {
                     if input.starts_with('/') {
                         // Check user-defined commands first.
                         if self.try_user_command(input) {
+                            invalidate_completer_caches_if_mutating(&rl, input);
                             continue;
                         }
                         if !self.handle_command(input).await? {
                             break;
                         }
+                        invalidate_completer_caches_if_mutating(&rl, input);
                         continue;
                     }
 
