@@ -139,6 +139,11 @@ pub struct ChatCLI {
     /// assistant turn (token counts + cumulative + cost). Suppressed in
     /// headless / JSON mode. Toggled via `/usage footer on|off`.
     pub(crate) usage_footer_enabled: bool,
+    /// `--quiet` / `CUBI_QUIET=1`. When `true`, suppress decorative output
+    /// (banner, tips, spinner, stats/usage footers). Does NOT affect
+    /// assistant output, slash command output, errors, `--events`, or
+    /// `--trace-tools`. `--quiet` also implies `--no-banner`.
+    pub(crate) quiet_mode: bool,
     /// Optional structured event tap (`--events <path>`). Writes every
     /// internal event (turn boundaries, tool calls, rationales, MCP
     /// transitions, errors) as JSONL. `None` when the flag is unset.
@@ -167,6 +172,7 @@ pub struct CliFlags {
     pub no_banner: bool,
     pub usage_footer: bool,
     pub explain_tools: bool,
+    pub quiet: bool,
 }
 
 impl Default for CliFlags {
@@ -183,6 +189,7 @@ impl Default for CliFlags {
             no_banner: false,
             usage_footer: false,
             explain_tools: false,
+            quiet: false,
         }
     }
 }
@@ -259,6 +266,7 @@ impl ChatCLI {
             tool_tracer: None,
             usage_history: Vec::new(),
             usage_footer_enabled: flags.usage_footer,
+            quiet_mode: flags.quiet,
             event_sink: None,
             explain_tools_enabled: flags.explain_tools,
             history_cursor: 0,
@@ -476,7 +484,7 @@ impl ChatCLI {
                 self.history_command(args);
             }
             Cmd::Help => {
-                self.show_help();
+                self.show_help_for(args);
             }
             Cmd::Model => {
                 if args.is_empty() {
@@ -864,8 +872,19 @@ impl ChatCLI {
                 self.rewind(args);
             }
             Cmd::Compact => {
-                if let Err(e) = self.compact().await {
-                    eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                let arg = args.trim();
+                if arg.eq_ignore_ascii_case("preview") {
+                    self.compact_preview();
+                } else if arg.is_empty() {
+                    if let Err(e) = self.compact().await {
+                        eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                    }
+                } else {
+                    println!(
+                        "{} Usage: /compact [preview] (got {:?})",
+                        "Info:".bright_yellow(),
+                        arg
+                    );
                 }
             }
             Cmd::Pin => {
@@ -1329,6 +1348,56 @@ impl ChatCLI {
             println!("  {} - {}", spec.usage.bright_cyan(), spec.help);
         }
         println!();
+        println!(
+            "Type {} for long-form help on a single command.",
+            "/help <command>".bright_cyan()
+        );
+        println!();
+    }
+
+    /// `/help [command]` dispatcher. Bare `/help` prints the registry; a
+    /// `/help <name>` (with or without leading `/`) prints long-form help
+    /// for that single command. Unknown names route through the existing
+    /// fuzzy suggester so users get a "did you mean?" hint.
+    fn show_help_for(&self, args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            self.show_help();
+            return;
+        }
+        let typed = if let Some(rest) = arg.strip_prefix('/') {
+            format!("/{}", rest)
+        } else {
+            format!("/{}", arg)
+        };
+        if let Some(spec) = commands::find_command(&typed) {
+            println!();
+            println!("  {}", spec.name.bright_cyan().bold());
+            println!("  {} {}", "usage:".bright_yellow(), spec.usage);
+            println!("  {} {}", "  doc:".bright_yellow(), spec.help);
+            println!();
+            return;
+        }
+        let suggestions = commands::suggestions(&typed);
+        if suggestions.is_empty() {
+            println!(
+                "{} Unknown command `{}`. Type {} to list all.",
+                "✗".bright_red(),
+                arg,
+                "/help".bright_cyan()
+            );
+        } else {
+            println!(
+                "{} Unknown command `{}`. Did you mean: {}?",
+                "✗".bright_red(),
+                arg,
+                suggestions
+                    .iter()
+                    .map(|s| s.bright_cyan().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
     #[cfg(test)]
@@ -3325,6 +3394,73 @@ impl ChatCLI {
         self.checkpoint_session();
     }
 
+    /// `/compact preview` — dry-run that reports what `/compact` would do
+    /// without calling the summarizer or mutating history. Reports are
+    /// explicit estimates (we don't know the exact summary length until
+    /// the LLM produces it).
+    fn compact_preview(&self) {
+        const KEEP_RECENT: usize = 6;
+        // Hard upper bound for the synthesized summary message. Used so
+        // the preview can report a meaningful "post-compact upper bound"
+        // even though the real summary length depends on the LLM.
+        const SUMMARY_TOKEN_BUDGET: usize = 400;
+
+        let plan = compact_preview_plan(&self.history, KEEP_RECENT, SUMMARY_TOKEN_BUDGET);
+
+        if plan.summarize_count == 0 {
+            println!(
+                "{} Nothing to compact ({} non-system messages, keeps last {}).",
+                "ℹ".bright_blue(),
+                plan.non_system_count,
+                KEEP_RECENT
+            );
+            return;
+        }
+        println!();
+        println!(
+            "{} {} (dry-run, no mutation)",
+            "/compact preview".bright_yellow().bold(),
+            "—".bright_black()
+        );
+        println!(
+            "  {} would summarize {} non-system message{} ({} kept verbatim, plus system+pinned).",
+            "▸".bright_cyan(),
+            plan.summarize_count,
+            if plan.summarize_count == 1 { "" } else { "s" },
+            plan.keep_recent_count
+        );
+        println!(
+            "  {} current estimated prompt tokens: {}",
+            "▸".bright_cyan(),
+            plan.current_tokens.to_string().bright_cyan()
+        );
+        println!(
+            "  {} tokens retained verbatim (system+pinned+tail): {}",
+            "▸".bright_cyan(),
+            plan.retained_tokens.to_string().bright_cyan()
+        );
+        println!(
+            "  {} estimated upper bound after compact: {} (retained + ≤{} summary tokens)",
+            "▸".bright_cyan(),
+            plan.upper_bound_tokens.to_string().bright_cyan(),
+            SUMMARY_TOKEN_BUDGET
+        );
+        println!(
+            "  {} estimated savings: {} tokens (upper bound — actual depends on summary length).",
+            "▸".bright_cyan(),
+            plan.estimated_savings.to_string().bright_green()
+        );
+        if let Some(window) = crate::llm::context_window_for_model(self.executor.get_model()) {
+            println!(
+                "  {} model context window: {} tokens",
+                "▸".bright_cyan(),
+                window.to_string().bright_cyan()
+            );
+        }
+        println!("  Run {} to apply.", "/compact".bright_cyan());
+        println!();
+    }
+
     /// `/compact` — summarizes older conversation turns into a single
     /// system message, preserving the last few exchanges in full fidelity.
     /// Uses the model itself to generate the summary.
@@ -5057,6 +5193,84 @@ pub(crate) fn history_page_slice(total: usize, page_size: usize, page: usize) ->
     (start, end)
 }
 
+/// Result of [`compact_preview_plan`]: a non-mutating description of what
+/// `/compact` would do for the given history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactPreview {
+    pub non_system_count: usize,
+    pub summarize_count: usize,
+    pub keep_recent_count: usize,
+    pub current_tokens: usize,
+    pub retained_tokens: usize,
+    pub upper_bound_tokens: usize,
+    pub estimated_savings: usize,
+}
+
+/// Pure planner used by `/compact preview`. Mirrors the cutoff logic in
+/// [`ChatCLI::compact`] (`keep_recent` non-system messages preserved
+/// verbatim) but never mutates and never calls the summarizer.
+///
+/// `summary_budget` is the upper bound we assume for the synthesized
+/// summary message (in tokens). `estimated_savings` is always
+/// `current - upper_bound`, saturating at zero — actual savings depend
+/// on the LLM's response length.
+pub(crate) fn compact_preview_plan(
+    history: &[crate::ollama::Message],
+    keep_recent: usize,
+    summary_budget: usize,
+) -> CompactPreview {
+    let non_system_indices: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role != "system")
+        .map(|(i, _)| i)
+        .collect();
+    let non_system_count = non_system_indices.len();
+    let current_tokens = crate::llm::estimate_conversation_tokens(history);
+
+    if non_system_count <= keep_recent {
+        return CompactPreview {
+            non_system_count,
+            summarize_count: 0,
+            keep_recent_count: non_system_count,
+            current_tokens,
+            retained_tokens: current_tokens,
+            upper_bound_tokens: current_tokens,
+            estimated_savings: 0,
+        };
+    }
+
+    let cutoff_idx = non_system_indices[non_system_count - keep_recent];
+    let summarize_count = history[..cutoff_idx]
+        .iter()
+        .filter(|m| m.role != "system")
+        .count();
+    let retained: Vec<&crate::ollama::Message> = history
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| m.role == "system" || *i >= cutoff_idx)
+        .map(|(_, m)| m)
+        .collect();
+    let retained_tokens: usize = retained
+        .iter()
+        .map(|m| 4 + crate::llm::estimate_tokens(&m.content))
+        .sum();
+    // Reserve role overhead for the synthesized summary system message
+    // plus the configured budget so the upper bound mirrors what
+    // `estimate_conversation_tokens` would report post-compact.
+    let upper_bound_tokens = retained_tokens + 4 + summary_budget;
+    let estimated_savings = current_tokens.saturating_sub(upper_bound_tokens);
+    CompactPreview {
+        non_system_count,
+        summarize_count,
+        keep_recent_count: keep_recent,
+        current_tokens,
+        retained_tokens,
+        upper_bound_tokens,
+        estimated_savings,
+    }
+}
+
 /// `/history N` trim helper. Drops everything before the last `n` user
 /// turns (system messages — including `SYSTEM[pinned]:` — are always
 /// preserved). Pure: returns the rebuilt vector so it can be unit-
@@ -5318,6 +5532,79 @@ mod tests {
         if let Some(v) = prev {
             unsafe { std::env::set_var("CUBI_HISTORY_PAGE", v) };
         }
+    }
+
+    // ---- /compact preview planner ----
+
+    #[test]
+    fn compact_preview_plan_reports_nothing_when_short() {
+        let h = vec![
+            system("S"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+        ];
+        let plan = compact_preview_plan(&h, 6, 400);
+        assert_eq!(plan.summarize_count, 0);
+        assert_eq!(plan.estimated_savings, 0);
+        // No mutation: caller still holds the same history slice.
+        assert_eq!(h.len(), 5);
+    }
+
+    #[test]
+    fn compact_preview_plan_summarizes_when_long_enough() {
+        let mut h = vec![system("S: keep verbatim")];
+        for i in 0..10 {
+            h.push(user(&format!("user {} prompt with some content", i)));
+            h.push(assistant(&format!(
+                "assistant {} reply with some content",
+                i
+            )));
+        }
+        let plan = compact_preview_plan(&h, 6, 400);
+        // 20 non-system; keep last 6, summarize 14.
+        assert_eq!(plan.non_system_count, 20);
+        assert_eq!(plan.summarize_count, 14);
+        assert_eq!(plan.keep_recent_count, 6);
+        assert!(plan.current_tokens > plan.retained_tokens);
+        // Upper bound is retained + role overhead + summary budget.
+        assert_eq!(plan.upper_bound_tokens, plan.retained_tokens + 4 + 400);
+        // History is untouched.
+        assert_eq!(h.len(), 21);
+    }
+
+    #[test]
+    fn compact_preview_plan_savings_saturate_to_zero() {
+        // Tiny conversation past the cutoff threshold should never
+        // report negative savings.
+        let mut h = vec![];
+        for i in 0..8 {
+            h.push(user(&format!("u{}", i)));
+            h.push(assistant(&format!("a{}", i)));
+        }
+        let plan = compact_preview_plan(&h, 6, 10_000);
+        assert_eq!(plan.estimated_savings, 0);
+    }
+
+    // ---- /help <command> lookup ----
+
+    #[test]
+    fn find_command_returns_spec_for_exact_name() {
+        let spec = commands::find_command("/help").expect("registered");
+        assert_eq!(spec.name, "/help");
+    }
+
+    #[test]
+    fn find_command_returns_none_for_prefix() {
+        // `find_command` is intentionally exact-match only so `/help
+        // <prefix>` does not silently pick a longer command.
+        assert!(commands::find_command("/he").is_none());
+    }
+
+    #[test]
+    fn find_command_returns_none_for_unknown() {
+        assert!(commands::find_command("/definitely-not-a-command").is_none());
     }
 
     // ---- B3: explain-tools rationale resolver ----
