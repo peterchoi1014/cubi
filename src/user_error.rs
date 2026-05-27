@@ -412,7 +412,7 @@ pub fn default_hint(kind: ErrorKind, ctx: &HintContext<'_>) -> Option<String> {
                 .to_string(),
         ),
         ErrorKind::Auth => Some(
-            "set or update the API key (CUBI_<PROVIDER>_API_KEY) or run /login.".to_string(),
+            "set or update the API key (OPENAI_API_KEY or CUBI_API_KEY) or run /login.".to_string(),
         ),
         ErrorKind::RateLimited => Some(match ctx.retry_after_secs {
             Some(n) => format!("rate-limited; retry in ~{}s.", n),
@@ -561,7 +561,15 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // Find the largest char boundary <= max so we never split a
+        // multi-byte UTF-8 sequence.
+        let cut = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &s[..cut])
     }
 }
 
