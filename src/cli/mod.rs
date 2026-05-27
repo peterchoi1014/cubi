@@ -48,6 +48,7 @@ const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
+mod multiline;
 mod render;
 mod repl;
 

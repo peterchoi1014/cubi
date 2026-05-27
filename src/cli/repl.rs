@@ -57,7 +57,78 @@ impl ChatCLI {
 
             match rl.readline(&prompt) {
                 Ok(line) => {
-                    let input = line.trim();
+                    // Multi-line fold: if this line is a `"""` fence opener
+                    // or ends in an unescaped backslash, keep reading until
+                    // the block closes. Ctrl-C inside a block aborts the
+                    // buffer cleanly. The bare-`"""`-only edge case is
+                    // covered by `opener_kind` returning `Fence`, so we
+                    // never treat an isolated `"""` as a no-op.
+                    use super::multiline::{
+                        OpenerKind, fold_multiline, is_continuation, opener_kind,
+                    };
+                    let kind = opener_kind(&line);
+                    let folded = match kind {
+                        OpenerKind::None | OpenerKind::FenceClosedInline => {
+                            // Single-line path; let fold_multiline collapse
+                            // the inline-fence case into its body.
+                            let buf = vec![line.clone()];
+                            let (body, _) = fold_multiline(&buf);
+                            Some(body)
+                        }
+                        OpenerKind::Fence | OpenerKind::Backslash => {
+                            // Read continuation lines with a dim `… `
+                            // prompt so users can see they're inside a
+                            // multi-line block. We change rustyline's
+                            // prompt rather than pre-emitting a hint line,
+                            // because the prompt re-renders correctly on
+                            // terminal resize and history navigation.
+                            let cont_prompt = format!("{} ", "…".bright_black());
+                            let mut buf: Vec<String> = vec![line.clone()];
+                            let mut aborted = false;
+                            loop {
+                                let done = match kind {
+                                    OpenerKind::Fence => buf
+                                        .last()
+                                        .map(|l| buf.len() > 1 && l == "\"\"\"")
+                                        .unwrap_or(false),
+                                    OpenerKind::Backslash => {
+                                        buf.last().map(|l| !is_continuation(l)).unwrap_or(true)
+                                    }
+                                    _ => true,
+                                };
+                                if done {
+                                    break;
+                                }
+                                match rl.readline(&cont_prompt) {
+                                    Ok(l) => buf.push(l),
+                                    Err(ReadlineError::Interrupted) => {
+                                        println!("{}", "multi-line input cancelled".bright_black());
+                                        aborted = true;
+                                        break;
+                                    }
+                                    Err(ReadlineError::Eof) => {
+                                        aborted = true;
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Error: {:?}", err);
+                                        aborted = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if aborted {
+                                None
+                            } else {
+                                let (body, _) = fold_multiline(&buf);
+                                Some(body)
+                            }
+                        }
+                    };
+                    let Some(folded) = folded else {
+                        continue;
+                    };
+                    let input = folded.trim();
 
                     if input.is_empty() {
                         continue;
