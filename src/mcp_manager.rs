@@ -54,6 +54,12 @@ impl std::error::Error for ToolTimeoutError {}
 pub struct McpManager {
     clients: HashMap<String, McpClient>,
     tools: HashMap<String, (String, Tool)>, // tool_name -> (server_name, tool)
+    /// Servers we've marked offline mid-session (reconnect attempts
+    /// exhausted). Their tools are removed from [`Self::tools`] so the
+    /// agent loop stops advertising them, but the entry stays around
+    /// so `/mcp` can surface the failure to the user and the REPL turn
+    /// can continue without killing the process.
+    failed_servers: HashMap<String, String>,
     builtin_tools: BuiltinToolRegistry,
     tool_timeout_secs: Option<u64>,
 }
@@ -121,6 +127,7 @@ impl McpManager {
         let mut manager = Self {
             clients: HashMap::new(),
             tools: HashMap::new(),
+            failed_servers: HashMap::new(),
             builtin_tools: BuiltinToolRegistry::with_journal(permissions, plan_mode, journal),
             tool_timeout_secs: Some(60),
         };
@@ -352,9 +359,31 @@ impl McpManager {
                             target: "cubi::mcp",
                             server = %server_name,
                             error = %reconnect_err,
-                            "MCP reconnect failed; surfacing original error"
+                            "MCP reconnect failed; degrading server to Failed state"
                         );
-                        Err(err)
+                        let reason = format!("{}", reconnect_err);
+                        self.mark_server_failed(&server_name, &reason);
+                        crate::user_error::print_user_warning(
+                            &format!(
+                                "MCP server '{}' is offline; its tools have been disabled \
+                                 for this session. Restart cubi or `/reconnect` to retry.",
+                                server_name
+                            ),
+                            Some(&format!("reason: {}", reason)),
+                            false,
+                        );
+                        // Convert the kill-the-turn error into a soft
+                        // tool-error result so the REPL can keep going.
+                        Ok(crate::mcp_client::ToolCallResult {
+                            content: vec![crate::mcp_client::Content {
+                                content_type: "text".to_string(),
+                                text: format!(
+                                    "MCP server '{}' is offline ({}); tool '{}' is unavailable for this session.",
+                                    server_name, reason, name
+                                ),
+                            }],
+                            is_error: Some(true),
+                        })
                     }
                 }
             }
@@ -461,6 +490,29 @@ impl McpManager {
 
     pub fn has_tools(&self) -> bool {
         !self.tools.is_empty()
+    }
+
+    /// Returns the list of MCP servers marked offline mid-session.
+    /// Each entry is `(server_name, reason)`. Stable order by name.
+    pub fn failed_servers(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .failed_servers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Mark an MCP server as offline for the rest of this session: the
+    /// reason is stored for `/mcp` to surface and every tool that
+    /// belongs to that server is removed from the active tool list so
+    /// the agent loop stops advertising it.
+    pub fn mark_server_failed(&mut self, server: &str, reason: &str) {
+        self.failed_servers
+            .insert(server.to_string(), reason.to_string());
+        self.tools.retain(|_, (owner, _)| owner != server);
+        self.clients.remove(server);
     }
 
     pub async fn list_resources(&mut self) -> Result<Vec<(String, McpResource)>> {
@@ -638,5 +690,78 @@ mod tests {
         assert!(!is_transport_dead(&err));
         let err = anyhow::anyhow!("invalid arguments: missing field 'command'");
         assert!(!is_transport_dead(&err));
+    }
+
+    /// Build an empty manager (no clients, no MCP config loaded) so
+    /// the failed-server bookkeeping can be exercised in isolation.
+    fn empty_manager() -> McpManager {
+        let permissions = Arc::new(Mutex::new(crate::permissions::Permissions::default()));
+        let plan_mode = Arc::new(AtomicBool::new(false));
+        let journal = FileJournal::default();
+        let builtin_tools = BuiltinToolRegistry::with_journal(permissions, plan_mode, journal);
+        McpManager {
+            clients: HashMap::new(),
+            tools: HashMap::new(),
+            failed_servers: HashMap::new(),
+            builtin_tools,
+            tool_timeout_secs: Some(60),
+        }
+    }
+
+    fn fake_tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: format!("desc for {}", name),
+            input_schema: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn mark_server_failed_removes_tools_and_records_reason() {
+        let mut mgr = empty_manager();
+        mgr.tools.insert(
+            "toolA".to_string(),
+            ("serverX".to_string(), fake_tool("toolA")),
+        );
+        mgr.tools.insert(
+            "toolB".to_string(),
+            ("serverX".to_string(), fake_tool("toolB")),
+        );
+        mgr.tools.insert(
+            "toolC".to_string(),
+            ("serverY".to_string(), fake_tool("toolC")),
+        );
+        assert_eq!(mgr.list_tools().len(), 3);
+
+        mgr.mark_server_failed("serverX", "broken pipe");
+
+        // Only serverY's tool survives.
+        let names: Vec<&str> = mgr.list_tools().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["toolC"]);
+
+        // Failed list contains serverX with the recorded reason.
+        let failed = mgr.failed_servers();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "serverX");
+        assert_eq!(failed[0].1, "broken pipe");
+    }
+
+    #[test]
+    fn mark_server_failed_is_idempotent_and_sorted() {
+        let mut mgr = empty_manager();
+        mgr.mark_server_failed("zeta", "boom");
+        mgr.mark_server_failed("alpha", "kaboom");
+        mgr.mark_server_failed("alpha", "updated reason");
+        let failed = mgr.failed_servers();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0].0, "alpha");
+        assert_eq!(failed[0].1, "updated reason");
+        assert_eq!(failed[1].0, "zeta");
+    }
+
+    #[test]
+    fn empty_manager_reports_no_failed_servers() {
+        let mgr = empty_manager();
+        assert!(mgr.failed_servers().is_empty());
     }
 }
