@@ -601,10 +601,12 @@ async fn main() -> Result<()> {
     if !headless {
         match McpManager::health_check_configured().await {
             Ok(health) => {
-                if !health.is_empty() {
-                    cli_flags.mcp_health_line =
-                        Some(mcp_manager::format_health_line(&health, true));
-                }
+                let loaded = health
+                    .iter()
+                    .filter(|h| matches!(h.state, mcp_manager::McpHealthState::Ready))
+                    .count();
+                let configured = health.len();
+                cli_flags.mcp_counts = (loaded, configured);
             }
             Err(e) => eprintln!(
                 "{} Failed to check MCP server health: {}",

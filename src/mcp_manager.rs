@@ -34,52 +34,6 @@ where
     }
 }
 
-pub fn format_health_line(health: &[McpHealth], color: bool) -> String {
-    let ready = health
-        .iter()
-        .filter(|h| matches!(h.state, McpHealthState::Ready))
-        .count();
-    let failed: Vec<&str> = health
-        .iter()
-        .filter_map(|h| match &h.state {
-            McpHealthState::Failed(_) => Some(h.name.as_str()),
-            McpHealthState::Ready => None,
-        })
-        .collect();
-    let failed_label = if failed.is_empty() {
-        "".to_string()
-    } else if failed.len() == 1 {
-        format!("({})", failed[0])
-    } else {
-        format!("({}+{})", failed[0], failed.len() - 1)
-    };
-
-    let green = if color {
-        "●".bright_green().to_string()
-    } else {
-        "●".to_string()
-    };
-    let red = if color {
-        "●".bright_red().to_string()
-    } else {
-        "●".to_string()
-    };
-    let dim = if color {
-        "●".bright_black().to_string()
-    } else {
-        "●".to_string()
-    };
-    let disabled = if color {
-        "0(disabled)".bright_black().to_string()
-    } else {
-        "0(disabled)".to_string()
-    };
-
-    format!(
-        "MCP: {green}{ready}  {red}{}{failed_label}  {dim}{disabled}",
-        failed.len()
-    )
-}
 use crate::oauth;
 use crate::permissions::Permissions;
 

@@ -26,6 +26,19 @@ text.
 
 Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `130` cancelled.
 
+## Quiet output
+
+Headless / JSON mode automatically suppresses every decorative element:
+the startup banner, the tool spinner, slash-command edits via `/edit`,
+and color codes (when piped or with `NO_COLOR`). Three orthogonal env
+knobs let interactive users disable the same affordances individually:
+
+- `CUBI_NO_BANNER=1` — skip the one-line startup banner.
+- `CUBI_NO_SPINNER=1` — disable the elapsed-time spinner around tool
+  calls. Also honored by `NO_COLOR` and `CUBI_NO_COLOR`.
+- `CUBI_EDITOR=…` — pin the editor `/edit` opens (otherwise falls back
+  through `$VISUAL`, `$EDITOR`, and the platform default).
+
 Examples:
 
 ```sh
