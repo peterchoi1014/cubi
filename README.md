@@ -277,6 +277,38 @@ You: Thanks!
 AI: You're welcome! Feel free to ask if you have more questions.
 ```
 
+### REPL UX
+
+A few quality-of-life affordances on top of the basic prompt:
+
+* **Multi-line input.** Open a block with a line containing only `"""` (or
+  `"""text` with inline content) and end it with a closing `"""` on its
+  own line. Inside the block a dim `…` continuation prompt signals the
+  multi-line state; Ctrl-C aborts the buffer without submitting.
+  Alternatively, end a single line with an unescaped backslash `\` to
+  consume the next line (stackable across many lines, the trailing
+  `\` and newline are dropped on fold).
+* **`/edit` slash command.** Opens the next prompt in your editor — handy
+  for longer composes. Editor resolution order is `$CUBI_EDITOR`, then
+  `$VISUAL`, then `$EDITOR`, then `vi` on unix or `notepad.exe` on
+  windows. Use `/edit some seed text` to prefill; with no arguments the
+  last assistant reply is pre-loaded so you can iterate on it. An empty
+  or unchanged buffer cancels cleanly.
+* **One-line startup banner.** Shape:
+  `cubi v{ver} • {model} ({provider}) • mcp {loaded}/{configured} • sessions {ok|ro|missing}`.
+  Suppress with `--no-banner` or `CUBI_NO_BANNER=1`. The full
+  slash-command grid is still available via `/help`.
+* **Tool spinner.** While a tool call runs, a braille spinner with an
+  elapsed-seconds readout paints on stderr after a 400 ms grace period.
+  Suppressed automatically when stderr is not a TTY and via any of
+  `NO_COLOR`, `CUBI_NO_COLOR`, `CUBI_NO_SPINNER`, and `--json` /
+  headless modes.
+* **Markdown polish.** When markdown rendering is on (non-streaming +
+  TTY), fenced code blocks get a dim language label above them, blocks
+  longer than 12 lines get a right-aligned dim line-number gutter, and
+  inline links render as underline + dim instead of bold cyan.
+  `NO_COLOR` switches to plain text fallbacks.
+
 ### Commands
 
 The slash-command surface is a single source of truth defined in
@@ -290,6 +322,7 @@ groups below mirror that registry.
 | `/help` | Show all available commands |
 | `/status` | Show session status (model, trust, plan mode, counts) |
 | `/version` | Show version |
+| `/edit` | Open `$EDITOR` to compose the next prompt |
 | `/quit` (alias `/exit`) | Exit the chat |
 
 #### Model & history
