@@ -129,6 +129,10 @@ pub enum Cmd {
     Stream,
     Markdown,
     StatsFooter,
+    // -- Phase 9: context management --
+    Pin,
+    Pins,
+    Unpin,
     Quit,
 }
 
@@ -384,6 +388,24 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/compact",
         help: "Summarize old turns to reduce context length",
         cmd: Cmd::Compact,
+    },
+    SlashCommandSpec {
+        name: "/pin",
+        usage: "/pin <text>",
+        help: "Pin text as a persistent system note that survives /compact",
+        cmd: Cmd::Pin,
+    },
+    SlashCommandSpec {
+        name: "/pins",
+        usage: "/pins",
+        help: "List pinned items with 1-based indices",
+        cmd: Cmd::Pins,
+    },
+    SlashCommandSpec {
+        name: "/unpin",
+        usage: "/unpin <idx>",
+        help: "Remove the pinned item at the given 1-based index",
+        cmd: Cmd::Unpin,
     },
     SlashCommandSpec {
         name: "/skills",

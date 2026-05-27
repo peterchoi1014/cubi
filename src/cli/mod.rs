@@ -43,6 +43,10 @@ const SINGLE_TURN_SYSTEM_TAG: &str = "SYSTEM[single-turn]:";
 /// can be located and replaced on `/memory-reload`.
 const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 
+/// Prefix used to tag system messages that came from `/pin`. Recognized
+/// by `compact` so pinned context is preserved across summarization.
+const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
+
 mod agent;
 mod render;
 mod repl;
@@ -109,6 +113,19 @@ pub struct ChatCLI {
     mcp_health_line: Option<String>,
     /// Suppresses the welcome banner and tip-of-the-day output.
     no_banner: bool,
+    /// Persistent user config. Read at startup so the agent loop can
+    /// consult e.g. `auto_compact` / `compact_threshold_pct` without
+    /// re-parsing the JSON every turn.
+    app_config: AppConfig,
+    /// User-curated pinned items. Each entry is also rendered as a
+    /// `PINNED_SYSTEM_TAG`-prefixed system message at the front of
+    /// `history` so the LLM sees it on every turn; `/compact` is aware
+    /// of the tag and preserves these messages verbatim.
+    pinned: Vec<String>,
+    /// Optional `--trace-tools` JSONL audit log. When `Some`, every
+    /// tool dispatch in `agent_turn` writes a tool_start + tool_complete
+    /// pair to the configured path.
+    tool_tracer: Option<Arc<crate::trace_tools::ToolTracer>>,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -208,6 +225,9 @@ impl ChatCLI {
             json_enabled: flags.json,
             mcp_health_line: flags.mcp_health_line,
             no_banner: flags.no_banner,
+            app_config: AppConfig::load(),
+            pinned: Vec::new(),
+            tool_tracer: None,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -262,6 +282,21 @@ impl ChatCLI {
         })?;
         self.history = parsed;
         Ok(())
+    }
+
+    /// Appends pre-rendered messages to the end of history. Used by
+    /// `cubi run <file.md>` to seed a replayed transcript before the
+    /// final user turn is sent through `run_one_shot`. No side effects
+    /// (no `agent_turn`, no checkpoint) — pure history mutation.
+    pub fn preload_history(&mut self, msgs: Vec<Message>) {
+        self.history.extend(msgs);
+    }
+
+    /// Wires a tool tracer into the agent loop. `None` disables
+    /// tracing; passing a fresh `ToolTracer` enables the JSONL audit
+    /// log for subsequent tool dispatches.
+    pub fn set_tool_tracer(&mut self, tracer: Option<Arc<crate::trace_tools::ToolTracer>>) {
+        self.tool_tracer = tracer;
     }
 
     /// Runs a single prompt without the welcome banner or rustyline REPL.
@@ -785,7 +820,50 @@ impl ChatCLI {
                 self.rewind(args);
             }
             Cmd::Compact => {
-                self.compact().await;
+                if let Err(e) = self.compact().await {
+                    eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                }
+            }
+            Cmd::Pin => {
+                if args.is_empty() {
+                    println!("{} Usage: /pin <text>", "Info:".bright_yellow());
+                } else {
+                    let idx = self.pin(args);
+                    println!(
+                        "{} Pinned item #{}",
+                        "✓".bright_green(),
+                        idx.to_string().bright_cyan()
+                    );
+                }
+            }
+            Cmd::Pins => {
+                self.show_pins();
+            }
+            Cmd::Unpin => {
+                if args.is_empty() {
+                    println!("{} Usage: /unpin <idx>", "Info:".bright_yellow());
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(n) if n >= 1 => match self.unpin(n) {
+                            Some(text) => println!(
+                                "{} Unpinned #{}: {}",
+                                "✓".bright_green(),
+                                n,
+                                text.chars().take(60).collect::<String>().bright_cyan()
+                            ),
+                            None => eprintln!(
+                                "{} No pinned item with index {}",
+                                "Error:".bright_red(),
+                                n
+                            ),
+                        },
+                        _ => eprintln!(
+                            "{} /unpin requires a 1-based index, got {:?}",
+                            "Error:".bright_red(),
+                            args
+                        ),
+                    }
+                }
             }
             Cmd::Skills => {
                 self.handle_skills(args).await;
@@ -2096,6 +2174,7 @@ impl ChatCLI {
                     session.history.len()
                 );
                 self.history = session.history.clone();
+                self.pinned = session.pinned.clone();
                 self.current_session = Some(session);
                 // Re-inject project memory so resumed sessions see the
                 // current `CUBI.md`, not a snapshot from when the
@@ -2136,6 +2215,7 @@ impl ChatCLI {
             // is reflected in the snapshot.
             session.model = self.executor.get_model().to_string();
             session.history = self.history.clone();
+            session.pinned = self.pinned.clone();
             if let Err(e) = store.save(session) {
                 eprintln!(
                     "{} Failed to checkpoint session: {}",
@@ -2940,7 +3020,12 @@ impl ChatCLI {
     /// `/compact` — summarizes older conversation turns into a single
     /// system message, preserving the last few exchanges in full fidelity.
     /// Uses the model itself to generate the summary.
-    async fn compact(&mut self) {
+    ///
+    /// Returns `Ok(N)` where `N` is the count of summarized messages
+    /// (0 when nothing was compacted), or an error when the summarizer
+    /// call failed. The count lets `agent_turn` emit a `compacted` JSON
+    /// event with an accurate `summarized_messages` field.
+    async fn compact(&mut self) -> Result<usize> {
         // We keep the last N non-system messages intact and summarize
         // everything before that.
         const KEEP_RECENT: usize = 6; // ~3 exchanges
@@ -2959,7 +3044,7 @@ impl ChatCLI {
                 "ℹ".bright_blue(),
                 non_system_indices.len()
             );
-            return;
+            return Ok(0);
         }
 
         // Split: messages to summarize vs. messages to keep.
@@ -2971,7 +3056,7 @@ impl ChatCLI {
 
         if to_summarize.is_empty() {
             println!("{} Nothing to compact.", "ℹ".bright_blue());
-            return;
+            return Ok(0);
         }
 
         // Build a condensed transcript for the summarizer.
@@ -3011,12 +3096,16 @@ impl ChatCLI {
 
         match self.executor.chat(summary_prompt).await {
             Ok(summary) => {
+                let summarized_count = to_summarize.len();
                 // Rebuild history: keep all messages at their original positions,
                 // but replace old non-system messages before cutoff with a single
                 // summary. Messages at/after cutoff are preserved as-is.
                 let mut new_history: Vec<Message> = Vec::new();
 
-                // Keep system messages that appeared before the cutoff.
+                // Keep system messages that appeared before the cutoff
+                // (this includes PINNED_SYSTEM_TAG entries, which must
+                // survive compaction so the user's pinned context isn't
+                // silently dropped along with the summarized turns).
                 for msg in &self.history[..cutoff_idx] {
                     if msg.role == "system" {
                         new_history.push(msg.clone());
@@ -3074,9 +3163,178 @@ impl ChatCLI {
                     }
                 }
                 self.checkpoint_session();
+                Ok(summarized_count)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Pre-flight check: if the estimated prompt tokens would exceed
+    /// the active model's context window, refuse the LLM request.
+    ///
+    /// Returns `Ok(true)` when the caller should stop the turn (the
+    /// REPL path keeps the user's input in history so they can
+    /// `/compact`/`/pin` and retry; headless returns an `AppExit`
+    /// error). Returns `Ok(false)` when the request is within budget
+    /// or the model's window is unknown (in which case we can't make
+    /// an informed decision and let the request through — the provider
+    /// will return its own error).
+    pub(super) fn check_token_budget(&self, _turn_start: usize) -> Result<bool> {
+        let model = self.executor.get_model().to_string();
+        let Some(window) = crate::llm::context_window_for_model(&model) else {
+            return Ok(false);
+        };
+        let needed = crate::llm::estimate_conversation_tokens(&self.history);
+        if needed <= window {
+            return Ok(false);
+        }
+        let json_enabled = self.json_enabled && self.headless_mode;
+        if json_enabled {
+            Self::emit_json_event(crate::json_events::budget_error(needed, window, &model));
+            return Err(exit_code::err(
+                ExitCode::Budget,
+                format!(
+                    "cubi: would exceed context window ({} tokens estimated, model window is {})",
+                    needed, window
+                ),
+            ));
+        }
+        if self.headless_mode {
+            return Err(exit_code::err(
+                ExitCode::Budget,
+                format!(
+                    "cubi: refusing — prompt ({} est. tokens) exceeds {} window of {} tokens. \
+                     Run /compact or shorten the prompt and retry.",
+                    needed, model, window
+                ),
+            ));
+        }
+        eprintln!(
+            "{} prompt would exceed the model's context window ({} estimated tokens > {} window for {}).",
+            "[budget]".bright_red(),
+            needed,
+            window,
+            model.bright_cyan()
+        );
+        eprintln!(
+            "  {} run {} to summarize older turns, or {} / {} to drop pinned context, then resend.",
+            "↳".bright_black(),
+            "/compact".bright_cyan(),
+            "/pins".bright_cyan(),
+            "/unpin <idx>".bright_cyan()
+        );
+        Ok(true)
+    }
+
+    /// Adds `text` as a persistent pinned context item. Returns the
+    /// new item's 1-based index (matching `/pins` output). The tagged
+    /// system message is inserted near the head of `history` (after
+    /// any pre-existing system preamble) so the LLM sees pins before
+    /// the conversation transcript on every turn.
+    fn pin(&mut self, text: &str) -> usize {
+        let text = text.trim().to_string();
+        self.pinned.push(text.clone());
+        let msg = Message::text("system", format!("{} {}", PINNED_SYSTEM_TAG, text));
+        // Insert right after the leading run of system messages so
+        // pins live with the preamble rather than at the tail.
+        let mut insert_at = 0usize;
+        for (i, m) in self.history.iter().enumerate() {
+            if m.role == "system" {
+                insert_at = i + 1;
+            } else {
+                break;
+            }
+        }
+        self.history.insert(insert_at, msg);
+        self.checkpoint_session();
+        self.pinned.len()
+    }
+
+    /// Removes the pinned item at the given 1-based index. Returns the
+    /// removed text, or `None` if the index is out of range. The
+    /// matching `PINNED_SYSTEM_TAG` system message is removed from
+    /// `history` as well so the LLM stops seeing it on the next turn.
+    fn unpin(&mut self, idx_1based: usize) -> Option<String> {
+        if idx_1based == 0 || idx_1based > self.pinned.len() {
+            return None;
+        }
+        let removed = self.pinned.remove(idx_1based - 1);
+        // Drop only the *first* matching tagged system message so
+        // duplicate pins (same text) are handled in order. The wire
+        // form mirrors what `pin` injects.
+        let needle = format!("{} {}", PINNED_SYSTEM_TAG, removed);
+        if let Some(pos) = self
+            .history
+            .iter()
+            .position(|m| m.role == "system" && m.content == needle)
+        {
+            self.history.remove(pos);
+        }
+        self.checkpoint_session();
+        Some(removed)
+    }
+
+    /// `/pins` — render the pinned list with 1-based indices.
+    fn show_pins(&self) {
+        if self.pinned.is_empty() {
+            println!("{} No pinned items.", "ℹ".bright_blue());
+            return;
+        }
+        println!("{}", "Pinned context:".bright_yellow().bold());
+        for (i, text) in self.pinned.iter().enumerate() {
+            println!("  {}. {}", (i + 1).to_string().bright_cyan(), text);
+        }
+    }
+
+    /// Inspects the current history against the active model's context
+    /// window. If `auto_compact` is enabled and the estimated prompt
+    /// tokens cross `compact_threshold_pct`, invoke [`compact`] before
+    /// the next LLM call. No-op when the model's window is unknown
+    /// (we'd be guessing) or when `auto_compact` is disabled.
+    pub(super) async fn maybe_auto_compact(&mut self) {
+        if !self.app_config.auto_compact {
+            return;
+        }
+        let model = self.executor.get_model().to_string();
+        let Some(window) = crate::llm::context_window_for_model(&model) else {
+            return;
+        };
+        let threshold =
+            crate::onboarding::clamp_compact_threshold(self.app_config.compact_threshold_pct)
+                as usize;
+        let estimated = crate::llm::estimate_conversation_tokens(&self.history);
+        // window * threshold / 100 — order chosen to keep precision and
+        // stay inside usize on tiny windows.
+        let cutoff = window.saturating_mul(threshold) / 100;
+        if estimated < cutoff {
+            return;
+        }
+        let json_enabled = self.json_enabled && self.headless_mode;
+        match self.compact().await {
+            Ok(0) => {
+                tracing::debug!(
+                    target: "cubi::cli",
+                    estimated,
+                    cutoff,
+                    "auto-compact skipped: nothing to summarize",
+                );
+            }
+            Ok(n) => {
+                if !json_enabled {
+                    println!(
+                        "{} auto-compacted {} earlier turn(s) into a summary",
+                        "⚙".bright_blue(),
+                        n
+                    );
+                }
+                Self::emit_json_event_if(json_enabled, crate::json_events::compacted(n, window));
             }
             Err(e) => {
-                eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                tracing::warn!(
+                    target: "cubi::cli",
+                    error = %e,
+                    "auto-compact failed; continuing with full history",
+                );
             }
         }
     }
@@ -4683,5 +4941,106 @@ mod tests {
             std::env::remove_var("CUBI_OAUTH_FILE");
             std::env::remove_var("CUBI_GITHUB_API_KEY");
         }
+    }
+
+    #[test]
+    fn pin_inserts_tagged_system_message_and_returns_1based_index() {
+        let mut cli = new_test_cli();
+        let history_before = cli.history.len();
+        let idx = cli.pin("remember Project X spec");
+        assert_eq!(idx, 1);
+        assert_eq!(cli.pinned.len(), 1);
+        assert_eq!(cli.history.len(), history_before + 1);
+        let pinned = cli
+            .history
+            .iter()
+            .find(|m| m.role == "system" && m.content.starts_with(PINNED_SYSTEM_TAG))
+            .expect("pinned tagged system message must be present");
+        assert!(pinned.content.contains("Project X"));
+        // Pinned items live in the leading system-preamble band, never
+        // after a non-system message.
+        let pinned_pos = cli
+            .history
+            .iter()
+            .position(|m| m.role == "system" && m.content.starts_with(PINNED_SYSTEM_TAG))
+            .unwrap();
+        let first_non_system = cli.history.iter().position(|m| m.role != "system");
+        if let Some(p) = first_non_system {
+            assert!(
+                pinned_pos < p,
+                "pin should sit before any user/assistant turn"
+            );
+        }
+
+        let idx2 = cli.pin("second pin");
+        assert_eq!(idx2, 2);
+        assert_eq!(cli.pinned, vec!["remember Project X spec", "second pin"]);
+    }
+
+    #[test]
+    fn unpin_removes_pin_and_its_tagged_system_message() {
+        let mut cli = new_test_cli();
+        cli.pin("first");
+        cli.pin("second");
+        let after_pins = cli.history.len();
+
+        let removed = cli.unpin(1).expect("first pin should exist");
+        assert_eq!(removed, "first");
+        assert_eq!(cli.pinned, vec!["second"]);
+        assert_eq!(cli.history.len(), after_pins - 1);
+        // No remaining tagged system message for "first"; "second" stays.
+        assert!(
+            cli.history
+                .iter()
+                .filter(|m| m.role == "system" && m.content.starts_with(PINNED_SYSTEM_TAG))
+                .count()
+                == 1
+        );
+
+        assert!(cli.unpin(99).is_none());
+        assert!(cli.unpin(0).is_none());
+    }
+
+    #[test]
+    fn pinned_system_messages_survive_compact_rebuild() {
+        // Simulates the rebuild step from `compact()` directly: pinned
+        // system messages must be retained verbatim and reappear before
+        // the summary in the new history.
+        let mut cli = new_test_cli();
+        cli.pin("keep me through compaction");
+        // Stuff some user/assistant turns to be summarized.
+        for i in 0..10 {
+            cli.history.push(Message::text("user", format!("u{}", i)));
+            cli.history
+                .push(Message::text("assistant", format!("a{}", i)));
+        }
+        // Replicate the rebuild rule: every system message in the
+        // pre-cutoff slice survives. With KEEP_RECENT = 6, cutoff_idx
+        // is at index of the 6th-from-last non-system message.
+        let non_system_indices: Vec<usize> = cli
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system")
+            .map(|(i, _)| i)
+            .collect();
+        let cutoff_idx = non_system_indices[non_system_indices.len() - 6];
+        let preserved: Vec<&Message> = cli.history[..cutoff_idx]
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
+        assert!(
+            preserved
+                .iter()
+                .any(|m| m.content.starts_with(PINNED_SYSTEM_TAG)
+                    && m.content.contains("keep me through compaction")),
+            "pinned system message must be preserved across compact rebuild"
+        );
+    }
+
+    #[test]
+    fn show_pins_with_empty_list_does_not_panic() {
+        let cli = new_test_cli();
+        cli.show_pins();
     }
 }

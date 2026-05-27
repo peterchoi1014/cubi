@@ -815,7 +815,19 @@ pub fn estimate_conversation_tokens(messages: &[Message]) -> usize {
 }
 
 /// Known context window sizes for popular models.
+///
+/// Test hook: setting `CUBI_MAX_PROMPT_TOKENS_OVERRIDE=<n>` (positive
+/// integer) returns `Some(n)` for every model. This lets the headless
+/// budget-error path be exercised without depending on a particular
+/// model's real window size.
 pub fn context_window_for_model(model: &str) -> Option<usize> {
+    if let Ok(raw) = std::env::var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE") {
+        if let Ok(n) = raw.parse::<usize>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
     // Normalize: strip version tags for matching.
     let model_lower = model.to_lowercase();
     let base = model_lower.split(':').next().unwrap_or(&model_lower);
@@ -966,6 +978,18 @@ mod tests {
         ];
         let total = estimate_conversation_tokens(&msgs);
         assert_eq!(total, 13);
+    }
+
+    #[test]
+    fn estimate_conversation_tokens_empty_history_is_zero() {
+        assert_eq!(estimate_conversation_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_conversation_tokens_single_message_adds_role_overhead() {
+        let msgs = vec![Message::text("user", "")];
+        // role overhead 4, content empty → 4
+        assert_eq!(estimate_conversation_tokens(&msgs), 4);
     }
 
     #[test]

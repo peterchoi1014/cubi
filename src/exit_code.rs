@@ -8,6 +8,11 @@ pub enum ExitCode {
     Usage = 2,
     Model = 10,
     Tool = 11,
+    /// Refused: the prompt would exceed the model's context window even
+    /// after any auto-compaction attempt. Surfaced as a separate code so
+    /// scripts can branch on it (e.g. retry with a smaller system prompt
+    /// or `/pin` fewer items).
+    Budget = 12,
     Cancelled = 130,
 }
 

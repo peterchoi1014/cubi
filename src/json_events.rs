@@ -47,6 +47,27 @@ pub fn done(stats: &ChatStats) -> Value {
     json!({ "type": "done", "stats": stats })
 }
 
+/// Extended variant of [`done`] that includes the active model's
+/// context window and the prompt-vs-window utilization (in percent).
+/// When `window` is `None` the original `done` shape is returned so
+/// existing consumers keep parsing.
+pub fn done_with_window(stats: &ChatStats, window: Option<usize>) -> Value {
+    let mut v = done(stats);
+    if let Some(w) = window {
+        let pct = if w == 0 {
+            0u32
+        } else {
+            let pct = stats.prompt_tokens.saturating_mul(100) / (w as u64);
+            u32::try_from(pct).unwrap_or(u32::MAX)
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("window".to_string(), json!(w));
+            obj.insert("utilization_pct".to_string(), json!(pct));
+        }
+    }
+    v
+}
+
 #[allow(dead_code)]
 pub fn emit_done(enabled: bool, stats: &ChatStats) -> Value {
     let v = done(stats);
@@ -109,6 +130,30 @@ pub fn emit_error(enabled: bool, message: &str) -> Value {
     v
 }
 
+pub fn compacted(summarized_messages: usize, window: usize) -> Value {
+    json!({
+        "type": "compacted",
+        "summarized_messages": summarized_messages,
+        "window": window,
+    })
+}
+
+#[allow(dead_code)]
+pub fn emit_compacted(enabled: bool, summarized_messages: usize, window: usize) -> Value {
+    let v = compacted(summarized_messages, window);
+    emit(enabled, &v);
+    v
+}
+
+pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
+    json!({
+        "type": "budget_error",
+        "needed": needed,
+        "window": window,
+        "model": model,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +177,34 @@ mod tests {
         assert_eq!(v["stats"]["prompt_tokens"], 12);
         assert_eq!(v["stats"]["completion_tokens"], 34);
         assert_eq!(v["stats"]["elapsed_ms"], 56);
+    }
+
+    #[test]
+    fn done_with_window_attaches_utilization() {
+        let stats = ChatStats {
+            prompt_tokens: 250,
+            completion_tokens: 0,
+            elapsed_ms: 0,
+        };
+        let v = done_with_window(&stats, Some(1000));
+        assert_eq!(v["window"], 1000);
+        assert_eq!(v["utilization_pct"], 25);
+        // None should leave the payload unmodified beyond `done`.
+        let v2 = done_with_window(&stats, None);
+        assert!(v2.get("window").is_none());
+        assert!(v2.get("utilization_pct").is_none());
+    }
+
+    #[test]
+    fn done_with_window_zero_window_is_zero_pct() {
+        let stats = ChatStats {
+            prompt_tokens: 250,
+            completion_tokens: 0,
+            elapsed_ms: 0,
+        };
+        let v = done_with_window(&stats, Some(0));
+        assert_eq!(v["window"], 0);
+        assert_eq!(v["utilization_pct"], 0);
     }
 
     #[test]
