@@ -373,3 +373,36 @@ fn help_lists_budget_exit_code() {
         .success()
         .stdout(predicate::str::contains("12 context budget"));
 }
+
+#[test]
+fn exec_subcommand_emits_json_done_event() {
+    let home = tempdir().unwrap();
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "scripted reply")
+        .args(["exec", "summarize", "this", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    // Every line must be valid JSON (no banner, no stream noise).
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "token"));
+    assert!(events.iter().any(|e| e["type"] == "done"));
+}
+
+#[test]
+fn exec_without_prompt_exits_with_usage_error() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("exec")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cubi: exec requires a prompt"));
+}
