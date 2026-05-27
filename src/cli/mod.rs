@@ -109,6 +109,10 @@ pub struct ChatCLI {
     mcp_health_line: Option<String>,
     /// Suppresses the welcome banner and tip-of-the-day output.
     no_banner: bool,
+    /// Persistent user config. Read at startup so the agent loop can
+    /// consult e.g. `auto_compact` / `compact_threshold_pct` without
+    /// re-parsing the JSON every turn.
+    app_config: AppConfig,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -208,6 +212,7 @@ impl ChatCLI {
             json_enabled: flags.json,
             mcp_health_line: flags.mcp_health_line,
             no_banner: flags.no_banner,
+            app_config: AppConfig::load(),
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -785,7 +790,9 @@ impl ChatCLI {
                 self.rewind(args);
             }
             Cmd::Compact => {
-                self.compact().await;
+                if let Err(e) = self.compact().await {
+                    eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                }
             }
             Cmd::Skills => {
                 self.handle_skills(args).await;
@@ -2940,7 +2947,12 @@ impl ChatCLI {
     /// `/compact` — summarizes older conversation turns into a single
     /// system message, preserving the last few exchanges in full fidelity.
     /// Uses the model itself to generate the summary.
-    async fn compact(&mut self) {
+    ///
+    /// Returns `Ok(N)` where `N` is the count of summarized messages
+    /// (0 when nothing was compacted), or an error when the summarizer
+    /// call failed. The count lets `agent_turn` emit a `compacted` JSON
+    /// event with an accurate `summarized_messages` field.
+    async fn compact(&mut self) -> Result<usize> {
         // We keep the last N non-system messages intact and summarize
         // everything before that.
         const KEEP_RECENT: usize = 6; // ~3 exchanges
@@ -2959,7 +2971,7 @@ impl ChatCLI {
                 "ℹ".bright_blue(),
                 non_system_indices.len()
             );
-            return;
+            return Ok(0);
         }
 
         // Split: messages to summarize vs. messages to keep.
@@ -2971,7 +2983,7 @@ impl ChatCLI {
 
         if to_summarize.is_empty() {
             println!("{} Nothing to compact.", "ℹ".bright_blue());
-            return;
+            return Ok(0);
         }
 
         // Build a condensed transcript for the summarizer.
@@ -3011,6 +3023,7 @@ impl ChatCLI {
 
         match self.executor.chat(summary_prompt).await {
             Ok(summary) => {
+                let summarized_count = to_summarize.len();
                 // Rebuild history: keep all messages at their original positions,
                 // but replace old non-system messages before cutoff with a single
                 // summary. Messages at/after cutoff are preserved as-is.
@@ -3074,9 +3087,61 @@ impl ChatCLI {
                     }
                 }
                 self.checkpoint_session();
+                Ok(summarized_count)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inspects the current history against the active model's context
+    /// window. If `auto_compact` is enabled and the estimated prompt
+    /// tokens cross `compact_threshold_pct`, invoke [`compact`] before
+    /// the next LLM call. No-op when the model's window is unknown
+    /// (we'd be guessing) or when `auto_compact` is disabled.
+    pub(super) async fn maybe_auto_compact(&mut self) {
+        if !self.app_config.auto_compact {
+            return;
+        }
+        let model = self.executor.get_model().to_string();
+        let Some(window) = crate::llm::context_window_for_model(&model) else {
+            return;
+        };
+        let threshold =
+            crate::onboarding::clamp_compact_threshold(self.app_config.compact_threshold_pct)
+                as usize;
+        let estimated = crate::llm::estimate_conversation_tokens(&self.history);
+        // window * threshold / 100 — order chosen to keep precision and
+        // stay inside usize on tiny windows.
+        let cutoff = window.saturating_mul(threshold) / 100;
+        if estimated < cutoff {
+            return;
+        }
+        let json_enabled = self.json_enabled && self.headless_mode;
+        match self.compact().await {
+            Ok(0) => {
+                tracing::debug!(
+                    target: "cubi::cli",
+                    estimated,
+                    cutoff,
+                    "auto-compact skipped: nothing to summarize",
+                );
+            }
+            Ok(n) => {
+                if !json_enabled {
+                    println!(
+                        "{} auto-compacted {} earlier turn(s) into a summary",
+                        "⚙".bright_blue(),
+                        n
+                    );
+                }
+                Self::emit_json_event_if(json_enabled, crate::json_events::compacted(n, window));
             }
             Err(e) => {
-                eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                tracing::warn!(
+                    target: "cubi::cli",
+                    error = %e,
+                    "auto-compact failed; continuing with full history",
+                );
             }
         }
     }

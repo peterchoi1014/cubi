@@ -109,6 +109,21 @@ pub fn emit_error(enabled: bool, message: &str) -> Value {
     v
 }
 
+pub fn compacted(summarized_messages: usize, window: usize) -> Value {
+    json!({
+        "type": "compacted",
+        "summarized_messages": summarized_messages,
+        "window": window,
+    })
+}
+
+#[allow(dead_code)]
+pub fn emit_compacted(enabled: bool, summarized_messages: usize, window: usize) -> Value {
+    let v = compacted(summarized_messages, window);
+    emit(enabled, &v);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

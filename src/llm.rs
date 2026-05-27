@@ -969,6 +969,18 @@ mod tests {
     }
 
     #[test]
+    fn estimate_conversation_tokens_empty_history_is_zero() {
+        assert_eq!(estimate_conversation_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_conversation_tokens_single_message_adds_role_overhead() {
+        let msgs = vec![Message::text("user", "")];
+        // role overhead 4, content empty → 4
+        assert_eq!(estimate_conversation_tokens(&msgs), 4);
+    }
+
+    #[test]
     fn context_window_known_models() {
         assert_eq!(context_window_for_model("llama3.2:1b"), Some(128_000));
         assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
