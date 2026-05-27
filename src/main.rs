@@ -165,6 +165,28 @@ async fn main() -> Result<()> {
             }
             "--no-banner" => cli_flags.no_banner = true,
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
+            "exec" => {
+                // `cubi exec <prompt words>` — script-friendly one-shot
+                // shorthand for `cubi -p "<joined>" --json --no-stream
+                // --no-banner`. Remaining argv (everything after `exec`)
+                // is joined with single spaces to form the prompt.
+                let rest: Vec<String> = argv[i + 1..]
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                if rest.is_empty() {
+                    eprintln!("cubi: exec requires a prompt. Usage: cubi exec <prompt>");
+                    std::process::exit(2);
+                }
+                let joined = rest.join(" ");
+                set_prompt(&mut one_shot_prompt, joined);
+                cli_flags.json = true;
+                cli_flags.stream = false;
+                stream_explicit = true;
+                cli_flags.no_banner = true;
+                // Everything after `exec` was consumed as prompt text.
+                break;
+            }
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
             }
@@ -658,6 +680,8 @@ fn print_help() {
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
          cubi --prune-sessions --older-than <duration> [--dry-run]\n  \
                                      Delete old session files (30d, 2w, 6m, 1y)\n  \
+         cubi exec <prompt words>     One-shot, JSON output, no banner, no stream\n  \
+                                      (shorthand for -p \"<words>\" --json --no-stream --no-banner)\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
