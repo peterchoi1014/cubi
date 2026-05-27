@@ -113,9 +113,9 @@ pub struct ChatCLI {
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
     json_enabled: bool,
-    /// (loaded, configured) MCP server counts shown in the one-line
-    /// startup banner. Both are 0 when MCP is fully disabled.
-    mcp_counts: (usize, usize),
+    /// (ok, failed, not_loaded) MCP server counts shown in the one-line
+    /// startup banner. All three are 0 when MCP is fully disabled.
+    mcp_counts: (usize, usize, usize),
     /// Suppresses the welcome banner and tip-of-the-day output.
     no_banner: bool,
     /// Persistent user config. Read at startup so the agent loop can
@@ -163,7 +163,7 @@ pub struct CliFlags {
     pub stats_footer: bool,
     pub system_prompt: Option<String>,
     pub json: bool,
-    pub mcp_counts: (usize, usize),
+    pub mcp_counts: (usize, usize, usize),
     pub no_banner: bool,
     pub usage_footer: bool,
     pub explain_tools: bool,
@@ -179,7 +179,7 @@ impl Default for CliFlags {
             stats_footer: false,
             system_prompt: None,
             json: false,
-            mcp_counts: (0, 0),
+            mcp_counts: (0, 0, 0),
             no_banner: false,
             usage_footer: false,
             explain_tools: false,
@@ -1061,7 +1061,10 @@ impl ChatCLI {
             Cmd::Logout => self.handle_logout(args),
             Cmd::OauthRefresh => self.show_oauth_refresh(args),
             Cmd::PrivacySettings => self.handle_privacy_settings(args),
-            Cmd::Mcp => self.show_mcp_status(),
+            Cmd::Mcp => {
+                self.show_mcp_status();
+                self.refresh_mcp_counts();
+            }
             Cmd::Plugin => self.show_plugins(),
             Cmd::ReloadPlugins => self.reload_plugins(),
             Cmd::Cost => self.show_cost(),
@@ -1619,6 +1622,43 @@ impl ChatCLI {
         );
         println!();
     }
+
+    /// Recomputes the MCP-health triple shown in the startup/footer
+    /// banner from the live manager. Cheap to call after `/mcp` /
+    /// `/mcp-reload` / transition events so the next prompt redraw
+    /// reflects the current state.
+    pub(crate) fn refresh_mcp_counts(&mut self) {
+        // Total configured servers is the source of truth for the
+        // denominator. We re-read the config rather than cache it so
+        // the user editing mcp.json + `/mcp-reload` shows up.
+        let configured = crate::mcp_config::McpConfig::load()
+            .map(|c| c.mcp_servers.len())
+            .unwrap_or(0);
+        let failed = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.failed_servers().len())
+            .unwrap_or(0);
+        let ok = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| {
+                // Distinct external server names that still have at
+                // least one tool registered. Built-in tools live under
+                // the "builtin" pseudo-server, which we exclude here.
+                let mut servers: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (owner, _tool) in m.get_tools_with_server().values() {
+                    if owner != "builtin" {
+                        servers.insert(owner.as_str());
+                    }
+                }
+                servers.len()
+            })
+            .unwrap_or(0);
+        let not_loaded = configured.saturating_sub(ok + failed);
+        self.mcp_counts = (ok, failed, not_loaded);
+    }
+
 
     /// `/doctor` — runs a sanity check on the runtime environment.
     /// Each probe prints a ✓ / ✗ line; the function never returns an error

@@ -864,12 +864,21 @@ async fn main() -> Result<()> {
     if !headless {
         match McpManager::health_check_configured().await {
             Ok(health) => {
-                let loaded = health
+                let ok = health
                     .iter()
                     .filter(|h| matches!(h.state, mcp_manager::McpHealthState::Ready))
                     .count();
-                let configured = health.len();
-                cli_flags.mcp_counts = (loaded, configured);
+                let failed = health
+                    .iter()
+                    .filter(|h| matches!(h.state, mcp_manager::McpHealthState::Failed(_)))
+                    .count();
+                // `health_check_configured` returns one entry per
+                // configured server, so anything not Ok or Failed
+                // (currently nothing in the state machine, but future-
+                // proofing) is counted as "not loaded".
+                let total = health.len();
+                let not_loaded = total.saturating_sub(ok + failed);
+                cli_flags.mcp_counts = (ok, failed, not_loaded);
             }
             Err(e) => eprintln!(
                 "{} Failed to check MCP server health: {}",
