@@ -1140,6 +1140,19 @@ impl ChatCLI {
                 }
             }
 
+            let failed = mcp.failed_servers();
+            if !failed.is_empty() {
+                println!("\n{}", "Offline MCP Servers:".bright_red().bold());
+                for (name, reason) in failed {
+                    println!(
+                        "  {} {} — {}",
+                        "✗".bright_red(),
+                        name.bright_magenta(),
+                        reason
+                    );
+                }
+            }
+
             println!("\n{}\n", "=".repeat(60).bright_black());
             println!("Use {} <tool> <args> to execute", "/mcp-call".bright_cyan());
         }

@@ -24,7 +24,25 @@ Flags meant to influence the run (e.g. `--system`, `--model`) must
 appear *before* `exec`; everything after `exec` is treated as prompt
 text.
 
-Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `130` cancelled.
+Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `130` cancelled.
+
+## Error events
+
+The `error` JSON event has been extended (backward-compatibly) with
+optional `kind`, `exit_code`, and `hint` fields. The legacy `message`
+field is preserved unchanged.
+
+```json
+{"type":"error","message":"could not connect to localhost:11434","kind":"connect_refused","exit_code":13,"hint":"is `ollama serve` running on localhost:11434?"}
+```
+
+Known `kind` values: `config`, `auth`, `quota`, `rate_limited`,
+`connect_refused`, `dns`, `tls`, `timeout`, `server_error`,
+`bad_request`, `cancelled`, `tool`, `budget`, `other`. The set may
+grow; consumers should treat unknown values as `other`.
+
+Set `--debug` (or `CUBI_DEBUG=1`, or any non-empty `RUST_BACKTRACE`)
+to also print the full anyhow cause chain to stderr in non-JSON mode.
 
 ## Quiet output
 

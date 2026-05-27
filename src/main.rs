@@ -42,6 +42,8 @@ mod themes;
 mod tips;
 mod todos;
 mod trace_tools;
+#[allow(dead_code)]
+mod user_error;
 
 use crate::style::CubiStyle;
 use anyhow::{Context, Result};
@@ -91,6 +93,7 @@ async fn main() -> Result<()> {
     // log target. Stored as a String so we can hand it to ToolTracer
     // once everything else is parsed.
     let mut trace_tools_path: Option<String> = None;
+    let mut doctor_fix = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -192,6 +195,9 @@ async fn main() -> Result<()> {
                 }
             }
             "--no-banner" => cli_flags.no_banner = true,
+            "--debug" => {
+                user_error::set_debug_flag(true);
+            }
             "--trace-tools" => {
                 i += 1;
                 let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
@@ -259,6 +265,9 @@ async fn main() -> Result<()> {
             }
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
+            }
+            "--fix" => {
+                doctor_fix = true;
             }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
@@ -333,6 +342,11 @@ async fn main() -> Result<()> {
         cli_flags.no_banner = true;
     }
 
+    if doctor_fix && !matches!(primary, PrimaryCommand::Doctor) {
+        eprintln!("cubi: --fix is only valid with the `doctor` subcommand.");
+        std::process::exit(2);
+    }
+
     if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
         eprintln!(
             "cubi: --prompt cannot be combined with --resume, --list-sessions, or --delete-session."
@@ -357,7 +371,7 @@ async fn main() -> Result<()> {
 
     match &primary {
         PrimaryCommand::Doctor => {
-            let ok = doctor::run(cli_flags.json).await;
+            let ok = doctor::run(cli_flags.json, doctor_fix).await;
             if !ok {
                 std::process::exit(2);
             }
@@ -706,24 +720,46 @@ async fn main() -> Result<()> {
     cli.shutdown().await;
 
     if let Err(err) = run_result {
-        if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
-            if json_output && headless {
-                json_events::emit_error(true, &exit.message);
-            } else if !exit.message.is_empty() {
-                eprintln!("{}", exit.message);
+        let debug = user_error::debug_mode();
+        // Already a classified UserError? Use it directly.
+        if err.downcast_ref::<user_error::UserError>().is_some() {
+            match err.downcast::<user_error::UserError>() {
+                Ok(ue) => {
+                    let code = ue.exit_code;
+                    user_error::report_user_error(&ue, json_output && headless, debug);
+                    exit_code::exit(code);
+                }
+                Err(_) => unreachable!(),
             }
-            exit_code::exit(exit.code);
         }
-        if json_output && headless {
-            json_events::emit_error(true, &err.to_string());
-        } else {
-            eprintln!("{}", err);
+        if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
+            // Preserve the legacy exit code & message; promote to a
+            // typed UserError so JSON/human paths share one shape.
+            let msg = exit.message.clone();
+            let code = exit.code;
+            let mut ue = user_error::UserError::new(
+                kind_for_legacy_exit(code),
+                if msg.is_empty() {
+                    format!("exit code {}", code.as_i32())
+                } else {
+                    msg
+                },
+            );
+            ue.exit_code = code;
+            ue.cause = Some(err);
+            user_error::report_user_error(&ue, json_output && headless, debug);
+            exit_code::exit(code);
         }
-        exit_code::exit(if headless {
-            ExitCode::Model
+        let ue = user_error::UserError::from_anyhow(err);
+        let fallback_code = if headless {
+            exit_code::ExitCode::Model
         } else {
-            ExitCode::Usage
-        });
+            exit_code::ExitCode::Usage
+        };
+        let mut ue = ue;
+        ue.exit_code = fallback_code;
+        user_error::report_user_error(&ue, json_output && headless, debug);
+        exit_code::exit(fallback_code);
     }
 
     Ok(())
@@ -762,6 +798,21 @@ fn set_primary(slot: &mut PrimaryCommand, value: PrimaryCommand) {
     *slot = value;
 }
 
+/// Maps a legacy [`ExitCode`] back into the closest [`user_error::ErrorKind`]
+/// so existing `AppExit`-bearing errors can flow through the
+/// classified-error path uniformly.
+fn kind_for_legacy_exit(code: ExitCode) -> user_error::ErrorKind {
+    match code {
+        ExitCode::Ok => user_error::ErrorKind::Other,
+        ExitCode::Usage => user_error::ErrorKind::Config,
+        ExitCode::Model => user_error::ErrorKind::Other,
+        ExitCode::Tool => user_error::ErrorKind::Tool,
+        ExitCode::Budget => user_error::ErrorKind::Budget,
+        ExitCode::Network => user_error::ErrorKind::ConnectRefused,
+        ExitCode::Cancelled => user_error::ErrorKind::Cancelled,
+    }
+}
+
 fn status_line(headless: bool, msg: impl std::fmt::Display) {
     out::status_line(headless, msg);
 }
@@ -791,6 +842,9 @@ fn print_help() {
          cubi plugins new <name>      Scaffold ~/.cubi/plugins/<name>/ with a\n  \
                                       manifest, handler stub, and README\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
+         cubi doctor --fix            Run checks and apply safe automated fixes\n  \
+                                      (create missing sessions dir, write a\n  \
+                                      stub config, install shell completions)\n  \
          cubi doctor --json           Same, machine-readable JSON output\n  \
          cubi --print-config          Print the resolved config as JSON and exit\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
@@ -808,13 +862,16 @@ fn print_help() {
                                         message before chat starts\n  \
          --no-banner                    Suppress the welcome banner and tip\n  \
                                          of the day (also honors CUBI_NO_BANNER)\n  \
+         --debug                         Show the full error cause chain on\n  \
+                                         failure (also honors CUBI_DEBUG=1 and\n  \
+                                         RUST_BACKTRACE)\n  \
          --json                          Emit machine-readable output where\n  \
                                         supported (session arrays or headless\n  \
                                         line-delimited events)\n  \
          --trace-tools <path>           Append a JSONL audit line per tool\n  \
                                         start/complete (also honors\n  \
                                         CUBI_TRACE_TOOLS env)\n\n\
-         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 130 cancelled\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n\n\
