@@ -89,6 +89,26 @@ pub struct UserError {
     pub cause: Option<anyhow::Error>,
 }
 
+impl std::fmt::Debug for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserError")
+            .field("kind", &self.kind)
+            .field("exit_code", &self.exit_code.as_i32())
+            .field("summary", &self.summary)
+            .field("hint", &self.hint)
+            .field("cause", &self.cause.as_ref().map(|c| format!("{c}")))
+            .finish()
+    }
+}
+
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for UserError {}
+
 impl UserError {
     pub fn new(kind: ErrorKind, summary: impl Into<String>) -> Self {
         Self {
@@ -271,6 +291,280 @@ pub fn print_user_warning(summary: &str, hint: Option<&str>, json_mode: bool) {
     }
 }
 
+// ─── Error classification ───────────────────────────────────────────────────
+
+/// Minimal adapter trait around `reqwest::Error` (or any HTTP-send error)
+/// so the classifier can be unit-tested without constructing reqwest
+/// internals.
+pub trait HttpSendErrorLike {
+    fn is_timeout(&self) -> bool;
+    fn is_connect(&self) -> bool;
+    /// Returns the deepest `io::ErrorKind` in the cause chain, if any.
+    fn io_error_kind(&self) -> Option<std::io::ErrorKind>;
+    /// Full cause chain rendered as a single space-separated string.
+    /// Used for substring matching on TLS / DNS markers since the
+    /// underlying error types (rustls / hyper) are buried.
+    fn cause_chain_string(&self) -> String;
+}
+
+impl HttpSendErrorLike for reqwest::Error {
+    fn is_timeout(&self) -> bool {
+        reqwest::Error::is_timeout(self)
+    }
+    fn is_connect(&self) -> bool {
+        reqwest::Error::is_connect(self)
+    }
+    fn io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        let mut current: &dyn std::error::Error = self;
+        loop {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                return Some(io.kind());
+            }
+            match current.source() {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
+    }
+    fn cause_chain_string(&self) -> String {
+        let mut parts = Vec::new();
+        let mut current: Option<&dyn std::error::Error> = Some(self);
+        while let Some(e) = current {
+            parts.push(format!("{}", e));
+            current = e.source();
+        }
+        parts.join(" | ")
+    }
+}
+
+/// Returns `true` when the URL's host is a loopback literal (`localhost`,
+/// `127.0.0.1`, or `::1`). Used so the `ConnectRefused` hint can suggest
+/// `ollama serve` only when the user is pointing at a local server.
+pub fn url_host_is_local(url: &str) -> bool {
+    // Strip scheme.
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    // Drop path / query.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip userinfo.
+    let host_port = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    // IPv6 literal — bracketed.
+    let host = if let Some(end) = host_port.strip_prefix('[') {
+        match end.find(']') {
+            Some(i) => &end[..i],
+            None => host_port,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Extracts host:port for use in hint messages. Returns the raw
+/// authority string when parsing fully would be overkill.
+fn url_host_port(url: &str) -> String {
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .to_string()
+}
+
+/// Build a default hint for the given `(kind, ctx)`. `ctx` carries the
+/// request URL, optional `Retry-After` seconds, and optional HTTP
+/// status — anything the classifier already knows.
+#[derive(Debug, Clone, Default)]
+pub struct HintContext<'a> {
+    pub url: Option<&'a str>,
+    pub retry_after_secs: Option<u64>,
+    pub http_status: Option<u16>,
+    pub timeout_secs: Option<u64>,
+}
+
+pub fn default_hint(kind: ErrorKind, ctx: &HintContext<'_>) -> Option<String> {
+    match kind {
+        ErrorKind::ConnectRefused => match ctx.url {
+            Some(url) if url_host_is_local(url) => Some(format!(
+                "is `ollama serve` running on {}?",
+                url_host_port(url)
+            )),
+            Some(_) => Some(
+                "confirm the model endpoint URL and that the server is reachable.".to_string(),
+            ),
+            None => Some(
+                "confirm the model endpoint URL and that the server is reachable.".to_string(),
+            ),
+        },
+        ErrorKind::Dns => Some(
+            "check DNS / proxy / VPN; verify the host in your config or CUBI_*_HOST env."
+                .to_string(),
+        ),
+        ErrorKind::Tls => Some(
+            "verify the server's TLS certificate; for self-signed dev hosts set CUBI_INSECURE_TLS=1."
+                .to_string(),
+        ),
+        ErrorKind::Auth => Some(
+            "set or update the API key (CUBI_<PROVIDER>_API_KEY) or run /login.".to_string(),
+        ),
+        ErrorKind::RateLimited => Some(match ctx.retry_after_secs {
+            Some(n) => format!("rate-limited; retry in ~{}s.", n),
+            None => "rate-limited; retry shortly.".to_string(),
+        }),
+        ErrorKind::Quota => {
+            Some("your provider returned 402; check your account quota.".to_string())
+        }
+        ErrorKind::Timeout => Some(match ctx.timeout_secs {
+            Some(n) => format!(
+                "LLM request timed out after {}s; bump CUBI_LLM_TIMEOUT or simplify the prompt.",
+                n
+            ),
+            None => {
+                "LLM request timed out; bump CUBI_LLM_TIMEOUT or simplify the prompt.".to_string()
+            }
+        }),
+        ErrorKind::ServerError => Some(match ctx.http_status {
+            Some(s) => format!(
+                "the model server returned {}; transient — try again or check its logs.",
+                s
+            ),
+            None => "the model server returned 5xx; transient — try again.".to_string(),
+        }),
+        ErrorKind::BadRequest => Some(match ctx.http_status {
+            Some(s) => format!(
+                "the model server rejected the request ({}); check the model name and payload.",
+                s
+            ),
+            None => "the model server rejected the request; check the model name and payload."
+                .to_string(),
+        }),
+        ErrorKind::Budget
+        | ErrorKind::Tool
+        | ErrorKind::Cancelled
+        | ErrorKind::Config
+        | ErrorKind::Other => None,
+    }
+}
+
+/// Classify an HTTP response status (non-2xx) into a [`UserError`].
+/// The caller is expected to have already exhausted retries.
+pub fn classify_http_status(
+    status: u16,
+    retry_after_secs: Option<u64>,
+    url: &str,
+    error_body: &str,
+) -> UserError {
+    let kind = match status {
+        401 | 403 => ErrorKind::Auth,
+        402 => ErrorKind::Quota,
+        429 => ErrorKind::RateLimited,
+        408 => ErrorKind::Timeout,
+        s if (500..600).contains(&s) => ErrorKind::ServerError,
+        s if (400..500).contains(&s) => ErrorKind::BadRequest,
+        _ => ErrorKind::Other,
+    };
+    let ctx = HintContext {
+        url: Some(url),
+        retry_after_secs,
+        http_status: Some(status),
+        timeout_secs: None,
+    };
+    let summary = match kind {
+        ErrorKind::Auth => format!("authentication failed ({})", status),
+        ErrorKind::Quota => format!("provider quota exceeded ({})", status),
+        ErrorKind::RateLimited => format!("provider rate-limited the request ({})", status),
+        ErrorKind::Timeout => format!("provider returned {} request-timeout", status),
+        ErrorKind::ServerError => format!("provider returned {} (server error)", status),
+        ErrorKind::BadRequest => format!("provider returned {} (bad request)", status),
+        _ => format!("provider returned HTTP {}", status),
+    };
+    let mut ue = UserError::new(kind, summary);
+    ue.hint = default_hint(kind, &ctx);
+    if !error_body.is_empty() {
+        ue.cause = Some(anyhow::anyhow!(
+            "response body: {}",
+            truncate(error_body, 512)
+        ));
+    }
+    ue
+}
+
+/// Classify a transport-level send error (`reqwest::Error` / mock).
+/// `url` is the request URL so connect-refused on localhost can suggest
+/// `ollama serve`.
+pub fn classify_send_error<E: HttpSendErrorLike>(err: &E, url: &str) -> UserError {
+    let chain = err.cause_chain_string();
+    let lower = chain.to_ascii_lowercase();
+    let kind = if err.is_timeout() {
+        ErrorKind::Timeout
+    } else if let Some(io_kind) = err.io_error_kind() {
+        use std::io::ErrorKind as IoK;
+        match io_kind {
+            IoK::ConnectionRefused => ErrorKind::ConnectRefused,
+            IoK::TimedOut => ErrorKind::Timeout,
+            IoK::NotFound => ErrorKind::Dns,
+            _ => {
+                if err.is_connect() {
+                    if lower.contains("dns")
+                        || lower.contains("resolve")
+                        || lower.contains("lookup")
+                    {
+                        ErrorKind::Dns
+                    } else {
+                        ErrorKind::ConnectRefused
+                    }
+                } else {
+                    ErrorKind::Other
+                }
+            }
+        }
+    } else if err.is_connect() {
+        if lower.contains("dns") || lower.contains("resolve") || lower.contains("lookup") {
+            ErrorKind::Dns
+        } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("webpki")
+        {
+            ErrorKind::Tls
+        } else {
+            ErrorKind::ConnectRefused
+        }
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("webpki") {
+        ErrorKind::Tls
+    } else {
+        ErrorKind::Other
+    };
+    let summary = match kind {
+        ErrorKind::ConnectRefused => format!("could not connect to {}", url_host_port(url)),
+        ErrorKind::Dns => format!("could not resolve {}", url_host_port(url)),
+        ErrorKind::Tls => format!("TLS handshake failed against {}", url_host_port(url)),
+        ErrorKind::Timeout => format!("request to {} timed out", url_host_port(url)),
+        _ => format!("request to {} failed", url_host_port(url)),
+    };
+    let ctx = HintContext {
+        url: Some(url),
+        retry_after_secs: None,
+        http_status: None,
+        timeout_secs: None,
+    };
+    let mut ue = UserError::new(kind, summary);
+    ue.hint = default_hint(kind, &ctx);
+    ue
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +712,142 @@ mod tests {
     fn debug_mode_off_by_default() {
         let env = |_: &str| None;
         assert!(!debug_mode_with(env, false));
+    }
+
+    // ─── Classifier tests ───────────────────────────────────────────────
+
+    /// Mock implementing [`HttpSendErrorLike`].
+    struct MockErr {
+        is_timeout: bool,
+        is_connect: bool,
+        io_kind: Option<std::io::ErrorKind>,
+        chain: String,
+    }
+    impl HttpSendErrorLike for MockErr {
+        fn is_timeout(&self) -> bool {
+            self.is_timeout
+        }
+        fn is_connect(&self) -> bool {
+            self.is_connect
+        }
+        fn io_error_kind(&self) -> Option<std::io::ErrorKind> {
+            self.io_kind
+        }
+        fn cause_chain_string(&self) -> String {
+            self.chain.clone()
+        }
+    }
+
+    #[test]
+    fn classify_connection_refused_localhost_suggests_ollama() {
+        let err = MockErr {
+            is_timeout: false,
+            is_connect: true,
+            io_kind: Some(std::io::ErrorKind::ConnectionRefused),
+            chain: "Connection refused".to_string(),
+        };
+        let ue = classify_send_error(&err, "http://localhost:11434/api/chat");
+        assert_eq!(ue.kind, ErrorKind::ConnectRefused);
+        assert_eq!(ue.exit_code, ExitCode::Network);
+        let hint = ue.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("ollama serve"), "got hint: {hint}");
+        assert!(hint.contains("localhost:11434"), "got hint: {hint}");
+    }
+
+    #[test]
+    fn classify_connection_refused_remote_uses_generic_hint() {
+        let err = MockErr {
+            is_timeout: false,
+            is_connect: true,
+            io_kind: Some(std::io::ErrorKind::ConnectionRefused),
+            chain: "connection refused".to_string(),
+        };
+        let ue = classify_send_error(&err, "https://api.example.com/v1/chat/completions");
+        assert_eq!(ue.kind, ErrorKind::ConnectRefused);
+        assert!(!ue.hint.as_deref().unwrap_or("").contains("ollama serve"));
+    }
+
+    #[test]
+    fn classify_timeout_from_is_timeout_flag() {
+        let err = MockErr {
+            is_timeout: true,
+            is_connect: false,
+            io_kind: None,
+            chain: "operation timed out".to_string(),
+        };
+        let ue = classify_send_error(&err, "http://example.com/");
+        assert_eq!(ue.kind, ErrorKind::Timeout);
+        assert_eq!(ue.exit_code, ExitCode::Model);
+    }
+
+    #[test]
+    fn classify_dns_from_lookup_in_chain() {
+        let err = MockErr {
+            is_timeout: false,
+            is_connect: true,
+            io_kind: None,
+            chain: "dns error: failed to lookup address information".to_string(),
+        };
+        let ue = classify_send_error(&err, "https://nowhere.invalid/x");
+        assert_eq!(ue.kind, ErrorKind::Dns);
+        assert_eq!(ue.exit_code, ExitCode::Network);
+    }
+
+    #[test]
+    fn classify_tls_substring_in_chain() {
+        let err = MockErr {
+            is_timeout: false,
+            is_connect: false,
+            io_kind: None,
+            chain: "invalid certificate: webpki UnknownIssuer".to_string(),
+        };
+        let ue = classify_send_error(&err, "https://api.example.com/");
+        assert_eq!(ue.kind, ErrorKind::Tls);
+        assert_eq!(ue.exit_code, ExitCode::Network);
+    }
+
+    #[test]
+    fn classify_http_401_is_auth() {
+        let ue = classify_http_status(401, None, "https://api.example.com/v1/chat", "unauth");
+        assert_eq!(ue.kind, ErrorKind::Auth);
+        assert_eq!(ue.exit_code, ExitCode::Model);
+        let h = ue.hint.as_deref().unwrap_or("");
+        assert!(h.contains("API key") || h.contains("/login"), "got: {h}");
+    }
+
+    #[test]
+    fn classify_http_429_with_retry_after_mentions_seconds() {
+        let ue = classify_http_status(429, Some(7), "https://api.example.com/v1", "");
+        assert_eq!(ue.kind, ErrorKind::RateLimited);
+        let h = ue.hint.as_deref().unwrap_or("");
+        assert!(h.contains("7"), "got hint: {h}");
+    }
+
+    #[test]
+    fn classify_http_402_is_quota() {
+        let ue = classify_http_status(402, None, "https://api.example.com/v1", "");
+        assert_eq!(ue.kind, ErrorKind::Quota);
+    }
+
+    #[test]
+    fn classify_http_500_is_server_error() {
+        let ue = classify_http_status(500, None, "https://api.example.com/v1", "boom");
+        assert_eq!(ue.kind, ErrorKind::ServerError);
+        assert!(ue.hint.is_some());
+    }
+
+    #[test]
+    fn classify_http_400_is_bad_request() {
+        let ue = classify_http_status(400, None, "https://api.example.com/v1", "");
+        assert_eq!(ue.kind, ErrorKind::BadRequest);
+        assert_eq!(ue.exit_code, ExitCode::Usage);
+    }
+
+    #[test]
+    fn url_host_is_local_handles_loopback_variants() {
+        assert!(url_host_is_local("http://localhost:11434/api/tags"));
+        assert!(url_host_is_local("http://127.0.0.1:11434/x"));
+        assert!(url_host_is_local("http://[::1]:11434/x"));
+        assert!(!url_host_is_local("https://api.openai.com/v1"));
     }
 }

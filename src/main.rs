@@ -712,6 +712,17 @@ async fn main() -> Result<()> {
 
     if let Err(err) = run_result {
         let debug = user_error::debug_mode();
+        // Already a classified UserError? Use it directly.
+        if err.downcast_ref::<user_error::UserError>().is_some() {
+            match err.downcast::<user_error::UserError>() {
+                Ok(ue) => {
+                    let code = ue.exit_code;
+                    user_error::report_user_error(&ue, json_output && headless, debug);
+                    exit_code::exit(code);
+                }
+                Err(_) => unreachable!(),
+            }
+        }
         if let Some(exit) = err.downcast_ref::<exit_code::AppExit>() {
             // Preserve the legacy exit code & message; promote to a
             // typed UserError so JSON/human paths share one shape.
