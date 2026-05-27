@@ -124,6 +124,7 @@ pub fn error(message: &str) -> Value {
     json!({ "type": "error", "message": message })
 }
 
+#[allow(dead_code)]
 pub fn emit_error(enabled: bool, message: &str) -> Value {
     let v = error(message);
     emit(enabled, &v);
