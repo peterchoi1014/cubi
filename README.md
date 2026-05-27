@@ -698,9 +698,36 @@ Main dependencies (see `Cargo.toml` for the complete list):
 
 ## 🐛 Troubleshooting
 
+### Debugging
+
+By default cubi prints a one-line `error: …` followed by an optional
+`hint: …` and an `[code N]` tag matching the headless exit code. To
+see the full underlying cause chain, pass `--debug`, set
+`CUBI_DEBUG=1`, or set any non-empty `RUST_BACKTRACE` value:
+
+```bash
+cubi --debug -p "hi"
+CUBI_DEBUG=1 cubi exec "hi"
+```
+
+### Run `cubi doctor`
+
+```bash
+cubi doctor          # Check config, sessions dir, model host, MCP, plugins
+cubi doctor --fix    # Same + create missing sessions dir, write a stub
+                     # config, install shell completions when SHELL is known
+cubi doctor --json   # Machine-readable output
+```
+
+`--fix` only performs **safe** actions: it never overwrites existing
+files and never edits your shell rc. The completions installer drops
+the script under `~/.cubi/completions/` and prints the snippet you
+need to add manually.
+
 ### Ollama connection failed
 
-**Error**: `Failed to send request to Ollama`
+**Error**: `could not connect to localhost:11434` (kind
+`connect_refused`, exit code 13)
 
 **Solution**:
 ```bash
@@ -710,6 +737,30 @@ curl http://localhost:11434/api/tags
 # If not running, start it
 ollama serve
 ```
+
+### Authentication failed
+
+**Error**: `authentication failed (401)` (kind `auth`, exit code 10)
+
+**Solution**: set or refresh the provider API key, e.g.
+`export OPENAI_API_KEY=…` (or the matching `CUBI_*_API_KEY`).
+
+### Rate-limited
+
+**Error**: `provider rate-limited the request (429)` — the hint
+includes the `Retry-After` value when the server provided one. cubi
+already auto-retries transient HTTP failures (408/429/5xx, connect
+errors) with backoff; this only surfaces once those retries are
+exhausted.
+
+### MCP server went offline mid-session
+
+If an MCP server's stdio transport dies mid-session and reconnecting
+fails, cubi now degrades that server instead of killing the REPL
+turn: it prints a warning, drops its tools from the advertised
+toolset for the rest of the session, and `/mcp-tools` shows the
+server under `Offline MCP Servers`. Restart cubi (or rerun
+`cubi doctor`) to retry.
 
 ### Model not found
 
