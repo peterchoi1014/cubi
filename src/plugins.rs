@@ -47,7 +47,92 @@ impl PluginCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PluginPermissions {
+    pub network: bool,
+    pub fs_write: bool,
+    pub shell: bool,
+}
+
+impl PluginPermissions {
+    /// Parse from the optional `permissions` object on a plugin manifest.
+    /// Missing keys default to `false`, so an absent block produces an
+    /// all-false (deny-by-default) [`Self`].
+    pub fn from_manifest(value: &serde_json::Value) -> Self {
+        let obj = match value.get("permissions").and_then(|v| v.as_object()) {
+            Some(o) => o,
+            None => return Self::default(),
+        };
+        let pull = |key: &str| -> bool { obj.get(key).and_then(|v| v.as_bool()).unwrap_or(false) };
+        Self {
+            network: pull("network"),
+            fs_write: pull("fs_write"),
+            shell: pull("shell"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginManifest {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub entry: Option<String>,
+    pub permissions: PluginPermissions,
+    pub path: PathBuf,
+}
+
+impl PluginManifest {
+    /// Parse a `manifest.json` from a plugin root. Returns `None` when
+    /// the file is missing or unreadable. Lenient by design: fields
+    /// missing from the JSON default rather than erroring so partial
+    /// manifests are still useful in `cubi plugins show`.
+    pub fn load(root: &Path) -> Option<Self> {
+        let path = root.join("manifest.json");
+        let raw = fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+        let version = json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let description = json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let entry = json
+            .get("entry")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let permissions = PluginPermissions::from_manifest(&json);
+        Some(Self {
+            name,
+            version,
+            description,
+            entry,
+            permissions,
+            path,
+        })
+    }
+}
+
 pub fn plugins_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CUBI_PLUGINS_DIR") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
     dirs::home_dir().map(|h| h.join(".cubi").join("plugins"))
 }
 
@@ -132,6 +217,141 @@ pub fn print_plugin_list(plugins: &[Plugin]) {
             plugin.root.display()
         );
     }
+}
+
+/// JSON variant of [`print_plugin_list`]. Returns the rendered JSON
+/// string so call sites can decide where to write it.
+pub fn plugin_list_json(plugins: &[Plugin]) -> String {
+    let arr: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "version": p.version,
+                "path": p.root.display().to_string(),
+                "commands": p.commands.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
+}
+
+/// Print a pretty-printed manifest plus a permissions summary for one
+/// named plugin. Returns `Ok(false)` when the plugin is not found so
+/// the dispatcher can exit with code 2 instead of crashing.
+pub fn show_plugin(plugins: &[Plugin], name: &str, json: bool) -> bool {
+    let Some(plugin) = plugins.iter().find(|p| p.name == name) else {
+        return false;
+    };
+    let manifest = PluginManifest::load(&plugin.root);
+    if json {
+        let v = serde_json::json!({
+            "name": plugin.name,
+            "version": plugin.version,
+            "path": plugin.root.display().to_string(),
+            "handler": manifest.as_ref().and_then(|m| m.entry.clone()),
+            "description": manifest.as_ref().map(|m| m.description.clone()).unwrap_or_default(),
+            "permissions": {
+                "network": manifest.as_ref().map(|m| m.permissions.network).unwrap_or(false),
+                "fs_write": manifest.as_ref().map(|m| m.permissions.fs_write).unwrap_or(false),
+                "shell": manifest.as_ref().map(|m| m.permissions.shell).unwrap_or(false),
+            },
+            "commands": plugin.commands.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return true;
+    }
+    println!("Plugin: {}", plugin.name);
+    println!("  version:  {}", plugin.version);
+    println!("  path:     {}", plugin.root.display());
+    let raw = fs::read_to_string(plugin.root.join("manifest.json")).unwrap_or_default();
+    if !raw.is_empty() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            println!("  manifest:");
+            for line in serde_json::to_string_pretty(&value).unwrap_or(raw).lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    let perms = manifest.as_ref().map(|m| m.permissions).unwrap_or_default();
+    println!(
+        "  permissions: network={} fs_write={} shell={}",
+        perms.network, perms.fs_write, perms.shell
+    );
+    if !plugin.commands.is_empty() {
+        println!("  commands:");
+        for c in &plugin.commands {
+            println!("    /{}:{}\t{}", plugin.name, c.name, c.description);
+        }
+    }
+    true
+}
+
+/// Files the scaffolder produces; `remove` refuses to delete plugins
+/// that hold anything beyond this set unless `--force` is passed.
+pub const SCAFFOLDER_FILES: &[&str] = &["manifest.json", "handler.sh", "handler.cmd", "README.md"];
+
+#[derive(Debug, PartialEq)]
+pub enum RemoveError {
+    NotFound,
+    /// Resolved path is not a child of the configured plugins root.
+    PathEscape,
+    /// Directory contains files the scaffolder did not author; pass
+    /// `--force` to delete anyway.
+    HasExtraFiles(Vec<String>),
+}
+
+/// Validates that `name` resolves to a child directory of `parent` and
+/// contains only files we recognise as scaffolder output. Returns the
+/// resolved plugin root on success.
+pub fn resolve_remove_target(
+    parent: &Path,
+    name: &str,
+    force: bool,
+) -> Result<PathBuf, RemoveError> {
+    let root = parent.join(name);
+    if !root.exists() {
+        return Err(RemoveError::NotFound);
+    }
+    // Canonicalize both sides to defeat `..` / symlink traversal.
+    let canon_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    if !canon_root.starts_with(&canon_parent) || canon_root == canon_parent {
+        return Err(RemoveError::PathEscape);
+    }
+    if !force {
+        let unexpected = collect_unexpected_entries(&canon_root);
+        if !unexpected.is_empty() {
+            return Err(RemoveError::HasExtraFiles(unexpected));
+        }
+    }
+    Ok(canon_root)
+}
+
+fn collect_unexpected_entries(root: &Path) -> Vec<String> {
+    let mut bad = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return bad;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            bad.push("<non-utf8>".to_string());
+            continue;
+        };
+        // Allow the scaffolder file list and the `commands/` subtree
+        // (which is the documented place for Markdown command files).
+        if SCAFFOLDER_FILES.contains(&file_name.as_str()) {
+            continue;
+        }
+        if file_name == "commands" && entry.path().is_dir() {
+            continue;
+        }
+        bad.push(file_name);
+    }
+    bad.sort();
+    bad
 }
 
 pub fn print_reload_summary(before: &[Plugin], after: &[Plugin], skill_count: usize) {
@@ -265,6 +485,15 @@ fn scaffold_new_in(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
         "version": "0.1.0",
         "description": format!("Plugin '{}' scaffolded by `cubi plugins new`", name),
         "entry": entry,
+        // Deny-by-default permission block. Flip individual keys to
+        // `true` to opt into the corresponding capability. The runtime
+        // consults this block in `cubi plugins run` and the agent's
+        // tool-permission prompt path.
+        "permissions": {
+            "network": false,
+            "fs_write": false,
+            "shell": false
+        }
     });
     fs::write(
         root.join("manifest.json"),
@@ -312,15 +541,11 @@ fn scaffold_new_in(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
-/// Resolves the plugins root for scaffolding. Honors the explicit
-/// `CUBI_PLUGINS_DIR` env var (used by tests) before falling back to
-/// `~/.cubi/plugins/`.
+/// Resolves the plugins root for scaffolding. Identical to
+/// [`plugins_dir`] today; preserved as a separate helper so the
+/// scaffold path can diverge later if needed (e.g. tests that mock
+/// the destination independently of the discovery root).
 fn scaffold_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CUBI_PLUGINS_DIR") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
     plugins_dir()
 }
 
@@ -500,5 +725,97 @@ mod tests {
         let err = scaffold_new_in(&root, "bad name").expect_err("invalid name must fail");
         assert!(format!("{err:#}").contains("invalid plugin name"));
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scaffold_new_writes_permissions_block_all_false() {
+        let root = temp_root("perms-scaffold");
+        let path = scaffold_new_in(&root, "permy").expect("scaffold ok");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path.join("manifest.json")).unwrap()).unwrap();
+        let perms = PluginPermissions::from_manifest(&manifest);
+        assert_eq!(perms, PluginPermissions::default());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn permissions_missing_block_defaults_all_false() {
+        let v = serde_json::json!({"name": "p", "version": "0.1.0"});
+        let perms = PluginPermissions::from_manifest(&v);
+        assert_eq!(perms, PluginPermissions::default());
+        assert!(!perms.network);
+        assert!(!perms.fs_write);
+        assert!(!perms.shell);
+    }
+
+    #[test]
+    fn permissions_partial_block_uses_explicit_keys() {
+        let v = serde_json::json!({
+            "permissions": {"shell": true, "network": false}
+        });
+        let perms = PluginPermissions::from_manifest(&v);
+        assert!(perms.shell);
+        assert!(!perms.network);
+        assert!(!perms.fs_write);
+    }
+
+    #[test]
+    fn manifest_load_parses_full_record() {
+        let root = temp_root("manifest");
+        let plug = scaffold_new_in(&root, "ml").expect("scaffold ok");
+        let m = PluginManifest::load(&plug).expect("manifest loaded");
+        assert_eq!(m.name, "ml");
+        assert_eq!(m.version, "0.1.0");
+        assert!(m.description.contains("ml"));
+        assert!(m.entry.is_some());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_target_refuses_when_unexpected_files_present() {
+        let root = temp_root("remove-extras");
+        let plug = scaffold_new_in(&root, "rem").expect("scaffold ok");
+        fs::write(plug.join("extra.txt"), "hi").unwrap();
+        let err = resolve_remove_target(&root, "rem", false).expect_err("must refuse");
+        match err {
+            RemoveError::HasExtraFiles(items) => assert!(items.iter().any(|s| s == "extra.txt")),
+            other => panic!("expected HasExtraFiles, got {other:?}"),
+        }
+        // With --force the same path is accepted.
+        let ok = resolve_remove_target(&root, "rem", true).expect("force allows");
+        assert!(ok.ends_with("rem"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_target_refuses_parent_traversal() {
+        let root = temp_root("remove-escape");
+        fs::create_dir_all(root.join("inner")).unwrap();
+        // The name `..` would resolve outside `parent` once canonicalized.
+        let err = resolve_remove_target(&root, "..", false).expect_err("must refuse");
+        assert_eq!(err, RemoveError::PathEscape);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_target_not_found_when_missing() {
+        let root = temp_root("remove-missing");
+        let err = resolve_remove_target(&root, "ghost", false).expect_err("must refuse");
+        assert_eq!(err, RemoveError::NotFound);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn show_plugin_returns_false_for_unknown() {
+        let plugins: Vec<Plugin> = Vec::new();
+        assert!(!show_plugin(&plugins, "nope", false));
+    }
+
+    #[test]
+    fn plugin_list_json_is_valid_array() {
+        let s = plugin_list_json(&[]);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 0);
     }
 }

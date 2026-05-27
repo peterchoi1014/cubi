@@ -177,8 +177,8 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/usage",
-        usage: "/usage",
-        help: "Show session usage statistics",
+        usage: "/usage [footer on|off]",
+        help: "Per-turn token usage + cost table",
         cmd: Cmd::Usage,
     },
     SlashCommandSpec {
@@ -249,8 +249,8 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/history",
-        usage: "/history",
-        help: "Show conversation history",
+        usage: "/history [next|prev|<N>]",
+        help: "Page conversation history; /history N trims",
         cmd: Cmd::History,
     },
     SlashCommandSpec {
