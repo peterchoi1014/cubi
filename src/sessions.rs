@@ -225,8 +225,13 @@ impl SessionStore {
     ///   inside it fails (permissions, full disk, etc.).
     /// * `Ok` — writable.
     pub fn status(&self) -> SessionStoreStatus {
-        if !self.dir.exists() {
-            return SessionStoreStatus::Missing;
+        // Use try_exists so a permission-denied stat doesn't masquerade
+        // as "Missing"; an inaccessible-but-present directory should be
+        // surfaced to the user as ReadOnly (unwritable) instead.
+        match self.dir.try_exists() {
+            Ok(false) => return SessionStoreStatus::Missing,
+            Err(_) => return SessionStoreStatus::ReadOnly,
+            Ok(true) => {}
         }
         // Cheap writability probe: try to create + remove a sentinel.
         let probe = self.dir.join(".cubi-write-probe");
