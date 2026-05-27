@@ -48,6 +48,7 @@ const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
+mod edit_cmd;
 mod multiline;
 mod render;
 mod repl;
@@ -863,6 +864,56 @@ impl ChatCLI {
                             "Error:".bright_red(),
                             args
                         ),
+                    }
+                }
+            }
+            Cmd::Edit => {
+                let seed = if args.is_empty() {
+                    // Fall back to the last assistant message so the
+                    // user can refine a prior answer. If there is none,
+                    // open an empty buffer.
+                    self.history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant")
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default()
+                } else {
+                    args.to_string()
+                };
+                let editor = edit_cmd::resolve_editor();
+                let outcome = edit_cmd::run_editor_session(&seed, |path| {
+                    edit_cmd::spawn_editor_blocking(&editor, path)
+                });
+                match outcome {
+                    Ok(edit_cmd::EditOutcome::Submit(body)) => {
+                        let expanded = file_mentions::expand_file_mentions(&body);
+                        let turn_start = self.history.len();
+                        self.history.push(Message::text("user", &expanded));
+                        self.journal.start_turn();
+                        if let Err(e) = self.agent_turn(turn_start).await {
+                            eprintln!("{} {}\n", "Error:".bright_red().bold(), e);
+                        }
+                    }
+                    Ok(edit_cmd::EditOutcome::Empty) => {
+                        println!(
+                            "{} editor returned empty buffer — nothing submitted",
+                            "ℹ".bright_blue()
+                        );
+                    }
+                    Ok(edit_cmd::EditOutcome::Unchanged) => {
+                        println!(
+                            "{} editor buffer unchanged — nothing submitted",
+                            "ℹ".bright_blue()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{} could not run editor ({}): {}",
+                            "Error:".bright_red(),
+                            editor,
+                            e
+                        );
                     }
                 }
             }
