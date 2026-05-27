@@ -529,6 +529,11 @@ async fn main() -> Result<()> {
         cli_flags.explain_tools = true;
     }
 
+    if doctor_fix && !matches!(primary, PrimaryCommand::Doctor) {
+        eprintln!("cubi: --fix is only valid with the `doctor` subcommand.");
+        std::process::exit(2);
+    }
+
     if one_shot_prompt.is_some() && !matches!(primary, PrimaryCommand::Interactive) {
         eprintln!(
             "cubi: --prompt cannot be combined with --resume, --list-sessions, or --delete-session."
@@ -1374,7 +1379,7 @@ fn print_help() {
          --usage-footer                 Append a one-line usage footer\n  \
                                         after each REPL turn (also\n  \
                                         togglable via /usage footer).\n\n\
-         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 130 cancelled\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n\n\
