@@ -268,18 +268,12 @@ pub fn show_plugin(plugins: &[Plugin], name: &str, json: bool) -> bool {
     if !raw.is_empty() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
             println!("  manifest:");
-            for line in serde_json::to_string_pretty(&value)
-                .unwrap_or(raw)
-                .lines()
-            {
+            for line in serde_json::to_string_pretty(&value).unwrap_or(raw).lines() {
                 println!("    {line}");
             }
         }
     }
-    let perms = manifest
-        .as_ref()
-        .map(|m| m.permissions)
-        .unwrap_or_default();
+    let perms = manifest.as_ref().map(|m| m.permissions).unwrap_or_default();
     println!(
         "  permissions: network={} fs_write={} shell={}",
         perms.network, perms.fs_write, perms.shell
@@ -295,12 +289,7 @@ pub fn show_plugin(plugins: &[Plugin], name: &str, json: bool) -> bool {
 
 /// Files the scaffolder produces; `remove` refuses to delete plugins
 /// that hold anything beyond this set unless `--force` is passed.
-pub const SCAFFOLDER_FILES: &[&str] = &[
-    "manifest.json",
-    "handler.sh",
-    "handler.cmd",
-    "README.md",
-];
+pub const SCAFFOLDER_FILES: &[&str] = &["manifest.json", "handler.sh", "handler.cmd", "README.md"];
 
 #[derive(Debug, PartialEq)]
 pub enum RemoveError {
@@ -315,13 +304,19 @@ pub enum RemoveError {
 /// Validates that `name` resolves to a child directory of `parent` and
 /// contains only files we recognise as scaffolder output. Returns the
 /// resolved plugin root on success.
-pub fn resolve_remove_target(parent: &Path, name: &str, force: bool) -> Result<PathBuf, RemoveError> {
+pub fn resolve_remove_target(
+    parent: &Path,
+    name: &str,
+    force: bool,
+) -> Result<PathBuf, RemoveError> {
     let root = parent.join(name);
     if !root.exists() {
         return Err(RemoveError::NotFound);
     }
     // Canonicalize both sides to defeat `..` / symlink traversal.
-    let canon_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let canon_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
     if !canon_root.starts_with(&canon_parent) || canon_root == canon_parent {
         return Err(RemoveError::PathEscape);

@@ -64,3 +64,34 @@ git diff | cubi -p "summarize the risky changes"
 cubi --json --no-stream -p "list the failing checks" | jq -c .
 cat release-notes.md | cubi --system tone.txt
 ```
+
+## Structured event tap (`--events <path>`)
+
+`--events <path>` (or `CUBI_EVENTS=…`) opens the path in append+create
+mode and writes one JSON line per internal event. The shape is a strict
+superset of `--trace-tools` — it captures full turn lifecycles plus tool
+rationales and MCP transitions in addition to tool start/complete. If
+the path can't be opened, cubi prints one warning (suppressed in JSON
+mode) and continues without the tap rather than aborting the run.
+
+Event types currently emitted:
+
+- `turn_start` — `{type, ts, turn, model}` at the top of each agent turn.
+- `tool_call_start` — `{type, ts, tool, args}` with secrets redacted
+  through the same `redact_secrets` helper as `--trace-tools` and
+  `--print-config`.
+- `tool_rationale` — `{type, ts, tool, rationale}` when
+  `--explain-tools` (or `CUBI_EXPLAIN_TOOLS=1`) is set; rationale is the
+  assistant message that accompanied the tool call, falling back to the
+  MCP manifest description, then to `(no description)`.
+- `tool_call_complete` — `{type, ts, tool, ok, result_chars}`.
+- `mcp_status_change` — `{type, ts, before, after}` where each side is
+  `{ok, failed, not_loaded}`. Emitted when the agent loop detects an
+  MCP server transition during a turn.
+- `turn_end` — `{type, ts, usage, model}`. `usage` carries
+  `{prompt_tokens, completion_tokens, elapsed_ms}`.
+
+`--trace-tools <path>` still produces its original `tool_start` /
+`tool_complete` record shape for back-compat, but new integrations
+should prefer `--events`; the same redaction rules apply.
+

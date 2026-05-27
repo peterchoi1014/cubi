@@ -215,8 +215,13 @@ cubi --list-sessions --json  List all saved sessions as a JSON array
 cubi --delete-session <id>   Delete by full id or unique prefix
 cubi --prune-sessions --older-than <duration> [--dry-run]
                              Delete old sessions (duration: 30d, 2w, 6m, 1y)
-cubi plugins list            List discovered plugin bundles
+cubi plugins list [--json]   List discovered plugin bundles
+cubi plugins show <name>     Show manifest, handler, and permissions for a plugin
+cubi plugins remove <name>   Remove a plugin (refuses extras unless --force)
+cubi plugins run <name> ...  Execute a plugin handler with extra arguments
 cubi plugins reload          Rediscover skills and plugin bundles
+cubi plugins new <name>      Scaffold ~/.cubi/plugins/<name>/ with manifest + handler
+cubi mcp test <server>       Connect and smoke-test every tool with stub args
 cubi completions <shell>     Print a completion script (bash, zsh, fish)
 cubi --version               Print version and exit
 cubi --help                  Print help and exit
@@ -226,14 +231,20 @@ Output flags (combine with chat commands):
   --markdown / --no-markdown     Enable / disable markdown rendering. Markdown only
                                  applies with --no-stream; auto-disabled for non-TTY
   --show-stats-footer            Print a token/timing footer after each reply
+  --usage-footer                 Print a one-line token/cost footer after each turn
   --system <file>                 Prepend file contents as a system message
   --json                          Emit machine-readable output where supported
                                   (`--list-sessions` JSON arrays; headless chat
                                   line-delimited JSON events)
+  --trace-tools <path>           Append a JSONL audit line per tool start/complete
+  --events <path>                Append every internal event (turn boundaries, tool
+                                 calls, rationales, MCP transitions) as JSONL
+  --explain-tools                Surface a one-line rationale before each tool call
 ```
 
 The same toggles are reachable mid-session via `/stream on|off`,
-`/markdown on|off`, and `/stats-footer on|off`. `-p/--prompt` requires inline
+`/markdown on|off`, `/stats-footer on|off`, and `/usage footer on|off`.
+`-p/--prompt` requires inline
 text and does not read stdin; without `-p`, piped stdin becomes the prompt.
 Use `--system <file>` to prepend a system instruction file before the prompt.
 Use `--json -p "..."` to stream line-delimited events such as `token`,
@@ -243,6 +254,19 @@ model/API error, `11` tool failure, and `130` cancellation. Press **Ctrl-C**
 during an in-flight reply or tool call to cancel it and return to the prompt;
 the unanswered user message is rolled back so history stays clean. Dropping a
 tool future cannot always stop subprocesses already spawned by shell-out tools.
+
+The REPL also surfaces two new slash commands for power users:
+`/usage` prints a per-turn prompt/completion/total/cost table (cost
+resolved from a built-in pricing table; local models show
+`$0.00 (local)`), and `/history` pages through messages
+(`/history next|prev`, page size from `CUBI_HISTORY_PAGE`) or trims
+to the last *N* user turns (`/history 5`).
+
+For headless or scripted use, `--events <path>` (or `CUBI_EVENTS=…`)
+captures every internal event as JSONL — turn lifecycle, tool calls,
+rationales, MCP transitions, and errors. `--explain-tools` adds a one-
+line rationale before each tool call. See
+[`docs/headless.md`](docs/headless.md) for the full event schema.
 
 Generate shell completions with `cubi completions bash`, `cubi completions zsh`,
 or `cubi completions fish`, then install the printed script using your shell's

@@ -570,8 +570,8 @@ fn events_flag_writes_jsonl_for_a_single_turn() {
     assert!(!lines.is_empty(), "events file empty");
     let mut types: Vec<String> = Vec::new();
     for line in &lines {
-        let v: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|_| panic!("invalid JSONL line: {line}"));
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("invalid JSONL line: {line}"));
         types.push(v["type"].as_str().unwrap_or("").to_string());
     }
     // Must observe a full turn lifecycle and the tool round-trip.
@@ -667,4 +667,3 @@ fn plugins_remove_refuses_extras_without_force() {
         .success()
         .stdout(predicate::str::contains("removed"));
 }
-

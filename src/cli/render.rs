@@ -400,7 +400,16 @@ mod tests {
 
     #[test]
     fn banner_all_zero_mcp_renders_none() {
-        let line = format_banner("0.1.0", "m", "p", 0, 0, 0, SessionStoreStatus::Missing, false);
+        let line = format_banner(
+            "0.1.0",
+            "m",
+            "p",
+            0,
+            0,
+            0,
+            SessionStoreStatus::Missing,
+            false,
+        );
         assert!(line.contains("mcp: none"), "{}", line);
     }
 

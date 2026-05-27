@@ -1659,7 +1659,6 @@ impl ChatCLI {
         self.mcp_counts = (ok, failed, not_loaded);
     }
 
-
     /// `/doctor` — runs a sanity check on the runtime environment.
     /// Each probe prints a ✓ / ✗ line; the function never returns an error
     /// so users always see the full report.
@@ -5062,7 +5061,10 @@ pub(crate) fn history_page_slice(total: usize, page_size: usize, page: usize) ->
 /// turns (system messages — including `SYSTEM[pinned]:` — are always
 /// preserved). Pure: returns the rebuilt vector so it can be unit-
 /// tested without touching session state.
-pub(crate) fn trim_history_keep_last_n(history: &[crate::ollama::Message], n: usize) -> Vec<crate::ollama::Message> {
+pub(crate) fn trim_history_keep_last_n(
+    history: &[crate::ollama::Message],
+    n: usize,
+) -> Vec<crate::ollama::Message> {
     if n == 0 {
         return history
             .iter()
@@ -5331,7 +5333,6 @@ mod tests {
         let r = super::agent::resolve_tool_rationale("   ", "bash", None);
         assert_eq!(r, "(no description)");
     }
-
 
     #[test]
     fn repl_history_path_lives_under_cubi_home() {
