@@ -46,6 +46,7 @@ fn env_suppresses_spinner() -> bool {
 /// to clear the line and join the painter task.
 pub struct ToolSpinner {
     stop: Arc<AtomicBool>,
+    notify: Option<Arc<tokio::sync::Notify>>,
     handle: Option<tokio::task::JoinHandle<()>>,
     active: bool,
 }
@@ -67,6 +68,7 @@ impl ToolSpinner {
         if suppress {
             return Self {
                 stop,
+                notify: None,
                 handle: None,
                 active: false,
             };
@@ -74,28 +76,41 @@ impl ToolSpinner {
 
         let name = tool_name.into();
         let s = stop.clone();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let n = notify.clone();
         let handle = tokio::spawn(async move {
             // Grace period: don't draw anything for the first ~400ms so
             // fast tools (cheap built-ins, cached lookups) never flash
-            // the spinner. The flag is checked after every sleep so an
-            // early `finish()` exits without painting at all.
-            tokio::time::sleep(GRACE_PERIOD).await;
+            // the spinner. The sleep is interruptible via `notify` so a
+            // sub-grace `finish()` returns immediately instead of
+            // blocking the caller for the rest of the 400ms.
+            tokio::select! {
+                _ = tokio::time::sleep(GRACE_PERIOD) => {}
+                _ = n.notified() => return,
+            }
             if s.load(Ordering::SeqCst) {
                 return;
             }
             let start = Instant::now();
             let mut idx = 0usize;
-            while !s.load(Ordering::SeqCst) {
+            loop {
+                if s.load(Ordering::SeqCst) {
+                    break;
+                }
                 let line = format_frame(idx, &name, start.elapsed());
                 eprint!("{}", line);
                 let _ = std::io::stderr().flush();
-                tokio::time::sleep(FRAME_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(FRAME_INTERVAL) => {}
+                    _ = n.notified() => break,
+                }
                 idx = idx.wrapping_add(1);
             }
         });
 
         Self {
             stop,
+            notify: Some(notify),
             handle: Some(handle),
             active: true,
         }
@@ -115,6 +130,16 @@ impl ToolSpinner {
 
     fn stop_inner(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Wake the painter task if it's parked on the grace-period
+        // sleep or a frame-interval sleep so `finish()` doesn't have
+        // to wait for the next tick.
+        if let Some(n) = self.notify.as_ref() {
+            // Use notify_one so a notification issued *before* the
+            // painter has parked still wakes it as soon as it parks.
+            // (notify_waiters has no permit semantics and would race
+            // with the painter's first `.notified().await`.)
+            n.notify_one();
+        }
     }
 }
 
@@ -168,5 +193,38 @@ mod tests {
         let sp = ToolSpinner::start_with_mode("x", true);
         assert!(!sp.active);
         sp.finish().await;
+    }
+
+    #[tokio::test]
+    async fn finish_before_grace_period_returns_promptly() {
+        // Construct an active spinner directly so we don't depend on a
+        // TTY. The painter parks on the grace-period sleep; `finish()`
+        // must preempt it via `notify` rather than waiting out the
+        // full 400ms grace window.
+        let stop = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let s = stop.clone();
+        let n = notify.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(GRACE_PERIOD) => {}
+                _ = n.notified() => return,
+            }
+            let _ = s.load(Ordering::SeqCst);
+        });
+        let sp = ToolSpinner {
+            stop,
+            notify: Some(notify),
+            handle: Some(handle),
+            active: true,
+        };
+
+        let start = Instant::now();
+        sp.finish().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < GRACE_PERIOD,
+            "finish() should preempt the grace-period sleep, but waited {elapsed:?}"
+        );
     }
 }

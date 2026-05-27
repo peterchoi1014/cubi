@@ -12,9 +12,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 /// Result of a single `/edit` round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,55 +47,27 @@ pub(crate) fn resolve_editor() -> String {
     }
 }
 
-/// RAII tempfile cleanup. Best-effort: if removal fails (e.g. the editor
-/// already deleted it) we swallow the error.
-struct TempFileGuard {
-    path: PathBuf,
-}
-
-impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Returns a unique tempfile path under `std::env::temp_dir()` with the
-/// `cubi-edit-*.md` shape. The suffix mixes wall-clock nanos, the pid,
-/// and a process-wide atomic counter so parallel REPLs (and parallel
-/// tests) never collide.
-pub(crate) fn tempfile_path() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!("cubi-edit-{}-{}-{}.md", pid, nanos, seq);
-    std::env::temp_dir().join(name)
-}
-
 /// Core helper: seed a tempfile, hand it to `invoke`, then classify the
 /// result. The closure is responsible for actually spawning the editor;
 /// tests can swap in a no-op closure that writes synthetic content.
 ///
-/// The tempfile is always deleted, even on error or panic, via a
-/// [`TempFileGuard`].
+/// Uses [`tempfile::Builder`] with `O_EXCL`-style semantics so a hostile
+/// process in a shared temp dir cannot pre-create the path as a symlink
+/// and race us into overwriting an attacker-controlled target. The
+/// tempfile is unlinked automatically when the [`tempfile::NamedTempFile`]
+/// is dropped (even on panic).
 pub(crate) fn run_editor_session<F>(seed: &str, invoke: F) -> io::Result<EditOutcome>
 where
     F: FnOnce(&Path) -> io::Result<()>,
 {
-    let path = tempfile_path();
-    let _guard = TempFileGuard::new(path.clone());
-    fs::write(&path, seed)?;
-    invoke(&path)?;
-    let raw = fs::read_to_string(&path)?;
+    let named = tempfile::Builder::new()
+        .prefix("cubi-edit-")
+        .suffix(".md")
+        .rand_bytes(12)
+        .tempfile()?;
+    fs::write(named.path(), seed)?;
+    invoke(named.path())?;
+    let raw = fs::read_to_string(named.path())?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(EditOutcome::Empty);
@@ -141,6 +111,7 @@ pub(crate) fn spawn_editor_blocking(editor: &str, path: &Path) -> io::Result<()>
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn submit_when_editor_writes_new_content() {
@@ -158,7 +129,6 @@ mod tests {
 
     #[test]
     fn unchanged_when_editor_keeps_seed() {
-        // Editor closure leaves the seed in place (writes the same bytes).
         let outcome =
             run_editor_session("seed text", |p| fs::write(p, "seed text")).expect("session ok");
         assert_eq!(outcome, EditOutcome::Unchanged);
@@ -176,33 +146,44 @@ mod tests {
         let path = captured.expect("path captured");
         assert!(
             !path.exists(),
-            "expected tempfile to be removed: {}",
+            "expected tempfile to be removed after NamedTempFile drop: {}",
             path.display()
         );
     }
 
     #[test]
-    fn tempfile_path_has_expected_shape() {
-        let p = tempfile_path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap();
-        assert!(name.starts_with("cubi-edit-"));
-        assert!(name.ends_with(".md"));
+    fn tempfile_has_expected_name_shape() {
+        // Peek at the path the helper builds for the editor by capturing
+        // it from inside the closure.
+        let mut captured: Option<PathBuf> = None;
+        let cap = &mut captured;
+        let _ = run_editor_session("x", |p| {
+            *cap = Some(p.to_path_buf());
+            fs::write(p, "y")
+        })
+        .expect("session ok");
+        let name = captured
+            .expect("path captured")
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        assert!(name.starts_with("cubi-edit-"), "got {name}");
+        assert!(name.ends_with(".md"), "got {name}");
     }
 
     #[test]
     fn resolve_editor_falls_back_to_platform_default() {
         // We can't mutate process env in parallel tests safely, so just
         // assert the fallback constant matches the current platform.
-        let editor = if std::env::var("CUBI_EDITOR")
+        if std::env::var("CUBI_EDITOR")
             .or_else(|_| std::env::var("VISUAL"))
             .or_else(|_| std::env::var("EDITOR"))
             .is_ok()
         {
-            // Some env is set in CI — skip the fallback assertion.
             return;
-        } else {
-            resolve_editor()
-        };
+        }
+        let editor = resolve_editor();
         if cfg!(windows) {
             assert_eq!(editor, "notepad.exe");
         } else {

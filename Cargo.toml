@@ -58,10 +58,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # enable when reproducing a bug.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 insta = "1.47.2"
 predicates = "3.1.4"
-tempfile = "3.27.0"
 
