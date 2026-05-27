@@ -1192,16 +1192,24 @@ async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
     }
     // Confirm shell execution unless the manifest explicitly opts in.
     let perms = manifest.as_ref().map(|m| m.permissions).unwrap_or_default();
-    if !perms.shell
-        && !json
-        && !confirm_yn(&format!(
+    if !perms.shell {
+        if json {
+            // Headless/JSON callers cannot answer an interactive prompt; refuse
+            // rather than silently bypassing the shell-permission check.
+            eprintln!(
+                "cubi: plugin '{}' requires permissions.shell=true to run in --json mode.",
+                name
+            );
+            return 2;
+        }
+        if !confirm_yn(&format!(
             "Plugin '{}' wants to execute {}. Allow?",
             name,
             handler.display()
-        ))
-    {
-        eprintln!("cubi: aborted.");
-        return 2;
+        )) {
+            eprintln!("cubi: aborted.");
+            return 2;
+        }
     }
     let mut cmd = std::process::Command::new(&handler);
     for a in args {
@@ -1266,7 +1274,7 @@ async fn run_mcp_test(server: &str, only_tool: Option<&str>, json: bool) -> i32 
                 let resp = mcp_client::tool_result_to_json(&r);
                 if json {
                     let env = serde_json::json!({
-                        "tool": tool.name,
+                        "tool": tool.name.as_str(),
                         "request": request,
                         "response": resp,
                         "elapsed_ms": elapsed,
@@ -1287,7 +1295,7 @@ async fn run_mcp_test(server: &str, only_tool: Option<&str>, json: bool) -> i32 
                 );
                 if json {
                     let env = serde_json::json!({
-                        "tool": tool.name,
+                        "tool": tool.name.as_str(),
                         "request": request,
                         "error": ue.summary,
                         "elapsed_ms": elapsed,
