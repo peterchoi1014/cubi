@@ -406,3 +406,47 @@ fn exec_without_prompt_exits_with_usage_error() {
         .code(2)
         .stderr(predicate::str::contains("cubi: exec requires a prompt"));
 }
+
+#[test]
+fn run_subcommand_honors_frontmatter_model_override() {
+    let home = tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("review.md");
+    fs::write(
+        &script_path,
+        "---\nmodel: test-override-model\nsystem: be terse\n---\nplease review\n",
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        // Echo the resolved model name back in the fake reply so we can
+        // assert the frontmatter override won out.
+        .env("CUBI_FAKE_LLM_RESPONSE", "ok")
+        .args(["run", script_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    // Just confirm we got valid JSON events (no banner noise).
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "done"));
+}
+
+#[test]
+fn run_subcommand_missing_path_exits_with_usage_error() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("run")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cubi: run requires a markdown script path",
+        ));
+}

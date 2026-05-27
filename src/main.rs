@@ -31,6 +31,7 @@ pub mod plugins;
 mod policy;
 mod project_memory;
 mod schemas;
+mod script;
 mod sessions;
 mod settings_sync;
 pub mod skills;
@@ -81,6 +82,10 @@ async fn main() -> Result<()> {
     let mut stream_explicit = false;
     let mut prune_older_than: Option<u64> = None;
     let mut dry_run = false;
+    // When `cubi run <file.md>` is used, the parsed transcript is
+    // stashed here and applied (prefill history, tools toggle) after
+    // ChatCLI is constructed but before the final prompt is sent.
+    let mut run_script: Option<script::RunScript> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -165,6 +170,37 @@ async fn main() -> Result<()> {
             }
             "--no-banner" => cli_flags.no_banner = true,
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
+            "run" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: run requires a markdown script path. Usage: cubi run <file.md>"
+                    );
+                    std::process::exit(2);
+                };
+                let script = match script::load(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("cubi: failed to load run script '{}': {:#}", path, e);
+                        std::process::exit(2);
+                    }
+                };
+                // Apply frontmatter overrides: model via env so
+                // resolve_model picks it up; system via cli_flags.
+                if let Some(model) = &script.model {
+                    // SAFETY: argv parsing is single-threaded.
+                    unsafe { std::env::set_var("CUBI_MODEL", model) };
+                }
+                if let Some(sys) = &script.system {
+                    cli_flags.system_prompt = Some(sys.clone());
+                }
+                set_prompt(&mut one_shot_prompt, script.prompt.clone());
+                cli_flags.json = true;
+                cli_flags.stream = false;
+                stream_explicit = true;
+                cli_flags.no_banner = true;
+                run_script = Some(script);
+            }
             "exec" => {
                 // `cubi exec <prompt words>` — script-friendly one-shot
                 // shorthand for `cubi -p "<joined>" --json --no-stream
@@ -567,6 +603,14 @@ async fn main() -> Result<()> {
         }
     };
 
+    // `cubi run <file.md>` honors `tools: false` by detaching the MCP
+    // manager before the CLI is constructed.
+    let mcp_manager = if matches!(run_script.as_ref().and_then(|s| s.tools), Some(false)) {
+        None
+    } else {
+        mcp_manager
+    };
+
     status_line(
         headless,
         format!("{} AI executor ready", "✓".bright_green()),
@@ -593,6 +637,9 @@ async fn main() -> Result<()> {
     );
     if let PrimaryCommand::Resume(target) = &primary {
         cli.resume_session(target);
+    }
+    if let Some(script) = run_script.take() {
+        cli.preload_history(script.prefill);
     }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
@@ -682,6 +729,9 @@ fn print_help() {
                                      Delete old session files (30d, 2w, 6m, 1y)\n  \
          cubi exec <prompt words>     One-shot, JSON output, no banner, no stream\n  \
                                       (shorthand for -p \"<words>\" --json --no-stream --no-banner)\n  \
+         cubi run <file.md>           Run a Markdown script (optional YAML\n  \
+                                      frontmatter: model, system, tools); uses\n  \
+                                      headless --json output\n  \
          cubi plugins list            List discovered plugin bundles\n  \
          cubi plugins reload          Rediscover skills and plugin bundles\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
