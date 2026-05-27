@@ -582,3 +582,89 @@ fn events_flag_writes_jsonl_for_a_single_turn() {
     assert!(types.iter().any(|t| t == "turn_end"));
 }
 
+#[test]
+fn plugins_list_json_emits_array() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "demo"])
+        .assert()
+        .success();
+    let output = cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(output).unwrap();
+    let v: serde_json::Value = serde_json::from_str(s.trim()).expect("valid JSON");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "demo");
+}
+
+#[test]
+fn plugins_show_includes_permissions_section() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "perms"])
+        .assert()
+        .success();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "show", "perms"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("permissions:")
+                .and(predicate::str::contains("network=false"))
+                .and(predicate::str::contains("fs_write=false"))
+                .and(predicate::str::contains("shell=false")),
+        );
+}
+
+#[test]
+fn plugins_remove_refuses_unknown_name() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "remove", "ghost", "--yes"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("no plugin named"));
+}
+
+#[test]
+fn plugins_remove_refuses_extras_without_force() {
+    let home = tempdir().unwrap();
+    let dest = tempdir().unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "new", "extras"])
+        .assert()
+        .success();
+    fs::write(dest.path().join("extras").join("extra.txt"), "hi").unwrap();
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "remove", "extras", "--yes"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("unexpected files"));
+
+    // With --force the same removal succeeds.
+    cubi(home.path())
+        .env("CUBI_PLUGINS_DIR", dest.path())
+        .args(["plugins", "remove", "extras", "--yes", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed"));
+}
+
