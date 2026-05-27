@@ -366,7 +366,7 @@ impl McpManager {
                         crate::user_error::print_user_warning(
                             &format!(
                                 "MCP server '{}' is offline; its tools have been disabled \
-                                 for this session. Restart cubi or `/reconnect` to retry.",
+                                 for this session. Restart cubi or `/mcp-reload` to retry.",
                                 server_name
                             ),
                             Some(&format!("reason: {}", reason)),
