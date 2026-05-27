@@ -630,6 +630,31 @@ impl ChatCLI {
             );
         }
 
+        let pre_counts = self.mcp_counts;
+        // Refresh the cached MCP health triple shown in the banner so
+        // any Ok↔Failed transitions during tool dispatch are visible
+        // on the next prompt redraw.
+        self.refresh_mcp_counts();
+        if self.mcp_counts != pre_counts {
+            if let Some(sink) = self.event_sink.as_ref() {
+                sink.emit(
+                    "mcp_status_change",
+                    serde_json::json!({
+                        "before": {
+                            "ok": pre_counts.0,
+                            "failed": pre_counts.1,
+                            "not_loaded": pre_counts.2,
+                        },
+                        "after": {
+                            "ok": self.mcp_counts.0,
+                            "failed": self.mcp_counts.1,
+                            "not_loaded": self.mcp_counts.2,
+                        },
+                    }),
+                );
+            }
+        }
+
         // Drop any system messages tagged as single-turn (e.g. from `/ask`)
         // so they don't keep nudging every subsequent turn.
         self.strip_single_turn_system_messages();
