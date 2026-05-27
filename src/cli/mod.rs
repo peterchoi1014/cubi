@@ -279,6 +279,14 @@ impl ChatCLI {
         Ok(())
     }
 
+    /// Appends pre-rendered messages to the end of history. Used by
+    /// `cubi run <file.md>` to seed a replayed transcript before the
+    /// final user turn is sent through `run_one_shot`. No side effects
+    /// (no `agent_turn`, no checkpoint) — pure history mutation.
+    pub fn preload_history(&mut self, msgs: Vec<Message>) {
+        self.history.extend(msgs);
+    }
+
     /// Runs a single prompt without the welcome banner or rustyline REPL.
     /// Human-facing progress stays on stderr; only model reply tokens/content
     /// are written to stdout so callers can pipe the result.
