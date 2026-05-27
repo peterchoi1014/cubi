@@ -55,7 +55,6 @@ mod repl;
 mod spinner;
 
 #[cfg(test)]
-#[cfg(test)]
 use render::welcome_banner_rows;
 #[cfg(test)]
 use repl::repl_history_path;
