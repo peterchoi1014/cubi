@@ -13,7 +13,7 @@
 //! CLI keeps starting on a fresh machine.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A discovered plugin bundle. We keep the metadata trio (name, root
 /// path, command list) cheaply cloneable so the CLI can rebuild it on
@@ -228,6 +228,15 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 /// minimal manifest, an executable handler stub, and a README. Returns
 /// the plugin root on success.
 pub fn scaffold_new(name: &str) -> anyhow::Result<PathBuf> {
+    use anyhow::anyhow;
+    let parent = scaffold_root().ok_or_else(|| anyhow!("could not resolve plugins directory"))?;
+    scaffold_new_in(&parent, name)
+}
+
+/// Internal variant taking an explicit parent directory. Lets tests
+/// scaffold into per-test tempdirs without racing on a shared
+/// `CUBI_PLUGINS_DIR` env var.
+fn scaffold_new_in(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
     use anyhow::{Context, anyhow};
 
     if !is_valid_plugin_name(name) {
@@ -236,7 +245,6 @@ pub fn scaffold_new(name: &str) -> anyhow::Result<PathBuf> {
             name
         ));
     }
-    let parent = scaffold_root().ok_or_else(|| anyhow!("could not resolve plugins directory"))?;
     let root = parent.join(name);
     if root.exists() {
         return Err(anyhow!(
@@ -447,13 +455,7 @@ mod tests {
     #[test]
     fn scaffold_new_creates_manifest_handler_and_readme() {
         let root = temp_root("scaffold");
-        // SAFETY: tests in this module are not strictly serialized but
-        // each gets a unique nanos-suffixed root, so the env var is
-        // only used to redirect this one call. Reset after to avoid
-        // leaking into sibling tests.
-        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
-        let path = scaffold_new("myplug").expect("scaffold ok");
-        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
+        let path = scaffold_new_in(&root, "myplug").expect("scaffold ok");
 
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path.join("manifest.json")).unwrap()).unwrap();
@@ -477,9 +479,7 @@ mod tests {
     fn scaffold_new_makes_unix_handler_executable() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_root("scaffold-mode");
-        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
-        let path = scaffold_new("modeplug").expect("scaffold ok");
-        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
+        let path = scaffold_new_in(&root, "modeplug").expect("scaffold ok");
         let perms = fs::metadata(path.join("handler.sh")).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o755);
         fs::remove_dir_all(&root).ok();
@@ -488,21 +488,17 @@ mod tests {
     #[test]
     fn scaffold_new_refuses_to_overwrite_existing_directory() {
         let root = temp_root("dup");
-        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
-        scaffold_new("dup").expect("first scaffold ok");
-        let err = scaffold_new("dup").expect_err("second scaffold must fail");
+        scaffold_new_in(&root, "dup").expect("first scaffold ok");
+        let err = scaffold_new_in(&root, "dup").expect_err("second scaffold must fail");
         assert!(format!("{err:#}").contains("already exists"));
-        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn scaffold_new_rejects_invalid_names() {
         let root = temp_root("badname");
-        unsafe { std::env::set_var("CUBI_PLUGINS_DIR", &root) };
-        let err = scaffold_new("bad name").expect_err("invalid name must fail");
+        let err = scaffold_new_in(&root, "bad name").expect_err("invalid name must fail");
         assert!(format!("{err:#}").contains("invalid plugin name"));
-        unsafe { std::env::remove_var("CUBI_PLUGINS_DIR") };
         fs::remove_dir_all(&root).ok();
     }
 }
