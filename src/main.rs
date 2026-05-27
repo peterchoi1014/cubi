@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
     // log target. Stored as a String so we can hand it to ToolTracer
     // once everything else is parsed.
     let mut trace_tools_path: Option<String> = None;
+    let mut doctor_fix = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -265,6 +266,9 @@ async fn main() -> Result<()> {
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
             }
+            "--fix" => {
+                doctor_fix = true;
+            }
             "completions" => {
                 let Some(shell) = argv.get(i + 1).and_then(|a| a.to_str()) else {
                     eprintln!(
@@ -362,7 +366,7 @@ async fn main() -> Result<()> {
 
     match &primary {
         PrimaryCommand::Doctor => {
-            let ok = doctor::run(cli_flags.json).await;
+            let ok = doctor::run(cli_flags.json, doctor_fix).await;
             if !ok {
                 std::process::exit(2);
             }
@@ -833,6 +837,9 @@ fn print_help() {
          cubi plugins new <name>      Scaffold ~/.cubi/plugins/<name>/ with a\n  \
                                       manifest, handler stub, and README\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
+         cubi doctor --fix            Run checks and apply safe automated fixes\n  \
+                                      (create missing sessions dir, write a\n  \
+                                      stub config, install shell completions)\n  \
          cubi doctor --json           Same, machine-readable JSON output\n  \
          cubi --print-config          Print the resolved config as JSON and exit\n  \
          cubi completions <shell>     Print a completion script (bash, zsh, fish)\n  \
