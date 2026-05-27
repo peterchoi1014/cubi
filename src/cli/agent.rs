@@ -158,6 +158,13 @@ impl ChatCLI {
         use std::io::Write;
         use std::sync::atomic::Ordering;
 
+        // Auto-compact: when the prompt token estimate crosses
+        // `compact_threshold_pct` of the active model's context window,
+        // summarize older turns before sending. Best-effort; failures
+        // are logged but never abort the turn — we'd rather attempt the
+        // request than refuse silently.
+        self.maybe_auto_compact().await;
+
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
         let tools = self

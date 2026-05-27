@@ -77,6 +77,19 @@ pub struct AppConfig {
     /// present. `0` disables retries entirely. Default is 2.
     #[serde(default = "default_llm_max_retries")]
     pub llm_max_retries: u32,
+    /// Auto-fire `/compact` when the prompt token estimate crosses
+    /// `compact_threshold_pct` of the active model's context window.
+    /// Disable by setting to `false` if you want strict control over when
+    /// summarization runs.
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
+    /// Threshold (percent of the model's context window) at which an
+    /// auto-compaction fires before the next user turn. Clamped to
+    /// 50..=95 on load — values outside that band are clipped with a
+    /// `tracing::warn!` so the user notices, but the binary still
+    /// starts. Default: 80.
+    #[serde(default = "default_compact_threshold_pct")]
+    pub compact_threshold_pct: u8,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
     /// when a breaking change to this struct is introduced; older configs
     /// are migrated forward on load.
@@ -92,6 +105,44 @@ fn default_llm_max_retries() -> u32 {
     2
 }
 
+fn default_auto_compact() -> bool {
+    true
+}
+
+fn default_compact_threshold_pct() -> u8 {
+    80
+}
+
+/// Allowed inclusive range for `compact_threshold_pct`. Values outside
+/// the band are clamped on load.
+pub const COMPACT_THRESHOLD_MIN: u8 = 50;
+pub const COMPACT_THRESHOLD_MAX: u8 = 95;
+
+/// Clamps `compact_threshold_pct` into [COMPACT_THRESHOLD_MIN,
+/// COMPACT_THRESHOLD_MAX]. Logs a warning when a value is changed so
+/// users who hand-edit config.json see why their setting was ignored.
+pub fn clamp_compact_threshold(pct: u8) -> u8 {
+    if pct < COMPACT_THRESHOLD_MIN {
+        tracing::warn!(
+            target: "cubi::onboarding",
+            value = pct,
+            min = COMPACT_THRESHOLD_MIN,
+            "compact_threshold_pct below allowed range; clamping",
+        );
+        return COMPACT_THRESHOLD_MIN;
+    }
+    if pct > COMPACT_THRESHOLD_MAX {
+        tracing::warn!(
+            target: "cubi::onboarding",
+            value = pct,
+            max = COMPACT_THRESHOLD_MAX,
+            "compact_threshold_pct above allowed range; clamping",
+        );
+        return COMPACT_THRESHOLD_MAX;
+    }
+    pct
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -104,6 +155,8 @@ impl Default for AppConfig {
             telemetry: false,
             tool_timeout_secs: default_tool_timeout_secs(),
             llm_max_retries: default_llm_max_retries(),
+            auto_compact: default_auto_compact(),
+            compact_threshold_pct: default_compact_threshold_pct(),
             config_version: 0,
         }
     }
@@ -125,10 +178,12 @@ impl AppConfig {
         let Some(path) = Self::storage_path() else {
             return Self::default();
         };
-        match fs::read_to_string(&path) {
+        let mut cfg: Self = match fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        cfg.compact_threshold_pct = clamp_compact_threshold(cfg.compact_threshold_pct);
+        cfg
     }
 
     pub fn save(&self) -> Result<()> {
@@ -467,5 +522,24 @@ mod tests {
         ] {
             assert!(!is_known_non_tool_capable(m), "unexpected flag for {m}");
         }
+    }
+
+    #[test]
+    fn clamp_compact_threshold_inside_range_is_identity() {
+        assert_eq!(clamp_compact_threshold(50), 50);
+        assert_eq!(clamp_compact_threshold(80), 80);
+        assert_eq!(clamp_compact_threshold(95), 95);
+    }
+
+    #[test]
+    fn clamp_compact_threshold_below_min_is_clipped() {
+        assert_eq!(clamp_compact_threshold(0), COMPACT_THRESHOLD_MIN);
+        assert_eq!(clamp_compact_threshold(49), COMPACT_THRESHOLD_MIN);
+    }
+
+    #[test]
+    fn clamp_compact_threshold_above_max_is_clipped() {
+        assert_eq!(clamp_compact_threshold(96), COMPACT_THRESHOLD_MAX);
+        assert_eq!(clamp_compact_threshold(255), COMPACT_THRESHOLD_MAX);
     }
 }
