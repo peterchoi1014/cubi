@@ -998,6 +998,9 @@ impl ChatCLI {
             Cmd::Resume => {
                 self.resume_session(args);
             }
+            Cmd::Fork => {
+                self.fork_session(args);
+            }
             Cmd::Trust => {
                 self.handle_trust(args);
             }
@@ -2574,6 +2577,99 @@ impl ChatCLI {
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
+    }
+
+    /// `/fork` — branch the current session at the last completed
+    /// assistant turn, save it as a sibling on disk, and switch the
+    /// active REPL to the new fork. Aborts cleanly if no session store
+    /// is available, the history has no completed assistant turn yet,
+    /// or either the parent or child fails to save.
+    pub fn fork_session(&mut self, args: &str) {
+        if !args.trim().is_empty() {
+            eprintln!(
+                "{} /fork takes no arguments (named forks are not supported yet).",
+                "Error:".bright_red()
+            );
+            return;
+        }
+        let Some(store) = self.session_store.as_ref() else {
+            eprintln!(
+                "{} Sessions disabled: could not resolve home directory.",
+                "Error:".bright_red()
+            );
+            return;
+        };
+        let Some(cut_idx) = last_completed_assistant_index(&self.history) else {
+            eprintln!(
+                "{} No completed assistant turn to fork from. Chat first, then /fork.",
+                "Error:".bright_red()
+            );
+            return;
+        };
+        let new_history: Vec<Message> = self.history[..=cut_idx].to_vec();
+        let model = self.executor.get_model().to_string();
+
+        // Step 1: durably checkpoint the parent at its full current
+        // state so the user can /resume back to it. We deliberately do
+        // not truncate the parent — only the fork is the clean cut.
+        if self.current_session.is_none() {
+            self.current_session = Some(store.new_session(model.clone()));
+        }
+        let parent_id = match self.current_session.as_mut() {
+            Some(session) => {
+                session.model = model.clone();
+                session.history = self.history.clone();
+                session.pinned = self.pinned.clone();
+                if let Err(e) = store.save(session) {
+                    eprintln!(
+                        "{} Failed to checkpoint parent session: {}",
+                        "Error:".bright_red(),
+                        e
+                    );
+                    return;
+                }
+                session.id.clone()
+            }
+            None => {
+                eprintln!(
+                    "{} Could not initialize parent session; aborting fork.",
+                    "Error:".bright_red()
+                );
+                return;
+            }
+        };
+
+        // Step 2: write the fork. We materialize the new session
+        // independently of `new_session()` calls earlier so a
+        // collision-resistant fresh id is generated at fork time.
+        let mut child = store.new_session(model);
+        child.history = new_history.clone();
+        child.pinned = self.pinned.clone();
+        if let Err(e) = store.save(&child) {
+            eprintln!(
+                "{} Failed to write fork session: {}",
+                "Error:".bright_red(),
+                e
+            );
+            return;
+        }
+        let child_id = child.id.clone();
+        let kept = new_history.len();
+
+        // Step 3: switch the live REPL to the fork. Pinned items are
+        // unchanged; project memory is already injected.
+        self.history = new_history;
+        self.current_session = Some(child);
+
+        println!(
+            "{} Now on fork {} (kept {} message{}); parent is {}. /resume {} to return.",
+            "✓".bright_green(),
+            child_id.bright_cyan(),
+            kept,
+            if kept == 1 { "" } else { "s" },
+            parent_id.bright_cyan(),
+            parent_id
+        );
     }
 
     /// Writes the current history to the per-project session store.
@@ -5271,6 +5367,26 @@ pub(crate) fn compact_preview_plan(
     }
 }
 
+/// Finds the last *completed assistant turn* in `history`: the highest
+/// index of a message with `role == "assistant"` whose `tool_calls`
+/// list is empty or absent (i.e. no pending tool execution).
+///
+/// Used by `/fork` to truncate the conversation to a clean cut point
+/// before branching, so the fork never inherits a dangling user prompt,
+/// half-executed tool loop, or trailing single-turn system message.
+///
+/// Returns `Some(i)` where `i` is the inclusive last index of the
+/// completed-assistant message in the fork. Returns `None` if no
+/// completed assistant message exists in `history`.
+pub(crate) fn last_completed_assistant_index(history: &[crate::ollama::Message]) -> Option<usize> {
+    for (i, m) in history.iter().enumerate().rev() {
+        if m.role == "assistant" && m.tool_calls.as_ref().is_none_or(|t| t.is_empty()) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// `/history N` trim helper. Drops everything before the last `n` user
 /// turns (system messages — including `SYSTEM[pinned]:` — are always
 /// preserved). Pure: returns the rebuilt vector so it can be unit-
@@ -5585,6 +5701,65 @@ mod tests {
         }
         let plan = compact_preview_plan(&h, 6, 10_000);
         assert_eq!(plan.estimated_savings, 0);
+    }
+
+    // ---- /fork boundary helper ----
+
+    fn assistant_tool_call(content: &str) -> Message {
+        let mut m = Message::text("assistant", content);
+        m.tool_calls = Some(vec![crate::ollama::ToolCall {
+            id: None,
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: "stub".into(),
+                arguments: serde_json::json!({}),
+            },
+        }]);
+        m
+    }
+
+    #[test]
+    fn fork_boundary_finds_last_clean_assistant() {
+        let h = vec![
+            system("S"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+        ];
+        assert_eq!(last_completed_assistant_index(&h), Some(4));
+    }
+
+    #[test]
+    fn fork_boundary_skips_assistant_with_pending_tool_calls() {
+        let h = vec![
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant_tool_call("calling tool"),
+        ];
+        // The dangling tool-call assistant cannot be the fork point.
+        assert_eq!(last_completed_assistant_index(&h), Some(1));
+    }
+
+    #[test]
+    fn fork_boundary_truncates_trailing_user_prompt() {
+        // History ends with a user prompt that has no reply yet —
+        // fork should cut back to the last completed assistant turn.
+        let h = vec![user("u1"), assistant("a1"), user("u2")];
+        assert_eq!(last_completed_assistant_index(&h), Some(1));
+    }
+
+    #[test]
+    fn fork_boundary_none_when_no_assistant_yet() {
+        let h = vec![system("S"), user("u1")];
+        assert!(last_completed_assistant_index(&h).is_none());
+    }
+
+    #[test]
+    fn fork_boundary_none_when_only_tool_call_assistant() {
+        let h = vec![user("u1"), assistant_tool_call("call")];
+        assert!(last_completed_assistant_index(&h).is_none());
     }
 
     // ---- /help <command> lookup ----

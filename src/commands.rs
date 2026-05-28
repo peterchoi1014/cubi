@@ -136,6 +136,8 @@ pub enum Cmd {
     // -- Phase 9C: UX polish --
     Edit,
     Quit,
+    // -- Phase 12: session branching --
+    Fork,
 }
 
 /// One row in the slash-command registry.
@@ -288,6 +290,12 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/resume [id]",
         help: "Resume the latest (or named) auto-saved session",
         cmd: Cmd::Resume,
+    },
+    SlashCommandSpec {
+        name: "/fork",
+        usage: "/fork",
+        help: "Branch the current session at the last completed turn and continue in the fork",
+        cmd: Cmd::Fork,
     },
     SlashCommandSpec {
         name: "/trust",

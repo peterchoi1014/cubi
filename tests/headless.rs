@@ -187,6 +187,86 @@ fn delete_nonexistent_session_reports_not_found() {
 }
 
 #[test]
+fn diff_sessions_reports_divergence_in_json() {
+    let home = tempdir().unwrap();
+    let bucket = home.path().join(".cubi").join("sessions").join("bucket");
+    fs::create_dir_all(&bucket).unwrap();
+    fs::write(
+        bucket.join("20250101-000000-aaaa.json"),
+        r#"{
+  "id": "20250101-000000-aaaa",
+  "started_at": 1735689600,
+  "cwd": "/work/project",
+  "model": "qwen3:4b",
+  "history": [
+    {"role":"user","content":"hi"},
+    {"role":"assistant","content":"hello"}
+  ],
+  "pinned": []
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        bucket.join("20250101-000000-bbbb.json"),
+        r#"{
+  "id": "20250101-000000-bbbb",
+  "started_at": 1735689600,
+  "cwd": "/work/project",
+  "model": "qwen3:4b",
+  "history": [
+    {"role":"user","content":"hi"},
+    {"role":"assistant","content":"hello there"}
+  ],
+  "pinned": []
+}"#,
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .args([
+            "--diff-sessions",
+            "20250101-000000-aaaa",
+            "20250101-000000-bbbb",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["common_prefix_len"], 1);
+    assert_eq!(value["divergence"]["index"], 1);
+    assert_eq!(value["divergence"]["a_preview"], "hello");
+    assert_eq!(value["divergence"]["b_preview"], "hello there");
+    assert_eq!(value["model_drift"], false);
+}
+
+#[test]
+fn diff_sessions_missing_arity_reports_usage_error() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .args(["--diff-sessions", "abc"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--diff-sessions requires two session ids",
+        ));
+}
+
+#[test]
+fn diff_sessions_unknown_prefix_reports_not_found() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .args(["--diff-sessions", "ghost-a", "ghost-b"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("no session matches 'ghost-a'"));
+}
+
+#[test]
 fn bash_completions_emit_function() {
     let home = tempdir().unwrap();
 
