@@ -776,6 +776,27 @@ fn load_from_path(path: &Path) -> Result<SessionFile> {
     serde_json::from_str(&raw).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
+/// Loads a session by full id or unique prefix (searching across all
+/// cwd buckets, like `find_by_prefix`). Returns `NotFound` /
+/// `Ambiguous` on the corresponding lookup outcomes.
+pub fn load_by_prefix(prefix: &str) -> Result<LoadSessionResult> {
+    match SessionStore::find_by_prefix(prefix)? {
+        FindSessionResult::Found(meta) => {
+            let session = load_from_path(&meta.path)?;
+            Ok(LoadSessionResult::Found(Box::new(session), meta))
+        }
+        FindSessionResult::NotFound => Ok(LoadSessionResult::NotFound),
+        FindSessionResult::Ambiguous(c) => Ok(LoadSessionResult::Ambiguous(c)),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LoadSessionResult {
+    Found(Box<SessionFile>, SessionMeta),
+    NotFound,
+    Ambiguous(Vec<SessionMeta>),
+}
+
 fn modified_secs(path: &Path) -> Option<u64> {
     path.metadata()
         .ok()?

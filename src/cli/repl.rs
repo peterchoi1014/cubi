@@ -22,6 +22,7 @@ fn invalidate_completer_caches_if_mutating(rl: &Editor<SlashHelper, DefaultHisto
             | Cmd::ReloadPlugins
             | Cmd::Mcp
             | Cmd::McpReload
+            | Cmd::Fork
     );
     if !mutates {
         return;
