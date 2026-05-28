@@ -166,14 +166,18 @@ fn pinned_multiset_diff(a: &[String], b: &[String]) -> (Vec<String>, Vec<String>
     keys.dedup();
     for k in keys {
         let delta = cb.get(k).copied().unwrap_or(0) - ca.get(k).copied().unwrap_or(0);
-        if delta > 0 {
-            for _ in 0..delta {
-                added.push(k.to_string());
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                for _ in 0..delta {
+                    added.push(k.to_string());
+                }
             }
-        } else if delta < 0 {
-            for _ in 0..(-delta) {
-                removed.push(k.to_string());
+            std::cmp::Ordering::Less => {
+                for _ in 0..(-delta) {
+                    removed.push(k.to_string());
+                }
             }
+            std::cmp::Ordering::Equal => {}
         }
     }
     (added, removed)
