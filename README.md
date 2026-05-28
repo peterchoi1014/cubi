@@ -213,6 +213,10 @@ cubi --resume [<id>]         Resume a prior chat. With no id, prefer the latest
 cubi --list-sessions         List all saved sessions newest-first
 cubi --list-sessions --json  List all saved sessions as a JSON array
 cubi --delete-session <id>   Delete by full id or unique prefix
+cubi --diff-sessions <a> <b> [--json]
+                             Structured diff between two saved sessions:
+                             model drift, common-prefix length, first divergence,
+                             and pinned-item delta.
 cubi --prune-sessions --older-than <duration> [--dry-run]
                              Delete old sessions (duration: 30d, 2w, 6m, 1y)
 cubi plugins list [--json]   List discovered plugin bundles
@@ -375,6 +379,7 @@ groups below mirror that registry.
 | `/batch <f>` | Process a file of prompts (one per line) |
 | `/sessions` | List auto-saved sessions for this project |
 | `/resume [id]` | Resume the latest (or named) auto-saved session |
+| `/fork` | Branch the current session at the last completed assistant turn, save the parent, and switch to the fork. Inherits history (truncated to the cut point), pinned items, and model. Print the parent id so `/resume` can return. |
 
 #### Project memory & todos
 
