@@ -387,8 +387,8 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/compact",
-        usage: "/compact",
-        help: "Summarize old turns to reduce context length",
+        usage: "/compact [preview]",
+        help: "Summarize old turns (preview = dry-run, no mutation)",
         cmd: Cmd::Compact,
     },
     SlashCommandSpec {
@@ -873,6 +873,13 @@ fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     previous[b.chars().count()]
+}
+
+/// Look up a single slash command spec by exact name. Returns `None` for
+/// unknown commands; prefix matching is intentionally not applied here so
+/// `/help <name>` is unambiguous.
+pub fn find_command(name: &str) -> Option<&'static SlashCommandSpec> {
+    COMMANDS.iter().find(|s| s.name == name)
 }
 
 /// Parses an input line that starts with `/` into a `(Cmd, args)` pair.

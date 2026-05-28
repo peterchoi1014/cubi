@@ -390,6 +390,10 @@ async fn main() -> Result<()> {
             "--usage-footer" => {
                 cli_flags.usage_footer = true;
             }
+            "--quiet" => {
+                cli_flags.quiet = true;
+                cli_flags.no_banner = true;
+            }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
                 i += 1;
@@ -521,6 +525,27 @@ async fn main() -> Result<()> {
         .unwrap_or(false)
     {
         cli_flags.no_banner = true;
+    }
+    if !cli_flags.quiet
+        && std::env::var("CUBI_QUIET")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    {
+        cli_flags.quiet = true;
+        cli_flags.no_banner = true;
+    }
+    if cli_flags.quiet {
+        // Suppress the global "thinking…" / tool-call spinner via the
+        // existing env knob so we don't have to thread a flag through
+        // every spinner call site.
+        // SAFETY: this runs during early argv processing in `main`,
+        // before any task is spawned that reads CUBI_NO_SPINNER or
+        // otherwise concurrently touches the process environment.
+        // Tokio's runtime worker threads exist by this point (since
+        // we're inside `#[tokio::main]`), but they're idle until we
+        // hand them work below, so there are no concurrent env
+        // readers racing with this set_var.
+        unsafe { std::env::set_var("CUBI_NO_SPINNER", "1") };
     }
     if std::env::var("CUBI_EXPLAIN_TOOLS")
         .map(|v| !v.is_empty() && v != "0")
@@ -937,8 +962,12 @@ async fn main() -> Result<()> {
     );
 
     // Tip-of-the-day banner. Suppressed in non-TTY contexts so logs
-    // stay quiet under CI.
-    if !headless && !cli_flags.no_banner && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    // stay quiet under CI; also suppressed by --quiet.
+    if !headless
+        && !cli_flags.no_banner
+        && !cli_flags.quiet
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
         if let Some(tip) = tips::tip_of_the_day() {
             println!("{} {}", "💡 tip:".bright_yellow(), tip);
         }
@@ -1386,7 +1415,13 @@ fn print_help() {
                                         honors CUBI_EXPLAIN_TOOLS=1.\n  \
          --usage-footer                 Append a one-line usage footer\n  \
                                         after each REPL turn (also\n  \
-                                        togglable via /usage footer).\n\n\
+                                        togglable via /usage footer).\n  \
+         --quiet                        Suppress banner, tip-of-the-day,\n  \
+                                        spinner, stats/usage footers in one\n  \
+                                        switch. Implies --no-banner. Does not\n  \
+                                        affect assistant output, slash command\n  \
+                                        output, errors, --events or JSON\n  \
+                                        events. Also honors CUBI_QUIET=1.\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

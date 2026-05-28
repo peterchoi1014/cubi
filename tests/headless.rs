@@ -340,6 +340,16 @@ fn no_banner_flag_listed_in_help() {
 }
 
 #[test]
+fn quiet_flag_listed_in_help() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--quiet"));
+}
+
+#[test]
 fn headless_json_emits_budget_error_when_history_exceeds_window() {
     let home = tempdir().unwrap();
 
