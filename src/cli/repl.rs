@@ -6,19 +6,22 @@ pub(super) fn repl_history_path() -> Option<PathBuf> {
 
 /// Drops cached session / plugin / MCP suggestion lists when the user
 /// runs a slash command that could change them, so the next Tab press
-/// re-reads from disk.
+/// re-reads from disk. Matches on the canonical `Cmd` so prefix-typed
+/// commands (e.g. `/sav` → `/save`) still invalidate.
 fn invalidate_completer_caches_if_mutating(rl: &Editor<SlashHelper, DefaultHistory>, input: &str) {
-    let head = input.split_whitespace().next().unwrap_or("");
+    let Some((cmd, _)) = commands::parse(input) else {
+        return;
+    };
     let mutates = matches!(
-        head,
-        "/save"
-            | "/load"
-            | "/resume"
-            | "/sessions"
-            | "/plugin"
-            | "/reload-plugins"
-            | "/mcp"
-            | "/mcp-reload"
+        cmd,
+        Cmd::Save
+            | Cmd::Load
+            | Cmd::Resume
+            | Cmd::Sessions
+            | Cmd::Plugin
+            | Cmd::ReloadPlugins
+            | Cmd::Mcp
+            | Cmd::McpReload
     );
     if !mutates {
         return;

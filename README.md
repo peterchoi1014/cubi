@@ -326,8 +326,8 @@ A few quality-of-life affordances on top of the basic prompt:
   affect assistant output, slash command output, errors, `--events`, or
   JSON events. The full slash-command grid is still available via
   `/help`, and per-command details via `/help <cmd>`. Tab completion
-  also fills in arguments for `/save`, `/load`, `/resume`, `/plugin
-  list`, and the `/mcp-*` commands that take a server name.
+  also fills in arguments for `/save`, `/load`, `/resume`, `/plugin`,
+  and the `/mcp-*` commands that take a server name.
 * **Tool spinner.** While a tool call runs, a braille spinner with an
   elapsed-seconds readout paints on stderr after a 400 ms grace period.
   Suppressed automatically when stderr is not a TTY and via any of
