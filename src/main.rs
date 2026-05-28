@@ -538,7 +538,13 @@ async fn main() -> Result<()> {
         // Suppress the global "thinking…" / tool-call spinner via the
         // existing env knob so we don't have to thread a flag through
         // every spinner call site.
-        // SAFETY: argv parsing runs single-threaded before tokio starts.
+        // SAFETY: this runs during early argv processing in `main`,
+        // before any task is spawned that reads CUBI_NO_SPINNER or
+        // otherwise concurrently touches the process environment.
+        // Tokio's runtime worker threads exist by this point (since
+        // we're inside `#[tokio::main]`), but they're idle until we
+        // hand them work below, so there are no concurrent env
+        // readers racing with this set_var.
         unsafe { std::env::set_var("CUBI_NO_SPINNER", "1") };
     }
     if std::env::var("CUBI_EXPLAIN_TOOLS")

@@ -12,7 +12,7 @@
 //!   listed lazily from disk on the first tab press and cached for
 //!   subsequent presses within the same REPL session. Refreshable via
 //!   [`SlashHelper::invalidate_caches`] after a `/save` / `/load` /
-//!   `/sessions trim` / `/plugins reload` / `/mcp-reload` so the
+//!   `/sessions` / `/reload-plugins` / `/mcp-reload` so the
 //!   suggestions don't go stale.
 
 use crate::commands;
