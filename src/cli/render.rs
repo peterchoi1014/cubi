@@ -152,7 +152,6 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-#[cfg(test)]
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
         if color {
@@ -255,13 +254,14 @@ pub(crate) fn format_mcp_health_segment(ok: usize, failed: usize, not_loaded: us
 
 impl ChatCLI {
     pub(super) fn print_welcome(&self) {
-        // Concise one-line banner. We deliberately drop the multi-row
-        // mascot / command grid here — `/help` still shows the full
-        // command grid for users who want it. The single line keeps
-        // startup quiet for power users and lines up with how the rest
-        // of the CLI surfaces information.
+        // Show the mascot + command grid first so a fresh REPL is
+        // immediately self-describing, then drop the concise one-line
+        // status line that summarizes model / MCP / sessions state.
         let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
             && std::env::var("NO_COLOR").is_err();
+        for row in welcome_banner_rows(color) {
+            println!("{}", row);
+        }
         let model = self.executor.get_model();
         let provider = self.executor.provider_name();
         let sessions = self

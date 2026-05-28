@@ -392,6 +392,18 @@ impl ChatCLI {
                     }
                 } else if any_output && !json_enabled {
                     println!("\n");
+                } else if !any_output && !json_enabled && !headless_mode {
+                    // The model returned no content and no tool calls.
+                    // Without this, the REPL would silently re-prompt
+                    // and the user would have no idea their last turn
+                    // produced nothing. Surface a dim hint instead.
+                    println!(
+                        "{} {}",
+                        "AI:".bright_blue().bold(),
+                        "(no response — try rephrasing, switching model, or \
+                         running /usage to check the context budget)"
+                            .bright_black()
+                    );
                 }
                 break;
             }
