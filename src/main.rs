@@ -35,6 +35,7 @@ mod project_memory;
 mod schemas;
 mod script;
 mod sessions;
+mod sessions_diff;
 mod settings_sync;
 pub mod skills;
 mod spinner;
@@ -512,6 +513,34 @@ async fn main() -> Result<()> {
                 };
                 set_primary(&mut primary, PrimaryCommand::DeleteSession(id.to_string()));
             }
+            "--diff-sessions" => {
+                let Some(a) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: --diff-sessions requires two session ids or unique prefixes: --diff-sessions <a> <b>."
+                    );
+                    std::process::exit(2);
+                };
+                let Some(b) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: --diff-sessions requires two session ids or unique prefixes: --diff-sessions <a> <b>."
+                    );
+                    std::process::exit(2);
+                };
+                if a.starts_with('-') || b.starts_with('-') {
+                    eprintln!(
+                        "cubi: --diff-sessions arguments must be session ids or prefixes, not flags."
+                    );
+                    std::process::exit(2);
+                }
+                set_primary(
+                    &mut primary,
+                    PrimaryCommand::DiffSessions {
+                        a: a.to_string(),
+                        b: b.to_string(),
+                    },
+                );
+                i += 2;
+            }
             _ => {
                 eprintln!("cubi: unrecognized argument {arg:?}. Run `cubi --help` for usage.");
                 std::process::exit(2);
@@ -599,6 +628,10 @@ async fn main() -> Result<()> {
         }
         PrimaryCommand::DeleteSession(id) => {
             delete_session(id)?;
+            return Ok(());
+        }
+        PrimaryCommand::DiffSessions { a, b } => {
+            run_diff_sessions(a.as_str(), b.as_str(), cli_flags.json)?;
             return Ok(());
         }
         PrimaryCommand::PluginsList => {
@@ -1073,6 +1106,10 @@ enum PrimaryCommand {
     Resume(String),
     ListSessions,
     DeleteSession(String),
+    DiffSessions {
+        a: String,
+        b: String,
+    },
     PluginsList,
     PluginsListJson,
     PluginsReload,
@@ -1355,6 +1392,10 @@ fn print_help() {
          cubi --list-sessions         List saved sessions newest-first\n  \
          cubi --list-sessions --json  List saved sessions as a JSON array\n  \
          cubi --delete-session <id>   Delete by full id or unique prefix\n  \
+         cubi --diff-sessions <a> <b> [--json]\n  \
+                                     Structured diff between two saved sessions.\n  \
+                                     Reports model drift, common-prefix length,\n  \
+                                     first divergence, and pinned-item delta.\n  \
          cubi --prune-sessions --older-than <duration> [--dry-run]\n  \
                                      Delete old session files (30d, 2w, 6m, 1y)\n  \
          cubi exec <prompt words>     One-shot, JSON output, no banner, no stream\n  \
@@ -1497,6 +1538,74 @@ fn delete_session(id: &str) -> Result<()> {
                 eprintln!("  {}  {}", meta.id, meta.cwd);
             }
             std::process::exit(2);
+        }
+    }
+}
+
+fn run_diff_sessions(a: &str, b: &str, json: bool) -> Result<()> {
+    let session_a = resolve_session_for_diff(a)?;
+    let session_b = resolve_session_for_diff(b)?;
+    let diff = sessions_diff::diff(&session_a, &session_b);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+        return Ok(());
+    }
+    print_session_diff_pretty(&diff);
+    Ok(())
+}
+
+fn resolve_session_for_diff(prefix: &str) -> Result<sessions::SessionFile> {
+    match sessions::load_by_prefix(prefix)? {
+        sessions::LoadSessionResult::Found(session, _meta) => Ok(*session),
+        sessions::LoadSessionResult::NotFound => {
+            eprintln!("cubi: no session matches '{prefix}'.");
+            std::process::exit(2);
+        }
+        sessions::LoadSessionResult::Ambiguous(candidates) => {
+            eprintln!("cubi: session prefix '{prefix}' is ambiguous. Candidates:");
+            for meta in candidates {
+                eprintln!("  {}  {}", meta.id, meta.cwd);
+            }
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_session_diff_pretty(d: &sessions_diff::SessionDiff) {
+    println!("Session A: {}  (model: {})", d.id_a, d.model_a);
+    println!("Session B: {}  (model: {})", d.id_b, d.model_b);
+    if d.identical_id {
+        println!("(both prefixes resolve to the same session)");
+        return;
+    }
+    if d.model_drift {
+        println!("Model drift: {} → {}", d.model_a, d.model_b);
+    }
+    println!(
+        "Messages:  {} → {} (Δ {:+})",
+        d.count_a,
+        d.count_b,
+        (d.count_b as i64) - (d.count_a as i64)
+    );
+    println!("Common prefix: {} message(s)", d.common_prefix_len);
+    match &d.divergence {
+        Some(div) => {
+            println!("First divergence at index {}:", div.index);
+            println!("  A [{}] {}", div.a_role, div.a_preview);
+            println!("  B [{}] {}", div.b_role, div.b_preview);
+        }
+        None => println!("Histories are identical."),
+    }
+    if !d.pinned_added.is_empty() {
+        println!("Pinned items added in B:");
+        for s in &d.pinned_added {
+            println!("  + {s}");
+        }
+    }
+    if !d.pinned_removed.is_empty() {
+        println!("Pinned items missing from B:");
+        for s in &d.pinned_removed {
+            println!("  - {s}");
         }
     }
 }
