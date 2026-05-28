@@ -320,8 +320,14 @@ A few quality-of-life affordances on top of the basic prompt:
   or unchanged buffer cancels cleanly.
 * **One-line startup banner.** Shape:
   `cubi v{ver} • {model} ({provider}) • mcp {loaded}/{configured} • sessions {ok|ro|missing}`.
-  Suppress with `--no-banner` or `CUBI_NO_BANNER=1`. The full
-  slash-command grid is still available via `/help`.
+  Suppress with `--no-banner` or `CUBI_NO_BANNER=1`. For a fully quiet
+  shell — banner, tip, spinner, stats footer, usage footer all off in
+  one switch — pass `--quiet` or set `CUBI_QUIET=1`. `--quiet` does not
+  affect assistant output, slash command output, errors, `--events`, or
+  JSON events. The full slash-command grid is still available via
+  `/help`, and per-command details via `/help <cmd>`. Tab completion
+  also fills in arguments for `/save`, `/load`, `/resume`, `/plugin`,
+  and the `/mcp-*` commands that take a server name.
 * **Tool spinner.** While a tool call runs, a braille spinner with an
   elapsed-seconds readout paints on stderr after a 400 ms grace period.
   Suppressed automatically when stderr is not a TTY and via any of
@@ -343,7 +349,7 @@ groups below mirror that registry.
 
 | Command | Description |
 | --- | --- |
-| `/help` | Show all available commands |
+| `/help` | Show all available commands (use `/help <cmd>` for details) |
 | `/status` | Show session status (model, trust, plan mode, counts) |
 | `/version` | Show version |
 | `/edit` | Open `$EDITOR` to compose the next prompt |
@@ -357,7 +363,7 @@ groups below mirror that registry.
 | `/history` | Show conversation history |
 | `/clear` | Clear conversation history |
 | `/rewind [n]` | Remove the last `n` exchanges (default 1) |
-| `/compact` | Summarize old turns to reduce context length |
+| `/compact [preview]` | Summarize old turns to reduce context length. `preview` shows a non-mutating estimate of what compaction would change. |
 
 #### Conversation persistence
 

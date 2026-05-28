@@ -589,8 +589,8 @@ impl ChatCLI {
         }
 
         // Per-turn footer (opt-in via `/stats-footer on`). Skipped when the
-        // provider returned nothing useful.
-        if self.stats_footer_enabled && !turn_stats.is_empty() {
+        // provider returned nothing useful or when `--quiet` is set.
+        if self.stats_footer_enabled && !self.quiet_mode && !turn_stats.is_empty() {
             let window = crate::llm::context_window_for_model(self.executor.get_model());
             super::render::print_stats_footer(&turn_stats, window);
         }
@@ -600,10 +600,12 @@ impl ChatCLI {
         // Retain a copy of the per-turn stats so `/usage` and the optional
         // usage footer can render without re-querying the provider.
         self.usage_history.push(turn_stats.clone());
-        // Optional one-line usage footer (suppressed in headless/JSON).
+        // Optional one-line usage footer (suppressed in headless/JSON and
+        // when `--quiet` is set).
         if self.usage_footer_enabled
             && !self.headless_mode
             && !self.json_enabled
+            && !self.quiet_mode
             && !turn_stats.is_empty()
         {
             let pricing = crate::pricing::lookup(self.executor.get_model());
