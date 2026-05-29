@@ -257,8 +257,7 @@ impl ChatCLI {
         // Show the mascot + command grid first so a fresh REPL is
         // immediately self-describing, then drop the concise one-line
         // status line that summarizes model / MCP / sessions state.
-        let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
-            && std::env::var("NO_COLOR").is_err();
+        let color = crate::style::should_color();
         for row in welcome_banner_rows(color) {
             println!("{}", row);
         }
