@@ -400,8 +400,7 @@ impl ChatCLI {
                     println!(
                         "{} {}",
                         "AI:".bright_blue().bold(),
-                        "(no response — try rephrasing, switching model, or \
-                         running /usage to check the context budget)"
+                        "(no response — try rephrasing, switching model, or running /usage to check the context budget)"
                             .bright_black()
                     );
                 }
