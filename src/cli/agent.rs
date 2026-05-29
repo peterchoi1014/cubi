@@ -403,6 +403,15 @@ impl ChatCLI {
                         "(no response — try rephrasing, switching model, or running /usage to check the context budget)"
                             .bright_black()
                     );
+                } else if !any_output && !json_enabled && headless_mode {
+                    // Headless one-shot also produced nothing. Route a
+                    // short warning to stderr so a `cubi -p ... | tool`
+                    // pipeline keeps stdout empty (truthful: zero bytes
+                    // of model output) while still telling the user the
+                    // turn completed without a reply.
+                    eprintln!(
+                        "cubi: model returned no content; try rephrasing or switching model."
+                    );
                 }
                 break;
             }
