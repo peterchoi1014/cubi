@@ -152,20 +152,17 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// Compact 2D ASCII-art square used as Cubi's startup mascot.
-/// Four lines tall and only uses Unicode box-drawing characters that
-/// the rest of the CLI already emits.
-pub(super) fn mascot_rows(color: bool) -> Vec<String> {
-    let art = ["┌───────┐", "│ ◕   ◕ │", "│   ◡   │", "└───────┘"];
-    art.iter()
-        .map(|line| {
-            if color {
-                line.bright_cyan().to_string()
-            } else {
-                (*line).to_string()
-            }
-        })
-        .collect()
+/// Single-glyph Cubi mascot, inspired by Claude Code's `✻` greeting
+/// prefix. Uses U+25A3 (white square containing black small square)
+/// because it reads as a cube-in-cube, matching the "Cubi" name.
+pub(super) const MASCOT_GLYPH: &str = "▣";
+
+fn stylize_mascot(color: bool) -> String {
+    if color {
+        MASCOT_GLYPH.bright_cyan().to_string()
+    } else {
+        MASCOT_GLYPH.to_string()
+    }
 }
 
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
@@ -177,25 +174,22 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
         }
     };
 
-    let mut rows = vec![String::new()];
-    rows.extend(mascot_rows(color));
-    rows.extend([
+    let tagline = if color {
+        "a pocket-sized AI".bright_white().to_string()
+    } else {
+        "a pocket-sized AI".to_string()
+    };
+
+    let mut rows = vec![
         String::new(),
-        format!(
-            "hi, i'm Cubi — {}",
-            if color {
-                "a pocket-sized AI".bright_white().to_string()
-            } else {
-                "a pocket-sized AI".to_string()
-            }
-        ),
+        format!("{}  hi, i'm Cubi — {}", stylize_mascot(color), tagline),
         format!(
             "{} · {} to exit · Tab completes slash commands · Ctrl-R searches history",
             stylize("/help"),
             stylize("/quit")
         ),
         "Commands:".to_string(),
-    ]);
+    ];
 
     for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
         rows.push(
