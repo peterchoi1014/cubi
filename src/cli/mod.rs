@@ -5813,6 +5813,18 @@ mod tests {
         assert!(!banner.contains("Available Commands:"));
     }
 
+    #[test]
+    fn welcome_banner_rows_include_mascot_art() {
+        let banner = welcome_banner_rows(false).join("\n");
+        // Spot-check a couple of distinctive mascot lines so a future
+        // refactor that drops the art trips this test.
+        assert!(
+            banner.contains("┌─────┐"),
+            "welcome banner missing mascot top edge"
+        );
+        assert!(banner.contains("◕ ◕"), "welcome banner missing mascot face");
+    }
+
     // ---- parse_force_and_filename ----
 
     #[test]
