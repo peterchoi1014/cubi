@@ -5814,17 +5814,15 @@ mod tests {
     }
 
     #[test]
-    fn welcome_banner_rows_include_mascot_art() {
+    fn welcome_banner_rows_include_mascot_glyph() {
         let banner = welcome_banner_rows(false).join("\n");
-        // Spot-check a couple of distinctive mascot lines so a future
-        // refactor that drops the art trips this test.
         assert!(
-            banner.contains("┌───────┐"),
-            "welcome banner missing mascot top edge"
+            banner.contains(render::MASCOT_GLYPH),
+            "welcome banner missing mascot glyph"
         );
         assert!(
-            banner.contains("◕   ◕"),
-            "welcome banner missing mascot face"
+            banner.contains("hi, i'm Cubi"),
+            "welcome banner missing greeting"
         );
     }
 
