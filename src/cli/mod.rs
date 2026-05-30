@@ -5805,12 +5805,22 @@ mod tests {
     }
 
     #[test]
-    fn welcome_banner_rows_include_every_command_name() {
+    fn welcome_banner_rows_omit_command_grid() {
+        // The command grid was dropped from the welcome banner — users
+        // can fetch the full list via /help. Assert that neither the
+        // header nor a sampling of command names appears so a future
+        // regression that reintroduces the grid trips this test.
         let banner = welcome_banner_rows(false).join("\n");
-        for name in commands::command_names() {
-            assert!(banner.contains(name), "welcome banner missing {name}");
+        assert!(
+            !banner.contains("Commands:"),
+            "welcome banner should not include the Commands header"
+        );
+        for sample in ["/status", "/usage", "/sessions"] {
+            assert!(
+                !banner.contains(sample),
+                "welcome banner should not include command name {sample}"
+            );
         }
-        assert!(!banner.contains("Available Commands:"));
     }
 
     #[test]

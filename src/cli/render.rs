@@ -224,18 +224,7 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
             stylize("/help"),
             stylize("/quit")
         ),
-        "Commands:".to_string(),
     ]);
-
-    for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
-        rows.push(
-            chunk
-                .iter()
-                .map(|name| stylize(name))
-                .collect::<Vec<_>>()
-                .join("  "),
-        );
-    }
 
     rows
 }
