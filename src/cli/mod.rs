@@ -5819,10 +5819,13 @@ mod tests {
         // Spot-check a couple of distinctive mascot lines so a future
         // refactor that drops the art trips this test.
         assert!(
-            banner.contains("┌─────┐"),
+            banner.contains("┌───────┐"),
             "welcome banner missing mascot top edge"
         );
-        assert!(banner.contains("◕ ◕"), "welcome banner missing mascot face");
+        assert!(
+            banner.contains("◕   ◕"),
+            "welcome banner missing mascot face"
+        );
     }
 
     // ---- parse_force_and_filename ----

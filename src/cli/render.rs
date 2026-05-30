@@ -152,18 +152,11 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// Compact isometric ASCII-art cube used as Cubi's startup mascot.
-/// Six lines tall, fits in ~12 columns, and only uses Unicode box-drawing
-/// characters that the rest of the CLI already emits.
+/// Compact 2D ASCII-art square used as Cubi's startup mascot.
+/// Four lines tall and only uses Unicode box-drawing characters that
+/// the rest of the CLI already emits.
 pub(super) fn mascot_rows(color: bool) -> Vec<String> {
-    let art = [
-        "  ┌─────┐",
-        " ╱     ╱│",
-        "┌─────┐ │",
-        "│ ◕ ◕ │ │",
-        "│  ◡  │ ┘",
-        "└─────┘╱",
-    ];
+    let art = ["┌───────┐", "│ ◕   ◕ │", "│   ◡   │", "└───────┘"];
     art.iter()
         .map(|line| {
             if color {
