@@ -152,6 +152,29 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
+/// Compact isometric ASCII-art cube used as Cubi's startup mascot.
+/// Six lines tall, fits in ~12 columns, and only uses Unicode box-drawing
+/// characters that the rest of the CLI already emits.
+pub(super) fn mascot_rows(color: bool) -> Vec<String> {
+    let art = [
+        "  ┌─────┐",
+        " ╱     ╱│",
+        "┌─────┐ │",
+        "│ ◕ ◕ │ │",
+        "│  ◡  │ ┘",
+        "└─────┘╱",
+    ];
+    art.iter()
+        .map(|line| {
+            if color {
+                line.bright_cyan().to_string()
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect()
+}
+
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
         if color {
@@ -161,7 +184,9 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
         }
     };
 
-    let mut rows = vec![
+    let mut rows = vec![String::new()];
+    rows.extend(mascot_rows(color));
+    rows.extend([
         String::new(),
         format!(
             "hi, i'm Cubi — {}",
@@ -177,7 +202,7 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
             stylize("/quit")
         ),
         "Commands:".to_string(),
-    ];
+    ]);
 
     for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
         rows.push(
