@@ -5816,19 +5816,45 @@ mod tests {
     #[test]
     fn welcome_banner_rows_include_mascot_glyph() {
         let banner = welcome_banner_rows(false).join("\n");
-        // Spot-check two distinctive rows from the chibi mascot.
+        // Spot-check a few distinctive rows from the 11x8 idle sprite
+        // so a future refactor that drops the asset trips this test.
         assert!(
-            banner.contains("+--+"),
-            "welcome banner missing mascot border row"
+            banner.contains("  ███████  "),
+            "welcome banner missing mascot top row"
         );
         assert!(
-            banner.contains("|oo|"),
+            banner.contains("  █ ███ █  "),
             "welcome banner missing mascot eyes row"
+        );
+        assert!(
+            banner.contains("███████████"),
+            "welcome banner missing mascot arms row"
+        );
+        assert!(
+            banner.contains("  █     █  "),
+            "welcome banner missing mascot base anchor row"
         );
         assert!(
             banner.contains("hi, i'm Cubi"),
             "welcome banner missing greeting"
         );
+    }
+
+    #[test]
+    fn mascot_rows_are_exactly_eleven_cells_wide() {
+        // Lock in the strict 11x8 dimension contract: every row must
+        // be exactly 11 char-cells when rendered with single-cell
+        // glyphs (`█` / space). Swapping in emoji-presentation glyphs
+        // like ⬜ would double the width and silently break this.
+        let rows = render::mascot_rows(false);
+        assert_eq!(rows.len(), 8, "mascot must be exactly 8 rows tall");
+        for (i, row) in rows.iter().enumerate() {
+            let cells = row.chars().count();
+            assert_eq!(
+                cells, 11,
+                "mascot row {i} is {cells} cells wide, expected 11: {row:?}"
+            );
+        }
     }
 
     // ---- parse_force_and_filename ----
