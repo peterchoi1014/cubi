@@ -5813,6 +5813,24 @@ mod tests {
         assert!(!banner.contains("Available Commands:"));
     }
 
+    #[test]
+    fn welcome_banner_rows_include_mascot_glyph() {
+        let banner = welcome_banner_rows(false).join("\n");
+        // Spot-check two distinctive rows from the chibi mascot.
+        assert!(
+            banner.contains("+--+"),
+            "welcome banner missing mascot border row"
+        );
+        assert!(
+            banner.contains("|oo|"),
+            "welcome banner missing mascot eyes row"
+        );
+        assert!(
+            banner.contains("hi, i'm Cubi"),
+            "welcome banner missing greeting"
+        );
+    }
+
     // ---- parse_force_and_filename ----
 
     #[test]

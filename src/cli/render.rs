@@ -152,6 +152,23 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
+/// Compact 3×4 ASCII mascot for Cubi: an outlined square body with
+/// two `o` eyes. Pure ASCII so it renders identically across every
+/// terminal/font without relying on emoji presentation or wide
+/// Unicode glyphs.
+pub(super) fn mascot_rows(color: bool) -> Vec<String> {
+    let art = ["+--+", "|oo|", "+--+"];
+    art.iter()
+        .map(|line| {
+            if color {
+                line.bright_cyan().to_string()
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect()
+}
+
 pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
     let stylize = |name: &'static str| {
         if color {
@@ -161,23 +178,24 @@ pub(super) fn welcome_banner_rows(color: bool) -> Vec<String> {
         }
     };
 
-    let mut rows = vec![
+    let tagline = if color {
+        "a pocket-sized AI".bright_white().to_string()
+    } else {
+        "a pocket-sized AI".to_string()
+    };
+
+    let mut rows = vec![String::new()];
+    rows.extend(mascot_rows(color));
+    rows.extend([
         String::new(),
-        format!(
-            "hi, i'm Cubi — {}",
-            if color {
-                "a pocket-sized AI".bright_white().to_string()
-            } else {
-                "a pocket-sized AI".to_string()
-            }
-        ),
+        format!("hi, i'm Cubi — {}", tagline),
         format!(
             "{} · {} to exit · Tab completes slash commands · Ctrl-R searches history",
             stylize("/help"),
             stylize("/quit")
         ),
         "Commands:".to_string(),
-    ];
+    ]);
 
     for chunk in commands::command_names().collect::<Vec<_>>().chunks(5) {
         rows.push(
