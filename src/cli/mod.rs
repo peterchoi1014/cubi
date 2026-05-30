@@ -5818,12 +5818,16 @@ mod tests {
         let banner = welcome_banner_rows(false).join("\n");
         // Spot-check two distinctive rows from the chibi mascot.
         assert!(
-            banner.contains("▄▀▀▄"),
-            "welcome banner missing mascot top row"
+            banner.contains("⬜⬜⬜⬜"),
+            "welcome banner missing mascot border row"
         );
         assert!(
-            banner.contains("█◕◕█"),
-            "welcome banner missing mascot face row"
+            banner.contains("⬜⚪⚪⬜"),
+            "welcome banner missing mascot eyes row"
+        );
+        assert!(
+            banner.contains("⬜⬛⬛⬜"),
+            "welcome banner missing mascot lip row"
         );
         assert!(
             banner.contains("hi, i'm Cubi"),

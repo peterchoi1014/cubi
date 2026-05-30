@@ -152,12 +152,12 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// Compact pixel-art chibi mascot for Cubi. Four rows of half-block /
-/// quarter-block glyphs that read as a small cube-shaped character
-/// with a face. Inspired by Claude Code's single-glyph welcome, but
-/// expanded into a tiny sprite so a fresh REPL has more personality.
+/// Compact 4×4 emoji-block mascot for Cubi: a white square body with
+/// dot eyes and a flat lip. Inspired by Claude Code's single-glyph
+/// welcome, scaled up just enough to feel like a tiny character
+/// sprite while keeping a clean square silhouette.
 pub(super) fn mascot_rows(color: bool) -> Vec<String> {
-    let art = ["▄▀▀▄", "█◕◕█", "█ ◡█", "▀▄▄▀"];
+    let art = ["⬜⬜⬜⬜", "⬜⚪⚪⬜", "⬜⬛⬛⬜", "⬜⬜⬜⬜"];
     art.iter()
         .map(|line| {
             if color {
