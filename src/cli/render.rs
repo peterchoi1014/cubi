@@ -152,12 +152,12 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// Compact 3×4 emoji-block mascot for Cubi: a white square body with
-/// two dot eyes. Inspired by Claude Code's single-glyph welcome,
-/// scaled up just enough to feel like a tiny character sprite while
-/// keeping the silhouette square and unobtrusive.
+/// Compact 3×4 ASCII mascot for Cubi: an outlined square body with
+/// two `o` eyes. Pure ASCII so it renders identically across every
+/// terminal/font without relying on emoji presentation or wide
+/// Unicode glyphs.
 pub(super) fn mascot_rows(color: bool) -> Vec<String> {
-    let art = ["⬜⬜⬜⬜", "⬜⚪⚪⬜", "⬜⬜⬜⬜"];
+    let art = ["+--+", "|oo|", "+--+"];
     art.iter()
         .map(|line| {
             if color {
