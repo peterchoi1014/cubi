@@ -152,29 +152,27 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// The 11×8 "Clawd"-style idle sprite pixel matrix.
+/// The 11×5 "Clawd"-style idle sprite pixel matrix (head + body only,
+/// no legs).
 ///
 /// Each cell is rendered as either a filled pixel (`█`, U+2588) or a
 /// plain space, producing rows that occupy exactly 11 terminal cells.
 /// Full-block + space is used instead of `⬜`/`⬛` because those are
 /// emoji-presentation glyphs that render at double width on most
 /// terminals, which would silently stretch the sprite to 22 cells and
-/// break the strict 11×8 dimension contract.
+/// break the strict 11-cell-wide dimension contract.
 ///
 /// Future states (`thinking`, `low_context`) will swap individual rows
 /// of this matrix; the renderer in [`mascot_rows`] stays the same.
-pub(super) const MASCOT_IDLE: [[u8; 11]; 8] = [
+pub(super) const MASCOT_IDLE: [[u8; 11]; 5] = [
     [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0], // top of head
     [0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0], // eyes row
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // main head & arms
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // lower head & arms
     [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0], // lower body
-    [0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0], // upper legs gap
-    [0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0], // mid legs gap
-    [0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0], // outer legs base anchor
 ];
 
-fn render_mascot_matrix(matrix: &[[u8; 11]; 8]) -> Vec<String> {
+fn render_mascot_matrix(matrix: &[[u8; 11]]) -> Vec<String> {
     matrix
         .iter()
         .map(|row| {
