@@ -65,3 +65,31 @@ assert_cmd = "2.2.2"
 insta = "1.47.2"
 predicates = "3.1.4"
 
+# Tuned release profile. Defaults to `opt-level = 3` already, but
+# enabling thin LTO + a single codegen unit lets the linker inline
+# across crate boundaries (reqwest, tokio, hyper, serde) which is the
+# biggest single binary-size and steady-state CPU win for a CLI like
+# this. `strip = "symbols"` drops debug/symbol tables from the shipped
+# binary — we still publish source-mapped debug builds via `cargo build`,
+# and a panic backtrace will print symbolicated frames from the
+# in-process debug info reqwest/tokio carry until link time.
+#
+# `panic = "abort"` is intentionally NOT set: the REPL and several
+# tests rely on unwinding (e.g. `std::panic::catch_unwind` in the test
+# harness, and clean cleanup of in-flight tokio tasks on a panic).
+#
+# Incremental compilation is left at its default (off for release)
+# because LTO already invalidates it on every change.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Keep dev builds fast: no LTO, parallel codegen, debuginfo on.
+# Stated explicitly so future profile changes don't accidentally
+# slow down `cargo build` / `cargo test`.
+[profile.dev]
+opt-level = 0
+debug = true
+codegen-units = 256
+
