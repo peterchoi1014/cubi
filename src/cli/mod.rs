@@ -5805,12 +5805,74 @@ mod tests {
     }
 
     #[test]
-    fn welcome_banner_rows_include_every_command_name() {
+    fn welcome_banner_rows_omit_command_grid() {
+        // The command grid was dropped from the welcome banner — users
+        // can fetch the full list via /help. Assert that neither the
+        // header nor a sampling of command names appears so a future
+        // regression that reintroduces the grid trips this test.
         let banner = welcome_banner_rows(false).join("\n");
-        for name in commands::command_names() {
-            assert!(banner.contains(name), "welcome banner missing {name}");
+        assert!(
+            !banner.contains("Commands:"),
+            "welcome banner should not include the Commands header"
+        );
+        for sample in ["/status", "/usage", "/sessions"] {
+            assert!(
+                !banner.contains(sample),
+                "welcome banner should not include command name {sample}"
+            );
         }
-        assert!(!banner.contains("Available Commands:"));
+    }
+
+    #[test]
+    fn welcome_banner_rows_include_mascot_glyph() {
+        let banner = welcome_banner_rows(false).join("\n");
+        // Spot-check a few distinctive rows from the 11x5 idle sprite
+        // so a future refactor that drops the asset trips this test.
+        assert!(
+            banner.contains("  ███████  "),
+            "welcome banner missing mascot top row"
+        );
+        assert!(
+            banner.contains("  █ ███ █  "),
+            "welcome banner missing mascot eyes row"
+        );
+        assert!(
+            banner.contains("███████████"),
+            "welcome banner missing mascot arms row"
+        );
+        assert!(
+            banner.contains("hi, i'm Cubi"),
+            "welcome banner missing greeting"
+        );
+    }
+
+    #[test]
+    fn mascot_rows_are_exactly_eleven_cells_wide() {
+        // Lock in the 11-cell-wide dimension contract. `chars().count()`
+        // only measures the number of Unicode scalar values, not the
+        // terminal display width, so a 1-codepoint emoji like `⬜` that
+        // renders at 2 cells would still count as 1 and pass a naive
+        // length check. To actually enforce single-cell rendering, also
+        // assert that every char on every row is one of the two known
+        // single-cell glyphs we render with (`█` or space). That way a
+        // future swap to a wide glyph fails fast on the allowlist
+        // check, not just the count check.
+        let rows = render::mascot_rows(false);
+        assert_eq!(rows.len(), 5, "mascot must be exactly 5 rows tall");
+        for (i, row) in rows.iter().enumerate() {
+            let cells = row.chars().count();
+            assert_eq!(
+                cells, 11,
+                "mascot row {i} is {cells} chars wide, expected 11: {row:?}"
+            );
+            for (j, ch) in row.chars().enumerate() {
+                assert!(
+                    ch == '█' || ch == ' ',
+                    "mascot row {i} col {j} has unexpected char {ch:?}; \
+                     only `█` and space are single-cell-safe"
+                );
+            }
+        }
     }
 
     // ---- parse_force_and_filename ----
