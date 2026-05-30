@@ -5816,9 +5816,14 @@ mod tests {
     #[test]
     fn welcome_banner_rows_include_mascot_glyph() {
         let banner = welcome_banner_rows(false).join("\n");
+        // Spot-check two distinctive rows from the chibi mascot.
         assert!(
-            banner.contains(render::MASCOT_GLYPH),
-            "welcome banner missing mascot glyph"
+            banner.contains("▄▀▀▄"),
+            "welcome banner missing mascot top row"
+        );
+        assert!(
+            banner.contains("█◕◕█"),
+            "welcome banner missing mascot face row"
         );
         assert!(
             banner.contains("hi, i'm Cubi"),
