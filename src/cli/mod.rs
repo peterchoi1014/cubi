@@ -5848,18 +5848,30 @@ mod tests {
 
     #[test]
     fn mascot_rows_are_exactly_eleven_cells_wide() {
-        // Lock in the 11-cell-wide dimension contract: every row must
-        // be exactly 11 char-cells when rendered with single-cell
-        // glyphs (`█` / space). Swapping in emoji-presentation glyphs
-        // like ⬜ would double the width and silently break this.
+        // Lock in the 11-cell-wide dimension contract. `chars().count()`
+        // only measures the number of Unicode scalar values, not the
+        // terminal display width, so a 1-codepoint emoji like `⬜` that
+        // renders at 2 cells would still count as 1 and pass a naive
+        // length check. To actually enforce single-cell rendering, also
+        // assert that every char on every row is one of the two known
+        // single-cell glyphs we render with (`█` or space). That way a
+        // future swap to a wide glyph fails fast on the allowlist
+        // check, not just the count check.
         let rows = render::mascot_rows(false);
         assert_eq!(rows.len(), 5, "mascot must be exactly 5 rows tall");
         for (i, row) in rows.iter().enumerate() {
             let cells = row.chars().count();
             assert_eq!(
                 cells, 11,
-                "mascot row {i} is {cells} cells wide, expected 11: {row:?}"
+                "mascot row {i} is {cells} chars wide, expected 11: {row:?}"
             );
+            for (j, ch) in row.chars().enumerate() {
+                assert!(
+                    ch == '█' || ch == ' ',
+                    "mascot row {i} col {j} has unexpected char {ch:?}; \
+                     only `█` and space are single-cell-safe"
+                );
+            }
         }
     }
 
