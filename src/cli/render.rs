@@ -152,12 +152,12 @@ fn render_inline_links(line: &str, color: bool) -> String {
     out
 }
 
-/// Compact 4×4 emoji-block mascot for Cubi: a white square body with
-/// dot eyes and a flat lip. Inspired by Claude Code's single-glyph
-/// welcome, scaled up just enough to feel like a tiny character
-/// sprite while keeping a clean square silhouette.
+/// Compact 3×4 emoji-block mascot for Cubi: a white square body with
+/// two dot eyes. Inspired by Claude Code's single-glyph welcome,
+/// scaled up just enough to feel like a tiny character sprite while
+/// keeping the silhouette square and unobtrusive.
 pub(super) fn mascot_rows(color: bool) -> Vec<String> {
-    let art = ["⬜⬜⬜⬜", "⬜⚪⚪⬜", "⬜⬛⬛⬜", "⬜⬜⬜⬜"];
+    let art = ["⬜⬜⬜⬜", "⬜⚪⚪⬜", "⬜⬜⬜⬜"];
     art.iter()
         .map(|line| {
             if color {

@@ -5826,10 +5826,6 @@ mod tests {
             "welcome banner missing mascot eyes row"
         );
         assert!(
-            banner.contains("⬜⬛⬛⬜"),
-            "welcome banner missing mascot lip row"
-        );
-        assert!(
             banner.contains("hi, i'm Cubi"),
             "welcome banner missing greeting"
         );
