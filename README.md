@@ -704,7 +704,6 @@ cubi/
 │   ├── git_cmds.rs        # Shell-out helpers for the git slash commands
 │   ├── onboarding.rs      # First-run setup
 ├── Cargo.toml             # Dependencies
-├── ROADMAP.md             # Architectural roadmap & shipped/open items
 └── README.md              # This file
 ```
 
@@ -912,11 +911,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
-See [`ROADMAP.md`](ROADMAP.md) for the full plan (built-in tools, slash
-commands, subsystems, and implementation priorities derived from an
-architectural review of similar tools).
-
-Highlights still to come (see [`ROADMAP.md`](ROADMAP.md) for the full list):
+Highlights still to come:
 
 - [ ] RAG (Retrieval Augmented Generation) support
 - [ ] Multi-modal support (images, audio)
