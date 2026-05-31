@@ -1,7 +1,17 @@
+use crate::thinking_filter::{ThinkStripper, strip_thinking_blocks};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
+
+/// Strip `<think>...</think>` blocks from an assistant message's
+/// content before handing it back to the host. Some Ollama versions
+/// expose a separate `thinking` field that already strips these
+/// server-side; in that case the call is a no-op.
+fn strip_message_thinking(mut m: Message) -> Message {
+    m.content = strip_thinking_blocks(&m.content);
+    m
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
@@ -45,6 +55,14 @@ pub struct Message {
     /// pass it for tool messages and omit it everywhere else.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_name: Option<String>,
+    /// Echoes the `id` of the assistant `ToolCall` this message is the
+    /// result of. OpenAI-compatible servers (strict ones especially)
+    /// require `tool_call_id` on every `role:"tool"` message and reject
+    /// anything that doesn't match a prior call's id. Optional because
+    /// the Ollama path correlates on `tool_name` and may not have an id
+    /// at all.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -56,17 +74,26 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
         }
     }
 
     /// Constructor for a tool-result message produced by the host after
-    /// executing a model-requested tool call.
-    pub fn tool_result(tool_name: impl Into<String>, content: impl Into<String>) -> Self {
+    /// executing a model-requested tool call. Pass `tool_call_id` when
+    /// the assistant's `ToolCall` carried an `id` (OpenAI-compatible
+    /// backends require this for correlation); pass `None` only when the
+    /// backend didn't supply one (older Ollama responses).
+    pub fn tool_result(
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+        tool_call_id: Option<String>,
+    ) -> Self {
         Self {
             role: "tool".to_string(),
             content: content.into(),
             tool_calls: None,
             tool_name: Some(tool_name.into()),
+            tool_call_id,
         }
     }
 }
@@ -265,7 +292,7 @@ impl OllamaClient {
                         .unwrap_or(0),
                 };
 
-                Ok((chat_response.message, stats))
+                Ok((strip_message_thinking(chat_response.message), stats))
             }
         })
         .await
@@ -326,13 +353,18 @@ impl OllamaClient {
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
         let mut stats = ChatStats::default();
+        // Strips Qwen3-style <think>…</think> reasoning blocks from
+        // both the tokens we forward to the UI and the accumulated
+        // content we record in history.
+        let mut stripper = ThinkStripper::new();
 
         // Local closure so the trailing-buffer case after the read loop can
         // reuse the same parse-and-dispatch logic without duplication.
         let mut handle_line = |line: &str,
                                content: &mut String,
                                final_msg: &mut Option<Message>,
-                               stats: &mut ChatStats| {
+                               stats: &mut ChatStats,
+                               stripper: &mut ThinkStripper| {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 return;
@@ -342,14 +374,22 @@ impl OllamaClient {
                 Err(_) => return, // tolerate a malformed mid-stream line
             };
             if !parsed.message.content.is_empty() {
-                on_token(&parsed.message.content);
-                content.push_str(&parsed.message.content);
+                let clean = stripper.feed(&parsed.message.content);
+                if !clean.is_empty() {
+                    on_token(&clean);
+                    content.push_str(&clean);
+                }
             }
             if parsed.done {
                 // Capture provider stats from the terminal chunk.
                 stats.prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
                 stats.completion_tokens = parsed.eval_count.unwrap_or(0);
                 stats.elapsed_ms = parsed.total_duration.map(|ns| ns / 1_000_000).unwrap_or(0);
+                let tail = stripper.flush();
+                if !tail.is_empty() {
+                    on_token(&tail);
+                    content.push_str(&tail);
+                }
                 let mut m = parsed.message;
                 // Replace fragmentary content with the accumulated text so
                 // callers don't have to reconstruct it.
@@ -364,7 +404,13 @@ impl OllamaClient {
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].to_string();
                 buf.drain(..=nl);
-                handle_line(&line, &mut content, &mut final_msg, &mut stats);
+                handle_line(
+                    &line,
+                    &mut content,
+                    &mut final_msg,
+                    &mut stats,
+                    &mut stripper,
+                );
             }
         }
 
@@ -374,7 +420,13 @@ impl OllamaClient {
         // done chunk". Flush whatever's left.
         if !buf.trim().is_empty() {
             let remaining = std::mem::take(&mut buf);
-            handle_line(&remaining, &mut content, &mut final_msg, &mut stats);
+            handle_line(
+                &remaining,
+                &mut content,
+                &mut final_msg,
+                &mut stats,
+                &mut stripper,
+            );
         }
 
         let msg = final_msg
@@ -427,11 +479,24 @@ mod tests {
 
     #[test]
     fn message_tool_result_serializes_with_role_and_name() {
-        let m = Message::tool_result("bash", "ok");
+        let m = Message::tool_result("bash", "ok", None);
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""role":"tool""#), "got: {s}");
         assert!(s.contains(r#""tool_name":"bash""#), "got: {s}");
         assert!(s.contains(r#""content":"ok""#), "got: {s}");
+        // No id supplied → don't emit `tool_call_id` at all (the field is
+        // serde-skip'd when None).
+        assert!(!s.contains("tool_call_id"), "got: {s}");
+    }
+
+    #[test]
+    fn message_tool_result_round_trips_tool_call_id_when_present() {
+        let m = Message::tool_result("bash", "ok", Some("call_abc123".into()));
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""tool_call_id":"call_abc123""#), "got: {s}");
+        let back: Message = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tool_call_id.as_deref(), Some("call_abc123"));
+        assert_eq!(back.tool_name.as_deref(), Some("bash"));
     }
 
     #[test]
