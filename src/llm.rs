@@ -234,6 +234,23 @@ struct OaiToolFunctionSpec {
     parameters: serde_json::Value,
 }
 
+/// Serialized tool call inside an assistant request message. Mirrors
+/// OpenAI's wire format: `arguments` must be a JSON-encoded string,
+/// not a raw object.
+#[derive(Debug, Serialize)]
+struct OaiRequestToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: OaiRequestToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OaiRequestToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
 /// Serialized message for the OpenAI request.
 #[derive(Debug, Serialize)]
 struct OaiRequestMessage {
@@ -243,6 +260,11 @@ struct OaiRequestMessage {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Assistant-only. Must be present (and match the ids on subsequent
+    /// `role:"tool"` messages) for strict OpenAI-compatible validators
+    /// to accept the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OaiRequestToolCall>>,
 }
 
 impl OpenAiClient {
@@ -279,23 +301,63 @@ impl OpenAiClient {
     fn convert_messages(messages: &[Message]) -> Vec<OaiRequestMessage> {
         messages
             .iter()
-            .map(|m| OaiRequestMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-                // `name` is only relevant for tool-result messages.
-                name: if m.role == "tool" {
-                    m.tool_name.clone()
+            .map(|m| {
+                // Round-trip assistant tool_calls so the server can
+                // validate subsequent role:"tool" messages against the
+                // ids the model emitted. Chat completions is stateless
+                // — these must be on every request, not just the first.
+                let tool_calls = if m.role == "assistant" {
+                    m.tool_calls.as_ref().map(|calls| {
+                        calls
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| OaiRequestToolCall {
+                                // Synthesize a stable id when the source
+                                // backend (e.g. Ollama) didn't supply
+                                // one, so the matching tool-result
+                                // message has *something* consistent to
+                                // point at.
+                                id: c
+                                    .id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("call_{}_{}", i, c.function.name)),
+                                call_type: c
+                                    .call_type
+                                    .clone()
+                                    .unwrap_or_else(|| "function".to_string()),
+                                function: OaiRequestToolCallFunction {
+                                    name: c.function.name.clone(),
+                                    arguments: c.function.arguments.to_string(),
+                                },
+                            })
+                            .collect()
+                    })
                 } else {
                     None
-                },
-                // `tool_call_id` must only be set on role:"tool" messages and
-                // should match the tool call's id. We use tool_name as a
-                // fallback identifier when the full call id isn't available.
-                tool_call_id: if m.role == "tool" {
-                    m.tool_name.clone()
-                } else {
-                    None
-                },
+                };
+                OaiRequestMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    // `name` is only relevant for tool-result messages.
+                    name: if m.role == "tool" {
+                        m.tool_name.clone()
+                    } else {
+                        None
+                    },
+                    // `tool_call_id` must only be set on role:"tool" messages and
+                    // should match the id of the assistant ToolCall this is the
+                    // result of. Prefer the id we recorded when constructing the
+                    // tool-result message (set from `ToolCall::id`); fall back to
+                    // `tool_name` only when the assistant turn didn't carry an id
+                    // (older Ollama responses). Strict OpenAI validators reject
+                    // the fallback, but it's the best we can do in that case.
+                    tool_call_id: if m.role == "tool" {
+                        m.tool_call_id.clone().or_else(|| m.tool_name.clone())
+                    } else {
+                        None
+                    },
+                    tool_calls,
+                }
             })
             .collect()
     }
@@ -315,7 +377,8 @@ impl OpenAiClient {
     }
 
     fn oai_message_to_message(oai: OaiMessage) -> Message {
-        let content = oai.content.unwrap_or_default();
+        let content =
+            crate::thinking_filter::strip_thinking_blocks(&oai.content.unwrap_or_default());
         let tool_calls = oai.tool_calls.map(|calls| {
             calls
                 .into_iter()
@@ -335,6 +398,7 @@ impl OpenAiClient {
             content,
             tool_calls,
             tool_name: None,
+            tool_call_id: None,
         }
     }
 }
@@ -589,6 +653,9 @@ impl OpenAiClient {
         let mut content = String::new();
         let mut tool_calls_builder: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
         let mut usage: Option<OaiUsage> = None;
+        // Strips Qwen3-style <think>…</think> reasoning blocks from
+        // streamed tokens before forwarding to the UI and recording.
+        let mut stripper = crate::thinking_filter::ThinkStripper::new();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
@@ -611,8 +678,11 @@ impl OpenAiClient {
                 for choice in chunk.choices {
                     if let Some(text) = &choice.delta.content {
                         if !text.is_empty() {
-                            on_token(text);
-                            content.push_str(text);
+                            let clean = stripper.feed(text);
+                            if !clean.is_empty() {
+                                on_token(&clean);
+                                content.push_str(&clean);
+                            }
                         }
                     }
                     if let Some(tcs) = &choice.delta.tool_calls {
@@ -640,6 +710,11 @@ impl OpenAiClient {
                     }
                 }
             }
+        }
+        let tail = stripper.flush();
+        if !tail.is_empty() {
+            on_token(&tail);
+            content.push_str(&tail);
         }
 
         let tool_calls = if tool_calls_builder.is_empty() {
@@ -673,6 +748,7 @@ impl OpenAiClient {
                 content,
                 tool_calls,
                 tool_name: None,
+                tool_call_id: None,
             },
             stats,
         ))
@@ -719,6 +795,7 @@ fn fake_message(messages: &[Message]) -> Message {
                     content: String::new(),
                     tool_calls: Some(vec![call]),
                     tool_name: None,
+                    tool_call_id: None,
                 };
             }
         }
@@ -1081,5 +1158,106 @@ mod tests {
         // If the env doesn't have CUBI_PROVIDER=openai, we get ollama.
         // If it does (unlikely in test), we'd get openai — both are valid.
         assert!(provider.provider_name() == "ollama" || provider.provider_name() == "openai");
+    }
+
+    #[test]
+    fn openai_convert_messages_uses_tool_call_id_when_present() {
+        // Strict OpenAI validators require tool_call_id on role:"tool"
+        // messages to match the id the assistant supplied. Prove the
+        // converter sends the real id, not the (incorrect) tool_name
+        // fallback.
+        let msg = Message::tool_result("bash", "ok", Some("call_xyz".into()));
+        let converted = OpenAiClient::convert_messages(&[msg]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
+        assert_eq!(converted[0].name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn openai_convert_messages_falls_back_to_tool_name_when_no_id() {
+        // Older Ollama responses don't carry an id. The converter must
+        // still emit *some* tool_call_id so the request body validates,
+        // even though strict servers will reject the fallback.
+        let msg = Message::tool_result("bash", "ok", None);
+        let converted = OpenAiClient::convert_messages(&[msg]);
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn openai_convert_messages_never_sets_tool_call_id_on_non_tool_roles() {
+        for role in ["user", "assistant", "system"] {
+            let msg = Message::text(role, "hi");
+            let converted = OpenAiClient::convert_messages(&[msg]);
+            assert!(converted[0].tool_call_id.is_none(), "role {role}");
+            assert!(converted[0].name.is_none(), "role {role}");
+        }
+    }
+
+    #[test]
+    fn openai_convert_messages_round_trips_assistant_tool_calls() {
+        // Chat completions is stateless: every request must serialize
+        // the assistant's prior tool_calls so the server can validate
+        // subsequent role:"tool" messages against the ids it produced.
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_real_id".to_string()),
+                call_type: Some("function".to_string()),
+                function: ToolCallFunction {
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                },
+            }]),
+            tool_name: None,
+            tool_call_id: None,
+        };
+        let tool_result = Message::tool_result("bash", "ok", Some("call_real_id".into()));
+        let converted = OpenAiClient::convert_messages(&[assistant, tool_result]);
+
+        assert_eq!(converted.len(), 2);
+        let asst = &converted[0];
+        assert_eq!(asst.role, "assistant");
+        let tcs = asst
+            .tool_calls
+            .as_ref()
+            .expect("assistant tool_calls present");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].id, "call_real_id");
+        assert_eq!(tcs[0].call_type, "function");
+        assert_eq!(tcs[0].function.name, "bash");
+        // OpenAI requires `arguments` as a JSON-encoded string, not an object.
+        assert_eq!(tcs[0].function.arguments, r#"{"cmd":"ls"}"#);
+
+        let tool = &converted[1];
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_real_id"));
+        assert!(tool.tool_calls.is_none());
+    }
+
+    #[test]
+    fn openai_convert_messages_synthesizes_id_for_assistant_tool_calls_without_id() {
+        // Older Ollama-style assistant turns may not carry tool_call ids.
+        // The converter must still emit *some* stable id so subsequent
+        // tool-result messages have something to match against.
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: None,
+                call_type: None,
+                function: ToolCallFunction {
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            }]),
+            tool_name: None,
+            tool_call_id: None,
+        };
+        let converted = OpenAiClient::convert_messages(&[assistant]);
+        let tcs = converted[0].tool_calls.as_ref().unwrap();
+        assert!(!tcs[0].id.is_empty(), "must synthesize a non-empty id");
+        assert_eq!(tcs[0].call_type, "function");
     }
 }

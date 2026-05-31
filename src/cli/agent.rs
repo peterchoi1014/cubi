@@ -342,6 +342,19 @@ impl ChatCLI {
                 any_output = true;
             }
 
+            // Some backends (older Ollama) don't supply an `id` on each
+            // tool_call. Synthesize a stable, position-based id so the
+            // assistant message and its tool-result messages reference
+            // the same id — strict OpenAI-compatible validators require
+            // this.
+            let mut msg = msg;
+            if let Some(tcs) = msg.tool_calls.as_mut() {
+                for (i, c) in tcs.iter_mut().enumerate() {
+                    if c.id.is_none() {
+                        c.id = Some(format!("call_{}_{}", i, c.function.name));
+                    }
+                }
+            }
             let calls = msg.tool_calls.clone().unwrap_or_default();
             // Capture the final-content text BEFORE moving the message into
             // history — used by the markdown re-render below.
@@ -588,8 +601,11 @@ impl ChatCLI {
                     crate::json_events::tool_result(&call.function.name, &result_text),
                 );
 
-                self.history
-                    .push(Message::tool_result(&call.function.name, result_text));
+                self.history.push(Message::tool_result(
+                    &call.function.name,
+                    result_text,
+                    call.id.clone(),
+                ));
             }
 
             // Loop back: feed the tool outputs into the next model call.

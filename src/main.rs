@@ -42,6 +42,7 @@ mod spinner;
 mod style;
 mod telemetry;
 mod themes;
+mod thinking_filter;
 mod tips;
 mod todos;
 mod trace_tools;
@@ -70,7 +71,12 @@ use std::sync::{Arc, Mutex};
 /// tools via Ollama's `tools:` field. Tiny non-tool-trained models (the
 /// previous `llama3.2:1b` default) routinely garbled their replies into
 /// pseudo-JSON instead of either calling a tool or answering normally.
-const DEFAULT_MODEL: &str = "qwen3:4b";
+// Default model when neither $CUBI_MODEL nor config.default_model is set.
+// Bumped from qwen3:4b to qwen3:8b: the 8B variant is materially more
+// reliable at multi-turn native tool calling (which the agent loop
+// depends on) while still fitting in <6GB RAM. The 4B fallback is still
+// advertised below for users on smaller machines.
+const DEFAULT_MODEL: &str = "qwen3:8b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -904,12 +910,12 @@ async fn main() -> Result<()> {
         eprintln!(
             "{} Model '{}' is not known to reliably support tool calling. \
              Responses may be malformed when tools are attached. \
-             Consider switching to {} (best), {}, or {}.",
+             Consider switching to {} (best), {} (best for code), or {} (smallest).",
             "Warning:".bright_yellow(),
             model.bright_cyan(),
+            "qwen3:8b".bright_cyan(),
+            "devstral".bright_cyan(),
             "qwen3:4b".bright_cyan(),
-            "qwen2.5:3b".bright_cyan(),
-            "phi4-mini".bright_cyan(),
         );
     }
 

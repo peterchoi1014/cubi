@@ -298,11 +298,11 @@ pub async fn run_if_needed(
                 println!("  {}. {}", i + 1, label);
             }
             println!(
-                "{} Recommended for tool-calling: {}. Alternatives: {} or {}.",
+                "{} Recommended for tool-calling: {}. Alternatives: {} (best for code) or {} (smallest).",
                 "ℹ".bright_blue(),
+                "qwen3:8b".bright_cyan(),
+                "devstral".bright_cyan(),
                 "qwen3:4b".bright_cyan(),
-                "qwen2.5:3b".bright_cyan(),
-                "phi4-mini".bright_cyan(),
             );
             let pick = prompt(&format!(
                 "Pick a default model [1-{}] (press Enter to skip): ",
