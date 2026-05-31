@@ -289,10 +289,14 @@ impl OpenAiClient {
                     None
                 },
                 // `tool_call_id` must only be set on role:"tool" messages and
-                // should match the tool call's id. We use tool_name as a
-                // fallback identifier when the full call id isn't available.
+                // should match the id of the assistant ToolCall this is the
+                // result of. Prefer the id we recorded when constructing the
+                // tool-result message (set from `ToolCall::id`); fall back to
+                // `tool_name` only when the assistant turn didn't carry an id
+                // (older Ollama responses). Strict OpenAI validators reject
+                // the fallback, but it's the best we can do in that case.
                 tool_call_id: if m.role == "tool" {
-                    m.tool_name.clone()
+                    m.tool_call_id.clone().or_else(|| m.tool_name.clone())
                 } else {
                     None
                 },
@@ -335,6 +339,7 @@ impl OpenAiClient {
             content,
             tool_calls,
             tool_name: None,
+            tool_call_id: None,
         }
     }
 }
@@ -673,6 +678,7 @@ impl OpenAiClient {
                 content,
                 tool_calls,
                 tool_name: None,
+                tool_call_id: None,
             },
             stats,
         ))
@@ -719,6 +725,7 @@ fn fake_message(messages: &[Message]) -> Message {
                     content: String::new(),
                     tool_calls: Some(vec![call]),
                     tool_name: None,
+                    tool_call_id: None,
                 };
             }
         }
@@ -1081,5 +1088,39 @@ mod tests {
         // If the env doesn't have CUBI_PROVIDER=openai, we get ollama.
         // If it does (unlikely in test), we'd get openai — both are valid.
         assert!(provider.provider_name() == "ollama" || provider.provider_name() == "openai");
+    }
+
+    #[test]
+    fn openai_convert_messages_uses_tool_call_id_when_present() {
+        // Strict OpenAI validators require tool_call_id on role:"tool"
+        // messages to match the id the assistant supplied. Prove the
+        // converter sends the real id, not the (incorrect) tool_name
+        // fallback.
+        let msg = Message::tool_result("bash", "ok", Some("call_xyz".into()));
+        let converted = OpenAiClient::convert_messages(&[msg]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
+        assert_eq!(converted[0].name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn openai_convert_messages_falls_back_to_tool_name_when_no_id() {
+        // Older Ollama responses don't carry an id. The converter must
+        // still emit *some* tool_call_id so the request body validates,
+        // even though strict servers will reject the fallback.
+        let msg = Message::tool_result("bash", "ok", None);
+        let converted = OpenAiClient::convert_messages(&[msg]);
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn openai_convert_messages_never_sets_tool_call_id_on_non_tool_roles() {
+        for role in ["user", "assistant", "system"] {
+            let msg = Message::text(role, "hi");
+            let converted = OpenAiClient::convert_messages(&[msg]);
+            assert!(converted[0].tool_call_id.is_none(), "role {role}");
+            assert!(converted[0].name.is_none(), "role {role}");
+        }
     }
 }

@@ -216,7 +216,11 @@ pub async fn run_subagent(
                     call.function.name
                 )
             };
-            history.push(Message::tool_result(&call.function.name, result_text));
+            history.push(Message::tool_result(
+                &call.function.name,
+                result_text,
+                call.id.clone(),
+            ));
         }
 
         // If we're about to leave the loop without ever getting a clean
