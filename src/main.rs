@@ -42,6 +42,7 @@ mod spinner;
 mod style;
 mod telemetry;
 mod themes;
+mod thinking_filter;
 mod tips;
 mod todos;
 mod trace_tools;
