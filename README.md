@@ -591,7 +591,9 @@ Popular models you can use with Ollama:
 
 | Model | Size | Speed | Quality | Use Case |
 |-------|------|-------|---------|----------|
-| `qwen3:4b` | 2.6GB | ⚡⚡ | ⭐⭐⭐⭐ | **Default** — tool-capable, balanced |
+| `qwen3:8b` | 5.2GB | ⚡ | ⭐⭐⭐⭐⭐ | **Default** — most reliable tool-calling |
+| `qwen3:4b` | 2.6GB | ⚡⚡ | ⭐⭐⭐⭐ | Tool-capable, fits on smaller machines |
+| `devstral` | 14GB | ⚡ | ⭐⭐⭐⭐⭐ | Best for code/agent workflows, 131K context |
 | `qwen2.5:3b` | 1.9GB | ⚡⚡⚡ | ⭐⭐⭐ | Smaller tool-capable model |
 | `phi4-mini` | 2.5GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's tool-capable mini |
 | `mistral:7b` | 4.1GB | ⚡ | ⭐⭐⭐⭐ | High-quality responses |
@@ -606,6 +608,42 @@ List installed models:
 ```bash
 ollama list
 ```
+
+### Using a non-Ollama backend (llama-server, LM Studio, vLLM)
+
+cubi's OpenAI-compatible client speaks to any local server that
+exposes `/v1/chat/completions`. Set two environment variables before
+launching `cubi`:
+
+```bash
+# llama.cpp's llama-server on its default port
+export OPENAI_API_KEY=dummy
+export OPENAI_BASE_URL=http://localhost:8080/v1
+
+# LM Studio on its default port
+export OPENAI_API_KEY=lm-studio
+export OPENAI_BASE_URL=http://localhost:1234/v1
+```
+
+Then `cubi` and `/doctor` will probe and list models from that server
+instead of Ollama.
+
+**Tool-calling caveats:**
+
+- LM Studio's public chat-completions docs page does not list `tools`
+  in its supported-parameters table, but the field *is* forwarded to
+  llama.cpp under the hood and works for tool-capable models (qwen3,
+  llama3.1+, mistral-small, devstral). If you're on an older LM Studio
+  build and see the server reject `tools`, upgrade to a recent
+  release.
+- llama-server requires the model's chat template to advertise
+  `tools` support; check `llama-server --help` for the
+  `--chat-template` flag if calls aren't being parsed as
+  `tool_calls`.
+- Strict proxies that validate `tool_call_id` against the assistant's
+  prior `tool_calls` ids will reject older cubi versions; the current
+  release threads the real id through (see
+  `src/thinking_filter.rs` neighbor `Message::tool_result`).
 
 ## 🏗️ Architecture
 
