@@ -1737,46 +1737,117 @@ impl ChatCLI {
     async fn run_doctor(&self) {
         println!("\n{}", "Doctor:".bright_yellow().bold());
 
-        // 1. Ollama reachability + model listing.
-        let ollama = crate::ollama::OllamaClient::new();
+        // 1. LLM backend reachability + model listing. Dispatch on the
+        //    actual configured provider so users running against a
+        //    non-Ollama OpenAI-compat server (llama-server, LM Studio)
+        //    don't get a confusing "Ollama unreachable at :11434"
+        //    failure when their backend is actually up on a different
+        //    port.
         let model = self.executor.get_model();
-        match ollama.list_models().await {
+        let provider = self.executor.provider_name();
+        match self.executor.list_models().await {
             Ok(models) => {
-                println!(
-                    "  {} Ollama reachable at {} ({} model{} installed)",
-                    "✓".bright_green(),
-                    "http://localhost:11434".bright_cyan(),
-                    models.len(),
-                    if models.len() == 1 { "" } else { "s" }
-                );
-                // Mirror the startup check in main.rs (prefix match handles
-                // `name` vs `name:latest`).
-                if models.iter().any(|m| m.starts_with(model)) {
+                let in_list = models
+                    .iter()
+                    .any(|m| m == model || m.starts_with(model) || model.starts_with(m));
+                // OpenAI-compatible local servers don't all implement
+                // /v1/models (llama-server returns just the loaded model;
+                // some proxies return an empty list). In that case we can't
+                // verify and assume the configured model is OK. Ollama
+                // always returns the full installed list, so an empty list
+                // there genuinely means "no models installed" and we must
+                // surface the ✗.
+                let model_known = in_list || (provider == "openai" && models.is_empty());
+
+                if provider == "ollama" {
                     println!(
-                        "  {} Current model '{}' is installed",
+                        "  {} Ollama reachable at {} ({} model{} installed)",
                         "✓".bright_green(),
-                        model.bright_cyan()
+                        "http://localhost:11434".bright_cyan(),
+                        models.len(),
+                        if models.len() == 1 { "" } else { "s" }
                     );
+                    if model_known {
+                        println!(
+                            "  {} Current model '{}' is installed",
+                            "✓".bright_green(),
+                            model.bright_cyan()
+                        );
+                    } else {
+                        println!(
+                            "  {} Current model '{}' is not installed (try `ollama pull {}`)",
+                            "✗".bright_red(),
+                            model.bright_cyan(),
+                            model
+                        );
+                    }
                 } else {
+                    let provider_label = match provider {
+                        "openai" => "OpenAI-compatible backend",
+                        "fake" => "Fake test backend",
+                        other => other,
+                    };
+                    let backend_url = self.executor.base_url().unwrap_or("(in-process)");
                     println!(
-                        "  {} Current model '{}' is not installed (try `ollama pull {}`)",
-                        "✗".bright_red(),
-                        model.bright_cyan(),
-                        model
+                        "  {} {} reachable at {} ({} model{} available)",
+                        "✓".bright_green(),
+                        provider_label,
+                        backend_url.bright_cyan(),
+                        models.len(),
+                        if models.len() == 1 { "" } else { "s" }
                     );
+                    if model_known {
+                        println!(
+                            "  {} Current model '{}' is available",
+                            "✓".bright_green(),
+                            model.bright_cyan()
+                        );
+                    } else {
+                        let install_hint = match provider {
+                            "openai" => "load it in your local server or pick another with /model",
+                            _ => "pick another with /model",
+                        };
+                        println!(
+                            "  {} Current model '{}' is not in the backend's model list ({})",
+                            "✗".bright_red(),
+                            model.bright_cyan(),
+                            install_hint
+                        );
+                    }
                 }
             }
             Err(e) => {
-                println!(
-                    "  {} Ollama unreachable at {}: {}",
-                    "✗".bright_red(),
-                    "http://localhost:11434".bright_cyan(),
-                    e
-                );
-                println!(
-                    "  {} Skipping model check (Ollama not reachable)",
-                    "ℹ".bright_blue()
-                );
+                if provider == "ollama" {
+                    println!(
+                        "  {} Ollama unreachable at {}: {}",
+                        "✗".bright_red(),
+                        "http://localhost:11434".bright_cyan(),
+                        e
+                    );
+                    println!(
+                        "  {} Skipping model check (Ollama not reachable)",
+                        "ℹ".bright_blue()
+                    );
+                } else {
+                    let provider_label = match provider {
+                        "openai" => "OpenAI-compatible backend",
+                        "fake" => "Fake test backend",
+                        other => other,
+                    };
+                    let backend_url = self.executor.base_url().unwrap_or("(in-process)");
+                    println!(
+                        "  {} {} unreachable at {}: {}",
+                        "✗".bright_red(),
+                        provider_label,
+                        backend_url.bright_cyan(),
+                        e
+                    );
+                    println!(
+                        "  {} Skipping model check ({} not reachable)",
+                        "ℹ".bright_blue(),
+                        provider_label
+                    );
+                }
             }
         }
 

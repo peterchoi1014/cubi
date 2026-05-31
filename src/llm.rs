@@ -108,6 +108,18 @@ impl LlmBackend {
             Self::Fake => "fake",
         }
     }
+
+    /// Returns the HTTP endpoint this backend talks to, when applicable.
+    /// `None` for the `Fake` backend which has no network surface.
+    /// Used by `/doctor` so it can show the actual probed URL instead
+    /// of hard-coding `http://localhost:11434`.
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Ollama(c) => Some(c.base_url()),
+            Self::OpenAi(c) => Some(c.base_url()),
+            Self::Fake => None,
+        }
+    }
 }
 
 // ─── OpenAI-compatible provider ─────────────────────────────────────────────
@@ -255,6 +267,13 @@ impl OpenAiClient {
             base_url.trim_end_matches('/').to_string(),
             api_key,
         ))
+    }
+
+    /// Base URL this client is configured to talk to. Used by `/doctor`
+    /// and similar diagnostics to show the actual endpoint being probed
+    /// rather than hard-coding any specific URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn convert_messages(messages: &[Message]) -> Vec<OaiRequestMessage> {
@@ -844,18 +863,43 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
     }
     // Normalize: strip version tags for matching.
     let model_lower = model.to_lowercase();
+
+    // Tag-specific overrides for families where Ollama ships different
+    // context windows per parameter size. Must run before the bare-name
+    // match below.
+    match model_lower.as_str() {
+        // Gemma 3: 270M and 1B variants ship with a 32K window; 4B/12B/27B
+        // are 128K. See https://ollama.com/library/gemma3.
+        "gemma3:270m" | "gemma3:1b" => return Some(32_768),
+        _ => {}
+    }
+
     let base = model_lower.split(':').next().unwrap_or(&model_lower);
 
     match base {
         // Ollama models
-        "llama3.2" | "llama3.1" | "llama3" => Some(128_000),
+        "llama3.3" | "llama3.2" | "llama3.1" | "llama3" => Some(128_000),
         "llama2" => Some(4_096),
         "mistral" | "mixtral" => Some(32_768),
+        "mistral-small3.2" | "mistral-small3.1" | "mistral-small" => Some(131_072),
+        "devstral" => Some(131_072),
         "qwen2.5" | "qwen2" => Some(128_000),
+        // Qwen3 ships with a 32K native window; YaRN can extend it but
+        // we conservatively report the native value since the backend
+        // doesn't always enable YaRN by default.
+        "qwen3" => Some(32_768),
         "codellama" => Some(16_384),
         "phi3" | "phi-3" => Some(128_000),
+        // Phi-4 (14B dense) ships with a 16K window per Microsoft's model
+        // card; only phi4-mini is 128K.
+        "phi4" | "phi-4" => Some(16_384),
+        "phi4-mini" => Some(128_000),
         "gemma2" | "gemma" => Some(8_192),
+        "gemma3" => Some(128_000),
         "deepseek-coder" => Some(16_384),
+        "granite3.3" | "granite3.2" | "granite3.1" => Some(131_072),
+        "hermes3" => Some(131_072),
+        "command-r7b" | "command-r" => Some(131_072),
         // OpenAI models
         "gpt-4o" | "gpt-4o-mini" => Some(128_000),
         "gpt-4-turbo" | "gpt-4" => Some(128_000),
@@ -1011,6 +1055,21 @@ mod tests {
         assert_eq!(context_window_for_model("llama3.2:1b"), Some(128_000));
         assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
         assert_eq!(context_window_for_model("unknown-model"), None);
+        // Cover the newly added families so a future refactor that drops
+        // a row trips this test instead of silently regressing the
+        // budget warning for users on those models.
+        assert_eq!(context_window_for_model("qwen3:8b"), Some(32_768));
+        assert_eq!(context_window_for_model("devstral"), Some(131_072));
+        assert_eq!(context_window_for_model("mistral-small3.2"), Some(131_072));
+        assert_eq!(context_window_for_model("granite3.3:8b"), Some(131_072));
+        assert_eq!(context_window_for_model("hermes3:8b"), Some(131_072));
+        assert_eq!(context_window_for_model("llama3.3:70b"), Some(128_000));
+        assert_eq!(context_window_for_model("command-r7b"), Some(131_072));
+        assert_eq!(context_window_for_model("phi4"), Some(16_384));
+        assert_eq!(context_window_for_model("phi4-mini"), Some(128_000));
+        assert_eq!(context_window_for_model("gemma3:4b"), Some(128_000));
+        assert_eq!(context_window_for_model("gemma3:270m"), Some(32_768));
+        assert_eq!(context_window_for_model("gemma3:1b"), Some(32_768));
     }
 
     #[test]

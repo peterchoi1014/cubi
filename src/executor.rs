@@ -55,6 +55,19 @@ impl AIExecutor {
         self.backend.provider_name()
     }
 
+    /// Backend endpoint URL, or `None` for the fake test backend.
+    pub fn base_url(&self) -> Option<&str> {
+        self.backend.base_url()
+    }
+
+    /// Lists models the configured backend reports. Used by `/doctor`
+    /// so it can probe whichever backend is actually selected (Ollama
+    /// or any OpenAI-compatible local server like `llama-server` or
+    /// LM Studio) instead of always pinging `:11434`.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        self.backend.list_models().await
+    }
+
     pub async fn switch_model(&mut self, model: String) -> Result<()> {
         let models = self.backend.list_models().await?;
         if !models.is_empty() && !models.iter().any(|m| m.starts_with(&model) || m == &model) {
