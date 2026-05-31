@@ -28,7 +28,15 @@ const CLOSE: &str = "</think>";
 /// `<think>` at the end of input is dropped along with everything after
 /// it — that's the desired behavior for the case where a model crashed
 /// or was cancelled mid-thought.
+///
+/// Honors the `CUBI_KEEP_THINKING=1` escape hatch: set it to disable
+/// stripping entirely (useful when the user explicitly wants to see the
+/// model's reasoning, or when their content legitimately contains
+/// literal `<think>` tags in e.g. code samples about prompt formats).
 pub fn strip_thinking_blocks(s: &str) -> String {
+    if keep_thinking() {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find(OPEN) {
@@ -46,6 +54,12 @@ pub fn strip_thinking_blocks(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn keep_thinking() -> bool {
+    std::env::var("CUBI_KEEP_THINKING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Streaming stripper. Construct one per stream, call [`feed`] for each
@@ -78,7 +92,12 @@ impl ThinkStripper {
     /// safe to emit to the user. Always returns the empty string when
     /// the delta is fully inside a `<think>` block (or buffered as a
     /// possible partial tag).
+    ///
+    /// Honors `CUBI_KEEP_THINKING=1`: passes input through verbatim.
     pub fn feed(&mut self, chunk: &str) -> String {
+        if keep_thinking() {
+            return chunk.to_string();
+        }
         let mut input = std::mem::take(&mut self.pending);
         input.push_str(chunk);
         let mut out = String::with_capacity(input.len());
