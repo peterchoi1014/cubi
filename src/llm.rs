@@ -863,6 +863,17 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
     }
     // Normalize: strip version tags for matching.
     let model_lower = model.to_lowercase();
+
+    // Tag-specific overrides for families where Ollama ships different
+    // context windows per parameter size. Must run before the bare-name
+    // match below.
+    match model_lower.as_str() {
+        // Gemma 3: 270M and 1B variants ship with a 32K window; 4B/12B/27B
+        // are 128K. See https://ollama.com/library/gemma3.
+        "gemma3:270m" | "gemma3:1b" => return Some(32_768),
+        _ => {}
+    }
+
     let base = model_lower.split(':').next().unwrap_or(&model_lower);
 
     match base {
@@ -878,7 +889,10 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         // doesn't always enable YaRN by default.
         "qwen3" => Some(32_768),
         "codellama" => Some(16_384),
-        "phi3" | "phi-3" | "phi4" | "phi-4" => Some(128_000),
+        "phi3" | "phi-3" => Some(128_000),
+        // Phi-4 (14B dense) ships with a 16K window per Microsoft's model
+        // card; only phi4-mini is 128K.
+        "phi4" | "phi-4" => Some(16_384),
         "phi4-mini" => Some(128_000),
         "gemma2" | "gemma" => Some(8_192),
         "gemma3" => Some(128_000),
@@ -1051,8 +1065,11 @@ mod tests {
         assert_eq!(context_window_for_model("hermes3:8b"), Some(131_072));
         assert_eq!(context_window_for_model("llama3.3:70b"), Some(128_000));
         assert_eq!(context_window_for_model("command-r7b"), Some(131_072));
-        assert_eq!(context_window_for_model("phi4"), Some(128_000));
-        assert_eq!(context_window_for_model("gemma3"), Some(128_000));
+        assert_eq!(context_window_for_model("phi4"), Some(16_384));
+        assert_eq!(context_window_for_model("phi4-mini"), Some(128_000));
+        assert_eq!(context_window_for_model("gemma3:4b"), Some(128_000));
+        assert_eq!(context_window_for_model("gemma3:270m"), Some(32_768));
+        assert_eq!(context_window_for_model("gemma3:1b"), Some(32_768));
     }
 
     #[test]
