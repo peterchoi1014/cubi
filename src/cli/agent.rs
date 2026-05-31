@@ -588,8 +588,11 @@ impl ChatCLI {
                     crate::json_events::tool_result(&call.function.name, &result_text),
                 );
 
-                self.history
-                    .push(Message::tool_result(&call.function.name, result_text));
+                self.history.push(Message::tool_result(
+                    &call.function.name,
+                    result_text,
+                    call.id.clone(),
+                ));
             }
 
             // Loop back: feed the tool outputs into the next model call.
