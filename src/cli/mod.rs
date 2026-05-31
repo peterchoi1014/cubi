@@ -1737,45 +1737,72 @@ impl ChatCLI {
     async fn run_doctor(&self) {
         println!("\n{}", "Doctor:".bright_yellow().bold());
 
-        // 1. Ollama reachability + model listing.
-        let ollama = crate::ollama::OllamaClient::new();
+        // 1. LLM backend reachability + model listing. Dispatch on the
+        //    actual configured provider so users running against a
+        //    non-Ollama OpenAI-compat server (llama-server, LM Studio)
+        //    don't get a confusing "Ollama unreachable at :11434"
+        //    failure when their backend is actually up on a different
+        //    port.
         let model = self.executor.get_model();
-        match ollama.list_models().await {
+        let provider = self.executor.provider_name();
+        let backend_url = self.executor.base_url().unwrap_or("(in-process)");
+        let provider_label = match provider {
+            "ollama" => "Ollama",
+            "openai" => "OpenAI-compatible backend",
+            "fake" => "Fake test backend",
+            other => other,
+        };
+        match self.executor.list_models().await {
             Ok(models) => {
                 println!(
-                    "  {} Ollama reachable at {} ({} model{} installed)",
+                    "  {} {} reachable at {} ({} model{} available)",
                     "✓".bright_green(),
-                    "http://localhost:11434".bright_cyan(),
+                    provider_label,
+                    backend_url.bright_cyan(),
                     models.len(),
                     if models.len() == 1 { "" } else { "s" }
                 );
-                // Mirror the startup check in main.rs (prefix match handles
-                // `name` vs `name:latest`).
-                if models.iter().any(|m| m.starts_with(model)) {
+                // Prefix match handles `name` vs `name:latest` (Ollama)
+                // and exact ID matches (OpenAI-compat servers usually
+                // return canonical names without a tag).
+                let model_known = models.is_empty()
+                    || models
+                        .iter()
+                        .any(|m| m == model || m.starts_with(model) || model.starts_with(m));
+                if model_known {
                     println!(
-                        "  {} Current model '{}' is installed",
+                        "  {} Current model '{}' is available",
                         "✓".bright_green(),
                         model.bright_cyan()
                     );
                 } else {
+                    let install_hint = match provider {
+                        "ollama" => format!("try `ollama pull {}`", model),
+                        "openai" => {
+                            "load it in your local server or pick another with /model".to_string()
+                        }
+                        _ => "pick another with /model".to_string(),
+                    };
                     println!(
-                        "  {} Current model '{}' is not installed (try `ollama pull {}`)",
+                        "  {} Current model '{}' is not in the backend's model list ({})",
                         "✗".bright_red(),
                         model.bright_cyan(),
-                        model
+                        install_hint
                     );
                 }
             }
             Err(e) => {
                 println!(
-                    "  {} Ollama unreachable at {}: {}",
+                    "  {} {} unreachable at {}: {}",
                     "✗".bright_red(),
-                    "http://localhost:11434".bright_cyan(),
+                    provider_label,
+                    backend_url.bright_cyan(),
                     e
                 );
                 println!(
-                    "  {} Skipping model check (Ollama not reachable)",
-                    "ℹ".bright_blue()
+                    "  {} Skipping model check ({} not reachable)",
+                    "ℹ".bright_blue(),
+                    provider_label
                 );
             }
         }
