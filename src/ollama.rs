@@ -206,6 +206,13 @@ impl OllamaClient {
         }
     }
 
+    /// Base URL this client is configured to talk to. Used by `/doctor`
+    /// and similar diagnostics so they can show the actual probed
+    /// endpoint instead of hard-coding `http://localhost:11434`.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
         let (msg, _) = self.chat_with_tools(model, messages, None).await?;
         Ok(msg.content)
