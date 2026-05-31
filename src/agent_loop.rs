@@ -182,6 +182,18 @@ pub async fn run_subagent(
         let (msg, _stats) = executor
             .chat_with_tools(history.clone(), tools.clone())
             .await?;
+        // Some backends (older Ollama) don't supply an `id` on each
+        // tool_call. Synthesize a stable, position-based id so the
+        // assistant message and its tool-result messages reference the
+        // same id — strict OpenAI-compatible validators require this.
+        let mut msg = msg;
+        if let Some(calls) = msg.tool_calls.as_mut() {
+            for (i, c) in calls.iter_mut().enumerate() {
+                if c.id.is_none() {
+                    c.id = Some(format!("call_{}_{}", i, c.function.name));
+                }
+            }
+        }
         let calls = msg.tool_calls.clone().unwrap_or_default();
         let content = msg.content.clone();
         history.push(msg);

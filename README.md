@@ -126,10 +126,12 @@ ollama serve
 ### 2. Download an AI Model
 
 ```bash
-# Recommended default: tool-call-capable, balanced size (~2.6GB)
-ollama pull qwen3:4b
+# Recommended default: most reliable tool-calling (~5.2GB)
+ollama pull qwen3:8b
 
 # Or choose another model:
+ollama pull qwen3:4b       # Smaller tool-capable variant (~2.6GB)
+ollama pull devstral       # Best for code/agent workflows (~14GB, 131K context)
 ollama pull qwen2.5:3b     # Smaller tool-capable model (~1.9GB)
 ollama pull phi4-mini      # Microsoft's small tool-capable model (~2.5GB)
 ollama pull mistral:7b     # High quality (~4.1GB)
@@ -169,13 +171,13 @@ cargo run --release
 
 ### Choosing a model
 
-By default the CLI uses `qwen3:4b` (a tool-call-capable model). Override
+By default the CLI uses `qwen3:8b` (a tool-call-capable model). Override
 at startup with the `CUBI_MODEL` environment variable, or switch
 interactively with the `/model` command:
 
 ```bash
 # Pick a different default just for this session
-CUBI_MODEL=mistral:7b cargo run --release
+CUBI_MODEL=qwen3:4b cargo run --release
 ```
 
 Enable diagnostic logging by setting `CUBI_LOG` (off by default; output
@@ -505,7 +507,7 @@ groups below mirror that registry.
 
 ```
 You: /model
-Current model: qwen3:4b
+Current model: qwen3:8b
 
 You: /model mistral:7b
 ✓ Switched to model: mistral:7b
@@ -643,7 +645,10 @@ instead of Ollama.
 - Strict proxies that validate `tool_call_id` against the assistant's
   prior `tool_calls` ids will reject older cubi versions; the current
   release threads the real id through (see
-  `src/thinking_filter.rs` neighbor `Message::tool_result`).
+  [`Message::tool_result`](src/ollama.rs) and
+  [`OpenAiClient::convert_messages`](src/llm.rs), and
+  [`CUBI_KEEP_THINKING=1`](src/thinking_filter.rs) if you need to see
+  raw `<think>` blocks).
 
 ## 🏗️ Architecture
 
@@ -837,7 +842,7 @@ server under `Offline MCP Servers`. Restart cubi (or rerun
 
 ### Model not found
 
-**Error**: `Model 'qwen3:4b' not found`
+**Error**: `Model 'qwen3:8b' not found`
 
 **Solution**:
 ```bash
@@ -845,13 +850,13 @@ server under `Offline MCP Servers`. Restart cubi (or rerun
 ollama list
 
 # Pull the required model
-ollama pull qwen3:4b
+ollama pull qwen3:8b
 ```
 
 ### Slow responses
 
 **Solutions**:
-1. Use a smaller tool-capable model: `qwen2.5:3b` instead of `qwen3:4b`
+1. Use a smaller tool-capable model: `qwen3:4b` instead of `qwen3:8b`
 2. Close other applications to free up RAM
 3. Use GPU acceleration if available (Ollama automatic)
 
