@@ -160,10 +160,10 @@ fn maybe_write_stub_config(path: &std::path::Path) -> StubWriteResult {
     let model = std::env::var("CUBI_MODEL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "qwen3:4b".to_string());
+        .unwrap_or_else(|| "qwen3:8b".to_string());
     let stub = format!(
         "{{\n  \"default_model\": {}\n}}\n",
-        serde_json::to_string(&model).unwrap_or_else(|_| "\"qwen3:4b\"".to_string())
+        serde_json::to_string(&model).unwrap_or_else(|_| "\"qwen3:8b\"".to_string())
     );
     match std::fs::write(path, stub) {
         Ok(()) => StubWriteResult::Wrote,
@@ -315,7 +315,7 @@ fn rc_snippet_for(shell: &str, dir: &std::path::Path) -> String {
 
 async fn check_model_host() -> CheckResult {
     let config = AppConfig::load();
-    let model = crate::onboarding::resolve_model(&config, "qwen3:4b");
+    let model = crate::onboarding::resolve_model(&config, "qwen3:8b");
 
     // Resolve provider + URL the same way `executor`/`main` do.
     let openai_base = std::env::var("OPENAI_BASE_URL")
