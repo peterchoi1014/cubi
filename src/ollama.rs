@@ -1,7 +1,17 @@
+use crate::thinking_filter::{ThinkStripper, strip_thinking_blocks};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
+
+/// Strip `<think>...</think>` blocks from an assistant message's
+/// content before handing it back to the host. Some Ollama versions
+/// expose a separate `thinking` field that already strips these
+/// server-side; in that case the call is a no-op.
+fn strip_message_thinking(mut m: Message) -> Message {
+    m.content = strip_thinking_blocks(&m.content);
+    m
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
@@ -282,7 +292,7 @@ impl OllamaClient {
                         .unwrap_or(0),
                 };
 
-                Ok((chat_response.message, stats))
+                Ok((strip_message_thinking(chat_response.message), stats))
             }
         })
         .await
@@ -343,13 +353,18 @@ impl OllamaClient {
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
         let mut stats = ChatStats::default();
+        // Strips Qwen3-style <think>…</think> reasoning blocks from
+        // both the tokens we forward to the UI and the accumulated
+        // content we record in history.
+        let mut stripper = ThinkStripper::new();
 
         // Local closure so the trailing-buffer case after the read loop can
         // reuse the same parse-and-dispatch logic without duplication.
         let mut handle_line = |line: &str,
                                content: &mut String,
                                final_msg: &mut Option<Message>,
-                               stats: &mut ChatStats| {
+                               stats: &mut ChatStats,
+                               stripper: &mut ThinkStripper| {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 return;
@@ -359,14 +374,22 @@ impl OllamaClient {
                 Err(_) => return, // tolerate a malformed mid-stream line
             };
             if !parsed.message.content.is_empty() {
-                on_token(&parsed.message.content);
-                content.push_str(&parsed.message.content);
+                let clean = stripper.feed(&parsed.message.content);
+                if !clean.is_empty() {
+                    on_token(&clean);
+                    content.push_str(&clean);
+                }
             }
             if parsed.done {
                 // Capture provider stats from the terminal chunk.
                 stats.prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
                 stats.completion_tokens = parsed.eval_count.unwrap_or(0);
                 stats.elapsed_ms = parsed.total_duration.map(|ns| ns / 1_000_000).unwrap_or(0);
+                let tail = stripper.flush();
+                if !tail.is_empty() {
+                    on_token(&tail);
+                    content.push_str(&tail);
+                }
                 let mut m = parsed.message;
                 // Replace fragmentary content with the accumulated text so
                 // callers don't have to reconstruct it.
@@ -381,7 +404,13 @@ impl OllamaClient {
             while let Some(nl) = buf.find('\n') {
                 let line = buf[..nl].to_string();
                 buf.drain(..=nl);
-                handle_line(&line, &mut content, &mut final_msg, &mut stats);
+                handle_line(
+                    &line,
+                    &mut content,
+                    &mut final_msg,
+                    &mut stats,
+                    &mut stripper,
+                );
             }
         }
 
@@ -391,7 +420,13 @@ impl OllamaClient {
         // done chunk". Flush whatever's left.
         if !buf.trim().is_empty() {
             let remaining = std::mem::take(&mut buf);
-            handle_line(&remaining, &mut content, &mut final_msg, &mut stats);
+            handle_line(
+                &remaining,
+                &mut content,
+                &mut final_msg,
+                &mut stats,
+                &mut stripper,
+            );
         }
 
         let msg = final_msg

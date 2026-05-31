@@ -319,7 +319,8 @@ impl OpenAiClient {
     }
 
     fn oai_message_to_message(oai: OaiMessage) -> Message {
-        let content = oai.content.unwrap_or_default();
+        let content =
+            crate::thinking_filter::strip_thinking_blocks(&oai.content.unwrap_or_default());
         let tool_calls = oai.tool_calls.map(|calls| {
             calls
                 .into_iter()
@@ -594,6 +595,9 @@ impl OpenAiClient {
         let mut content = String::new();
         let mut tool_calls_builder: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
         let mut usage: Option<OaiUsage> = None;
+        // Strips Qwen3-style <think>…</think> reasoning blocks from
+        // streamed tokens before forwarding to the UI and recording.
+        let mut stripper = crate::thinking_filter::ThinkStripper::new();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
@@ -616,8 +620,11 @@ impl OpenAiClient {
                 for choice in chunk.choices {
                     if let Some(text) = &choice.delta.content {
                         if !text.is_empty() {
-                            on_token(text);
-                            content.push_str(text);
+                            let clean = stripper.feed(text);
+                            if !clean.is_empty() {
+                                on_token(&clean);
+                                content.push_str(&clean);
+                            }
                         }
                     }
                     if let Some(tcs) = &choice.delta.tool_calls {
@@ -645,6 +652,11 @@ impl OpenAiClient {
                     }
                 }
             }
+        }
+        let tail = stripper.flush();
+        if !tail.is_empty() {
+            on_token(&tail);
+            content.push_str(&tail);
         }
 
         let tool_calls = if tool_calls_builder.is_empty() {
