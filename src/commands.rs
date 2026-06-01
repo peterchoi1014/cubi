@@ -142,6 +142,8 @@ pub enum Cmd {
     // -- Phase 12: session branching --
     Fork,
     Repomap,
+    // -- Phase 5 differentiator: multi-model consensus --
+    Consensus,
 }
 
 /// One row in the slash-command registry.
@@ -823,6 +825,12 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/quit",
         help: "Exit the chat",
         cmd: Cmd::Quit,
+    },
+    SlashCommandSpec {
+        name: "/consensus",
+        usage: "/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>",
+        help: "Run a goal under N models in parallel and arbitrate (vote|best-of-n|judge)",
+        cmd: Cmd::Consensus,
     },
 ];
 

@@ -8,6 +8,7 @@ mod commands;
 mod compat;
 mod completer;
 mod completions;
+mod consensus;
 mod doctor;
 mod event_sink;
 mod executor;

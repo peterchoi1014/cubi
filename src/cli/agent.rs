@@ -134,6 +134,14 @@ impl ChatCLI {
                     Err(e) => format!("[tool error] subagent failed: {e}"),
                 }
             }
+        } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME {
+            // Meta-tool: spawn N consensus subagents in parallel. The
+            // subagent token usage is folded into `session_stats` here
+            // so `/cost` reflects the full bill.
+            match self.execute_consensus_tool_call(call).await {
+                Ok(text) => text,
+                Err(e) => format!("[tool error] consensus_run failed: {e}"),
+            }
         } else {
             match self.mcp_manager.as_mut() {
                 Some(mcp) => match mcp
@@ -782,5 +790,116 @@ impl ChatCLI {
             );
             self.emit_status(rewind);
         }
+    }
+
+    /// Backs the `consensus_run` meta-tool. Parses arguments out of
+    /// the model's JSON, drives [`consensus::run`], folds subagent
+    /// stats into `session_stats`, and returns a text report for the
+    /// model to consume on the next turn.
+    async fn execute_consensus_tool_call(&mut self, call: &ToolCall) -> anyhow::Result<String> {
+        let args = &call.function.arguments;
+        let goal = args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if goal.is_empty() {
+            anyhow::bail!("missing or empty `goal`");
+        }
+        let models: Vec<String> = args
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if models.len() < 2 {
+            anyhow::bail!("consensus_run requires at least 2 models");
+        }
+        let strategy_str = args
+            .get("strategy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("vote");
+        let judge_model = args
+            .get("judge_model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let strategy = match strategy_str {
+            "vote" => crate::consensus::ConsensusStrategy::Vote,
+            "best-of-n" => crate::consensus::ConsensusStrategy::BestOfN {
+                judge_model: judge_model
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("best-of-n requires `judge_model`"))?,
+            },
+            "judge" => crate::consensus::ConsensusStrategy::Judge {
+                judge_model: judge_model
+                    .ok_or_else(|| anyhow::anyhow!("judge requires `judge_model`"))?,
+            },
+            other => anyhow::bail!("unknown strategy `{other}`"),
+        };
+        let max_steps = args
+            .get("max_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS);
+        let concurrency = args
+            .get("concurrency")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+
+        let req = crate::consensus::ConsensusRequest {
+            goal: goal.clone(),
+            models: models.clone(),
+            strategy,
+            max_steps_per_subagent: max_steps,
+            concurrency,
+        };
+
+        self.emit_status(format!(
+            "  {} consensus over {} models: {}",
+            "↳".bright_magenta(),
+            models.len(),
+            goal.chars().take(120).collect::<String>().bright_white()
+        ));
+
+        let sink = super::CliConsensusSink {
+            json_enabled: self.json_enabled && self.headless_mode,
+            event_sink: self.event_sink.clone(),
+        };
+        let result = crate::consensus::run(req, &self.executor, &sink).await?;
+        self.session_stats.add(&result.aggregate_stats());
+        self.emit_status(format!(
+            "  {} consensus winner: {} — {}",
+            "↳".bright_magenta(),
+            result.winner_model,
+            result.decision_reason
+        ));
+
+        // Format the tool-result text the model will read next turn.
+        let mut report = String::new();
+        report.push_str(&format!(
+            "Consensus result (strategy: {}; winner: {}):\n",
+            super::CliConsensusSink::strategy_label(&result),
+            result.winner_model
+        ));
+        report.push_str(&format!("Decision: {}\n", result.decision_reason));
+        for sub in &result.subagent_outputs {
+            if let Some(err) = &sub.error {
+                report.push_str(&format!("- {} ✗ {}\n", sub.model, err));
+            } else {
+                report.push_str(&format!(
+                    "- {} ✓ ({} tokens, {} ms)\n",
+                    sub.model,
+                    sub.prompt_tokens + sub.completion_tokens,
+                    sub.elapsed_ms
+                ));
+            }
+        }
+        report.push_str("\n--- winning output ---\n");
+        report.push_str(&result.winner_output);
+        Ok(report)
     }
 }

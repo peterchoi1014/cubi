@@ -73,6 +73,7 @@ cubi/
 │   ├── cli/               # Terminal UI, command dispatch, agent-loop driver
 │   ├── commands.rs        # Slash-command registry (single source of truth)
 │   ├── agent_loop.rs      # Streaming tool-calling loop + `agent_run` meta-tool
+│   ├── consensus.rs       # Multi-model `consensus_run` meta-tool + arbitration
 │   ├── executor.rs        # AI executor & model switching
 │   ├── llm.rs             # Provider abstraction (Ollama / OpenAI / Fake)
 │   ├── ollama.rs          # Ollama HTTP client (streaming + tool calls)
@@ -108,6 +109,13 @@ cubi/
   dispatch can't drift apart.
 - **Agent loop** (`agent_loop.rs`) — runs the tool-calling loop (≤12
   round-trips per turn) and exposes the `agent_run` meta-tool for subagents.
+- **Consensus** (`consensus.rs`) — backs the `consensus_run` meta-tool and
+  `/consensus` slash command: spawns N subagents in parallel against
+  caller-supplied models, then arbitrates via `vote`, `best-of-n`, or
+  `judge`. Subagents are LLM-only (no tools) in the MVP so the parallel
+  dispatch needs no shared-mutable `McpManager` state. Anti-recursion
+  is enforced via `agent_loop::without_meta_tools`, which strips both
+  meta-tools in lockstep so neither can be invoked from a subagent.
 - **Built-in tools** (`builtin_tools.rs`) — shell, filesystem, web, REPL,
   notebook, git worktree, and LSP code-intel implementations.
 - **Headless browser** (`browser_tool.rs`, feature `browser`) —

@@ -5,7 +5,7 @@ Use headless mode when cubi is part of a script or pipeline.
 - Inline prompt: `cubi -p "summarize this repo"` or `cubi --prompt "..."`.
 - Piped prompt: `git diff | cubi -p "summarize"` keeps the diff on stdin for shell composition; without `-p`, cubi reads piped stdin as the prompt: `printf 'hello' | cubi`.
 - System prompt: `cubi --system ./system.txt -p "review"` prepends file contents as instructions.
-- JSON events: `cubi --json --no-stream -p "run tests"` emits line-delimited `token`, `tool_call`, `tool_result`, `tool_timeout`, `compacted`, `budget_error`, and `done` events.
+- JSON events: `cubi --json --no-stream -p "run tests"` emits line-delimited `token`, `tool_call`, `tool_result`, `tool_timeout`, `compacted`, `budget_error`, `consensus_start`, `consensus_subagent_result`, `consensus_decision`, and `done` events.
 - Streaming: one-shot mode buffers by default for predictable scripts; add `--stream` for live tokens.
 
 ## `cubi exec` shorthand
@@ -90,6 +90,17 @@ Event types currently emitted:
   MCP server transition during a turn.
 - `turn_end` — `{type, ts, usage, model}`. `usage` carries
   `{prompt_tokens, completion_tokens, elapsed_ms}`.
+- `consensus_start` — `{type, ts, goal, models, strategy}`. Emitted
+  before any subagent dispatches when the `consensus_run` meta-tool
+  (or the `/consensus` slash command) starts a run. `strategy` is one
+  of `vote`, `best-of-n`, `judge`.
+- `consensus_subagent_result` — `{type, ts, model, ok, steps_used,
+  elapsed_ms, prompt_tokens, completion_tokens, error?}`. One event per
+  subagent. `error` is present and non-null only when `ok` is false.
+- `consensus_decision` — `{type, ts, winner_model, decision_reason}`
+  after arbitration completes. `decision_reason` is free-form text
+  (e.g. "majority vote 2/3", "judge `qwen3:8b` picked `devstral`: …",
+  "best-of-n: `devstral` scored 9 (judge `…`)").
 
 `--trace-tools <path>` still produces its original `tool_start` /
 `tool_complete` record shape for back-compat, but new integrations

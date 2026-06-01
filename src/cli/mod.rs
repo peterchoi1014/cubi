@@ -1255,6 +1255,7 @@ impl ChatCLI {
             Cmd::Policy => self.show_policy(),
             Cmd::Tip => self.show_tip(),
             Cmd::McpPrompts => self.show_mcp_prompts(args).await,
+            Cmd::Consensus => self.handle_consensus(args).await,
         }
         Ok(true)
     }
@@ -5017,6 +5018,96 @@ impl ChatCLI {
         );
     }
 
+    /// `/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>`
+    ///
+    /// Drives a multi-model consensus run and prints a per-model
+    /// summary table plus the winning output. Subagent token usage is
+    /// folded into `session_stats` so `/cost` and the usage footer
+    /// include the additional traffic.
+    async fn handle_consensus(&mut self, args: &str) {
+        let req = match parse_consensus_args(args) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "{} {}\n  usage: {}",
+                    "Error:".bright_red(),
+                    e,
+                    "/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>"
+                        .bright_cyan()
+                );
+                return;
+            }
+        };
+
+        let sink = CliConsensusSink {
+            json_enabled: self.json_enabled && self.headless_mode,
+            event_sink: self.event_sink.clone(),
+        };
+
+        match crate::consensus::run(req, &self.executor, &sink).await {
+            Ok(result) => {
+                self.session_stats.add(&result.aggregate_stats());
+                self.print_consensus_result(&result);
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".bright_red(), e);
+            }
+        }
+    }
+
+    fn print_consensus_result(&self, r: &crate::consensus::ConsensusResult) {
+        println!(
+            "\n{} (strategy: {}) over {} models:",
+            "Consensus".bright_yellow().bold(),
+            self.consensus_strategy_label(r).bright_cyan(),
+            r.subagent_outputs.len()
+        );
+        let name_width = r
+            .subagent_outputs
+            .iter()
+            .map(|s| s.model.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(8);
+        for sub in &r.subagent_outputs {
+            let glyph = if sub.ok() {
+                "✓".bright_green()
+            } else {
+                "✗".bright_red()
+            };
+            let detail = if let Some(err) = &sub.error {
+                format!("error: {err}").bright_red().to_string()
+            } else {
+                format!(
+                    "(steps: {}, tokens: {})",
+                    sub.steps_used,
+                    sub.prompt_tokens + sub.completion_tokens
+                )
+            };
+            let secs = sub.elapsed_ms as f64 / 1000.0;
+            println!(
+                "  {:<width$} {} {:>5.1}s   {}",
+                sub.model,
+                glyph,
+                secs,
+                detail,
+                width = name_width
+            );
+        }
+        println!(
+            "\n{} {} — {}",
+            "Winner:".bright_yellow().bold(),
+            r.winner_model.bright_cyan(),
+            r.decision_reason.bright_white()
+        );
+        println!("\n--- winning output ---");
+        println!("{}\n", r.winner_output);
+    }
+
+    fn consensus_strategy_label(&self, r: &crate::consensus::ConsensusResult) -> &'static str {
+        CliConsensusSink::strategy_label(r)
+    }
+
     fn show_perf_issue_url(&self, args: &str) {
         let title = if args.trim().is_empty() {
             "Performance issue".to_string()
@@ -5413,6 +5504,150 @@ impl ChatCLI {
                 println!();
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        }
+    }
+}
+
+/// Parses the args of `/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>`.
+///
+/// Grammar (whitespace-delimited):
+///   1. `<strategy>` — one of `vote`, `best-of-n`, `judge`.
+///   2. `<models>`  — comma-separated, no internal whitespace.
+///   3. Optional `judge:<model>` token (required when strategy != vote).
+///   4. Everything that remains is the `<goal>` text (verbatim).
+fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("missing arguments".to_string());
+    }
+    let mut iter = raw.split_whitespace();
+    let strategy_str = iter.next().ok_or("missing <strategy>")?;
+    let models_str = iter.next().ok_or("missing <models>")?;
+    let models: Vec<String> = models_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if models.len() < 2 {
+        return Err(format!(
+            "need at least 2 models, got {} (use comma-separated, no spaces)",
+            models.len()
+        ));
+    }
+
+    // Optional `judge:<model>` token.
+    let mut judge_model: Option<String> = None;
+    let mut next = iter.next();
+    if let Some(tok) = next {
+        if let Some(rest) = tok.strip_prefix("judge:") {
+            judge_model = Some(rest.to_string());
+            next = iter.next();
+        }
+    }
+    // Reassemble the remaining tokens as the goal — preserving the
+    // single-space separator between tokens (we don't have the original
+    // delimiters back, but `split_whitespace` collapses runs, which is
+    // fine for an LLM prompt).
+    let mut goal_tokens: Vec<&str> = Vec::new();
+    if let Some(first) = next {
+        goal_tokens.push(first);
+    }
+    for t in iter {
+        goal_tokens.push(t);
+    }
+    let goal = goal_tokens.join(" ");
+    if goal.is_empty() {
+        return Err("missing <goal> text".to_string());
+    }
+
+    let strategy = match strategy_str {
+        "vote" => crate::consensus::ConsensusStrategy::Vote,
+        "best-of-n" => {
+            let judge_model =
+                judge_model.ok_or_else(|| "best-of-n requires judge:<model>".to_string())?;
+            crate::consensus::ConsensusStrategy::BestOfN { judge_model }
+        }
+        "judge" => {
+            let judge_model =
+                judge_model.ok_or_else(|| "judge requires judge:<model>".to_string())?;
+            crate::consensus::ConsensusStrategy::Judge { judge_model }
+        }
+        other => {
+            return Err(format!(
+                "unknown strategy `{other}` (expected vote|best-of-n|judge)"
+            ));
+        }
+    };
+
+    Ok(crate::consensus::ConsensusRequest {
+        goal,
+        models,
+        strategy,
+        max_steps_per_subagent: crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS,
+        concurrency: 0,
+    })
+}
+
+/// Event sink that fans consensus events out to both the headless JSON
+/// stream (when enabled) and the optional `--events` tap.
+pub(crate) struct CliConsensusSink {
+    pub(crate) json_enabled: bool,
+    pub(crate) event_sink: Option<Arc<crate::event_sink::EventSink>>,
+}
+
+impl CliConsensusSink {
+    /// Best-effort recovery of the strategy label from a
+    /// [`ConsensusResult`] for display / report purposes. Avoids
+    /// threading the original strategy back through the result type
+    /// just so the dispatcher can echo it.
+    pub(crate) fn strategy_label(r: &crate::consensus::ConsensusResult) -> &'static str {
+        if r.decision_reason.contains("best-of-n") {
+            "best-of-n"
+        } else if r.decision_reason.contains("judge `") {
+            "judge"
+        } else {
+            "vote"
+        }
+    }
+}
+
+impl crate::consensus::ConsensusEventSink for CliConsensusSink {
+    fn start(&self, goal: &str, models: &[String], strategy: &str) {
+        let payload = crate::json_events::consensus_start(goal, models, strategy);
+        crate::json_events::emit(self.json_enabled, &payload);
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit(
+                "consensus_start",
+                serde_json::json!({
+                    "goal": goal,
+                    "models": models,
+                    "strategy": strategy,
+                }),
+            );
+        }
+    }
+
+    fn subagent_result(&self, sub: &crate::consensus::SubagentOutput) {
+        let payload = crate::json_events::consensus_subagent_result(
+            &sub.model,
+            sub.ok(),
+            sub.steps_used,
+            sub.elapsed_ms,
+            sub.prompt_tokens,
+            sub.completion_tokens,
+            sub.error.as_deref(),
+        );
+        crate::json_events::emit(self.json_enabled, &payload);
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit("consensus_subagent_result", payload);
+        }
+    }
+
+    fn decision(&self, winner_model: &str, decision_reason: &str) {
+        let payload = crate::json_events::consensus_decision(winner_model, decision_reason);
+        crate::json_events::emit(self.json_enabled, &payload);
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit("consensus_decision", payload);
         }
     }
 }
