@@ -138,6 +138,7 @@ pub enum Cmd {
     Quit,
     // -- Phase 12: session branching --
     Fork,
+    Repomap,
 }
 
 /// One row in the slash-command registry.
@@ -296,6 +297,12 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/fork",
         help: "Branch the current session at the last completed turn and continue in the fork",
         cmd: Cmd::Fork,
+    },
+    SlashCommandSpec {
+        name: "/repomap",
+        usage: "/repomap [scope]",
+        help: "Print a compact outline of the project's files and top-level symbols",
+        cmd: Cmd::Repomap,
     },
     SlashCommandSpec {
         name: "/trust",

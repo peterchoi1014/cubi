@@ -1001,6 +1001,9 @@ impl ChatCLI {
             Cmd::Fork => {
                 self.fork_session(args);
             }
+            Cmd::Repomap => {
+                self.run_repomap(args);
+            }
             Cmd::Trust => {
                 self.handle_trust(args);
             }
@@ -1932,7 +1935,69 @@ impl ChatCLI {
             ),
         }
 
+        // Repo-map parser status: which symbol extractor is compiled in.
+        if cfg!(feature = "tree-sitter") {
+            println!(
+                "  {} tree-sitter: enabled (rust, python, javascript, typescript)",
+                "✓".bright_green()
+            );
+        } else {
+            println!(
+                "  {} tree-sitter: disabled (regex fallback active)",
+                "•".bright_yellow()
+            );
+        }
+
         println!();
+    }
+
+    /// `/repomap [scope]` — prints a compact outline of the project (file
+    /// list + top-level symbols). Backed by the `repo_map` built-in tool;
+    /// useful for orientation when first opening an unfamiliar repo.
+    fn run_repomap(&self, args: &str) {
+        use crate::repomap::{RepoMap, RepoMapOptions};
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "{} Could not resolve current directory: {e}",
+                    "✗".bright_red()
+                );
+                return;
+            }
+        };
+        let scope = args.trim();
+        let scope_path = if scope.is_empty() {
+            cwd.clone()
+        } else {
+            let p = Path::new(scope);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            }
+        };
+        let canonical = match fs::canonicalize(&scope_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "{} Could not canonicalize {}: {e}",
+                    "✗".bright_red(),
+                    scope_path.display()
+                );
+                return;
+            }
+        };
+        let opts = RepoMapOptions {
+            scope: Some(canonical.clone()),
+            ..Default::default()
+        };
+        match RepoMap::build(&canonical, &opts) {
+            Ok(outline) => {
+                print!("{}", RepoMap::render(&outline));
+            }
+            Err(e) => eprintln!("{} repo_map failed: {e}", "✗".bright_red()),
+        }
     }
 
     /// `/env` — prints the resolved runtime: model, project dir, trust

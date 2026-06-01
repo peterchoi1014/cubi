@@ -39,6 +39,8 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🧩 **Plugins + skills + hooks** — reusable Markdown skill packs, namespaced
   slash-command bundles, and `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/etc.
   lifecycle hooks
+- 🗺️ **Repo-map** — tree-sitter-based outline of the project's symbols,
+  available as the `repo_map` tool and `/repomap` slash command
 
 ## 🚀 Quick Start
 

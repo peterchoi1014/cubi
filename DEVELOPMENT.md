@@ -111,6 +111,11 @@ cubi/
   switching and streaming chat-completion calls with tool support.
 - **Thinking filter** (`thinking_filter.rs`) — strips `<think>...</think>`
   blocks from Qwen3-family responses; `CUBI_KEEP_THINKING=1` disables.
+- **Repo-map** (`repomap.rs`) — walks the project honoring `.gitignore`,
+  parses Rust/Python/JS/TS with tree-sitter (or a regex fallback when the
+  `tree-sitter` feature is off), and renders a compact file + symbol outline.
+  Backs the `repo_map` built-in tool and the `/repomap` slash command;
+  results are mtime-cached under `<cache_dir>/cubi/repomap/`.
 
 ## Main dependencies
 
