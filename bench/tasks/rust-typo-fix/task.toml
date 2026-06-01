@@ -1,0 +1,6 @@
+id = "rust-typo-fix"
+difficulty = "easy"
+description = "Fix a typo that breaks the build"
+prompt = "The crate fails to build because of a typo. Run `cargo build`, find the typo in `src/lib.rs`, fix it so the crate builds and `cargo test` passes."
+time_cap_seconds = 120
+step_cap = 15

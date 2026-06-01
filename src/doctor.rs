@@ -92,6 +92,7 @@ async fn run_checks(fix: bool) -> Vec<CheckResult> {
     results.push(check_plugins_dir());
     results.push(check_completions_installed(fix));
     results.push(check_browser().await);
+    results.push(check_bench_suite());
     results
 }
 
@@ -110,6 +111,73 @@ async fn check_browser() -> CheckResult {
             "disabled (compile with --features browser to enable)",
         )
     }
+}
+
+/// Reports on the curated `cubi bench` regression suite: how many
+/// total tasks ship in `bench/tasks/`, how big the `quick` subset is,
+/// and the timestamp of the most recent local run (if any). Pure
+/// filesystem inspection — never spawns a model.
+fn check_bench_suite() -> CheckResult {
+    let root = std::path::Path::new("bench/tasks");
+    if !root.exists() {
+        return CheckResult::warn(
+            "bench_suite",
+            "bench/tasks/ not present (run from the repo root to inspect)",
+        );
+    }
+    let mut total = 0usize;
+    let mut quick = 0usize;
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) => {
+            return CheckResult::warn("bench_suite", format!("read bench/tasks: {e}"));
+        }
+    };
+    for entry in entries.flatten() {
+        let toml_path = entry.path().join("task.toml");
+        if !toml_path.exists() {
+            continue;
+        }
+        total += 1;
+        if let Ok(raw) = std::fs::read_to_string(&toml_path) {
+            // Cheap substring sniff to avoid pulling toml into doctor.rs.
+            if raw.contains("difficulty = \"easy\"") {
+                quick += 1;
+            }
+        }
+    }
+    let last_run = latest_bench_run();
+    let last_msg = last_run
+        .map(|s| format!(", last run {s}"))
+        .unwrap_or_default();
+    CheckResult::ok(
+        "bench_suite",
+        format!("{total} tasks ({quick} in quick suite){last_msg}"),
+    )
+}
+
+fn latest_bench_run() -> Option<String> {
+    let results_dir = std::path::Path::new("bench/results");
+    if !results_dir.exists() {
+        return None;
+    }
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(results_dir).ok()?.flatten() {
+        let summary = entry.path().join("summary.json");
+        if !summary.exists() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let name = entry.file_name().to_string_lossy().to_string();
+        match &newest {
+            Some((t, _)) if *t >= modified => {}
+            _ => newest = Some((modified, name)),
+        }
+    }
+    newest.map(|(_, name)| name)
 }
 
 fn check_config(fix: bool) -> CheckResult {

@@ -1,0 +1,6 @@
+id = "py-leap-year"
+difficulty = "easy"
+description = "Implement Gregorian leap-year detection"
+prompt = "Implement `is_leap(year)` in `leap.py` so that `python -m pytest -q` passes. A year is a leap year if it is divisible by 4, except centuries which must also be divisible by 400."
+time_cap_seconds = 120
+step_cap = 15

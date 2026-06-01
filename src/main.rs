@@ -1,4 +1,5 @@
 mod agent_loop;
+mod bench;
 #[cfg(feature = "browser")]
 mod browser_tool;
 mod builtin_tools;
@@ -658,6 +659,117 @@ async fn main() -> Result<()> {
             "doctor" => {
                 set_primary(&mut primary, PrimaryCommand::Doctor);
             }
+            "bench" => {
+                let mut bench_args = bench::BenchArgs::default();
+                let mut j = i + 1;
+                while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                    match arg {
+                        "--suite" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --suite requires a value (quick|all).");
+                                std::process::exit(2);
+                            };
+                            let Some(s) = bench::Suite::parse(v) else {
+                                eprintln!("cubi: bench --suite must be one of: quick, all.");
+                                std::process::exit(2);
+                            };
+                            bench_args.suite = s;
+                        }
+                        _ if arg.starts_with("--suite=") => {
+                            let v = arg.trim_start_matches("--suite=");
+                            let Some(s) = bench::Suite::parse(v) else {
+                                eprintln!("cubi: bench --suite must be one of: quick, all.");
+                                std::process::exit(2);
+                            };
+                            bench_args.suite = s;
+                        }
+                        "--model" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --model requires a value.");
+                                std::process::exit(2);
+                            };
+                            bench_args.model = Some(v.to_string());
+                        }
+                        _ if arg.starts_with("--model=") => {
+                            bench_args.model = Some(arg.trim_start_matches("--model=").to_string());
+                        }
+                        "--task" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --task requires a task id.");
+                                std::process::exit(2);
+                            };
+                            bench_args.task = Some(v.to_string());
+                        }
+                        _ if arg.starts_with("--task=") => {
+                            bench_args.task = Some(arg.trim_start_matches("--task=").to_string());
+                        }
+                        "--output" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --output requires a directory path.");
+                                std::process::exit(2);
+                            };
+                            bench_args.output = Some(std::path::PathBuf::from(v));
+                        }
+                        _ if arg.starts_with("--output=") => {
+                            bench_args.output = Some(std::path::PathBuf::from(
+                                arg.trim_start_matches("--output="),
+                            ));
+                        }
+                        "--tasks-root" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --tasks-root requires a directory path.");
+                                std::process::exit(2);
+                            };
+                            bench_args.tasks_root = Some(std::path::PathBuf::from(v));
+                        }
+                        _ if arg.starts_with("--tasks-root=") => {
+                            bench_args.tasks_root = Some(std::path::PathBuf::from(
+                                arg.trim_start_matches("--tasks-root="),
+                            ));
+                        }
+                        "--step-cap" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: bench --step-cap requires an integer value.");
+                                std::process::exit(2);
+                            };
+                            let Ok(n) = v.parse::<u32>() else {
+                                eprintln!("cubi: bench --step-cap must be a positive integer.");
+                                std::process::exit(2);
+                            };
+                            bench_args.step_cap = Some(n);
+                        }
+                        _ if arg.starts_with("--step-cap=") => {
+                            let v = arg.trim_start_matches("--step-cap=");
+                            let Ok(n) = v.parse::<u32>() else {
+                                eprintln!("cubi: bench --step-cap must be a positive integer.");
+                                std::process::exit(2);
+                            };
+                            bench_args.step_cap = Some(n);
+                        }
+                        "--keep-workdir" => bench_args.keep_workdir = true,
+                        "--json" => bench_args.json = true,
+                        "--help" | "-h" => {
+                            print_bench_help();
+                            return Ok(());
+                        }
+                        _ => {
+                            eprintln!(
+                                "cubi: bench: unexpected argument {arg:?}. Run `cubi bench --help`."
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                    j += 1;
+                }
+                set_primary(&mut primary, PrimaryCommand::Bench(bench_args));
+                i = j - 1;
+            }
             "--fix" => {
                 doctor_fix = true;
             }
@@ -823,6 +935,16 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
             return Ok(());
+        }
+        PrimaryCommand::Bench(args) => {
+            let code = match bench::run(args.clone()).await {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("cubi: bench failed: {e:#}");
+                    2
+                }
+            };
+            std::process::exit(code);
         }
         PrimaryCommand::PrintConfig => {
             print_config()?;
@@ -1450,6 +1572,7 @@ enum PrimaryCommand {
         verify_payloads: bool,
         json: bool,
     },
+    Bench(bench::BenchArgs),
     PrintConfig,
 }
 
@@ -1776,6 +1899,28 @@ async fn run_mcp_test(server: &str, only_tool: Option<&str>, json: bool) -> i32 
     exit
 }
 
+fn print_bench_help() {
+    println!(
+        "cubi bench — run the curated regression suite\n\n\
+         USAGE:\n  cubi bench [FLAGS]\n\n\
+         FLAGS:\n  \
+         --suite <quick|all>       Task subset to run. `quick` is\n  \
+                                  difficulty=easy only (default: quick).\n  \
+         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3:8b).\n  \
+         --task <id>               Run only the named task (debugging).\n  \
+         --output <dir>            Output directory for results\n  \
+                                  (default: bench/results/<unix-ts>/).\n  \
+         --tasks-root <dir>        Override the tasks directory\n  \
+                                  (default: bench/tasks/).\n  \
+         --step-cap <n>            Override the per-task step cap.\n  \
+         --keep-workdir            Don't clean up the agent's tempdir.\n  \
+         --json                    Print summary as JSON to stdout.\n  \
+         -h, --help                Print this help and exit.\n\n\
+         Exits 0 if every selected task passed, 2 otherwise.\n\
+         See bench/README.md for task format and how to add tasks.",
+    );
+}
+
 fn print_help() {
     println!(
         "cubi {} — a pocket-sized AI for your shell\n\n\
@@ -1824,6 +1969,12 @@ fn print_help() {
                                       Re-walk a hash-chained receipts log and report\n  \
                                       any tampering (exit 0 ok, 2 tamper, 13 I/O)\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
+         cubi bench [--suite quick|all] [--model <name>] [--task <id>] [--json]\n  \
+                                      Run the curated regression suite under\n  \
+                                      bench/tasks/ against a local model. Writes\n  \
+                                      per-task results + summary.json to\n  \
+                                      bench/results/<timestamp>/. Run `cubi bench --help`\n  \
+                                      for the full flag list.\n  \
          cubi doctor --fix            Run checks and apply safe automated fixes\n  \
                                       (create missing sessions dir, write a\n  \
                                       stub config, install shell completions)\n  \
