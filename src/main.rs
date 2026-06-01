@@ -1,4 +1,6 @@
 mod agent_loop;
+#[cfg(feature = "browser")]
+mod browser_tool;
 mod builtin_tools;
 mod cli;
 mod commands;

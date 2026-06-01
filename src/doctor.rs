@@ -91,7 +91,25 @@ async fn run_checks(fix: bool) -> Vec<CheckResult> {
     results.extend(check_mcp_servers());
     results.push(check_plugins_dir());
     results.push(check_completions_installed(fix));
+    results.push(check_browser().await);
     results
+}
+
+async fn check_browser() -> CheckResult {
+    #[cfg(feature = "browser")]
+    {
+        match crate::browser_tool::doctor_probe(3).await {
+            Ok(()) => CheckResult::ok("browser", "headless browser launches"),
+            Err(e) => CheckResult::warn("browser", format!("{e}")),
+        }
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        CheckResult::ok(
+            "browser",
+            "disabled (compile with --features browser to enable)",
+        )
+    }
 }
 
 fn check_config(fix: bool) -> CheckResult {

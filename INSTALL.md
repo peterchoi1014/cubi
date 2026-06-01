@@ -119,6 +119,23 @@ switch interactively with `/model`:
 CUBI_MODEL=qwen3:4b cubi
 ```
 
+## Optional features
+
+Cubi ships with optional capabilities behind cargo feature flags so the
+default binary stays under 8 MB. Enable them at install time:
+
+```bash
+# Headless-browser tool family (browser_open / browser_eval /
+# browser_screenshot / browser_text / browser_close). Pulls in
+# chromiumoxide (~+4 MB to the release binary) and requires a
+# Chromium or Chrome binary on PATH at runtime.
+cargo install --features browser --path .
+```
+
+If the browser binary isn't on PATH, point Cubi at it with
+`CHROME=/path/to/chromium`. `cubi doctor` reports whether the launch
+probe succeeds.
+
 ## Using a non-Ollama backend
 
 Cubi's OpenAI-compatible client speaks to any local server that exposes

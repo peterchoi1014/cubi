@@ -82,6 +82,12 @@ pub struct BuiltinToolRegistry {
     /// `AsyncMutex` so it can be held across the awaits needed to read
     /// from the child process.
     repls: Arc<AsyncMutex<HashMap<String, ReplSession>>>,
+    /// Long-lived headless-browser sessions. Same opaque session-id
+    /// model as the REPL tools. Only present when the `browser` cargo
+    /// feature is enabled — without it the field, the tool specs, and
+    /// the `execute` arms are all absent.
+    #[cfg(feature = "browser")]
+    browsers: crate::browser_tool::BrowserManager,
 }
 
 /// One long-lived REPL backed by `bash -i`. We use a sentinel marker to
@@ -150,6 +156,16 @@ impl BuiltinToolRegistry {
             Self::notify_tool(),
             Self::prevent_sleep_tool(),
             Self::repo_map_tool(),
+            #[cfg(feature = "browser")]
+            Self::browser_open_tool(),
+            #[cfg(feature = "browser")]
+            Self::browser_eval_tool(),
+            #[cfg(feature = "browser")]
+            Self::browser_screenshot_tool(),
+            #[cfg(feature = "browser")]
+            Self::browser_text_tool(),
+            #[cfg(feature = "browser")]
+            Self::browser_close_tool(),
         ];
 
         Self {
@@ -158,6 +174,8 @@ impl BuiltinToolRegistry {
             plan_mode,
             journal,
             repls: Arc::new(AsyncMutex::new(HashMap::new())),
+            #[cfg(feature = "browser")]
+            browsers: crate::browser_tool::BrowserManager::new(),
         }
     }
 
@@ -203,6 +221,16 @@ impl BuiltinToolRegistry {
             "notify" => self.execute_notify(args),
             "prevent_sleep" => self.execute_prevent_sleep(args).await,
             "repo_map" => self.execute_repo_map(args),
+            #[cfg(feature = "browser")]
+            "browser_open" => self.execute_browser_open(args).await,
+            #[cfg(feature = "browser")]
+            "browser_eval" => self.execute_browser_eval(args).await,
+            #[cfg(feature = "browser")]
+            "browser_screenshot" => self.execute_browser_screenshot(args).await,
+            #[cfg(feature = "browser")]
+            "browser_text" => self.execute_browser_text(args).await,
+            #[cfg(feature = "browser")]
+            "browser_close" => self.execute_browser_close(args).await,
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -2191,6 +2219,212 @@ impl BuiltinToolRegistry {
             Err(e) => Ok(ToolResult::error(format!(
                 "prevent_sleep failed to start inhibitor: {e}"
             ))),
+        }
+    }
+
+    // ---- Headless-browser tools (feature = "browser") ----
+    //
+    // Tool surface mirrors the REPL family: caller-supplied opaque
+    // session id, long-lived per-session browser owned by the
+    // registry's `BrowserManager`. All five tools refuse in plan mode
+    // — even the read-only ones trigger arbitrary external network and
+    // JS execution which is not safe to perform while the user is
+    // still reviewing a plan. `browser_screenshot` additionally goes
+    // through `Permissions::check_write` because it mutates the disk.
+
+    #[cfg(feature = "browser")]
+    fn browser_open_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "browser_open".to_string(),
+            description: "Open a URL in a headless browser session. Reuses the session if \
+                          `session_id` is already open. Optionally waits for a CSS selector \
+                          before returning. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Caller-chosen stable id. Reuse on subsequent browser_* calls."
+                    },
+                    "url": { "type": "string", "description": "Absolute URL to open" },
+                    "wait_for": {
+                        "type": "string",
+                        "description": "Optional CSS selector to wait for before returning"
+                    }
+                },
+                "required": ["session_id", "url"]
+            }),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    fn browser_eval_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "browser_eval".to_string(),
+            description: "Execute JavaScript in the page and return the JSON-serializable \
+                          result. Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "js": { "type": "string", "description": "Expression or function source to evaluate" }
+                },
+                "required": ["session_id", "js"]
+            }),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    fn browser_screenshot_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "browser_screenshot".to_string(),
+            description: "Save a full-page PNG screenshot of the session to `path`. \
+                          Path-trust gated and refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "path": { "type": "string", "description": "Filesystem path to write the PNG" }
+                },
+                "required": ["session_id", "path"]
+            }),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    fn browser_text_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "browser_text".to_string(),
+            description: "Extract visible text from the page (whole page when `selector` is \
+                          omitted, otherwise the matched element). Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector; omit for full-page text"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    fn browser_close_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "browser_close".to_string(),
+            description: "Close a browser session and terminate the underlying Chrome process. \
+                          Refused in plan mode."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": ["session_id"]
+            }),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    async fn execute_browser_open(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("browser_open")));
+        }
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?;
+        let url = args["url"].as_str().context("Missing 'url' parameter")?;
+        let wait_for = args["wait_for"].as_str();
+        match self.browsers.open(session_id, url, wait_for).await {
+            Ok(msg) => Ok(ToolResult::success(msg)),
+            Err(e) => Ok(ToolResult::error(format!("browser_open: {e}"))),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    async fn execute_browser_eval(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("browser_eval")));
+        }
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?;
+        let js = args["js"].as_str().context("Missing 'js' parameter")?;
+        match self.browsers.eval(session_id, js).await {
+            Ok(value) => Ok(ToolResult::success(value.to_string())),
+            Err(e) => Ok(ToolResult::error(format!("browser_eval: {e}"))),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    async fn execute_browser_screenshot(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal(
+                "browser_screenshot",
+            )));
+        }
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?;
+        let path = args["path"].as_str().context("Missing 'path' parameter")?;
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap()
+            .check_write(Path::new(path))
+        {
+            return Ok(ToolResult::error(format!("{e}")));
+        }
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    return Ok(ToolResult::error(format!(
+                        "browser_screenshot: failed to create parent directories: {e}"
+                    )));
+                }
+            }
+        }
+        match self.browsers.screenshot(session_id, Path::new(path)).await {
+            Ok(()) => Ok(ToolResult::success(format!("screenshot saved to {path}"))),
+            Err(e) => Ok(ToolResult::error(format!("browser_screenshot: {e}"))),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    async fn execute_browser_text(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("browser_text")));
+        }
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?;
+        let selector = args["selector"].as_str();
+        match self.browsers.text(session_id, selector).await {
+            Ok(text) => Ok(ToolResult::success(text)),
+            Err(e) => Ok(ToolResult::error(format!("browser_text: {e}"))),
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    async fn execute_browser_close(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("browser_close")));
+        }
+        let session_id = args["session_id"]
+            .as_str()
+            .context("Missing 'session_id' parameter")?;
+        match self.browsers.close(session_id).await {
+            Ok(()) => Ok(ToolResult::success(format!(
+                "browser session '{session_id}' closed"
+            ))),
+            Err(e) => Ok(ToolResult::error(format!("browser_close: {e}"))),
         }
     }
 }
