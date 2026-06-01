@@ -80,6 +80,9 @@ pub enum Cmd {
     Usage,
     McpResources,
     McpRead,
+    McpSearch,
+    McpInstall,
+    McpUninstall,
     Bug,
     Issue,
     // -- New in 0.2.0 --
@@ -465,6 +468,24 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/mcp-read <uri>",
         help: "Read an MCP resource by URI",
         cmd: Cmd::McpRead,
+    },
+    SlashCommandSpec {
+        name: "/mcp-search",
+        usage: "/mcp-search [<query>]",
+        help: "Search the embedded MCP registry",
+        cmd: Cmd::McpSearch,
+    },
+    SlashCommandSpec {
+        name: "/mcp-install",
+        usage: "/mcp-install <name> [--force] [--env K=V]...",
+        help: "Install an MCP server from the registry",
+        cmd: Cmd::McpInstall,
+    },
+    SlashCommandSpec {
+        name: "/mcp-uninstall",
+        usage: "/mcp-uninstall <name>",
+        help: "Remove an MCP server from ~/.cubi/mcp.json",
+        cmd: Cmd::McpUninstall,
     },
     SlashCommandSpec {
         name: "/model",

@@ -19,9 +19,11 @@ mod json_events;
 #[allow(dead_code)]
 mod llm;
 mod lsp_client;
+mod mcp_cli;
 mod mcp_client;
 mod mcp_config;
 mod mcp_manager;
+mod mcp_registry;
 mod memdir;
 mod migrations;
 mod oauth;
@@ -319,7 +321,7 @@ async fn main() -> Result<()> {
             }
             "mcp" => {
                 let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
-                    eprintln!("cubi: mcp requires one of: test.");
+                    eprintln!("cubi: mcp requires one of: test, search, install, uninstall.");
                     std::process::exit(2);
                 };
                 match subcommand {
@@ -362,8 +364,112 @@ async fn main() -> Result<()> {
                         );
                         i = j - 1;
                     }
+                    "search" => {
+                        let mut query = String::new();
+                        let mut json = false;
+                        let mut j = i + 2;
+                        while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                            match arg {
+                                "--json" => json = true,
+                                _ if arg.starts_with("--") => {
+                                    eprintln!("cubi: mcp search: unexpected argument {arg:?}");
+                                    std::process::exit(2);
+                                }
+                                _ => {
+                                    if !query.is_empty() {
+                                        query.push(' ');
+                                    }
+                                    query.push_str(arg);
+                                }
+                            }
+                            j += 1;
+                        }
+                        set_primary(&mut primary, PrimaryCommand::McpSearch { query, json });
+                        i = j - 1;
+                    }
+                    "install" => {
+                        let Some(name) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: mcp install requires a server name.");
+                            std::process::exit(2);
+                        };
+                        let mut force = false;
+                        let mut json = false;
+                        let mut envs: Vec<(String, String)> = Vec::new();
+                        let mut j = i + 3;
+                        while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                            match arg {
+                                "--force" => force = true,
+                                "--json" => json = true,
+                                "--env" => {
+                                    j += 1;
+                                    let Some(kv) = argv.get(j).and_then(|a| a.to_str()) else {
+                                        eprintln!("cubi: mcp install --env requires KEY=VALUE.");
+                                        std::process::exit(2);
+                                    };
+                                    let Some((k, v)) = kv.split_once('=') else {
+                                        eprintln!(
+                                            "cubi: mcp install --env expects KEY=VALUE, got {kv:?}."
+                                        );
+                                        std::process::exit(2);
+                                    };
+                                    envs.push((k.to_string(), v.to_string()));
+                                }
+                                _ if arg.starts_with("--env=") => {
+                                    let kv = arg.trim_start_matches("--env=");
+                                    let Some((k, v)) = kv.split_once('=') else {
+                                        eprintln!(
+                                            "cubi: mcp install --env expects KEY=VALUE, got {kv:?}."
+                                        );
+                                        std::process::exit(2);
+                                    };
+                                    envs.push((k.to_string(), v.to_string()));
+                                }
+                                _ => {
+                                    eprintln!("cubi: mcp install: unexpected argument {arg:?}");
+                                    std::process::exit(2);
+                                }
+                            }
+                            j += 1;
+                        }
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::McpInstall {
+                                name: name.to_string(),
+                                force,
+                                json,
+                                envs,
+                            },
+                        );
+                        i = j - 1;
+                    }
+                    "uninstall" => {
+                        let Some(name) = argv.get(i + 2).and_then(|a| a.to_str()) else {
+                            eprintln!("cubi: mcp uninstall requires a server name.");
+                            std::process::exit(2);
+                        };
+                        let mut json = false;
+                        let mut j = i + 3;
+                        while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                            match arg {
+                                "--json" => json = true,
+                                _ => {
+                                    eprintln!("cubi: mcp uninstall: unexpected argument {arg:?}");
+                                    std::process::exit(2);
+                                }
+                            }
+                            j += 1;
+                        }
+                        set_primary(
+                            &mut primary,
+                            PrimaryCommand::McpUninstall {
+                                name: name.to_string(),
+                                json,
+                            },
+                        );
+                        i = j - 1;
+                    }
                     _ => {
-                        eprintln!("cubi: mcp requires one of: test.");
+                        eprintln!("cubi: mcp requires one of: test, search, install, uninstall.");
                         std::process::exit(2);
                     }
                 }
@@ -706,6 +812,23 @@ async fn main() -> Result<()> {
         }
         PrimaryCommand::McpTest { server, tool, json } => {
             let code = run_mcp_test(server, tool.as_deref(), *json).await;
+            std::process::exit(code);
+        }
+        PrimaryCommand::McpSearch { query, json } => {
+            let code = mcp_cli::run_mcp_search(query, *json);
+            std::process::exit(code);
+        }
+        PrimaryCommand::McpInstall {
+            name,
+            force,
+            json,
+            envs,
+        } => {
+            let code = mcp_cli::run_mcp_install(name, *force, *json, envs).await;
+            std::process::exit(code);
+        }
+        PrimaryCommand::McpUninstall { name, json } => {
+            let code = mcp_cli::run_mcp_uninstall(name, *json);
             std::process::exit(code);
         }
         PrimaryCommand::PluginsReload => {
@@ -1139,6 +1262,20 @@ enum PrimaryCommand {
         tool: Option<String>,
         json: bool,
     },
+    McpSearch {
+        query: String,
+        json: bool,
+    },
+    McpInstall {
+        name: String,
+        force: bool,
+        json: bool,
+        envs: Vec<(String, String)>,
+    },
+    McpUninstall {
+        name: String,
+        json: bool,
+    },
     PruneSessions,
     Doctor,
     PrintConfig,
@@ -1424,6 +1561,12 @@ fn print_help() {
                                       manifest, handler stub, and README\n  \
          cubi mcp test <server> [--tool <name>] [--json]\n  \
                                       Connect, list tools, and call each with stub args\n  \
+         cubi mcp search [<query>] [--json]\n  \
+                                      Search the embedded MCP registry\n  \
+         cubi mcp install <name> [--force] [--env K=V]... [--json]\n  \
+                                      Install a registry entry into ~/.cubi/mcp.json\n  \
+         cubi mcp uninstall <name> [--json]\n  \
+                                      Remove a server from ~/.cubi/mcp.json\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
          cubi doctor --fix            Run checks and apply safe automated fixes\n  \
                                       (create missing sessions dir, write a\n  \

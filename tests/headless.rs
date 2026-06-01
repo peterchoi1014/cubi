@@ -757,3 +757,58 @@ fn plugins_remove_refuses_extras_without_force() {
         .success()
         .stdout(predicate::str::contains("removed"));
 }
+
+#[test]
+fn mcp_search_json_emits_valid_json_array() {
+    let home = tempdir().unwrap();
+    let output = cubi(home.path())
+        .args(["mcp", "search", "--json"])
+        .assert()
+        .success();
+    let stdout = std::str::from_utf8(&output.get_output().stdout)
+        .expect("mcp search --json stdout is utf-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout).expect("mcp search --json output must parse as JSON");
+    let arr = parsed.as_array().expect("output is a JSON array");
+    assert!(
+        arr.len() >= 10,
+        "registry should expose at least 10 entries via --json; got {}",
+        arr.len()
+    );
+    for entry in arr {
+        assert!(entry.get("name").and_then(|v| v.as_str()).is_some());
+        assert!(entry.get("transport").and_then(|v| v.as_str()).is_some());
+        assert!(entry.get("description").and_then(|v| v.as_str()).is_some());
+    }
+}
+
+#[test]
+fn mcp_search_filters_by_name() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .args(["mcp", "search", "github"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("github"));
+}
+
+#[test]
+fn mcp_install_unknown_name_errors() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .args(["mcp", "install", "does-not-exist", "--json"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn mcp_uninstall_missing_entry_errors() {
+    let home = tempdir().unwrap();
+    cubi(home.path())
+        .args(["mcp", "uninstall", "github"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("no MCP server"));
+}

@@ -556,6 +556,93 @@ impl ChatCLI {
             Cmd::McpRead => {
                 self.read_mcp_resource(args).await;
             }
+            Cmd::McpSearch => {
+                let _ = crate::mcp_cli::run_mcp_search(args.trim(), false);
+            }
+            Cmd::McpInstall => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if parts.is_empty() {
+                    println!(
+                        "{} Usage: /mcp-install <name> [--force] [--env K=V]...",
+                        "Info:".bright_yellow()
+                    );
+                } else {
+                    let name = parts[0].to_string();
+                    let mut force = false;
+                    let mut envs: Vec<(String, String)> = Vec::new();
+                    let mut iter = parts.into_iter().skip(1);
+                    let mut bad = false;
+                    while let Some(tok) = iter.next() {
+                        match tok {
+                            "--force" => force = true,
+                            "--env" => {
+                                if let Some(kv) = iter.next() {
+                                    if let Some((k, v)) = kv.split_once('=') {
+                                        envs.push((k.to_string(), v.to_string()));
+                                    } else {
+                                        eprintln!(
+                                            "{} --env expects KEY=VALUE",
+                                            "Error:".bright_red()
+                                        );
+                                        bad = true;
+                                        break;
+                                    }
+                                } else {
+                                    eprintln!("{} --env requires KEY=VALUE", "Error:".bright_red());
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                            _ if tok.starts_with("--env=") => {
+                                let kv = tok.trim_start_matches("--env=");
+                                if let Some((k, v)) = kv.split_once('=') {
+                                    envs.push((k.to_string(), v.to_string()));
+                                } else {
+                                    eprintln!("{} --env expects KEY=VALUE", "Error:".bright_red());
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "{} unexpected argument {:?}",
+                                    "Error:".bright_red(),
+                                    tok
+                                );
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !bad {
+                        let _ = crate::mcp_cli::run_mcp_install(&name, force, false, &envs).await;
+                        // Refresh the live MCP manager so newly installed tools become available
+                        // in the running REPL without requiring a restart.
+                        if let Err(e) = self.reload_mcp().await {
+                            eprintln!(
+                                "{} Failed to reload MCP after install: {}",
+                                "Warn:".bright_yellow(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Cmd::McpUninstall => {
+                let name = args.trim();
+                if name.is_empty() {
+                    println!("{} Usage: /mcp-uninstall <name>", "Info:".bright_yellow());
+                } else {
+                    let _ = crate::mcp_cli::run_mcp_uninstall(name, false);
+                    if let Err(e) = self.reload_mcp().await {
+                        eprintln!(
+                            "{} Failed to reload MCP after uninstall: {}",
+                            "Warn:".bright_yellow(),
+                            e
+                        );
+                    }
+                }
+            }
             Cmd::Save => {
                 if args.is_empty() {
                     println!("{} Usage: /save [-f] <filename>", "Info:".bright_yellow());

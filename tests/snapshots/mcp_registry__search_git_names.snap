@@ -1,0 +1,9 @@
+---
+source: tests/mcp_registry.rs
+assertion_line: 154
+expression: hits
+---
+[
+    "github",
+    "gitlab",
+]
