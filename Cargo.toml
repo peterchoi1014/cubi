@@ -85,6 +85,13 @@ futures = { version = "0.3", optional = true }
 # `cubi mcp install`. Pure-Rust on Unix, winapi on Windows; ~200 LOC.
 rpassword = "7"
 
+# Tamper-evident receipts log: SHA-256 hash chain, optional Ed25519
+# signing. Hand-rolled hex encoding keeps the dep surface minimal.
+sha2 = "0.10"
+ed25519-dalek = "2"
+base64 = "0.22"
+getrandom = "0.2"
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [

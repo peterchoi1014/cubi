@@ -95,3 +95,31 @@ Event types currently emitted:
 `tool_complete` record shape for back-compat, but new integrations
 should prefer `--events`; the same redaction rules apply.
 
+## Tamper-evident receipts (`--receipts <path>`)
+
+`--receipts <path>` (or `CUBI_RECEIPTS=…`, or `receipts` in
+`~/.cubi/config.json`; precedence is flag > env > config) opens a
+hash-chained JSONL audit log. Every session, user message, tool call,
+tool result, assistant message, and session end produces one append-only
+entry whose `this_hash` covers `prev_hash` plus the canonical
+serialization of the rest of the record. Full args/results live in
+`<path>.payloads/<sha256>.json` so the receipts file itself stays small
+and grep-able.
+
+If `cubi keys init` has been run, every subsequent entry is signed with
+the Ed25519 key under `~/.cubi/keys/`. Verify a log (and optionally its
+signatures) with:
+
+```sh
+cubi verify-receipts /path/to/r.jsonl                         # chain + payloads
+cubi verify-receipts /path/to/r.jsonl --pub-key ~/.cubi/keys/ed25519.pub
+cubi verify-receipts /path/to/r.jsonl --no-verify-payloads --json
+```
+
+Exit codes: `0` ok, `2` tamper detected (chain break, payload mismatch,
+or signature mismatch — the offending `seq` is reported on stderr), `13`
+I/O error. Receipts are a side-channel: when the file can't be written
+mid-session, cubi degrades to a single `tracing::warn!` and the session
+continues. See `DEVELOPMENT.md` § "Receipts format" for the on-disk
+shape and canonical-serialization algorithm.
+

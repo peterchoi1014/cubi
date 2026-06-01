@@ -36,6 +36,7 @@ pub mod plugins;
 mod policy;
 mod pricing;
 mod project_memory;
+mod receipts;
 mod repomap;
 mod schemas;
 mod script;
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
     // once everything else is parsed.
     let mut trace_tools_path: Option<String> = None;
     let mut events_path: Option<String> = None;
+    let mut receipts_path: Option<String> = None;
     let mut doctor_fix = false;
 
     let mut i = 0;
@@ -500,6 +502,95 @@ async fn main() -> Result<()> {
             _ if arg.starts_with("--events=") => {
                 events_path = Some(arg.trim_start_matches("--events=").to_string());
             }
+            "--receipts" => {
+                i += 1;
+                let Some(path) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: --receipts requires a file path.");
+                    std::process::exit(2);
+                };
+                receipts_path = Some(path.to_string());
+            }
+            _ if arg.starts_with("--receipts=") => {
+                receipts_path = Some(arg.trim_start_matches("--receipts=").to_string());
+            }
+            "keys" => {
+                let Some(subcommand) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!("cubi: keys requires one of: init.");
+                    std::process::exit(2);
+                };
+                match subcommand {
+                    "init" => {
+                        let mut force = false;
+                        let mut j = i + 2;
+                        while let Some(extra) = argv.get(j).and_then(|a| a.to_str()) {
+                            match extra {
+                                "--force" => force = true,
+                                _ => {
+                                    eprintln!("cubi: keys init: unexpected argument {extra:?}");
+                                    std::process::exit(2);
+                                }
+                            }
+                            j += 1;
+                        }
+                        set_primary(&mut primary, PrimaryCommand::KeysInit { force });
+                        i = j - 1;
+                    }
+                    _ => {
+                        eprintln!("cubi: keys requires one of: init.");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "verify-receipts" => {
+                let Some(path) = argv.get(i + 1).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: verify-receipts requires a path. Usage: cubi verify-receipts <path> [--pub-key <path>] [--no-verify-payloads] [--json]"
+                    );
+                    std::process::exit(2);
+                };
+                if path.starts_with('-') {
+                    eprintln!(
+                        "cubi: verify-receipts requires a receipts file path before any flags."
+                    );
+                    std::process::exit(2);
+                }
+                let mut pub_key: Option<String> = None;
+                let mut verify_payloads = true;
+                let mut json = false;
+                let mut j = i + 2;
+                while let Some(extra) = argv.get(j).and_then(|a| a.to_str()) {
+                    match extra {
+                        "--no-verify-payloads" => verify_payloads = false,
+                        "--json" => json = true,
+                        "--pub-key" => {
+                            j += 1;
+                            let Some(p) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: --pub-key requires a path.");
+                                std::process::exit(2);
+                            };
+                            pub_key = Some(p.to_string());
+                        }
+                        _ if extra.starts_with("--pub-key=") => {
+                            pub_key = Some(extra.trim_start_matches("--pub-key=").to_string());
+                        }
+                        _ => {
+                            eprintln!("cubi: verify-receipts: unexpected argument {extra:?}");
+                            std::process::exit(2);
+                        }
+                    }
+                    j += 1;
+                }
+                set_primary(
+                    &mut primary,
+                    PrimaryCommand::VerifyReceipts {
+                        path: path.to_string(),
+                        pub_key,
+                        verify_payloads,
+                        json,
+                    },
+                );
+                i = j - 1;
+            }
             "--explain-tools" => {
                 cli_flags.explain_tools = true;
             }
@@ -860,6 +951,33 @@ async fn main() -> Result<()> {
             prune_sessions(age_secs, dry_run)?;
             return Ok(());
         }
+        PrimaryCommand::KeysInit { force } => match receipts::init_keypair(*force) {
+            Ok((pub_path, ssh_line)) => {
+                println!(
+                    "✓ Generated Ed25519 keypair under {}",
+                    pub_path
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+                println!("  public key: {}", pub_path.display());
+                println!("  {}", ssh_line);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("cubi: keys init failed: {e}");
+                std::process::exit(2);
+            }
+        },
+        PrimaryCommand::VerifyReceipts {
+            path,
+            pub_key,
+            verify_payloads,
+            json,
+        } => {
+            let exit_code = run_verify_receipts(path, pub_key.as_deref(), *verify_payloads, *json);
+            std::process::exit(exit_code);
+        }
         PrimaryCommand::Interactive | PrimaryCommand::Resume(_) => {}
     }
     let headless = one_shot_prompt.is_some();
@@ -1175,6 +1293,51 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // `--receipts` (or CUBI_RECEIPTS env, or config.receipts) opens a
+    // tamper-evident JSONL audit log. Side-channel: failures degrade
+    // to a warning so a misconfigured path can't kill an otherwise
+    // healthy session.
+    let receipts_target = receipts_path
+        .clone()
+        .or_else(|| {
+            std::env::var("CUBI_RECEIPTS")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| config.receipts.clone().filter(|v| !v.is_empty()));
+    if let Some(target) = receipts_target {
+        let signing_key = match receipts::load_default_signing_key() {
+            Ok(k) => k,
+            Err(e) => {
+                user_error::print_user_warning(
+                    &format!("cubi: could not load signing key: {e}"),
+                    Some("receipts will be logged unsigned"),
+                    json_output && headless,
+                );
+                None
+            }
+        };
+        match receipts::ReceiptsWriter::open(std::path::Path::new(&target), signing_key) {
+            Ok(writer) => match writer.probe() {
+                Ok(()) => cli.set_receipts(Some(Arc::new(writer))),
+                Err(e) => {
+                    user_error::print_user_warning(
+                        &format!("cubi: failed to open --receipts path {target}: {e}"),
+                        Some("tamper-evident audit log disabled for this session"),
+                        json_output && headless,
+                    );
+                }
+            },
+            Err(e) => {
+                user_error::print_user_warning(
+                    &format!("cubi: failed to initialize --receipts {target}: {e}"),
+                    Some("tamper-evident audit log disabled for this session"),
+                    json_output && headless,
+                );
+            }
+        }
+    }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
     } else {
@@ -1278,6 +1441,15 @@ enum PrimaryCommand {
     },
     PruneSessions,
     Doctor,
+    KeysInit {
+        force: bool,
+    },
+    VerifyReceipts {
+        path: String,
+        pub_key: Option<String>,
+        verify_payloads: bool,
+        json: bool,
+    },
     PrintConfig,
 }
 
@@ -1436,6 +1608,85 @@ async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
     }
 }
 
+/// Implements `cubi verify-receipts <path> [--pub-key …] [--no-verify-payloads] [--json]`.
+/// Exit codes: `0` ok, `2` tamper detected, `13` I/O error.
+fn run_verify_receipts(
+    path: &str,
+    pub_key: Option<&str>,
+    verify_payloads: bool,
+    json: bool,
+) -> i32 {
+    let receipts_path = std::path::PathBuf::from(path);
+    let pub_key_loaded = match pub_key {
+        Some(p) => match receipts::load_verifying_key(std::path::Path::new(p)) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                if json {
+                    let v = serde_json::json!({
+                        "ok": false,
+                        "error_kind": "io",
+                        "error": format!("failed to load public key: {e}"),
+                    });
+                    println!("{v}");
+                } else {
+                    eprintln!("error: failed to load public key {p}: {e}");
+                }
+                return 13;
+            }
+        },
+        None => None,
+    };
+    let opts = receipts::VerifyOptions {
+        verify_payloads,
+        pub_key: pub_key_loaded,
+    };
+    match receipts::verify_file(&receipts_path, &opts) {
+        Ok(report) => {
+            if json {
+                let v = serde_json::json!({
+                    "ok": true,
+                    "entries": report.entries,
+                    "signed": report.signed,
+                });
+                println!("{v}");
+            } else {
+                println!("OK: {} entries verified", report.entries);
+                if report.signed > 0 {
+                    println!("  ({} signed)", report.signed);
+                }
+            }
+            0
+        }
+        Err(receipts::VerifyError::Io { message }) => {
+            if json {
+                let v = serde_json::json!({
+                    "ok": false,
+                    "error_kind": "io",
+                    "error": message,
+                });
+                println!("{v}");
+            } else {
+                eprintln!("error: {message}");
+            }
+            13
+        }
+        Err(receipts::VerifyError::Tamper { seq, reason }) => {
+            if json {
+                let v = serde_json::json!({
+                    "ok": false,
+                    "error_kind": "tamper",
+                    "seq": seq,
+                    "reason": reason,
+                });
+                println!("{v}");
+            } else {
+                eprintln!("error: {reason} at seq={seq}");
+            }
+            2
+        }
+    }
+}
+
 /// Implements `cubi mcp test <server> [--tool NAME] [--json]`.
 async fn run_mcp_test(server: &str, only_tool: Option<&str>, json: bool) -> i32 {
     use crate::mcp_config::McpConfig;
@@ -1567,6 +1818,11 @@ fn print_help() {
                                       Install a registry entry into ~/.cubi/mcp.json\n  \
          cubi mcp uninstall <name> [--json]\n  \
                                       Remove a server from ~/.cubi/mcp.json\n  \
+         cubi keys init [--force]     Generate an Ed25519 signing keypair under\n  \
+                                      ~/.cubi/keys/ used to sign --receipts entries\n  \
+         cubi verify-receipts <path> [--pub-key <path>] [--no-verify-payloads] [--json]\n  \
+                                      Re-walk a hash-chained receipts log and report\n  \
+                                      any tampering (exit 0 ok, 2 tamper, 13 I/O)\n  \
          cubi doctor                  Run preflight checks and exit (0 ok, 2 fail)\n  \
          cubi doctor --fix            Run checks and apply safe automated fixes\n  \
                                       (create missing sessions dir, write a\n  \
@@ -1602,6 +1858,13 @@ fn print_help() {
                                         boundaries, tool calls, rationales,\n  \
                                         MCP transitions) as JSONL. Also\n  \
                                         honors CUBI_EVENTS env.\n  \
+         --receipts <path>              Append a tamper-evident, hash-chained\n  \
+                                        JSONL audit log of every tool call and\n  \
+                                        lifecycle event; payloads land in\n  \
+                                        <path>.payloads/. Signed if\n  \
+                                        `cubi keys init` was run. Also honors\n  \
+                                        CUBI_RECEIPTS env and `receipts` in\n  \
+                                        config.\n  \
          --explain-tools                Surface a one-line rationale before\n  \
                                         each tool call (or `tool_rationale`\n  \
                                         event in headless JSON mode). Also\n  \

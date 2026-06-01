@@ -42,6 +42,17 @@ impl ChatCLI {
 
         // Fire SessionStart hooks.
         self.hooks.fire_session_start(self.executor.get_model());
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionStart {
+                model: self.executor.get_model().to_string(),
+                cwd: std::env::current_dir().unwrap_or_default(),
+            },
+            &serde_json::json!({
+                "model": self.executor.get_model(),
+                "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+                "mode": "interactive",
+            }),
+        );
 
         let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::new()?;
         rl.set_helper(Some(SlashHelper::new()));
@@ -231,6 +242,10 @@ impl ChatCLI {
 
         // Fire Stop hooks.
         self.hooks.fire_stop();
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionEnd,
+            &serde_json::json!({"mode": "interactive"}),
+        );
 
         // Leave the user with a clear hint on how to pick a chat back up.
         // Three cases:

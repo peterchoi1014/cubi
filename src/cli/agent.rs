@@ -223,6 +223,16 @@ impl ChatCLI {
             );
         }
 
+        // Receipts: capture the user message that opens this turn.
+        if let Some(msg) = self.history.get(turn_start) {
+            if msg.role == "user" {
+                self.emit_receipt(
+                    crate::receipts::ReceiptEvent::UserMessage,
+                    &serde_json::json!({"text": msg.content}),
+                );
+            }
+        }
+
         // Snapshot the journal start so /rewind still works after Ctrl-C
         // cancel: we leave file edits in place but pop the history.
         // (turn_start was captured before the user message was pushed.)
@@ -366,6 +376,16 @@ impl ChatCLI {
             self.history.push(msg);
 
             if calls.is_empty() {
+                // Receipts: final assistant content for this turn.
+                // Filtered through `<think>` stripping so we never
+                // commit chain-of-thought to a long-lived audit log.
+                {
+                    let filtered = crate::thinking_filter::strip_thinking_blocks(&msg_content);
+                    self.emit_receipt(
+                        crate::receipts::ReceiptEvent::AssistantMessage,
+                        &serde_json::json!({"text": filtered}),
+                    );
+                }
                 // Plain text response: we're done with this turn. Some
                 // providers put the completed message only in the final chunk;
                 // print it here if the streaming callback saw no tokens.
@@ -495,6 +515,22 @@ impl ChatCLI {
                     );
                 }
 
+                // Receipts: capture the tool call before dispatch. The
+                // payload is the *raw* args (post-redaction is a
+                // separate concern handled by the event sink); the
+                // receipts side-channel is meant for cryptographic
+                // provenance, so we preserve the original arguments.
+                self.emit_receipt(
+                    crate::receipts::ReceiptEvent::ToolCall {
+                        name: call.function.name.clone(),
+                    },
+                    &serde_json::json!({
+                        "name": call.function.name,
+                        "args": call.function.arguments,
+                        "call_id": call.id,
+                    }),
+                );
+
                 // --trace-tools: record tool_start / tool_complete
                 // pairs around the dispatch. Best-effort: tracer write
                 // failures only log a warning.
@@ -564,6 +600,26 @@ impl ChatCLI {
                             "tool": call.function.name,
                             "ok": !is_err,
                             "result_chars": result_text.chars().count(),
+                        }),
+                    );
+                }
+
+                // Receipts: capture the tool result. Stores the full
+                // (potentially large) text in the payload sidecar so
+                // the JSONL line stays a single line.
+                {
+                    let is_err = result_text.starts_with("[tool error]")
+                        || result_text.starts_with("[tool denied]");
+                    self.emit_receipt(
+                        crate::receipts::ReceiptEvent::ToolResult {
+                            name: call.function.name.clone(),
+                            ok: !is_err,
+                        },
+                        &serde_json::json!({
+                            "name": call.function.name,
+                            "ok": !is_err,
+                            "result": result_text,
+                            "call_id": call.id,
                         }),
                     );
                 }

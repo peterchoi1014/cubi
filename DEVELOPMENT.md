@@ -165,3 +165,105 @@ Reviewers prioritize:
 4. **Tests** — added or updated for new/changed behavior
 
 Style-only nits are not surfaced unless they materially affect readability.
+
+## Receipts format
+
+`--receipts <path>` writes a tamper-evident, append-only JSONL audit
+log. The intent is that an auditor (or a CI tool, or an external
+verifier in Python / Go) can re-walk the chain offline and prove that
+no entry has been mutated since the session ran.
+
+### File layout
+
+```
+<path>                          one JSON object per line, append-only
+<path>.payloads/<sha256>.json   the full payload referenced by each entry
+```
+
+The receipts file stays small and grep-able; large blobs (tool args,
+tool results) live in the sidecar directory keyed by the SHA-256 hash
+the receipts entry commits to.
+
+### Entry shape
+
+```json
+{
+  "seq": 42,
+  "ts": "2026-05-31T12:35:31Z",
+  "event": "tool_call",
+  "name": "bash",
+  "payload_sha256": "abc...",
+  "prev_hash": "def...",
+  "this_hash": "ghi...",
+  "sig": "base64-encoded ed25519 signature of this_hash (optional)"
+}
+```
+
+`event` is one of `session_start`, `user_message`, `tool_call`,
+`tool_result`, `assistant_message`, `session_end`. `name` appears on
+`tool_call` / `tool_result`; `tool_result` also carries `ok: bool`;
+`session_start` carries `model` and `cwd`. `prev_hash` is `""` for the
+first entry of a fresh file (cubi recovers the chain tip if the file
+already exists, so resuming appends rather than forking).
+
+### Hash chain
+
+```
+this_hash = sha256( prev_hash_utf8_bytes || canonical(record_without_this_hash_or_sig) )
+```
+
+Both inputs are concatenated byte-wise (no separator, no length
+prefix). The output is hex-encoded lowercase, 64 chars.
+
+### Canonical serialization
+
+The canonical form is byte-stable sorted-key JSON with no whitespace.
+
+- **Objects**: keys sorted in lexicographic (`BTreeMap`) order; each
+  key serialized with `serde_json`'s standard string escaping;
+  `key`, `:`, `value`, `,` joined directly.
+- **Arrays**: items in input order, joined by `,`, surrounded by
+  `[ ]`.
+- **Strings / numbers / bools / null**: serialized exactly as
+  `serde_json` would (no extra whitespace).
+
+Equivalent in pseudo-Python:
+
+```python
+def canonical(v):
+    if isinstance(v, dict):
+        return b"{" + b",".join(
+            json.dumps(k, ensure_ascii=False).encode() + b":" + canonical(v[k])
+            for k in sorted(v)
+        ) + b"}"
+    if isinstance(v, list):
+        return b"[" + b",".join(canonical(x) for x in v) + b"]"
+    return json.dumps(v, ensure_ascii=False).encode()
+```
+
+`payload_sha256` is `sha256(canonical(payload_blob))` over the full
+payload object (the one written to `<path>.payloads/<hash>.json`). A
+verifier re-reads the sidecar, re-applies `canonical`, and re-hashes
+it to confirm the claim.
+
+### Signatures
+
+When `cubi keys init` has been run, every entry's `this_hash` is signed
+with the Ed25519 private key at `~/.cubi/keys/ed25519.priv`. The
+signature is over the ASCII bytes of the lowercase-hex `this_hash`
+string (not the raw 32-byte digest) so a verifier can sign / verify
+without re-hashing. The base64-encoded 64-byte signature is stored in
+the entry's `sig` field.
+
+The matching public key is written to `~/.cubi/keys/ed25519.pub` in the
+standard `ssh-ed25519 <base64-wire-format> cubi-receipts` single-line
+shape, so `cubi verify-receipts --pub-key …` (and any other tool that
+already speaks SSH wire format) can consume it directly.
+
+### Failure mode
+
+The receipts side-channel must NEVER block tool execution. If a write
+fails mid-session (full disk, deleted directory, etc.), cubi logs one
+`tracing::warn!` to stderr and the session continues without further
+audit entries. The on-disk chain is still verifiable up to the last
+successful write.

@@ -148,6 +148,11 @@ pub struct ChatCLI {
     /// internal event (turn boundaries, tool calls, rationales, MCP
     /// transitions, errors) as JSONL. `None` when the flag is unset.
     pub(crate) event_sink: Option<Arc<crate::event_sink::EventSink>>,
+    /// Optional `--receipts <path>` tamper-evident audit log. When
+    /// `Some`, the agent loop captures session_start/end,
+    /// user_message, assistant_message, tool_call, and tool_result
+    /// events as a hash-chained JSONL entry plus a payload sidecar.
+    pub(crate) receipts: Option<Arc<crate::receipts::ReceiptsWriter>>,
     /// When `true`, print one dim `↳ {tool}: {rationale}` line on stderr
     /// just before each tool call (or emit a `tool_rationale` JSON event
     /// in headless mode). Set by `--explain-tools` / `CUBI_EXPLAIN_TOOLS=1`.
@@ -268,6 +273,7 @@ impl ChatCLI {
             usage_footer_enabled: flags.usage_footer,
             quiet_mode: flags.quiet,
             event_sink: None,
+            receipts: None,
             explain_tools_enabled: flags.explain_tools,
             history_cursor: 0,
             history_page_size: resolve_history_page_size(),
@@ -348,6 +354,33 @@ impl ChatCLI {
         self.event_sink = sink;
     }
 
+    /// Attaches the optional `--receipts <path>` tamper-evident audit
+    /// log. `None` disables the side-channel.
+    pub fn set_receipts(&mut self, receipts: Option<Arc<crate::receipts::ReceiptsWriter>>) {
+        self.receipts = receipts;
+    }
+
+    /// Append a receipts entry if a writer is configured. Failures
+    /// degrade to a single `tracing::warn!`: a full disk or a deleted
+    /// directory must never abort an in-progress session.
+    pub(crate) fn emit_receipt(
+        &self,
+        event: crate::receipts::ReceiptEvent,
+        payload: &serde_json::Value,
+    ) {
+        let Some(receipts) = self.receipts.as_ref() else {
+            return;
+        };
+        if let Err(e) = receipts.write(event, payload) {
+            tracing::warn!(
+                target: "cubi::receipts",
+                error = %e,
+                path = %receipts.path().display(),
+                "receipts write failed; continuing",
+            );
+        }
+    }
+
     /// Runs a single prompt without the welcome banner or rustyline REPL.
     /// Human-facing progress stays on stderr; only model reply tokens/content
     /// are written to stdout so callers can pipe the result.
@@ -357,12 +390,27 @@ impl ChatCLI {
             self.markdown_enabled = false;
         }
         self.hooks.fire_session_start(self.executor.get_model());
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionStart {
+                model: self.executor.get_model().to_string(),
+                cwd: std::env::current_dir().unwrap_or_default(),
+            },
+            &serde_json::json!({
+                "model": self.executor.get_model(),
+                "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+                "mode": "headless",
+            }),
+        );
         let expanded = file_mentions::expand_file_mentions(prompt);
         let turn_start = self.history.len();
         self.history.push(Message::text("user", expanded));
         self.journal.start_turn();
         let result = self.agent_turn(turn_start).await;
         self.hooks.fire_stop();
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionEnd,
+            &serde_json::json!({"mode": "headless"}),
+        );
         result
     }
 

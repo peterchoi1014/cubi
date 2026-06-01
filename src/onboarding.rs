@@ -90,6 +90,12 @@ pub struct AppConfig {
     /// starts. Default: 80.
     #[serde(default = "default_compact_threshold_pct")]
     pub compact_threshold_pct: u8,
+    /// Default `--receipts <path>`. When set, every cubi session
+    /// produces a hash-chained JSONL audit log at this path (unless
+    /// overridden by the CLI flag or `CUBI_RECEIPTS` env). `None` (the
+    /// default) keeps the side-channel opt-in.
+    #[serde(default)]
+    pub receipts: Option<String>,
     /// Schema version for the on-disk config. Bumped by `migrations.rs`
     /// when a breaking change to this struct is introduced; older configs
     /// are migrated forward on load.
@@ -157,6 +163,7 @@ impl Default for AppConfig {
             llm_max_retries: default_llm_max_retries(),
             auto_compact: default_auto_compact(),
             compact_threshold_pct: default_compact_threshold_pct(),
+            receipts: None,
             config_version: 0,
         }
     }

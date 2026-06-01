@@ -49,6 +49,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   `browser_eval` / `browser_screenshot` / `browser_text` / `browser_close`
   backed by chromiumoxide for web debugging tasks. Off by default to keep the
   lean binary; enable with `cargo install --features browser`.
+- 🔐 **Tamper-evident receipts** (`--receipts <path>`) — hash-chained JSONL
+  audit log of every tool call and lifecycle event; optional Ed25519 signing
+  via `cubi keys init`. Verify with `cubi verify-receipts`.
 
 ## 🚀 Quick Start
 
