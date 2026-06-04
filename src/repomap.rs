@@ -214,10 +214,10 @@ fn walk_files(root: &Path, soft_cap: usize) -> Result<Vec<PathBuf>> {
         if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
-        if let Ok(meta) = dent.metadata()
-            && meta.len() > MAX_FILE_BYTES
-        {
-            continue;
+        if let Ok(meta) = dent.metadata() {
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
         }
         out.push(dent.into_path());
         if out.len() >= cap {
@@ -318,14 +318,14 @@ fn collect(node: tree_sitter::Node, bytes: &[u8], lang: &str, out: &mut Vec<Symb
             _ => None,
         };
 
-        if let Some(symkind) = mapped
-            && let Some(name) = symbol_name(&child, bytes, lang)
-        {
-            out.push(Symbol {
-                name,
-                kind: symkind,
-                line: child.start_position().row + 1,
-            });
+        if let Some(symkind) = mapped {
+            if let Some(name) = symbol_name(&child, bytes, lang) {
+                out.push(Symbol {
+                    name,
+                    kind: symkind,
+                    line: child.start_position().row + 1,
+                });
+            }
         }
 
         // Recurse into JS/TS `export_statement`, `export_default_declaration`,
@@ -349,18 +349,18 @@ fn collect(node: tree_sitter::Node, bytes: &[u8], lang: &str, out: &mut Vec<Symb
 #[cfg(feature = "tree-sitter")]
 fn symbol_name(node: &tree_sitter::Node, bytes: &[u8], lang: &str) -> Option<String> {
     // Most node types put the identifier in a `name` field.
-    if let Some(name_node) = node.child_by_field_name("name")
-        && let Ok(text) = name_node.utf8_text(bytes)
-    {
-        return Some(text.to_string());
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(text) = name_node.utf8_text(bytes) {
+            return Some(text.to_string());
+        }
     }
     // For Rust `impl_item` use the "type" field as the display name.
-    if lang == "rust"
-        && node.kind() == "impl_item"
-        && let Some(ty) = node.child_by_field_name("type")
-        && let Ok(text) = ty.utf8_text(bytes)
-    {
-        return Some(text.to_string());
+    if lang == "rust" && node.kind() == "impl_item" {
+        if let Some(ty) = node.child_by_field_name("type") {
+            if let Ok(text) = ty.utf8_text(bytes) {
+                return Some(text.to_string());
+            }
+        }
     }
     None
 }
@@ -375,8 +375,8 @@ fn extract_symbols(language: &'static str, source: &str) -> Vec<Symbol> {
             "rust" => {
                 let rest = strip_prefix(line, "pub ").unwrap_or(line);
                 let rest = strip_visibility(rest);
-                if let Some((kw, ident)) = split_keyword_ident(rest)
-                    && let Some(kind) = match kw {
+                if let Some((kw, ident)) = split_keyword_ident(rest) {
+                    let kind = match kw {
                         "fn" => Some(SymbolKind::Function),
                         "struct" => Some(SymbolKind::Struct),
                         "enum" => Some(SymbolKind::Enum),
@@ -386,48 +386,51 @@ fn extract_symbols(language: &'static str, source: &str) -> Vec<Symbol> {
                         "const" | "static" => Some(SymbolKind::Const),
                         "type" => Some(SymbolKind::TypeAlias),
                         _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        out.push(Symbol {
+                            name: ident,
+                            kind,
+                            line: line_no,
+                        });
                     }
-                {
-                    out.push(Symbol {
-                        name: ident,
-                        kind,
-                        line: line_no,
-                    });
                 }
             }
             "python" => {
                 let rest = strip_prefix(line, "async ").unwrap_or(line);
-                if let Some((kw, ident)) = split_keyword_ident(rest)
-                    && let Some(kind) = match kw {
+                if let Some((kw, ident)) = split_keyword_ident(rest) {
+                    let kind = match kw {
                         "def" => Some(SymbolKind::Function),
                         "class" => Some(SymbolKind::Class),
                         _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        out.push(Symbol {
+                            name: ident,
+                            kind,
+                            line: line_no,
+                        });
                     }
-                {
-                    out.push(Symbol {
-                        name: ident,
-                        kind,
-                        line: line_no,
-                    });
                 }
             }
             "javascript" | "typescript" => {
                 let rest = strip_prefix(line, "export ").unwrap_or(line);
                 let rest = strip_prefix(rest, "default ").unwrap_or(rest);
                 let rest = strip_prefix(rest, "async ").unwrap_or(rest);
-                if let Some((kw, ident)) = split_keyword_ident(rest)
-                    && let Some(kind) = match kw {
+                if let Some((kw, ident)) = split_keyword_ident(rest) {
+                    let kind = match kw {
                         "function" => Some(SymbolKind::Function),
                         "class" => Some(SymbolKind::Class),
                         "interface" | "type" => Some(SymbolKind::TypeAlias),
                         _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        out.push(Symbol {
+                            name: ident,
+                            kind,
+                            line: line_no,
+                        });
                     }
-                {
-                    out.push(Symbol {
-                        name: ident,
-                        kind,
-                        line: line_no,
-                    });
                 }
             }
             _ => {}
@@ -444,10 +447,10 @@ fn strip_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(not(feature = "tree-sitter"))]
 fn strip_visibility(s: &str) -> &str {
     // Strip Rust `pub(crate)` / `pub(super)` / `pub(in …)` qualifiers.
-    if let Some(rest) = s.strip_prefix("pub(")
-        && let Some(end) = rest.find(')')
-    {
-        return rest[end + 1..].trim_start();
+    if let Some(rest) = s.strip_prefix("pub(") {
+        if let Some(end) = rest.find(')') {
+            return rest[end + 1..].trim_start();
+        }
     }
     s
 }
