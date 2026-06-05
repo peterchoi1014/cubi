@@ -28,6 +28,15 @@ use std::time::SystemTime;
 
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
+/// Identifies which extractor backend produced an [`Outline`]. Cached
+/// entries record this so a binary built with one extractor doesn't
+/// reuse a cache written by the other (their symbol kinds and depth
+/// differ).
+#[cfg(feature = "tree-sitter")]
+const EXTRACTOR_MODE: &str = "tree-sitter";
+#[cfg(not(feature = "tree-sitter"))]
+const EXTRACTOR_MODE: &str = "regex";
+
 pub struct RepoMap;
 
 #[derive(Debug, Clone)]
@@ -119,6 +128,12 @@ struct CacheEntry {
     root: PathBuf,
     max_files: usize,
     max_symbols_per_file: usize,
+    /// Which extractor produced `outline` (`"tree-sitter"` or `"regex"`).
+    /// Defaulted for backward compatibility with caches written before
+    /// this field existed; such entries are treated as a mismatch and
+    /// rebuilt.
+    #[serde(default)]
+    extractor: String,
     /// Sorted `(relative_path, mtime_nanos)` of every walked file.
     /// Used as the invalidation key so any add/remove/edit triggers
     /// a rebuild.
@@ -510,6 +525,7 @@ fn load_cache(
     if entry.root != root
         || entry.max_files != opts.max_files
         || entry.max_symbols_per_file != opts.max_symbols_per_file
+        || entry.extractor != EXTRACTOR_MODE
         || entry.fingerprint != fingerprint
     {
         return None;
@@ -533,6 +549,7 @@ fn store_cache(
         root: root.to_path_buf(),
         max_files: opts.max_files,
         max_symbols_per_file: opts.max_symbols_per_file,
+        extractor: EXTRACTOR_MODE.to_string(),
         fingerprint: fingerprint.to_vec(),
         outline: outline.clone(),
     };
