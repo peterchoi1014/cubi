@@ -158,12 +158,18 @@ pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
 /// Emitted at the start of a `consensus_run` invocation, before any
 /// subagent is dispatched. Mirrored to both stdout JSON and the
 /// `--events` tap.
-pub fn consensus_start(goal: &str, models: &[String], strategy: &str) -> Value {
+pub fn consensus_start(
+    goal: &str,
+    models: &[String],
+    strategy: &str,
+    max_steps_per_subagent: usize,
+) -> Value {
     json!({
         "type": "consensus_start",
         "goal": goal,
         "models": models,
         "strategy": strategy,
+        "max_steps_per_subagent": max_steps_per_subagent,
     })
 }
 
@@ -301,10 +307,11 @@ mod tests {
 
     #[test]
     fn consensus_start_includes_models_and_strategy() {
-        let v = consensus_start("pick", &["m1".into(), "m2".into()], "vote");
+        let v = consensus_start("pick", &["m1".into(), "m2".into()], "vote", 8);
         assert_eq!(v["type"], "consensus_start");
         assert_eq!(v["strategy"], "vote");
         assert_eq!(v["models"][1], "m2");
+        assert_eq!(v["max_steps_per_subagent"], 8);
     }
 
     #[test]

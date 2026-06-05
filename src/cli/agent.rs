@@ -825,6 +825,8 @@ impl ChatCLI {
         let judge_model = args
             .get("judge_model")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(str::to_string);
         let strategy = match strategy_str {
             "vote" => crate::consensus::ConsensusStrategy::Vote,

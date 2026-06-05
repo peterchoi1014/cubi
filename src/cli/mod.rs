@@ -5104,7 +5104,7 @@ impl ChatCLI {
         println!("{}\n", r.winner_output);
     }
 
-    fn consensus_strategy_label(&self, r: &crate::consensus::ConsensusResult) -> &'static str {
+    fn consensus_strategy_label<'a>(&self, r: &'a crate::consensus::ConsensusResult) -> &'a str {
         CliConsensusSink::strategy_label(r)
     }
 
@@ -5535,12 +5535,18 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
         ));
     }
 
-    // Optional `judge:<model>` token.
+    // Optional `judge:<model>` token. Empty/whitespace judge models
+    // would otherwise flow through to backend calls as an empty string,
+    // so reject them at the parse layer.
     let mut judge_model: Option<String> = None;
     let mut next = iter.next();
     if let Some(tok) = next {
         if let Some(rest) = tok.strip_prefix("judge:") {
-            judge_model = Some(rest.to_string());
+            let trimmed = rest.trim();
+            if trimmed.is_empty() {
+                return Err("judge:<model> requires a non-empty model name".to_string());
+            }
+            judge_model = Some(trimmed.to_string());
             next = iter.next();
         }
     }
@@ -5596,24 +5602,20 @@ pub(crate) struct CliConsensusSink {
 }
 
 impl CliConsensusSink {
-    /// Best-effort recovery of the strategy label from a
-    /// [`ConsensusResult`] for display / report purposes. Avoids
-    /// threading the original strategy back through the result type
-    /// just so the dispatcher can echo it.
-    pub(crate) fn strategy_label(r: &crate::consensus::ConsensusResult) -> &'static str {
-        if r.decision_reason.contains("best-of-n") {
-            "best-of-n"
-        } else if r.decision_reason.contains("judge `") {
-            "judge"
-        } else {
-            "vote"
-        }
+    /// Returns the strategy label recorded on the result by
+    /// `consensus::run`. Plumbed through on the result so display and
+    /// report code don't have to infer it from `decision_reason`
+    /// (which is fragile — a `Vote` run that tie-breaks via a judge
+    /// mentions "judge" in the reason).
+    pub(crate) fn strategy_label(r: &crate::consensus::ConsensusResult) -> &str {
+        &r.requested_strategy
     }
 }
 
 impl crate::consensus::ConsensusEventSink for CliConsensusSink {
-    fn start(&self, goal: &str, models: &[String], strategy: &str) {
-        let payload = crate::json_events::consensus_start(goal, models, strategy);
+    fn start(&self, goal: &str, models: &[String], strategy: &str, max_steps_per_subagent: usize) {
+        let payload =
+            crate::json_events::consensus_start(goal, models, strategy, max_steps_per_subagent);
         crate::json_events::emit(self.json_enabled, &payload);
         if let Some(sink) = self.event_sink.as_ref() {
             sink.emit(
@@ -5622,6 +5624,7 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
                     "goal": goal,
                     "models": models,
                     "strategy": strategy,
+                    "max_steps_per_subagent": max_steps_per_subagent,
                 }),
             );
         }
@@ -6661,5 +6664,39 @@ mod tests {
     fn show_pins_with_empty_list_does_not_panic() {
         let cli = new_test_cli();
         cli.show_pins();
+    }
+
+    #[test]
+    fn parse_consensus_rejects_empty_judge_model() {
+        let err = parse_consensus_args("best-of-n m1,m2 judge: do thing").unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_consensus_trims_judge_model_value() {
+        // `judge:` followed by tokens must round-trip cleanly when the
+        // judge token contains no whitespace (whitespace separates tokens
+        // upstream, so this just exercises the strip_prefix path).
+        let req = parse_consensus_args("judge m1,m2 judge:m3 do thing").unwrap();
+        match req.strategy {
+            crate::consensus::ConsensusStrategy::Judge { judge_model } => {
+                assert_eq!(judge_model, "m3");
+            }
+            other => panic!("expected Judge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consensus_strategy_label_uses_requested_not_inferred() {
+        // A vote run whose `decision_reason` mentions a judge tie-break
+        // must still report `vote` as the strategy label.
+        let r = crate::consensus::ConsensusResult {
+            winner_model: "m1".into(),
+            winner_output: "out".into(),
+            subagent_outputs: vec![],
+            decision_reason: "vote tie (2-way); escalated to judge `m1`: pick: 1".into(),
+            requested_strategy: "vote".into(),
+        };
+        assert_eq!(CliConsensusSink::strategy_label(&r), "vote");
     }
 }

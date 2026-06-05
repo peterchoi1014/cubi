@@ -49,7 +49,10 @@ impl LlmBackend {
                 let (msg, _) = c.chat_with_tools(model, messages, None).await?;
                 Ok(msg.content)
             }
-            Self::Fake => Ok(fake_content_for(model)),
+            Self::Fake => {
+                fake_check_fail(model)?;
+                Ok(fake_content_for(model))
+            }
         }
     }
 
@@ -85,6 +88,7 @@ impl LlmBackend {
             Self::Ollama(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::OpenAi(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::Fake => {
+                fake_check_fail(model)?;
                 let message = fake_message_for(model, &messages);
                 if message.tool_calls.is_none() {
                     on_token(&message.content);

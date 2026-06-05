@@ -79,8 +79,7 @@ pub struct ConsensusRequest {
     pub strategy: ConsensusStrategy,
     /// Per-subagent step cap. The MVP only runs a single LLM call per
     /// subagent, so this is retained as future-proofing; it's surfaced
-    /// in events so consumers can already key off it.
-    #[allow(dead_code)]
+    /// in the `consensus_start` event so consumers can already key off it.
     pub max_steps_per_subagent: usize,
     /// Maximum number of subagents in flight at once. `0` means
     /// `models.len()` — i.e. fully parallel. `1` is sequential.
@@ -115,6 +114,11 @@ pub struct ConsensusResult {
     pub winner_output: String,
     pub subagent_outputs: Vec<SubagentOutput>,
     pub decision_reason: String,
+    /// Strategy the caller asked for. Recorded so display and report
+    /// code don't have to infer the strategy back out of
+    /// `decision_reason` (which is fragile — a `Vote` run that
+    /// tie-breaks via a judge mentions "judge" in the reason).
+    pub requested_strategy: String,
 }
 
 impl ConsensusResult {
@@ -188,7 +192,7 @@ pub fn consensus_run_spec() -> ToolSpec {
 /// route to whatever sink is active (stdout JSON line, `--events`
 /// file, both).
 pub trait ConsensusEventSink: Send + Sync {
-    fn start(&self, goal: &str, models: &[String], strategy: &str);
+    fn start(&self, goal: &str, models: &[String], strategy: &str, max_steps_per_subagent: usize);
     fn subagent_result(&self, sub: &SubagentOutput);
     fn decision(&self, winner_model: &str, decision_reason: &str);
 }
@@ -197,7 +201,7 @@ pub trait ConsensusEventSink: Send + Sync {
 #[allow(dead_code)]
 pub struct NullSink;
 impl ConsensusEventSink for NullSink {
-    fn start(&self, _: &str, _: &[String], _: &str) {}
+    fn start(&self, _: &str, _: &[String], _: &str, _: usize) {}
     fn subagent_result(&self, _: &SubagentOutput) {}
     fn decision(&self, _: &str, _: &str) {}
 }
@@ -225,7 +229,12 @@ pub async fn run(
         ConsensusStrategy::BestOfN { .. } => "best-of-n",
         ConsensusStrategy::Judge { .. } => "judge",
     };
-    sink.start(&req.goal, &req.models, strategy_label);
+    sink.start(
+        &req.goal,
+        &req.models,
+        strategy_label,
+        req.max_steps_per_subagent,
+    );
 
     let permits = if req.concurrency == 0 {
         req.models.len()
@@ -293,7 +302,7 @@ pub async fn run(
         );
     }
     if successes.len() == 1 {
-        let only = successes[0].clone();
+        let only: SubagentOutput = (*successes[0]).clone();
         let reason = "only successful subagent".to_string();
         sink.decision(&only.model, &reason);
         return Ok(ConsensusResult {
@@ -301,6 +310,7 @@ pub async fn run(
             winner_output: only.output,
             subagent_outputs,
             decision_reason: reason,
+            requested_strategy: strategy_label.to_string(),
         });
     }
 
@@ -313,6 +323,7 @@ pub async fn run(
         winner_output: winner.output.clone(),
         subagent_outputs: subagent_outputs.clone(),
         decision_reason,
+        requested_strategy: strategy_label.to_string(),
     })
 }
 
@@ -346,7 +357,7 @@ async fn vote(
         let key = hash_normalized(&sub.output);
         let global_idx = all
             .iter()
-            .position(|s| std::ptr::eq(s, *sub))
+            .position(|s| std::ptr::eq::<SubagentOutput>(s, *sub))
             .expect("success is from same slice");
         buckets.entry(key).or_default().push(global_idx);
     }
@@ -410,7 +421,7 @@ async fn best_of_n(
         .unwrap_or((0, 0.0));
     let winner_idx = all
         .iter()
-        .position(|s| std::ptr::eq(s, successes[i]))
+        .position(|s| std::ptr::eq::<SubagentOutput>(s, successes[i]))
         .expect("success is from same slice");
     (
         winner_idx,
@@ -448,7 +459,7 @@ async fn judge(
                 .first()
                 .map(|s| {
                     all.iter()
-                        .position(|x| std::ptr::eq(x, *s))
+                        .position(|x| std::ptr::eq::<SubagentOutput>(x, *s))
                         .expect("success is from same slice")
                 })
                 .unwrap_or(0);
@@ -463,7 +474,7 @@ async fn judge(
     let (pick, reason) = parse_pick(&raw, successes.len());
     let winner_idx = all
         .iter()
-        .position(|s| std::ptr::eq(s, successes[pick]))
+        .position(|s| std::ptr::eq::<SubagentOutput>(s, successes[pick]))
         .expect("success is from same slice");
     (
         winner_idx,
