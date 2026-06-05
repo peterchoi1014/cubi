@@ -1012,6 +1012,9 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         "phi4-mini" => Some(128_000),
         "gemma2" | "gemma" => Some(8_192),
         "gemma3" => Some(128_000),
+        // Gemma 4 ships with a 256K context window across its variants.
+        // See https://ai.google.dev/gemma/docs/releases.
+        "gemma4" => Some(256_000),
         "deepseek-coder" => Some(16_384),
         "granite3.3" | "granite3.2" | "granite3.1" => Some(131_072),
         "hermes3" => Some(131_072),
@@ -1186,6 +1189,8 @@ mod tests {
         assert_eq!(context_window_for_model("gemma3:4b"), Some(128_000));
         assert_eq!(context_window_for_model("gemma3:270m"), Some(32_768));
         assert_eq!(context_window_for_model("gemma3:1b"), Some(32_768));
+        assert_eq!(context_window_for_model("gemma4"), Some(256_000));
+        assert_eq!(context_window_for_model("gemma4:31b"), Some(256_000));
     }
 
     #[test]

@@ -526,6 +526,8 @@ mod tests {
             "llama3.2:3b",
             "mistral:7b-instruct-v0.3",
             "phi4-mini",
+            "gemma4",
+            "gemma4:31b",
         ] {
             assert!(!is_known_non_tool_capable(m), "unexpected flag for {m}");
         }
