@@ -85,6 +85,15 @@ Once the crate is published:
 cargo install cubi
 ```
 
+The `tree-sitter` Cargo feature is **on by default** and adds ~4.5 MB to the
+release binary for the Rust/Python/JS/TS parsers used by the `repo_map`
+tool and `/repomap` command. To build the smallest possible binary (with a
+regex-based outline fallback instead), disable it:
+
+```bash
+cargo install --no-default-features cubi
+```
+
 ## 4. Verify
 
 ```bash

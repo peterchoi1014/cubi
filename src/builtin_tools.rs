@@ -17,6 +17,7 @@ use tokio::time::timeout;
 
 use crate::file_rollback::FileJournal;
 use crate::permissions::Permissions;
+use crate::repomap::{RepoMap, RepoMapOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinTool {
@@ -148,6 +149,7 @@ impl BuiltinToolRegistry {
             Self::remote_trigger_tool(),
             Self::notify_tool(),
             Self::prevent_sleep_tool(),
+            Self::repo_map_tool(),
         ];
 
         Self {
@@ -200,6 +202,7 @@ impl BuiltinToolRegistry {
             "remote_trigger" => self.execute_remote_trigger(args),
             "notify" => self.execute_notify(args),
             "prevent_sleep" => self.execute_prevent_sleep(args).await,
+            "repo_map" => self.execute_repo_map(args),
             _ => anyhow::bail!("Unknown built-in tool: {}", name),
         }
     }
@@ -250,6 +253,87 @@ impl BuiltinToolRegistry {
                 },
                 "required": ["path"]
             }),
+        }
+    }
+
+    fn repo_map_tool() -> BuiltinTool {
+        BuiltinTool {
+            name: "repo_map".to_string(),
+            description:
+                "Return a compact outline of the project's files and top-level symbols. Useful as a first step to orient in an unfamiliar codebase."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional directory to map (default: cwd)"
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Maximum files to include (default: 200)",
+                        "default": 200
+                    },
+                    "max_symbols_per_file": {
+                        "type": "integer",
+                        "description": "Maximum symbols per file (default: 20)",
+                        "default": 20
+                    }
+                }
+            }),
+        }
+    }
+
+    fn execute_repo_map(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let cwd = std::env::current_dir().context("Could not resolve current directory")?;
+        let scope = match args["scope"].as_str() {
+            Some(s) if !s.is_empty() => {
+                let p = Path::new(s);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    cwd.join(p)
+                }
+            }
+            _ => cwd.clone(),
+        };
+
+        // L1 trust: refuse to map directories outside the cwd unless
+        // the caller has trusted the parent. The repo-map walks every
+        // file's metadata, so this is the same access pattern as `read_file`.
+        let canonical_scope = fs::canonicalize(&scope).unwrap_or_else(|_| scope.clone());
+        let canonical_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        if !canonical_scope.starts_with(&canonical_cwd) {
+            let trusted = self
+                .permissions
+                .lock()
+                .map(|p| {
+                    p.trusted_roots()
+                        .any(|root| canonical_scope.starts_with(root))
+                })
+                .unwrap_or(false);
+            if !trusted {
+                return Ok(ToolResult::error(format!(
+                    "Refusing repo_map: scope {} is outside the current working directory and not in a trusted path. Add the directory with `/add-dir` or `/trust` first.",
+                    canonical_scope.display()
+                )));
+            }
+        }
+
+        let opts = RepoMapOptions {
+            scope: Some(canonical_scope.clone()),
+            max_files: args["max_files"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(200),
+            max_symbols_per_file: args["max_symbols_per_file"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(20),
+        };
+        match RepoMap::build(&canonical_scope, &opts) {
+            Ok(outline) => Ok(ToolResult::success(RepoMap::render(&outline))),
+            Err(e) => Ok(ToolResult::error(format!("repo_map failed: {e}"))),
         }
     }
 

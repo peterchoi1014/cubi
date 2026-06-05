@@ -32,6 +32,7 @@ pub mod plugins;
 mod policy;
 mod pricing;
 mod project_memory;
+mod repomap;
 mod schemas;
 mod script;
 mod sessions;
