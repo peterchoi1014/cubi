@@ -19,6 +19,15 @@ impl AIExecutor {
         }
     }
 
+    /// Test-only constructor that bypasses env-var-driven provider
+    /// selection. Used by the consensus unit tests so they don't
+    /// pollute the process env (which is global across the test
+    /// binary's parallel runners).
+    #[cfg(test)]
+    pub fn with_backend(backend: LlmBackend, model: String) -> Self {
+        Self { backend, model }
+    }
+
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {
         self.backend.chat(&self.model, messages).await
     }
@@ -45,6 +54,20 @@ impl AIExecutor {
         self.backend
             .chat_with_tools(&self.model, messages, tools)
             .await
+    }
+
+    /// Variant of [`chat_with_tools`] that overrides the executor's
+    /// stored default model for a single call. Used by the consensus
+    /// dispatcher to run the same goal under several models without
+    /// mutating the executor's global `model` field (which would race
+    /// with concurrent subagents). No tools are forwarded; consensus
+    /// subagents are intentionally tool-less in the MVP.
+    pub async fn chat_with_model(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+    ) -> Result<(Message, ChatStats)> {
+        self.backend.chat_with_tools(model, messages, None).await
     }
 
     pub fn get_model(&self) -> &str {

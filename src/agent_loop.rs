@@ -43,6 +43,13 @@ pub const SUBAGENT_MAX_STEPS: usize = MAX_AGENT_STEPS;
 /// drift out of sync.
 pub const AGENT_TOOL_NAME: &str = "agent_run";
 
+/// Name of the multi-model arbitration meta-tool. Kept alongside
+/// [`AGENT_TOOL_NAME`] so the same anti-recursion machinery (the
+/// [`without_meta_tools`] helper and the matching reject branches in
+/// `run_subagent` / `cli::agent::execute_tool_call`) can strip both
+/// in one place.
+pub const CONSENSUS_TOOL_NAME: &str = "consensus_run";
+
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
 /// it focused on the single goal and discourage it from chatting back.
@@ -76,6 +83,7 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
         })
         .collect();
     specs.push(agent_run_spec());
+    specs.push(crate::consensus::consensus_run_spec());
     Some(specs)
 }
 
@@ -111,12 +119,15 @@ pub fn agent_run_spec() -> ToolSpec {
     }
 }
 
-/// Strip the `agent_run` meta-tool from a tool list. Called when building
-/// the subagent's tool list so subagents can't recursively spawn their own
-/// subagents (which would blow up cost and depth tracking).
-pub fn without_agent_tool(tools: Option<Vec<ToolSpec>>) -> Option<Vec<ToolSpec>> {
+/// Strip every meta-tool (`agent_run`, `consensus_run`, …) from a tool
+/// list. Used when building a subagent's tool list so neither
+/// `agent_run` nor `consensus_run` can be invoked from inside another
+/// subagent. The single helper guarantees both meta-tools are stripped
+/// in lockstep — adding a new meta-tool only requires updating this
+/// list and the matching reject branch below.
+pub fn without_meta_tools(tools: Option<Vec<ToolSpec>>) -> Option<Vec<ToolSpec>> {
     tools.map(|mut v| {
-        v.retain(|t| t.function.name != AGENT_TOOL_NAME);
+        v.retain(|t| t.function.name != AGENT_TOOL_NAME && t.function.name != CONSENSUS_TOOL_NAME);
         v
     })
 }
@@ -171,7 +182,7 @@ pub async fn run_subagent(
     // burning unbounded budget via a large `max_steps`.
     let max_steps = requested_max_steps.clamp(1, SUBAGENT_MAX_STEPS);
 
-    let tools = without_agent_tool(mcp.as_ref().and_then(build_tool_specs));
+    let tools = without_meta_tools(mcp.as_ref().and_then(build_tool_specs));
 
     let mut history = vec![
         Message::text("system", SUBAGENT_SYSTEM_PROMPT),
@@ -208,12 +219,15 @@ pub async fn run_subagent(
         }
 
         for call in calls {
-            // Recursion guard: even though we strip `agent_run` from the
-            // tool list, a confused model might emit the name anyway.
-            // Reject explicitly so it shows up as a tool error and the
-            // model gives up rather than us silently doing nothing.
+            // Recursion guard: even though we strip `agent_run` and
+            // `consensus_run` from the tool list, a confused model might
+            // emit the name anyway. Reject explicitly so it shows up as
+            // a tool error and the model gives up rather than us
+            // silently doing nothing.
             let result_text = if call.function.name == AGENT_TOOL_NAME {
                 "[tool error] nested `agent_run` is not allowed".to_string()
+            } else if call.function.name == CONSENSUS_TOOL_NAME {
+                "[tool error] nested `consensus_run` is not allowed".to_string()
             } else if let Some(m) = mcp.as_mut() {
                 match m
                     .call_tool(&call.function.name, call.function.arguments.clone())
@@ -324,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn without_agent_tool_strips_only_the_meta_tool() {
+    fn without_meta_tools_strips_only_the_meta_tools() {
         let specs = Some(vec![
             agent_run_spec(),
             ToolSpec {
@@ -336,13 +350,32 @@ mod tests {
                 },
             },
         ]);
-        let stripped = without_agent_tool(specs).unwrap();
+        let stripped = without_meta_tools(specs).unwrap();
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0].function.name, "bash");
     }
 
     #[test]
-    fn without_agent_tool_handles_none() {
-        assert!(without_agent_tool(None).is_none());
+    fn without_meta_tools_handles_none() {
+        assert!(without_meta_tools(None).is_none());
+    }
+
+    #[test]
+    fn without_meta_tools_strips_both_meta_tools() {
+        let specs = Some(vec![
+            agent_run_spec(),
+            crate::consensus::consensus_run_spec(),
+            ToolSpec {
+                tool_type: "function".into(),
+                function: ToolFunction {
+                    name: "bash".into(),
+                    description: "shell".into(),
+                    parameters: json!({}),
+                },
+            },
+        ]);
+        let stripped = without_meta_tools(specs).unwrap();
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(stripped[0].function.name, "bash");
     }
 }

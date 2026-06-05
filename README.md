@@ -25,6 +25,13 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🧰 **Built-in tools** — shell, filesystem, git, web fetch/search, long-lived
   bash REPL, Jupyter notebooks, LSP code-intel, OS notifications, and a
   meta-`agent_run` tool for spawning focused subagents
+- 🎭 **Multi-model consensus** — `consensus_run` meta-tool and `/consensus`
+  slash command run the same goal under N local models in parallel and
+  arbitrate via vote, best-of-n, or judge. No other agent in the
+  comparison does this natively. On single-GPU setups, pass
+  `concurrency: 1` to the `consensus_run` tool to serialize the subagent
+  inference calls (the `/consensus` slash command always runs fully
+  parallel).
 - 🔌 **MCP support** — load external Model Context Protocol servers from
   `~/.cubi/mcp.json` and call their tools alongside built-ins
 - 🧰 **MCP registry** — `cubi mcp search/install/uninstall` for one-command

@@ -49,7 +49,10 @@ impl LlmBackend {
                 let (msg, _) = c.chat_with_tools(model, messages, None).await?;
                 Ok(msg.content)
             }
-            Self::Fake => Ok(fake_content()),
+            Self::Fake => {
+                fake_check_fail(model)?;
+                Ok(fake_content_for(model))
+            }
         }
     }
 
@@ -63,7 +66,10 @@ impl LlmBackend {
         match self {
             Self::Ollama(c) => c.chat_with_tools(model, messages, tools).await,
             Self::OpenAi(c) => c.chat_with_tools(model, messages, tools).await,
-            Self::Fake => Ok((fake_message(&messages), fake_stats())),
+            Self::Fake => {
+                fake_check_fail(model)?;
+                Ok((fake_message_for(model, &messages), fake_stats()))
+            }
         }
     }
 
@@ -82,7 +88,8 @@ impl LlmBackend {
             Self::Ollama(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::OpenAi(c) => c.chat_stream(model, messages, tools, on_token).await,
             Self::Fake => {
-                let message = fake_message(&messages);
+                fake_check_fail(model)?;
+                let message = fake_message_for(model, &messages);
                 if message.tool_calls.is_none() {
                     on_token(&message.content);
                 }
@@ -786,7 +793,23 @@ fn fake_content() -> String {
     std::env::var("CUBI_FAKE_LLM_RESPONSE").unwrap_or_else(|_| "hi".to_string())
 }
 
-fn fake_message(messages: &[Message]) -> Message {
+/// Per-model response lookup for the `Fake` backend. Resolution order:
+///   1. `CUBI_FAKE_LLM_MODEL_RESPONSES` as a JSON object mapping
+///      model name to canned response text. Used by the consensus
+///      tests to script different "model" outputs in the same process.
+///   2. Fallback to [`fake_content`] (single global response).
+pub(crate) fn fake_content_for(model: &str) -> String {
+    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_MODEL_RESPONSES") {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
+            if let Some(v) = map.get(model) {
+                return v.clone();
+            }
+        }
+    }
+    fake_content()
+}
+
+fn fake_message_for(model: &str, messages: &[Message]) -> Message {
     if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_TOOL_CALL") {
         if !messages.iter().any(|message| message.role == "tool") {
             if let Ok(call) = serde_json::from_str::<ToolCall>(&raw) {
@@ -800,7 +823,23 @@ fn fake_message(messages: &[Message]) -> Message {
             }
         }
     }
-    Message::text("assistant", fake_content())
+    Message::text("assistant", fake_content_for(model))
+}
+
+/// Fail injection used by the consensus tests to verify that one
+/// failing subagent doesn't abort the others. Set
+/// `CUBI_FAKE_LLM_FAIL_MODELS` to a comma-separated list of model
+/// names; matching calls return an error from the backend.
+pub(crate) fn fake_check_fail(model: &str) -> Result<()> {
+    if model.is_empty() {
+        return Ok(());
+    }
+    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_FAIL_MODELS") {
+        if raw.split(',').any(|m| m.trim() == model) {
+            anyhow::bail!("fake backend: scripted failure for model `{model}`");
+        }
+    }
+    Ok(())
 }
 
 fn fake_stats() -> ChatStats {

@@ -155,6 +155,63 @@ pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
     })
 }
 
+/// Emitted at the start of a `consensus_run` invocation, before any
+/// subagent is dispatched. Mirrored to both stdout JSON and the
+/// `--events` tap.
+pub fn consensus_start(
+    goal: &str,
+    models: &[String],
+    strategy: &str,
+    max_steps_per_subagent: usize,
+) -> Value {
+    json!({
+        "type": "consensus_start",
+        "goal": goal,
+        "models": models,
+        "strategy": strategy,
+        "max_steps_per_subagent": max_steps_per_subagent,
+    })
+}
+
+/// Emitted once per subagent when it finishes (successful or not).
+/// `ok` is true iff the subagent produced a non-error output. Token
+/// counts are zero when the subagent errored.
+pub fn consensus_subagent_result(
+    model: &str,
+    ok: bool,
+    steps_used: usize,
+    elapsed_ms: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    error: Option<&str>,
+) -> Value {
+    let mut v = json!({
+        "type": "consensus_subagent_result",
+        "model": model,
+        "ok": ok,
+        "steps_used": steps_used,
+        "elapsed_ms": elapsed_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    });
+    if let Some(err) = error {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("error".to_string(), json!(err));
+        }
+    }
+    v
+}
+
+/// Emitted after arbitration with the chosen winner and a free-form
+/// `decision_reason` describing why that subagent won.
+pub fn consensus_decision(winner_model: &str, decision_reason: &str) -> Value {
+    json!({
+        "type": "consensus_decision",
+        "winner_model": winner_model,
+        "decision_reason": decision_reason,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +303,38 @@ mod tests {
         // capture stdout here cheaply, but at minimum confirm it doesn't
         // panic and returns nothing observable from the value side.
         emit(false, &token("ignored"));
+    }
+
+    #[test]
+    fn consensus_start_includes_models_and_strategy() {
+        let v = consensus_start("pick", &["m1".into(), "m2".into()], "vote", 8);
+        assert_eq!(v["type"], "consensus_start");
+        assert_eq!(v["strategy"], "vote");
+        assert_eq!(v["models"][1], "m2");
+        assert_eq!(v["max_steps_per_subagent"], 8);
+    }
+
+    #[test]
+    fn consensus_subagent_result_omits_error_when_ok() {
+        let v = consensus_subagent_result("m1", true, 1, 42, 10, 20, None);
+        assert_eq!(v["type"], "consensus_subagent_result");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["prompt_tokens"], 10);
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn consensus_subagent_result_includes_error_when_failed() {
+        let v = consensus_subagent_result("m1", false, 0, 5, 0, 0, Some("boom"));
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn consensus_decision_payload_shape() {
+        let v = consensus_decision("m2", "judge picked");
+        assert_eq!(v["type"], "consensus_decision");
+        assert_eq!(v["winner_model"], "m2");
+        assert_eq!(v["decision_reason"], "judge picked");
     }
 }
