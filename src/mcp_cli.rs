@@ -20,12 +20,12 @@ pub fn run_mcp_search(query: &str, json: bool) -> i32 {
             .iter()
             .map(|e| {
                 serde_json::json!({
-                    "name": e.name,
-                    "description": e.description,
+                    "name": &e.name,
+                    "description": &e.description,
                     "transport": e.transport_label(),
-                    "homepage": e.homepage,
-                    "license": e.license,
-                    "tags": e.tags,
+                    "homepage": &e.homepage,
+                    "license": &e.license,
+                    "tags": &e.tags,
                 })
             })
             .collect();
@@ -105,14 +105,44 @@ fn prompt_env_vars(
             return None;
         }
         println!("  {} — {}", key, spec.description);
-        print!("  {} = ", key);
-        let _ = io::stdout().flush();
-        let mut buf = String::new();
-        if io::stdin().read_line(&mut buf).is_err() {
-            eprintln!("cubi: could not read env value for {}.", key);
-            return None;
-        }
-        let v = buf.trim().to_string();
+        // Treat env vars whose names look like credentials as secrets and
+        // suppress terminal echo so values don't leak into scrollback. The
+        // heuristic matches common naming conventions (TOKEN, KEY, SECRET,
+        // PASS/PASSWORD, CREDENTIAL, AUTH); everything else is read with
+        // normal echo so users can confirm typos in non-secret values.
+        let is_secret = {
+            let up = key.to_ascii_uppercase();
+            [
+                "TOKEN",
+                "KEY",
+                "SECRET",
+                "PASS",
+                "PASSWORD",
+                "CREDENTIAL",
+                "AUTH",
+            ]
+            .iter()
+            .any(|needle| up.contains(needle))
+        };
+        let v = if is_secret {
+            let prompt = format!("  {} = ", key);
+            match rpassword::prompt_password(&prompt) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => {
+                    eprintln!("cubi: could not read env value for {}.", key);
+                    return None;
+                }
+            }
+        } else {
+            print!("  {} = ", key);
+            let _ = io::stdout().flush();
+            let mut buf = String::new();
+            if io::stdin().read_line(&mut buf).is_err() {
+                eprintln!("cubi: could not read env value for {}.", key);
+                return None;
+            }
+            buf.trim().to_string()
+        };
         if v.is_empty() {
             eprintln!("cubi: '{}' is required; aborting.", key);
             return None;
@@ -212,13 +242,13 @@ pub async fn run_mcp_install(
         );
     }
     match validate_server(&entry.name).await {
-        Ok(_) => {
+        Ok(true) => {
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "status": "ok",
-                        "name": entry.name,
+                        "name": &entry.name,
                         "configured": true,
                         "env_provided": provided,
                     })
@@ -228,13 +258,40 @@ pub async fn run_mcp_install(
             }
             0
         }
+        Ok(false) => {
+            // Server responded to tools/list but advertised zero tools.
+            // The handshake succeeded so the entry is usable, but we
+            // can't claim it was "validated" — surface as a warning so
+            // the user can investigate (missing config, wrong endpoint,
+            // server in degraded state) without treating it as a hard
+            // failure.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "warning",
+                        "name": &entry.name,
+                        "configured": true,
+                        "env_provided": provided,
+                        "warning": "server responded but advertised zero tools",
+                    })
+                );
+            } else {
+                println!(
+                    "⚠ '{}' installed; server responded but advertised zero tools. \
+                     Verify configuration or re-run `cubi mcp test {}`.",
+                    entry.name, entry.name
+                );
+            }
+            0
+        }
         Err(e) => {
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "status": "failed",
-                        "name": entry.name,
+                        "name": &entry.name,
                         "configured": true,
                         "env_provided": provided,
                         "error": format!("validation failed: {:#}", e),

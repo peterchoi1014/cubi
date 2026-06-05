@@ -8,7 +8,7 @@ a marketplace.
 
 The registry is **only a set of install templates**. The user's actual
 configuration still lives in `~/.cubi/mcp.json`. Installing an entry copies
-its `command`/`args`/`env` (or `httpUrl`/`headers`) into that file with the
+its `command`/`args`/`env` (or `httpUrl`/`headers`/`oauthProvider`) into that file with the
 user-supplied env-var values; from then on Cubi treats the server like any
 other entry the user wrote by hand.
 
