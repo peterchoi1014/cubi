@@ -1,0 +1,6 @@
+id = "py-bug-off-by-one"
+difficulty = "easy"
+description = "Fix an off-by-one bug in a slice helper"
+prompt = "The failing test in `test_window.py` pinpoints an off-by-one bug in `window(seq, n)` in `window.py`. The function should return the first `n` items, not `n + 1`. Fix it so `python -m pytest -q` passes."
+time_cap_seconds = 120
+step_cap = 12

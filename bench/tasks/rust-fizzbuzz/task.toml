@@ -1,0 +1,6 @@
+id = "rust-fizzbuzz"
+difficulty = "easy"
+description = "Implement fizzbuzz to pass cargo test"
+prompt = "Implement the `fizzbuzz(n: u32) -> String` function in `src/lib.rs` so that `cargo test` passes. Multiples of 3 should return \"Fizz\", multiples of 5 \"Buzz\", multiples of both \"FizzBuzz\", and otherwise the number as a string."
+time_cap_seconds = 180
+step_cap = 20

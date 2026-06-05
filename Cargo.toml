@@ -92,6 +92,9 @@ ed25519-dalek = "2"
 base64 = "0.22"
 getrandom = "0.2"
 
+# Parse `bench/tasks/<id>/task.toml` definitions for `cubi bench`.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [

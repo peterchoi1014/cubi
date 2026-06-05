@@ -52,6 +52,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🔐 **Tamper-evident receipts** (`--receipts <path>`) — hash-chained JSONL
   audit log of every tool call and lifecycle event; optional Ed25519 signing
   via `cubi keys init`. Verify with `cubi verify-receipts`.
+- 🏁 **Benchmark suite** — `cubi bench --suite quick` runs Cubi's curated
+  regression suite against any local model. Nightly CI tracks `qwen3:8b`
+  scores; see [`bench/README.md`](bench/README.md).
 
 ## 🚀 Quick Start
 

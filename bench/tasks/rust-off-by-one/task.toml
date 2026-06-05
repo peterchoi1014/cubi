@@ -1,0 +1,6 @@
+id = "rust-off-by-one"
+difficulty = "easy"
+description = "Fix an off-by-one bug in a range checker"
+prompt = "The test `in_range_excludes_upper` is failing. Fix the off-by-one bug in `src/lib.rs` so that `in_range(value, lo, hi)` returns true only when `lo <= value < hi` (i.e. the upper bound is exclusive). Make `cargo test` pass."
+time_cap_seconds = 120
+step_cap = 15

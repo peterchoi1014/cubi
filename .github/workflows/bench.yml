@@ -1,0 +1,83 @@
+name: bench
+
+# Nightly + manual regression run for the `cubi bench` quick suite.
+#
+# Spins up Ollama, pulls qwen3:8b, and runs `cubi bench --suite quick
+# --model qwen3:8b --json`. The summary.json is uploaded as an
+# artifact so we can chart pass rate over time.
+#
+# This workflow deliberately does NOT fail the build on a score
+# regression — once we have several stable baseline runs we can
+# tighten the threshold here.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: quick suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85)
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release cubi
+        run: cargo build --release --bin cubi
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          # Run the server in the background; give it a moment to come up.
+          ollama serve >/tmp/ollama.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/version >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          ollama --version
+
+      - name: Pull model
+        run: ollama pull qwen3:8b
+
+      - name: Install Python test deps
+        # Some bench tasks (py-*) call `python3 -m pytest` in their
+        # verify.sh; ubuntu-latest ships Python 3 but not pytest.
+        run: python3 -m pip install --user --quiet pytest
+
+      - name: Run quick bench suite
+        # Use the freshly built release binary so this job exercises the
+        # exact `cubi bench` code in the PR / commit under test.
+        run: |
+          mkdir -p bench/results/ci
+          ./target/release/cubi bench \
+            --suite quick \
+            --model qwen3:8b \
+            --json \
+            --output bench/results/ci \
+            | tee bench/results/ci/stdout.json
+        continue-on-error: true
+
+      - name: Upload bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-summary-${{ github.run_id }}
+          path: bench/results/ci/
+          if-no-files-found: warn

@@ -1,0 +1,6 @@
+id = "py-import-fix"
+difficulty = "easy"
+description = "Add a missing import so the module loads"
+prompt = "The tests fail to import `report.py`. Add the missing standard-library import so that `python -m pytest -q` passes. Do not change anything else."
+time_cap_seconds = 120
+step_cap = 12

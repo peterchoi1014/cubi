@@ -27,6 +27,16 @@ A typical pre-push loop:
 cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --quiet
 ```
 
+### Regression bench suite
+
+`cubi bench` runs a small curated set of self-contained tasks against
+any local model and writes per-task results + a `summary.json`. The
+quick suite (easy tasks only) runs nightly in `.github/workflows/bench.yml`
+against `qwen3:8b`. See [`bench/README.md`](bench/README.md) for the
+task format and how to add a new task. Regular CI does **not** run
+`cubi bench` because it has no local model; the harness itself is
+covered by unit tests in `src/bench.rs` and `tests/bench.rs`.
+
 ## Architecture
 
 ```
