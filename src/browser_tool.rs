@@ -7,8 +7,11 @@
 //! tools in `builtin_tools.rs`). The browser process is owned by the
 //! session and dies when the session is closed (or when the manager
 //! itself is dropped).
-
-#![cfg(feature = "browser")]
+//!
+//! Module-level `#[cfg(feature = "browser")]` is applied by the
+//! `mod` declaration in `main.rs` and by the test file that includes
+//! this source via `#[path = ...]`, so no inner `#![cfg(...)]` is
+//! needed here (and adding one trips `clippy::duplicated_attributes`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,19 +58,22 @@ impl BrowserManager {
         url: &str,
         wait_for: Option<&str>,
     ) -> Result<String> {
-        let mut sessions = self.sessions.lock().await;
-        let page = if let Some(existing) = sessions.get(session_id) {
-            existing
-                .page
-                .goto(url)
+        // Fast-path: reuse an existing session's page. Clone the `Page`
+        // handle out of the map and drop the guard before awaiting any
+        // page operation so a slow page can never block other sessions
+        // (notably `close`).
+        let existing_page = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).map(|s| s.page.clone())
+        };
+        let page = if let Some(page) = existing_page {
+            page.goto(url)
                 .await
                 .with_context(|| format!("failed to navigate to {url}"))?;
-            existing
-                .page
-                .wait_for_navigation()
+            page.wait_for_navigation()
                 .await
                 .with_context(|| format!("navigation to {url} did not settle"))?;
-            existing.page.clone()
+            page
         } else {
             let config = BrowserConfig::builder()
                 .build()
@@ -95,7 +101,19 @@ impl BrowserManager {
                 page: page.clone(),
                 handler_task,
             };
-            sessions.insert(session_id.to_string(), session);
+            // Insert without holding the lock across any `.await`. If
+            // a concurrent open raced and inserted first, close the
+            // displaced session outside the lock so we don't leak a
+            // Chrome process.
+            let displaced = {
+                let mut sessions = self.sessions.lock().await;
+                sessions.insert(session_id.to_string(), session)
+            };
+            if let Some(mut old) = displaced {
+                let _ = old.browser.close().await;
+                let _ = old.browser.wait().await;
+                old.handler_task.abort();
+            }
             page
         };
 
@@ -114,12 +132,8 @@ impl BrowserManager {
     /// result as JSON. Promises are awaited (chromiumoxide handles the
     /// expression-vs-function fallback internally).
     pub async fn eval(&self, session_id: &str, js: &str) -> Result<serde_json::Value> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow!("no browser session '{session_id}'"))?;
-        let result = session
-            .page
+        let page = self.page_for(session_id).await?;
+        let result = page
             .evaluate(js)
             .await
             .with_context(|| "evaluate failed".to_string())?;
@@ -136,17 +150,12 @@ impl BrowserManager {
     /// Saves a full-page PNG screenshot to `path`. The caller is
     /// expected to have already gone through `Permissions::check_write`.
     pub async fn screenshot(&self, session_id: &str, path: &Path) -> Result<()> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow!("no browser session '{session_id}'"))?;
+        let page = self.page_for(session_id).await?;
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
             .full_page(true)
             .build();
-        session
-            .page
-            .save_screenshot(params, path)
+        page.save_screenshot(params, path)
             .await
             .with_context(|| format!("screenshot to {} failed", path.display()))?;
         Ok(())
@@ -155,10 +164,7 @@ impl BrowserManager {
     /// Extracts visible text from the page (or from a matched element
     /// when a selector is provided).
     pub async fn text(&self, session_id: &str, selector: Option<&str>) -> Result<String> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow!("no browser session '{session_id}'"))?;
+        let page = self.page_for(session_id).await?;
         let expr = match selector {
             Some(sel) => {
                 let escaped = sel.replace('\\', "\\\\").replace('"', "\\\"");
@@ -172,8 +178,7 @@ impl BrowserManager {
                     .to_string()
             }
         };
-        let result = session
-            .page
+        let result = page
             .evaluate(expr.as_str())
             .await
             .with_context(|| "text extraction failed".to_string())?;
@@ -197,12 +202,18 @@ impl BrowserManager {
     }
 
     /// Closes a session and terminates the underlying Chrome process.
-    /// Idempotent: closing an unknown session is an error so misuse is
-    /// surfaced to the model, but the manager state is unaffected.
+    /// Idempotent: closing an unknown (or already-closed) session is a
+    /// no-op so tools are safe to call twice.
     pub async fn close(&self, session_id: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        let Some(mut session) = sessions.remove(session_id) else {
-            return Err(anyhow!("no browser session '{session_id}'"));
+        // Remove the entry while holding the guard, then drop the
+        // guard before awaiting the (potentially slow) shutdown — a
+        // hung page must not block other sessions' operations.
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id)
+        };
+        let Some(mut session) = removed else {
+            return Ok(());
         };
         // Best-effort orderly close: ask Chrome to shut down, then
         // abort the handler task so the Browser handle can drop.
@@ -210,6 +221,17 @@ impl BrowserManager {
         let _ = session.browser.wait().await;
         session.handler_task.abort();
         Ok(())
+    }
+
+    /// Clones the `Page` handle for `session_id` out of the map and
+    /// drops the guard before returning, so callers can `.await` page
+    /// operations without holding the sessions mutex.
+    async fn page_for(&self, session_id: &str) -> Result<Page> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|s| s.page.clone())
+            .ok_or_else(|| anyhow!("no browser session '{session_id}'"))
     }
 }
 

@@ -26,13 +26,23 @@ fn chromium_available() -> bool {
         Some(p) => p,
         None => return false,
     };
-    for bin in [
-        "chromium",
-        "chromium-browser",
-        "chrome",
-        "google-chrome",
-        "google-chrome-stable",
-    ] {
+    let bins: &[&str] = if cfg!(windows) {
+        &[
+            "chromium.exe",
+            "chrome.exe",
+            "google-chrome.exe",
+            "msedge.exe",
+        ]
+    } else {
+        &[
+            "chromium",
+            "chromium-browser",
+            "chrome",
+            "google-chrome",
+            "google-chrome-stable",
+        ]
+    };
+    for bin in bins {
         for dir in std::env::split_paths(&path) {
             let candidate = dir.join(bin);
             if candidate.is_file() {
@@ -80,4 +90,16 @@ async fn browser_open_text_eval_close_roundtrip() {
     assert_eq!(value, serde_json::json!("cubi-test"));
 
     mgr.close(session).await.expect("browser_close failed");
+}
+
+#[tokio::test]
+async fn browser_close_unknown_session_is_idempotent() {
+    let mgr = browser_tool::BrowserManager::new();
+    mgr.close("never-opened")
+        .await
+        .expect("close on unknown session should be a no-op");
+    // Twice, for good measure.
+    mgr.close("never-opened")
+        .await
+        .expect("close should remain idempotent");
 }

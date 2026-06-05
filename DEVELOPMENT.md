@@ -100,9 +100,10 @@ cubi/
   round-trips per turn) and exposes the `agent_run` meta-tool for subagents.
 - **Built-in tools** (`builtin_tools.rs`) — shell, filesystem, web, REPL,
   notebook, git worktree, and LSP code-intel implementations.
-- **Headless browser** (`browser_tool.rs`, feature `browser`) — chromiumoxide
-  -backed session manager wired into `builtin_tools.rs` as the `browser_*`
-  tool family. Gated behind the `browser` cargo feature; default off.
+- **Headless browser** (`browser_tool.rs`, feature `browser`) —
+  chromiumoxide-backed session manager wired into `builtin_tools.rs` as
+  the `browser_*` tool family. Gated behind the `browser` cargo feature;
+  default off.
 - **MCP layer** (`mcp_client.rs`, `mcp_config.rs`, `mcp_manager.rs`) — loads
   external MCP servers and exposes their tools to the model.
 - **Permissions** (`permissions.rs`) — trust store consulted by every
