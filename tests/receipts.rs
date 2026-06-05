@@ -47,7 +47,7 @@ fn receipts_flag_writes_chain_and_verify_returns_ok() {
         .env("CUBI_FAKE_LLM_RESPONSE", "done")
         .env(
             "CUBI_FAKE_LLM_TOOL_CALL",
-            r#"{"function":{"name":"bash","arguments":{"command":"true"}}}"#,
+            r#"{"function":{"name":"list_files","arguments":{"path":"."}}}"#,
         )
         .args([
             "--receipts",
@@ -102,7 +102,7 @@ fn verify_receipts_detects_payload_tampering() {
         .env("CUBI_FAKE_LLM_RESPONSE", "done")
         .env(
             "CUBI_FAKE_LLM_TOOL_CALL",
-            r#"{"function":{"name":"bash","arguments":{"command":"true"}}}"#,
+            r#"{"function":{"name":"list_files","arguments":{"path":"."}}}"#,
         )
         .args([
             "--receipts",

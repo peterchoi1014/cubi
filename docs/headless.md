@@ -119,7 +119,23 @@ cubi verify-receipts /path/to/r.jsonl --no-verify-payloads --json
 Exit codes: `0` ok, `2` tamper detected (chain break, payload mismatch,
 or signature mismatch — the offending `seq` is reported on stderr), `13`
 I/O error. Receipts are a side-channel: when the file can't be written
-mid-session, cubi degrades to a single `tracing::warn!` and the session
-continues. See `DEVELOPMENT.md` § "Receipts format" for the on-disk
-shape and canonical-serialization algorithm.
+mid-session, cubi degrades to a single `tracing::warn!`, disables the
+writer for the rest of the process, and the session continues. See
+`DEVELOPMENT.md` § "Receipts format" for the on-disk shape and
+canonical-serialization algorithm.
+
+> ⚠️ **Security note.** Unlike `--events`/`--trace-tools`, which run
+> tool arguments and results through `redact_secrets` before
+> emitting, the payload sidecars under `<path>.payloads/` store the
+> **raw** tool args and results — including any API keys, tokens, file
+> contents, or other secrets the session touches. Treat the receipts
+> file and its `*.payloads/` directory as **sensitive**:
+>
+> - Keep them on a private filesystem with restrictive permissions
+>   (`chmod 600` / a user-only directory).
+> - Add the receipts path and `*.payloads/` to `.gitignore` (and to
+>   any container image / CI artifact exclusion lists) so they are
+>   never committed or uploaded.
+> - Rotate or scrub them before sharing a session log with anyone
+>   else.
 

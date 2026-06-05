@@ -24,9 +24,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One entry in the receipts log. Each variant maps onto a specific
 /// `event` string in the JSONL output; per-variant metadata (e.g. tool
@@ -73,6 +74,10 @@ pub struct ReceiptsWriter {
     payload_dir: PathBuf,
     signing_key: Option<SigningKey>,
     state: Mutex<Inner>,
+    /// Latched to `true` after the first IO failure so subsequent
+    /// `write` calls short-circuit instead of repeatedly hammering a
+    /// broken filesystem (and re-emitting the same warning).
+    disabled: AtomicBool,
 }
 
 impl ReceiptsWriter {
@@ -97,6 +102,7 @@ impl ReceiptsWriter {
             payload_dir,
             signing_key,
             state: Mutex::new(Inner { seq, prev_hash }),
+            disabled: AtomicBool::new(false),
         })
     }
 
@@ -104,9 +110,11 @@ impl ReceiptsWriter {
         &self.path
     }
 
-    /// Touch-create the receipts file (and parent / payload dirs) so
-    /// the caller can surface IO failures at startup rather than on
-    /// the first event mid-session.
+    /// Touch-create the receipts file (and parent dir) so the caller
+    /// can surface IO failures at startup rather than on the first
+    /// event mid-session. The payload sidecar directory is *not*
+    /// created here; it is materialized lazily on the first `write`
+    /// so a probe followed by no events leaves no detritus.
     pub fn probe(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -117,10 +125,20 @@ impl ReceiptsWriter {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        if !self.payload_dir.exists() {
-            std::fs::create_dir_all(&self.payload_dir)?;
-        }
         Ok(())
+    }
+
+    /// Returns `true` once a previous write has failed and the writer
+    /// has latched into a no-op state.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Latch the writer into a no-op state. Idempotent; returns `true`
+    /// if this call performed the transition (so the caller can emit a
+    /// single warning), `false` if it was already disabled.
+    pub fn disable(&self) -> bool {
+        !self.disabled.swap(true, Ordering::Relaxed)
     }
 
     /// Append one event. `payload` is the full data blob (tool args,
@@ -159,11 +177,15 @@ impl ReceiptsWriter {
             .state
             .lock()
             .map_err(|_| anyhow!("receipts writer mutex poisoned"))?;
-        state.seq += 1;
+        // Compute the next sequence locally so a failed write doesn't
+        // leak a gap into the on-disk chain. We only commit
+        // `state.seq` / `state.prev_hash` after the line has been
+        // appended successfully.
+        let next_seq = state.seq + 1;
 
         // Build the base record (everything except this_hash + sig).
         let mut record = serde_json::Map::new();
-        record.insert("seq".into(), json!(state.seq));
+        record.insert("seq".into(), json!(next_seq));
         record.insert("ts".into(), json!(now_rfc3339()));
         record.insert("event".into(), json!(event.kind()));
         match &event {
@@ -210,6 +232,9 @@ impl ReceiptsWriter {
         writeln!(file, "{line}")
             .with_context(|| format!("failed to write receipts line to {}", self.path.display()))?;
 
+        // Only commit the in-memory chain advance after the line has
+        // safely landed on disk.
+        state.seq = next_seq;
         state.prev_hash = this_hash;
         Ok(())
     }
@@ -294,12 +319,48 @@ fn sidecar_dir(path: &Path) -> PathBuf {
 
 /// Re-read the last well-formed line of an existing receipts file so a
 /// new writer continues the chain instead of restarting at seq=1.
+///
+/// Reads at most the trailing `TAIL_SCAN_BYTES` (64 KiB) of the file
+/// rather than slurping the whole thing — receipts entries are
+/// expected to stay well under that limit. If no newline is found in
+/// the tail window (e.g. one giant record larger than the window),
+/// we fall back to reading the entire file.
 fn recover_tail(path: &Path) -> Result<(u64, String)> {
+    const TAIL_SCAN_BYTES: u64 = 64 * 1024;
+
     if !path.exists() {
         return Ok((0, String::new()));
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read receipts file {}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open receipts file {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat receipts file {}", path.display()))?
+        .len();
+    if file_len == 0 {
+        return Ok((0, String::new()));
+    }
+
+    let read_len = std::cmp::min(file_len, TAIL_SCAN_BYTES);
+    let start = file_len - read_len;
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek receipts file {}", path.display()))?;
+    let mut buf = Vec::with_capacity(read_len as usize);
+    file.take(read_len)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("failed to read receipts tail of {}", path.display()))?;
+
+    // If we didn't reach the start of the file and didn't find a
+    // newline anywhere in the window, a single record exceeds the
+    // tail-scan budget — fall back to a full read.
+    let raw = if start > 0 && !buf.contains(&b'\n') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read receipts file {}", path.display()))?
+    } else {
+        String::from_utf8(buf)
+            .with_context(|| format!("receipts tail of {} is not valid UTF-8", path.display()))?
+    };
+
     let last = raw.lines().rfind(|l| !l.trim().is_empty());
     let Some(line) = last else {
         return Ok((0, String::new()));
@@ -361,7 +422,10 @@ pub struct VerifyReport {
 
 #[derive(Debug)]
 pub enum VerifyError {
-    /// I/O failure (missing file, can't read payload sidecar).
+    /// I/O failure reading the receipts file itself (missing file,
+    /// permission denied). Failures reading or parsing a payload
+    /// sidecar are surfaced as [`VerifyError::Tamper`] instead so the
+    /// caller still gets the offending `seq`.
     Io { message: String },
     /// Chain hash, signature, or payload-hash mismatch at a known seq.
     Tamper { seq: u64, reason: String },

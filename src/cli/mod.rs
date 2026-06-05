@@ -360,9 +360,13 @@ impl ChatCLI {
         self.receipts = receipts;
     }
 
-    /// Append a receipts entry if a writer is configured. Failures
-    /// degrade to a single `tracing::warn!`: a full disk or a deleted
-    /// directory must never abort an in-progress session.
+    /// Append a receipts entry if a writer is configured. The writer
+    /// is best-effort: on the *first* IO failure we emit a single
+    /// `tracing::warn!` and latch the writer into a disabled state so
+    /// subsequent calls become no-ops for the remainder of the
+    /// process. A full disk or a deleted directory must never abort
+    /// an in-progress session, and we deliberately avoid spamming the
+    /// log with one warning per event.
     pub(crate) fn emit_receipt(
         &self,
         event: crate::receipts::ReceiptEvent,
@@ -371,13 +375,18 @@ impl ChatCLI {
         let Some(receipts) = self.receipts.as_ref() else {
             return;
         };
+        if receipts.is_disabled() {
+            return;
+        }
         if let Err(e) = receipts.write(event, payload) {
-            tracing::warn!(
-                target: "cubi::receipts",
-                error = %e,
-                path = %receipts.path().display(),
-                "receipts write failed; continuing",
-            );
+            if receipts.disable() {
+                tracing::warn!(
+                    target: "cubi::receipts",
+                    error = %e,
+                    path = %receipts.path().display(),
+                    "receipts write failed; disabling receipts for the rest of this session",
+                );
+            }
         }
     }
 
