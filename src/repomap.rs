@@ -180,7 +180,7 @@ impl RepoMap {
         for file in &outline.files {
             out.push_str(&format!(
                 "## {} ({}, {} LoC)\n",
-                file.path.display(),
+                file.path.display().to_string().replace('\\', "/"),
                 file.language,
                 file.line_count
             ));
