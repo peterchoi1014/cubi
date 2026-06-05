@@ -81,6 +81,10 @@ tree-sitter-typescript = { version = "0.23", optional = true }
 chromiumoxide = { version = "0.9", optional = true, default-features = false }
 futures = { version = "0.3", optional = true }
 
+# No-echo terminal prompts for secret env vars (PATs, API keys) during
+# `cubi mcp install`. Pure-Rust on Unix, winapi on Windows; ~200 LOC.
+rpassword = "7"
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [

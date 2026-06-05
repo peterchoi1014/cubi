@@ -27,6 +27,10 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   meta-`agent_run` tool for spawning focused subagents
 - 🔌 **MCP support** — load external Model Context Protocol servers from
   `~/.cubi/mcp.json` and call their tools alongside built-ins
+- 🧰 **MCP registry** — `cubi mcp search/install/uninstall` for one-command
+  setup of common Model Context Protocol servers (filesystem, github,
+  gitlab, slack, sqlite, postgres, fetch, time, …); see
+  [`docs/mcp/registry.md`](docs/mcp/registry.md)
 - 🛡️ **Trust + plan mode + admin policy** — every write/exec path is gated by
   per-directory trust; `/plan` switches to a read-only mode; admins can ship a
   policy file with a tool deny-list

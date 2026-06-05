@@ -1,0 +1,167 @@
+[
+  {
+    "name": "filesystem",
+    "description": "Read, write, and list files under one or more allowed directories.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    "license": "MIT",
+    "tags": ["files", "official", "reference"]
+  },
+  {
+    "name": "github",
+    "description": "Read/write GitHub issues, PRs, and repository contents via the GitHub API.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": {
+        "required": true,
+        "description": "Personal access token; create at https://github.com/settings/tokens"
+      }
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+    "license": "MIT",
+    "tags": ["git", "github", "official"]
+  },
+  {
+    "name": "gitlab",
+    "description": "Read/write GitLab issues, MRs, and repository contents via the GitLab API.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-gitlab"],
+    "env": {
+      "GITLAB_PERSONAL_ACCESS_TOKEN": {
+        "required": true,
+        "description": "Personal access token; create at https://gitlab.com/-/user_settings/personal_access_tokens"
+      },
+      "GITLAB_API_URL": {
+        "required": false,
+        "description": "Override for self-hosted GitLab; defaults to https://gitlab.com/api/v4"
+      }
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/gitlab",
+    "license": "MIT",
+    "tags": ["git", "gitlab", "official"]
+  },
+  {
+    "name": "slack",
+    "description": "Post messages and read channel history from a Slack workspace.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-slack"],
+    "env": {
+      "SLACK_BOT_TOKEN": {
+        "required": true,
+        "description": "Bot token (starts with xoxb-); create a Slack app and install it to your workspace."
+      },
+      "SLACK_TEAM_ID": {
+        "required": true,
+        "description": "Slack workspace/team ID (T...)."
+      }
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/slack",
+    "license": "MIT",
+    "tags": ["chat", "slack", "official"]
+  },
+  {
+    "name": "gdrive",
+    "description": "Search Google Drive and read file contents. Performs an OAuth flow on first run.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-gdrive"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive",
+    "license": "MIT",
+    "tags": ["files", "google", "oauth", "official"]
+  },
+  {
+    "name": "sqlite",
+    "description": "Query and inspect a local SQLite database.",
+    "transport": "stdio",
+    "command": "uvx",
+    "args": ["mcp-server-sqlite", "--db-path", "./database.db"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite",
+    "license": "MIT",
+    "tags": ["database", "sqlite", "official"]
+  },
+  {
+    "name": "postgres",
+    "description": "Read-only query access to a Postgres database.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+    "env": {
+      "POSTGRES_CONNECTION_STRING": {
+        "required": true,
+        "description": "libpq connection string, e.g. postgres://user:pass@host:5432/db"
+      }
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+    "license": "MIT",
+    "tags": ["database", "postgres", "official"]
+  },
+  {
+    "name": "time",
+    "description": "Time and timezone conversion utilities.",
+    "transport": "stdio",
+    "command": "uvx",
+    "args": ["mcp-server-time"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+    "license": "MIT",
+    "tags": ["utility", "time", "official"]
+  },
+  {
+    "name": "brave-search",
+    "description": "Web search via the Brave Search API.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+    "env": {
+      "BRAVE_API_KEY": {
+        "required": true,
+        "description": "API key; get one at https://brave.com/search/api/"
+      }
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search",
+    "license": "MIT",
+    "tags": ["search", "web", "official"]
+  },
+  {
+    "name": "fetch",
+    "description": "Generic URL fetch tool that returns page contents converted to markdown.",
+    "transport": "stdio",
+    "command": "uvx",
+    "args": ["mcp-server-fetch"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    "license": "MIT",
+    "tags": ["web", "fetch", "official"]
+  },
+  {
+    "name": "memory",
+    "description": "Persistent knowledge-graph memory the model can read and write across sessions.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-memory"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+    "license": "MIT",
+    "tags": ["memory", "knowledge-graph", "official"]
+  },
+  {
+    "name": "everything",
+    "description": "Reference server exercising every MCP feature (tools, resources, prompts). Useful for testing.",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-everything"],
+    "env": {},
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/everything",
+    "license": "MIT",
+    "tags": ["reference", "testing", "official"]
+  }
+]
