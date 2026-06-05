@@ -487,6 +487,16 @@ async fn run_one_task(
         .context("create bench tempdir")?;
     copy_dir_all(&src_repo, workdir.path())?;
 
+    // Sibling tempdir used as the subprocess's HOME so that any
+    // `~/.cubi/` state (sessions, telemetry, policy, todos, …) lands
+    // here instead of the developer's real home. Kept separate from the
+    // workdir so verify.sh can list workdir contents without seeing the
+    // dotfile tree.
+    let home_dir = tempfile::Builder::new()
+        .prefix(&format!("cubi-bench-home-{}-", task.id))
+        .tempdir()
+        .context("create bench home tempdir")?;
+
     let events_path = output_dir.join(format!("{}.events.jsonl", task.id));
     let _step_cap = step_cap_override.unwrap_or(task.step_cap); // reserved: cubi has no public --max-steps flag yet
 
@@ -501,8 +511,13 @@ async fn run_one_task(
         .arg("--events")
         .arg(&events_path)
         .env("CUBI_MODEL", model)
-        // Avoid the binary writing into the developer's real
-        // `~/.cubi/sessions/` while running the bench.
+        // Redirect dotfile state (`~/.cubi/sessions/`, telemetry log,
+        // policy, todos, …) into a per-task tempdir so the bench never
+        // touches the developer's real home. `home_dir()` in this crate
+        // honors `HOME` (and `USERPROFILE` on Windows) before falling
+        // back to the platform lookup.
+        .env("HOME", home_dir.path())
+        .env("USERPROFILE", home_dir.path())
         .env("CUBI_NO_BANNER", "1")
         .current_dir(workdir.path())
         .stdin(Stdio::null())
@@ -562,8 +577,9 @@ async fn run_one_task(
         }
     }
 
-    // Run verify.sh from inside the workdir.
-    let verify_out = tokio::process::Command::new("bash")
+    // Run verify.sh from inside the workdir. `verify.sh` is documented
+    // as POSIX sh, so invoke `sh` rather than `bash`.
+    let verify_out = tokio::process::Command::new("sh")
         .arg(&verify_script)
         .current_dir(workdir.path())
         .stdin(Stdio::null())
@@ -587,11 +603,14 @@ async fn run_one_task(
         // TempDir drops on scope exit; this is here to make it explicit
         // and to enable the `--keep-workdir` toggle later.
         drop(workdir);
+        drop(home_dir);
     } else {
-        // Leak the TempDir so the directory survives. Print the path
-        // so the user can inspect it.
+        // Leak the TempDirs so the directories survive. Print the paths
+        // so the user can inspect them.
         let path = workdir.keep();
+        let home_path = home_dir.keep();
         eprintln!("cubi bench: kept workdir at {}", path.display());
+        eprintln!("cubi bench: kept home at {}", home_path.display());
     }
 
     Ok(TaskResult {

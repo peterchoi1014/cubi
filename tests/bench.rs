@@ -1,6 +1,7 @@
-//! Integration smoke tests for the `cubi bench` subcommand. These do
-//! **not** spawn the Cubi binary (that would require a live local
-//! model). They just verify task discovery + CLI plumbing.
+//! Integration smoke tests for the `cubi bench` subcommand. These
+//! spawn the Cubi binary via `assert_cmd`, but do **not** run any task
+//! end-to-end against a live model. They just verify task discovery +
+//! CLI plumbing.
 //!
 //! End-to-end runs against a real model live in the nightly
 //! `.github/workflows/bench.yml` job.
