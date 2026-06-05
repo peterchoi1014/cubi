@@ -74,6 +74,13 @@ tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 
+# Optional headless-browser driver. Pulled in only when the `browser`
+# feature is enabled so the default binary stays lean — chromiumoxide
+# pulls in CDP-generated code (~60K lines) and adds several MB to the
+# release artifact. See `src/browser_tool.rs`.
+chromiumoxide = { version = "0.9", optional = true, default-features = false }
+futures = { version = "0.3", optional = true }
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [
@@ -83,6 +90,10 @@ tree-sitter = [
     "dep:tree-sitter-javascript",
     "dep:tree-sitter-typescript",
 ]
+# Enables the `browser_open` / `browser_eval` / `browser_screenshot` /
+# `browser_text` / `browser_close` built-in tools. Requires a Chromium
+# or Chrome binary at runtime.
+browser = ["dep:chromiumoxide", "dep:futures"]
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

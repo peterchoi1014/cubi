@@ -41,6 +41,10 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   lifecycle hooks
 - 🗺️ **Repo-map** — tree-sitter-based outline of the project's symbols,
   available as the `repo_map` tool and `/repomap` slash command
+- 🌐 **Headless-browser tool** (feature `browser`) — `browser_open` /
+  `browser_eval` / `browser_screenshot` / `browser_text` / `browser_close`
+  backed by chromiumoxide for web debugging tasks. Off by default to keep the
+  lean binary; enable with `cargo install --features browser`.
 
 ## 🚀 Quick Start
 
