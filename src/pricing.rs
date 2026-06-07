@@ -112,7 +112,13 @@ mod tests {
 
     #[test]
     fn lookup_local_prefixes_return_zero_cost() {
-        for id in ["ollama/llama3", "llama3.2:1b", "qwen3:4b", "phi4-mini"] {
+        for id in [
+            "ollama/llama3",
+            "llama3.2:1b",
+            "qwen3:4b",
+            "phi4-mini",
+            "gemma4:31b",
+        ] {
             let p = lookup(id).unwrap_or_else(|| panic!("missing local prefix for {id}"));
             assert!(p.local, "{id} should be local");
             assert_eq!(p.cost_usd(1_000_000, 1_000_000), 0.0);
