@@ -109,6 +109,8 @@ A few common ones to get started:
 | `/sessions` / `/resume [id]` | List or resume auto-saved sessions |
 | `/plan` | Toggle plan mode (read-only) |
 | `/diff` / `/commit <msg>` / `/review` | Git workflow shortcuts |
+| `/repomap` | Print a tree-sitter outline of the current repo |
+| `/consensus <strategy> <m1,m2,...> [judge:<model>] <goal>` | Run a goal under multiple models and arbitrate (`vote` / `best-of-n` / `judge`) |
 | `/doctor` | Run environment health checks |
 | `/quit` | Exit |
 
@@ -121,6 +123,18 @@ cubi --json -p "list files"             # line-delimited JSON events
 cubi --resume                           # resume the latest session
 cubi --list-sessions                    # list all saved sessions
 cubi completions bash                   # shell completions
+
+# MCP registry — search and install curated servers
+cubi mcp search git
+cubi mcp install filesystem --env ALLOWED_DIR=/tmp
+
+# Benchmark — score any local model against the curated regression suite
+cubi bench --suite quick --model qwen3:4b
+
+# Tamper-evident audit log
+cubi keys init                          # one-time Ed25519 keypair (optional)
+cubi -p "list my repo" --receipts ./audit.jsonl
+cubi verify-receipts ./audit.jsonl      # exit 0 ok, 2 tamper, 13 I/O
 ```
 
 See the [headless cookbook](docs/headless.md) for scripts/pipelines, exit
