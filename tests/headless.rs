@@ -63,7 +63,7 @@ fn version_prints_package_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("cubi 0.3.0\n");
+        .stdout(format!("cubi {}\n", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn short_version_alias_matches_long_version() {
         .arg("-v")
         .assert()
         .success()
-        .stdout("cubi 0.3.0\n");
+        .stdout(format!("cubi {}\n", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
