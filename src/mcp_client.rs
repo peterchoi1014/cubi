@@ -188,7 +188,7 @@ impl StdioClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "cubi",
-                    "version": "0.3.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }
         });
@@ -371,7 +371,7 @@ impl HttpClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "cubi",
-                    "version": "0.3.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }
         });
