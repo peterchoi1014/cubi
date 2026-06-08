@@ -76,20 +76,20 @@ cd cubi && cargo install --path .
 cubi
 ```
 
-You should see:
+You should see (5-row idle mascot followed by the greeting):
 
 ```
-   ┌───────┐
-   │ ▣   ▣ │   Cubi
-   │   ◡   │   a pocket-sized AI for your shell
-   └───────┘
-    ░░░░░░░
+  ███████
+  █ ███ █
+███████████
+███████████
+  ███████
 
-Type /help to list all available slash commands.
-Start chatting! (Ctrl+C to interrupt, /quit to exit)
-
-You:
+hi, i'm Cubi — a pocket-sized AI
+/help · /quit to exit · Tab completes slash commands · Ctrl-R searches history
 ```
+
+Type `/help` to list every slash command. `Ctrl+C` interrupts; `/quit` exits.
 
 For full installation, model selection, and non-Ollama backend setup, see
 **[INSTALL.md](INSTALL.md)**.
