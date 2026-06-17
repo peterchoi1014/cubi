@@ -153,6 +153,23 @@ export OPENAI_BASE_URL=http://localhost:1234/v1
 
 Then `cubi` and `/doctor` will probe and list models from that server.
 
+### Large long-context models (e.g. GLM-5.2)
+
+Cubi recognizes the [GLM-5.2](https://z.ai/blog/glm-5.2) family (Z.ai / Zhipu,
+MIT-licensed) and maps it to its **1M-token context window** for token
+accounting and compaction. It is a tool-capable agentic coding model, so it is
+not flagged by the small-model tool-calling warning. Point cubi at any
+OpenAI-compatible server hosting it and select it with `CUBI_MODEL`:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8080/v1
+CUBI_MODEL=glm-5.2 cubi          # Ollama tag, HF repo id (zai-org/GLM-5.2),
+                                 # and provider-prefixed forms all resolve
+```
+
+GLM-5.2 is a flagship model — expect large weights and substantial RAM/VRAM
+requirements; run a quantized build on consumer hardware.
+
 ### Tool-calling caveats
 
 - **LM Studio**'s public chat-completions docs page omits `tools` from the

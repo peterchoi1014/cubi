@@ -528,6 +528,8 @@ mod tests {
             "phi4-mini",
             "gemma4",
             "gemma4:31b",
+            "glm-5.2",
+            "zai-org/GLM-5.2",
         ] {
             assert!(!is_known_non_tool_capable(m), "unexpected flag for {m}");
         }

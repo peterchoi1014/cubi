@@ -67,12 +67,28 @@ const TABLE: &[(&str, ModelPricing)] = &[
     ("phi", ModelPricing::local()),
     ("mistral", ModelPricing::local()),
     ("gemma", ModelPricing::local()),
+    ("glm", ModelPricing::local()),
 ];
 
 /// Returns the [`ModelPricing`] for `model_id` if any built-in prefix
 /// matches, else `None`. Comparison is case-insensitive.
 pub fn lookup(model_id: &str) -> Option<ModelPricing> {
     let id = model_id.to_ascii_lowercase();
+    if let Some(pricing) = lookup_prefix(&id) {
+        return Some(pricing);
+    }
+    // HuggingFace ids carry an `org/` repo prefix (e.g. "zai-org/glm-5.2").
+    // The full id is checked first above so provider catch-alls like
+    // "ollama/" still win; only retry on the final path segment when the
+    // whole id didn't match.
+    let stripped = id.rsplit('/').next().unwrap_or(&id);
+    if stripped != id {
+        return lookup_prefix(stripped);
+    }
+    None
+}
+
+fn lookup_prefix(id: &str) -> Option<ModelPricing> {
     for (prefix, pricing) in TABLE {
         if id.starts_with(prefix) {
             return Some(*pricing);
@@ -118,6 +134,7 @@ mod tests {
             "qwen3:4b",
             "phi4-mini",
             "gemma4:31b",
+            "glm-5.2",
         ] {
             let p = lookup(id).unwrap_or_else(|| panic!("missing local prefix for {id}"));
             assert!(p.local, "{id} should be local");
@@ -128,6 +145,15 @@ mod tests {
     #[test]
     fn lookup_unknown_returns_none() {
         assert!(lookup("totally-made-up-model-9000").is_none());
+    }
+
+    #[test]
+    fn lookup_strips_huggingface_org_prefix() {
+        // The full HF repo id ("zai-org/glm-5.2") doesn't start with a
+        // table prefix, but the final path segment does.
+        let p = lookup("zai-org/GLM-5.2").expect("hf repo id should resolve");
+        assert!(p.local, "glm-5.2 should be local");
+        assert_eq!(p.cost_usd(1_000_000, 1_000_000), 0.0);
     }
 
     #[test]
