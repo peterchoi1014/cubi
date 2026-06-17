@@ -990,7 +990,12 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         _ => {}
     }
 
-    let base = model_lower.split(':').next().unwrap_or(&model_lower);
+    let without_tag = model_lower.split(':').next().unwrap_or(&model_lower);
+    // HuggingFace-style ids carry an `org/` repo prefix (e.g.
+    // "zai-org/glm-5.2") and provider prefixes like "ollama/llama3" do the
+    // same. Match on the final path segment so they map identically to the
+    // bare family names below.
+    let base = without_tag.rsplit('/').next().unwrap_or(without_tag);
 
     match base {
         // Ollama models
@@ -1019,6 +1024,9 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         "granite3.3" | "granite3.2" | "granite3.1" => Some(131_072),
         "hermes3" => Some(131_072),
         "command-r7b" | "command-r" => Some(131_072),
+        // GLM-5.2 (Z.ai / Zhipu, MIT-licensed) ships with a solid 1M-token
+        // context for long-horizon agentic work. See https://z.ai/blog/glm-5.2.
+        "glm-5.2" | "glm5.2" => Some(1_000_000),
         // OpenAI models
         "gpt-4o" | "gpt-4o-mini" => Some(128_000),
         "gpt-4-turbo" | "gpt-4" => Some(128_000),
@@ -1191,6 +1199,11 @@ mod tests {
         assert_eq!(context_window_for_model("gemma3:1b"), Some(32_768));
         assert_eq!(context_window_for_model("gemma4"), Some(256_000));
         assert_eq!(context_window_for_model("gemma4:31b"), Some(256_000));
+        // GLM-5.2 — 1M context, recognized via Ollama tag, HF repo id, and
+        // provider-prefixed forms.
+        assert_eq!(context_window_for_model("glm-5.2"), Some(1_000_000));
+        assert_eq!(context_window_for_model("glm5.2:latest"), Some(1_000_000));
+        assert_eq!(context_window_for_model("zai-org/GLM-5.2"), Some(1_000_000));
     }
 
     #[test]
