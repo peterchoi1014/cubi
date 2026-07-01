@@ -377,15 +377,31 @@ fn cubi_binary() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cubi"))
 }
 
-/// Build the prompt handed to Cubi for one instance: a short fix directive
-/// followed by the raw issue text.
+/// Build the prompt handed to Cubi for one instance: an explicit
+/// explore-then-edit workflow followed by the raw issue text.
+///
+/// SWE-bench instances live in large, unfamiliar repos, so the biggest
+/// failure mode for a local model is *guessing* file paths (e.g.
+/// `settings.py`, `~/.cubi/settings.py`) instead of locating the real
+/// file. The directive below forces the model to ground itself — build a
+/// repo map / search for the relevant symbol and read the file — before
+/// editing, and to verify with the exact `old_text` an edit needs.
 pub fn build_prompt(problem_statement: &str) -> String {
     format!(
-        "You are fixing a bug in the current repository. Read the issue \
-         below and edit the source code to resolve it. Make the smallest \
-         change that fixes the issue. Do NOT edit or add test files — the \
-         graders supply their own tests. When done, ensure the code \
-         compiles/imports cleanly.\n\n---\n\n{problem_statement}"
+        "You are fixing a bug in a real software project checked out in the \
+         current working directory. Work methodically:\n\
+         1. EXPLORE FIRST. Do not guess file paths. Use `repo_map`, and \
+         `grep`/`bash` (e.g. `grep -rn <symbol> .`, `ls`) to locate the \
+         file(s) that actually implement the behavior described in the \
+         issue. Paths are relative to the current directory.\n\
+         2. READ the target file before editing so your `edit_file` \
+         `old_text` matches the real source exactly.\n\
+         3. EDIT the source to resolve the issue. Make the smallest change \
+         that fixes it. If an edit fails because `old_text` didn't match, \
+         re-read the file and try again with the exact text.\n\
+         4. Do NOT edit or add test files — the graders supply their own \
+         tests. Ensure the code still imports/compiles cleanly.\n\n\
+         ---\n\n{problem_statement}"
     )
 }
 
@@ -1131,10 +1147,13 @@ SKIPPED [1] tests/test_foo.py:12: needs network
     }
 
     #[test]
-    fn build_prompt_includes_issue_and_no_test_directive() {
+    fn build_prompt_includes_issue_and_directives() {
         let p = build_prompt("The widget crashes on None");
         assert!(p.contains("The widget crashes on None"));
         assert!(p.to_lowercase().contains("do not edit"));
+        // The explore-first workflow is the key anti-path-guessing directive.
+        assert!(p.to_lowercase().contains("explore"));
+        assert!(p.contains("repo_map"));
     }
 
     #[test]
