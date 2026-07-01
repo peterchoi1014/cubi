@@ -1014,10 +1014,15 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         "mistral-small3.2" | "mistral-small3.1" | "mistral-small" => Some(131_072),
         "devstral" => Some(131_072),
         "qwen2.5" | "qwen2" => Some(128_000),
+        // Qwen2.5-Coder shares the Qwen2.5 generation's 128K (YaRN-extended)
+        // window; map it alongside its instruct sibling.
+        "qwen2.5-coder" => Some(128_000),
         // Qwen3 ships with a 32K native window; YaRN can extend it but
         // we conservatively report the native value since the backend
         // doesn't always enable YaRN by default.
         "qwen3" => Some(32_768),
+        // Qwen3-Coder ships with a 256K native context (extensible to 1M).
+        "qwen3-coder" => Some(256_000),
         "codellama" => Some(16_384),
         "phi3" | "phi-3" => Some(128_000),
         // Phi-4 (14B dense) ships with a 16K window per Microsoft's model
@@ -1195,6 +1200,10 @@ mod tests {
         // a row trips this test instead of silently regressing the
         // budget warning for users on those models.
         assert_eq!(context_window_for_model("qwen3:8b"), Some(32_768));
+        // Coder variants: recognized distinctly from their instruct siblings.
+        assert_eq!(context_window_for_model("qwen2.5-coder:7b"), Some(128_000));
+        assert_eq!(context_window_for_model("qwen2.5-coder:14b"), Some(128_000));
+        assert_eq!(context_window_for_model("qwen3-coder:30b"), Some(256_000));
         assert_eq!(context_window_for_model("devstral"), Some(131_072));
         assert_eq!(context_window_for_model("mistral-small3.2"), Some(131_072));
         assert_eq!(context_window_for_model("granite3.3:8b"), Some(131_072));
