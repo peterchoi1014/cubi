@@ -317,7 +317,7 @@ fn headless_json_outputs_line_delimited_events() {
 
 #[cfg(unix)]
 #[test]
-fn headless_json_reports_tool_timeout() {
+fn headless_json_reports_tool_timeout_and_recovers() {
     let home = tempdir().unwrap();
     let cubi_dir = home.path().join(".cubi");
     fs::create_dir_all(&cubi_dir).unwrap();
@@ -328,6 +328,10 @@ fn headless_json_reports_tool_timeout() {
     )
     .unwrap();
 
+    // A single tool timeout is surfaced as a `tool_timeout` event but is
+    // NOT fatal: the error is fed back to the model, which recovers on the
+    // next step (the fake backend stops re-issuing the tool call once a
+    // tool result is in history) and the run exits successfully.
     let output = cubi(home.path())
         .env("CUBI_FAKE_LLM", "1")
         .env("CUBI_FAKE_LLM_RESPONSE", "done")
@@ -337,8 +341,7 @@ fn headless_json_reports_tool_timeout() {
         )
         .args(["--json", "--no-stream", "-p", "run slow shell"])
         .assert()
-        .failure()
-        .code(11)
+        .success()
         .get_output()
         .stdout
         .clone();
@@ -346,6 +349,39 @@ fn headless_json_reports_tool_timeout() {
     assert!(stdout.contains(r#""type":"tool_timeout""#));
     assert!(stdout.contains(r#""name":"bash""#));
     assert!(stdout.contains(r#""secs":1"#));
+    // The model recovered and produced its final content.
+    assert!(stdout.contains(r#""value":"done""#));
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_aborts_after_consecutive_tool_errors() {
+    let home = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({"trusted_roots": [cwd]}).to_string(),
+    )
+    .unwrap();
+
+    // A model that keeps issuing a failing tool call with no successful
+    // call in between is genuinely stuck: the headless safety valve bails
+    // out with ExitCode::Tool (11) after MAX_CONSECUTIVE_TOOL_ERRORS. The
+    // edit targets a file that does not exist, so every call errors.
+    cubi(home.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env("CUBI_FAKE_LLM_TOOL_CALL_REPEAT", "1")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"edit_file","arguments":{"path":"does_not_exist_xyz.txt","old_text":"a","new_text":"b"}}}"#,
+        )
+        .args(["--json", "--no-stream", "-p", "keep failing"])
+        .assert()
+        .failure()
+        .code(11);
 }
 
 #[test]

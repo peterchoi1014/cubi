@@ -811,7 +811,16 @@ pub(crate) fn fake_content_for(model: &str) -> String {
 
 fn fake_message_for(model: &str, messages: &[Message]) -> Message {
     if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_TOOL_CALL") {
-        if !messages.iter().any(|message| message.role == "tool") {
+        // Normally the scripted tool call is emitted once (until a tool
+        // result appears in history) so tests can drive a single
+        // model→tool→model round-trip. Setting
+        // `CUBI_FAKE_LLM_TOOL_CALL_REPEAT=1` removes that gate so the fake
+        // backend re-issues the call on every step — used to exercise the
+        // headless consecutive-tool-error safety valve.
+        let repeat = std::env::var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if repeat || !messages.iter().any(|message| message.role == "tool") {
             if let Ok(call) = serde_json::from_str::<ToolCall>(&raw) {
                 return Message {
                     role: "assistant".to_string(),

@@ -32,6 +32,13 @@ use crate::ollama::{Message, ToolFunction, ToolSpec};
 /// small enough that a runaway model gives up well before the user does.
 pub const MAX_AGENT_STEPS: usize = 12;
 
+/// In headless mode, tool errors are fed back to the model so it can
+/// recover (fix a path, re-read a file, correct `old_text`, ...) instead
+/// of aborting the whole run on the first miss. If the model emits this
+/// many *consecutive* tool errors with no successful call in between it is
+/// considered genuinely stuck and the run bails out with `ExitCode::Tool`.
+pub const MAX_CONSECUTIVE_TOOL_ERRORS: u32 = 6;
+
 /// Default ceiling on a subagent's own loop. The subagent always uses the
 /// minimum of (caller-supplied `max_steps`, this constant) so a misbehaving
 /// `agent_run` call can never grow the parent's budget by surprise.

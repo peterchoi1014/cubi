@@ -221,6 +221,11 @@ impl ChatCLI {
         let headless_mode = self.headless_mode;
         let json_enabled = self.json_enabled && headless_mode;
 
+        // Consecutive tool-error counter for the headless safety valve.
+        // Reset to 0 on any successful tool call; when it reaches
+        // MAX_CONSECUTIVE_TOOL_ERRORS the model is treated as stuck.
+        let mut consecutive_tool_errors: u32 = 0;
+
         if let Some(sink) = self.event_sink.as_ref() {
             sink.emit(
                 "turn_start",
@@ -637,14 +642,37 @@ impl ChatCLI {
                     || result_text.starts_with("[tool denied]");
                 self.hooks
                     .fire_post_tool_use(&call.function.name, &result_text, is_error);
-                if headless_mode && result_text.starts_with("[tool error]") {
-                    return Err(exit_code::err(
-                        ExitCode::Tool,
-                        format!(
-                            "cubi: tool '{}' failed: {}",
-                            call.function.name, result_text
-                        ),
-                    ));
+
+                // Tool errors are a normal part of an agentic loop: the model
+                // is expected to read the error and retry (fix a path, re-read
+                // a file, correct `old_text`, ...). Feed the error back into
+                // history (below) and continue rather than aborting the whole
+                // run on the first miss. As a safety valve, headless runs still
+                // bail out once the model emits MAX_CONSECUTIVE_TOOL_ERRORS
+                // errors in a row with no successful call in between (genuinely
+                // stuck), so scripts get a non-zero exit instead of burning the
+                // full step budget.
+                if result_text.starts_with("[tool error]") {
+                    consecutive_tool_errors += 1;
+                    if headless_mode && consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                        // Record the final error in history so an inspected or
+                        // resumed session shows what happened, then abort.
+                        self.history.push(Message::tool_result(
+                            &call.function.name,
+                            result_text.clone(),
+                            call.id.clone(),
+                        ));
+                        return Err(exit_code::err(
+                            ExitCode::Tool,
+                            format!(
+                                "cubi: aborting after {} consecutive tool errors; \
+                                 last: tool '{}' failed: {}",
+                                consecutive_tool_errors, call.function.name, result_text
+                            ),
+                        ));
+                    }
+                } else {
+                    consecutive_tool_errors = 0;
                 }
 
                 // Print a short preview so the user can see what came back
