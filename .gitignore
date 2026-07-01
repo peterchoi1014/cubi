@@ -1,4 +1,8 @@
 /target
 
+# Generated benchmark run artifacts
+/bench/results/
+/bench/swebench-results/
+
 # Internal-only planning doc, not for public distribution.
 /ROADMAP.md

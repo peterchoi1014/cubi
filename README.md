@@ -62,6 +62,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🏁 **Benchmark suite** — `cubi bench --suite quick` runs Cubi's curated
   regression suite against any local model. Nightly CI tracks `qwen3:8b`
   scores; see [`bench/README.md`](bench/README.md).
+- 🧪 **SWE-bench-Lite** — `cubi swebench --dataset <file>` drives Cubi over
+  the real SWE-bench-Lite issues, emitting official-schema predictions plus
+  an optional local `--score`; see [`docs/swebench.md`](docs/swebench.md).
 
 ## 🚀 Quick Start
 
@@ -130,6 +133,9 @@ cubi mcp install filesystem --env ALLOWED_DIR=/tmp
 
 # Benchmark — score any local model against the curated regression suite
 cubi bench --suite quick --model qwen3:4b
+
+# SWE-bench-Lite — generate official-schema predictions (+ optional local score)
+cubi swebench --dataset swe-bench-lite.jsonl --model qwen3:8b --limit 10
 
 # Tamper-evident audit log
 cubi keys init                          # one-time Ed25519 keypair (optional)

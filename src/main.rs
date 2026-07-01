@@ -48,6 +48,7 @@ mod settings_sync;
 pub mod skills;
 mod spinner;
 mod style;
+mod swebench;
 mod telemetry;
 mod themes;
 mod thinking_filter;
@@ -771,6 +772,138 @@ async fn main() -> Result<()> {
                 set_primary(&mut primary, PrimaryCommand::Bench(bench_args));
                 i = j - 1;
             }
+            "swebench" => {
+                let mut swe_args = swebench::SweBenchArgs::default();
+                let mut j = i + 1;
+                while let Some(arg) = argv.get(j).and_then(|a| a.to_str()) {
+                    match arg {
+                        "--dataset" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --dataset requires a path.");
+                                std::process::exit(2);
+                            };
+                            swe_args.dataset = Some(std::path::PathBuf::from(v));
+                        }
+                        _ if arg.starts_with("--dataset=") => {
+                            swe_args.dataset = Some(std::path::PathBuf::from(
+                                arg.trim_start_matches("--dataset="),
+                            ));
+                        }
+                        "--model" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --model requires a value.");
+                                std::process::exit(2);
+                            };
+                            swe_args.model = Some(v.to_string());
+                        }
+                        _ if arg.starts_with("--model=") => {
+                            swe_args.model = Some(arg.trim_start_matches("--model=").to_string());
+                        }
+                        "--instance" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --instance requires an instance id.");
+                                std::process::exit(2);
+                            };
+                            swe_args.instance = Some(v.to_string());
+                        }
+                        _ if arg.starts_with("--instance=") => {
+                            swe_args.instance =
+                                Some(arg.trim_start_matches("--instance=").to_string());
+                        }
+                        "--limit" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --limit requires an integer.");
+                                std::process::exit(2);
+                            };
+                            let Ok(n) = v.parse::<usize>() else {
+                                eprintln!("cubi: swebench --limit must be a positive integer.");
+                                std::process::exit(2);
+                            };
+                            swe_args.limit = Some(n);
+                        }
+                        _ if arg.starts_with("--limit=") => {
+                            let Ok(n) = arg.trim_start_matches("--limit=").parse::<usize>() else {
+                                eprintln!("cubi: swebench --limit must be a positive integer.");
+                                std::process::exit(2);
+                            };
+                            swe_args.limit = Some(n);
+                        }
+                        "--output" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --output requires a directory path.");
+                                std::process::exit(2);
+                            };
+                            swe_args.output = Some(std::path::PathBuf::from(v));
+                        }
+                        _ if arg.starts_with("--output=") => {
+                            swe_args.output = Some(std::path::PathBuf::from(
+                                arg.trim_start_matches("--output="),
+                            ));
+                        }
+                        "--repos-root" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --repos-root requires a directory path.");
+                                std::process::exit(2);
+                            };
+                            swe_args.repos_root = Some(std::path::PathBuf::from(v));
+                        }
+                        _ if arg.starts_with("--repos-root=") => {
+                            swe_args.repos_root = Some(std::path::PathBuf::from(
+                                arg.trim_start_matches("--repos-root="),
+                            ));
+                        }
+                        "--time-cap" => {
+                            j += 1;
+                            let Some(v) = argv.get(j).and_then(|a| a.to_str()) else {
+                                eprintln!("cubi: swebench --time-cap requires seconds.");
+                                std::process::exit(2);
+                            };
+                            match v.parse::<u64>() {
+                                Ok(n) if n > 0 => swe_args.time_cap_seconds = n,
+                                _ => {
+                                    eprintln!(
+                                        "cubi: swebench --time-cap must be a positive integer (seconds)."
+                                    );
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                        _ if arg.starts_with("--time-cap=") => {
+                            match arg.trim_start_matches("--time-cap=").parse::<u64>() {
+                                Ok(n) if n > 0 => swe_args.time_cap_seconds = n,
+                                _ => {
+                                    eprintln!(
+                                        "cubi: swebench --time-cap must be a positive integer (seconds)."
+                                    );
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                        "--score" => swe_args.score = true,
+                        "--keep-workdir" => swe_args.keep_workdir = true,
+                        "--json" => swe_args.json = true,
+                        "--help" | "-h" => {
+                            print_swebench_help();
+                            return Ok(());
+                        }
+                        _ => {
+                            eprintln!(
+                                "cubi: swebench: unexpected argument {arg:?}. Run `cubi swebench --help`."
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                    j += 1;
+                }
+                set_primary(&mut primary, PrimaryCommand::SweBench(swe_args));
+                i = j - 1;
+            }
             "--fix" => {
                 doctor_fix = true;
             }
@@ -942,6 +1075,16 @@ async fn main() -> Result<()> {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("cubi: bench failed: {e:#}");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
+        PrimaryCommand::SweBench(args) => {
+            let code = match swebench::run(args.clone()).await {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("cubi: swebench failed: {e:#}");
                     2
                 }
             };
@@ -1574,6 +1717,7 @@ enum PrimaryCommand {
         json: bool,
     },
     Bench(bench::BenchArgs),
+    SweBench(swebench::SweBenchArgs),
     PrintConfig,
 }
 
@@ -1922,6 +2066,38 @@ fn print_bench_help() {
     );
 }
 
+fn print_swebench_help() {
+    println!(
+        "cubi swebench — generate SWE-bench-Lite predictions (+ optional local score)\n\n\
+         USAGE:\n  cubi swebench --dataset <path.jsonl> [FLAGS]\n\n\
+         For each selected instance, Cubi checks out the repo at its base\n  \
+         commit, is driven headlessly with the issue text, and its git diff\n  \
+         is captured as the model patch. Predictions are written in the\n  \
+         official schema so the upstream harness can produce the canonical\n  \
+         resolved rate:\n  \
+         python -m swebench.harness.run_evaluation --predictions_path <out> \\\n    \
+           --dataset_name princeton-nlp/SWE-bench_Lite\n\n\
+         FLAGS:\n  \
+         --dataset <path.jsonl>    SWE-bench-Lite instances, one JSON per line\n  \
+                                   (export from princeton-nlp/SWE-bench_Lite). Required.\n  \
+         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3:8b).\n  \
+         --instance <id>           Run a single instance by id.\n  \
+         --limit <n>               Cap the number of instances.\n  \
+         --repos-root <dir>        Directory of pre-cloned repos (offline);\n  \
+                                   otherwise repos are cloned from GitHub.\n  \
+         --score                   Apply each test_patch and run pytest for a\n  \
+                                   local (best-effort, non-Docker) resolved rate.\n  \
+         --time-cap <seconds>      Per-instance wall-clock cap (default: 900).\n  \
+         --output <dir>            Output dir (default: bench/swebench-results/<ts>/).\n  \
+         --keep-workdir            Keep each instance's checkout for inspection.\n  \
+         --json                    Print the summary as JSON to stdout.\n  \
+         -h, --help                Print this help and exit.\n\n\
+         Writes predictions.jsonl + summary.json to the output dir. The\n  \
+         canonical score comes from the Dockerized upstream harness; --score\n  \
+         is a fast local approximation and needs the repo's Python env set up.",
+    );
+}
+
 fn print_help() {
     println!(
         "cubi {} — a pocket-sized AI for your shell\n\n\
@@ -1976,6 +2152,10 @@ fn print_help() {
                                       per-task results + summary.json to\n  \
                                       bench/results/<timestamp>/. Run `cubi bench --help`\n  \
                                       for the full flag list.\n  \
+         cubi swebench --dataset <f>  Drive Cubi over SWE-bench-Lite instances,\n  \
+                                      writing official-schema predictions.jsonl\n  \
+                                      (+ optional --score). Run `cubi swebench\n  \
+                                      --help` for the full flag list.\n  \
          cubi doctor --fix            Run checks and apply safe automated fixes\n  \
                                       (create missing sessions dir, write a\n  \
                                       stub config, install shell completions)\n  \
