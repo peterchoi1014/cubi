@@ -4,10 +4,11 @@ A small, self-contained set of regression tasks the Cubi agent should be
 able to solve end-to-end against a local model. Used by `cubi bench` and
 the nightly CI workflow to track score drift over time.
 
-> **Scope.** This is Cubi's *internal* regression suite. SWE-bench-Lite
-> integration (300 real GitHub tasks, Docker, full pytest suites) is a
-> future phase that will live alongside — not replace — this directory.
-> The MVP here intentionally has zero network and zero Docker dependency.
+> **Scope.** This is Cubi's *internal* regression suite — zero network,
+> zero Docker. For runs against the real SWE-bench-Lite dataset (300 GitHub
+> issues, official predictions + optional pytest scoring), see
+> [`cubi swebench`](../docs/swebench.md), which lives alongside this suite
+> rather than replacing it.
 
 ## Layout
 
