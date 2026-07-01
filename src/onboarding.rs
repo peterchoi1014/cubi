@@ -530,6 +530,8 @@ mod tests {
             "gemma4:31b",
             "glm-5.2",
             "zai-org/GLM-5.2",
+            "qwen2.5-coder:7b",
+            "qwen3-coder:30b",
         ] {
             assert!(!is_known_non_tool_capable(m), "unexpected flag for {m}");
         }

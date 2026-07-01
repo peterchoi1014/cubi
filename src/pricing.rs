@@ -135,6 +135,7 @@ mod tests {
             "phi4-mini",
             "gemma4:31b",
             "glm-5.2",
+            "qwen2.5-coder:7b",
         ] {
             let p = lookup(id).unwrap_or_else(|| panic!("missing local prefix for {id}"));
             assert!(p.local, "{id} should be local");
