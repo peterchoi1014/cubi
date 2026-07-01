@@ -50,6 +50,61 @@ interpreter) to already be importable, so treat its number as a smoke signal,
 not the published result. The scorer prefers `python3`, falls back to `python`,
 and honors `CUBI_SWEBENCH_PYTHON`.
 
+## Canonical scoring (CI)
+
+Use `.github/workflows/swebench-score.yml` when you need the canonical
+resolved-rate score for a Cubi-generated `predictions.jsonl`. The workflow runs
+the upstream SWE-bench Docker harness on GitHub's `ubuntu-latest` x86_64
+runners, where Docker is already available. This avoids the maintainer
+Apple-Silicon path: SWE-bench's prebuilt images target Linux/x86_64, and its
+ARM support requires local image builds and is still experimental.
+
+First, generate predictions locally or on any machine that can run Cubi:
+
+```bash
+cubi swebench --dataset swe-bench-lite.jsonl \
+  --model qwen3:8b \
+  --output bench/swebench-results/cubi-run
+```
+
+The CI workflow uses a repository path for the input because
+`workflow_dispatch` cannot attach a local file directly. Commit
+`predictions.jsonl` on the branch you dispatch. Keep that file on a scratch
+scoring branch if you do not want to merge generated predictions into `main`:
+
+```bash
+git checkout -b swebench-score/cubi-run
+git add bench/swebench-results/cubi-run/predictions.jsonl
+git commit -m "Add SWE-bench predictions for scoring"
+git push origin swebench-score/cubi-run
+```
+
+Then run the manual workflow from that branch:
+
+```bash
+gh workflow run swebench-score.yml \
+  --ref swebench-score/cubi-run \
+  -f predictions_path=bench/swebench-results/cubi-run/predictions.jsonl \
+  -f dataset_name=princeton-nlp/SWE-bench_Lite \
+  -f run_id=cubi-run
+```
+
+The workflow installs `swebench==4.1.0` and runs:
+
+```bash
+python -m swebench.harness.run_evaluation \
+  --predictions_path <predictions_path> \
+  --dataset_name <dataset_name> \
+  --run_id <run_id> \
+  --max_workers 4
+```
+
+When the run finishes, download the `swebench-score-<github-run-id>` artifact.
+It contains `run_evaluation.log`, Docker build/evaluation logs from `logs/`,
+and the upstream report files from `evaluation_results/`. Use the report under
+`evaluation_results/` as the canonical resolved-rate result; use the logs to
+debug Docker image builds or individual failing instances.
+
 ## Getting the dataset
 
 `cubi swebench` reads a JSONL file with one instance per line. Export the HF
