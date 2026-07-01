@@ -1,4 +1,6 @@
-use crate::agent_loop::{self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, SUBAGENT_DEFAULT_STEPS};
+use crate::agent_loop::{
+    self, AGENT_TOOL_NAME, MAX_AGENT_STEPS, MAX_CONSECUTIVE_TOOL_ERRORS, SUBAGENT_DEFAULT_STEPS,
+};
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::completer::SlashHelper;
 use crate::executor::AIExecutor;
