@@ -200,12 +200,12 @@ fn cleanup_worktree(repo_dir: &Path, path: &Path, branch: &str) {
             path.as_os_str(),
         ],
     );
-    remove_empty_worktree_dirs(path);
     let _ = run_git(repo_dir, &[OsStr::new("worktree"), OsStr::new("prune")]);
     let _ = run_git(
         repo_dir,
         &[OsStr::new("branch"), OsStr::new("-D"), OsStr::new(branch)],
     );
+    remove_empty_worktree_dirs(path);
 }
 
 fn remove_empty_worktree_dirs(path: &Path) {
@@ -341,7 +341,7 @@ fn ensure_worktree_parent_under_git_common_dir(
 
     let parent_dir = parent_dir.canonicalize().with_context(|| {
         format!(
-            "Could not resolve temporary directory `{}`",
+            "Could not resolve worktree parent directory `{}`",
             parent_dir.display()
         )
     })?;
@@ -859,8 +859,7 @@ mod tests {
             common_dir.display()
         );
         assert_eq!(
-            worktree_parent_path,
-            expected_parent_path,
+            worktree_parent_path, expected_parent_path,
             "worktree parent did not use expected git-common-dir parent"
         );
         assert!(
