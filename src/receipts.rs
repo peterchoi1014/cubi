@@ -849,16 +849,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap()
-                    .join("target")
-                    .join("receipts-tests")
-            });
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("cubi-receipts-{label}-{nanos}.jsonl"))
+        // Use the OS temp dir (stable, absolute) rather than the process
+        // current dir: other tests mutate the global cwd via
+        // set_current_dir into TempDirs that then get removed, which would
+        // make a cwd-relative path vanish between create_dir_all and open.
+        std::env::temp_dir().join(format!("cubi-receipts-{label}-{nanos}.jsonl"))
     }
 
     fn cleanup(path: &Path) {
