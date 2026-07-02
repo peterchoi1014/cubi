@@ -297,9 +297,6 @@ impl ChatCLI {
     /// assistant message is appended to history, single-turn system hints
     /// are stripped, and the session is checkpointed.
     pub(super) async fn agent_turn(&mut self, turn_start: usize) -> Result<()> {
-        use std::io::Write;
-        use std::sync::atomic::Ordering;
-
         // Auto-compact: when the prompt token estimate crosses
         // `compact_threshold_pct` of the active model's context window,
         // summarize older turns before sending. Best-effort; failures
@@ -327,6 +324,16 @@ impl ChatCLI {
         let mut turn_stats = ChatStats::default();
         let headless_mode = self.headless_mode;
         let json_enabled = self.json_enabled && headless_mode;
+
+        // Re-sync the UI sink's output-mode flags for this turn. `headless`
+        // is flipped on by `run_one_shot` *after* construction and markdown /
+        // json can be toggled mid-session via slash commands, so the sink
+        // must observe the current values before any per-turn output.
+        self.ui.reconfigure(super::ui_sink::SinkFlags {
+            headless: headless_mode,
+            json: json_enabled,
+            markdown: self.markdown_enabled,
+        });
 
         // Consecutive tool-error counter for the headless safety valve.
         // Reset to 0 on any successful tool call; when it reaches
@@ -385,22 +392,12 @@ impl ChatCLI {
             } else {
                 "processing tool results…"
             };
-            let spinner = crate::spinner::Spinner::start(spinner_label);
-            let stop_flag = spinner.stop_flag();
-
-            // Hold the spinner across the streaming call so the callback
-            // can clear it on the first token. We can't move `spinner`
-            // into the closure (we need to `.stop().await` after), so we
-            // share a `&Spinner` via Rc/Arc-like discipline: the closure
-            // only needs `clear_line` + `stop_flag`.
-            let spinner_ref = &spinner;
-
-            // Only print the "AI:" prefix once per user turn — multi-step
-            // turns continue inline below the previous tool block. We
-            // defer the print until the first streamed token so the
-            // spinner has full ownership of the status line.
-            let mut printed_prefix = step > 0;
-            let mut got_token = false;
+            // Start the thinking spinner through the sink. `continuation`
+            // (step > 0) means the `AI:` prefix was already printed earlier in
+            // this multi-step turn, so it is not repeated. The sink owns the
+            // spinner across the streaming call so its first-token handler can
+            // clear the status line at exactly the right moment.
+            self.ui.begin_thinking(spinner_label, step > 0);
 
             // Either stream tokens (default) or run buffered chat_with_tools
             // when the user has /stream off (markdown mode is buffered-only).
@@ -408,29 +405,16 @@ impl ChatCLI {
             // call; tool dispatch below is also cancellable between awaits.
             let mut hit_time_cap = false;
             let outcome: Option<Result<(Message, ChatStats)>> = if self.stream_enabled {
+                // Move the sink out of `self` for the duration of the stream
+                // so the token closure can own `&mut` it while `self.executor`
+                // is borrowed by `chat_stream`. Restored immediately after.
+                let mut ui = std::mem::replace(&mut self.ui, Box::new(super::ui_sink::NullSink));
                 let stream_fut =
                     self.executor
                         .chat_stream(self.history.clone(), tools.clone(), |tok| {
-                            if !got_token {
-                                stop_flag.store(true, Ordering::SeqCst);
-                                spinner_ref.clear_line();
-                                if !printed_prefix && !headless_mode {
-                                    print!("{} ", "AI:".bright_blue().bold());
-                                    printed_prefix = true;
-                                }
-                            }
-                            if json_enabled {
-                                Self::emit_json_event(crate::json_events::token(tok));
-                            } else if headless_mode {
-                                print!("{}", tok);
-                                let _ = std::io::stdout().flush();
-                            } else {
-                                print!("{}", tok.bright_white());
-                                let _ = std::io::stdout().flush();
-                            }
-                            got_token = true;
+                            ui.assistant_token(tok);
                         });
-                if let Some(deadline) = subprocess_deadline {
+                let res = if let Some(deadline) = subprocess_deadline {
                     tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
@@ -446,7 +430,9 @@ impl ChatCLI {
                         _ = tokio::signal::ctrl_c() => None,
                         r = stream_fut => Some(r),
                     }
-                }
+                };
+                self.ui = ui;
+                res
             } else {
                 let buf_fut = self
                     .executor
@@ -470,8 +456,10 @@ impl ChatCLI {
                 }
             };
             // Always retire the spinner before we print anything else.
-            stop_flag.store(true, Ordering::SeqCst);
-            spinner.stop().await;
+            if let Some(sp) = self.ui.end_thinking() {
+                sp.stop().await;
+            }
+            let got_token = self.ui.got_token();
 
             if hit_time_cap {
                 if got_token && headless_mode && !json_enabled {
@@ -496,17 +484,18 @@ impl ChatCLI {
                     // Move past any partial output.
                     println!();
                 }
-                crate::out::status_line(
-                    headless_mode,
-                    format!("{} {}", "✗".bright_red(), "cancelled (Ctrl-C)".bright_red()),
-                );
+                self.ui.status(&format!(
+                    "{} {}",
+                    "✗".bright_red(),
+                    "cancelled (Ctrl-C)".bright_red()
+                ));
                 if step > 0 {
                     let msg = format!(
                         "  {} prior tool side-effects in this turn may have run; \
                          `/rewind` can undo file edits.",
                         "ℹ".bright_blue()
                     );
-                    crate::out::status_line(headless_mode, msg);
+                    self.ui.status(&msg);
                 }
                 // Drop the journal bucket that `run()` opened for this
                 // turn if no tools have actually snapshotted anything yet,
@@ -583,7 +572,7 @@ impl ChatCLI {
                     } else {
                         // Buffered mode: render the message now. Markdown if
                         // enabled, otherwise plain text.
-                        self.render_final_reply(&msg_content);
+                        self.ui.assistant_final(&msg_content);
                     }
                     any_output = true;
                 }
@@ -918,7 +907,7 @@ impl ChatCLI {
         // provider returned nothing useful or when `--quiet` is set.
         if self.stats_footer_enabled && !self.quiet_mode && !turn_stats.is_empty() {
             let window = crate::llm::context_window_for_model(self.executor.get_model());
-            super::render::print_stats_footer(&turn_stats, window);
+            self.ui.usage_footer(&turn_stats, window);
         }
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
