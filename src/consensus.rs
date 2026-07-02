@@ -1663,8 +1663,11 @@ fn main() {
     let worktree_root =
         find_worktree_root(canonical_cwd.clone()).unwrap_or_else(|| canonical_cwd.clone());
     let canonical_root = fs::canonicalize(&worktree_root).unwrap_or(worktree_root);
-    let root_needle = format!("\"{}\"", canonical_root.to_string_lossy());
-    let cwd_needle = format!("\"{}\"", canonical_cwd.to_string_lossy());
+    // trusted_dirs.json is JSON, so backslashes in Windows paths are escaped
+    // (`\\`). Escape the needles the same way so the substring match works on
+    // Windows; on Unix paths have no backslashes, so this is a no-op.
+    let root_needle = format!("\"{}\"", canonical_root.to_string_lossy().replace('\\', "\\\\"));
+    let cwd_needle = format!("\"{}\"", canonical_cwd.to_string_lossy().replace('\\', "\\\\"));
     let trust_marker = if trust_raw.contains(&root_needle) {
         "root"
     } else if trust_raw.contains(&cwd_needle) {
