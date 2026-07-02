@@ -57,6 +57,7 @@ mod render;
 mod repl;
 mod spinner;
 mod status;
+mod tui;
 mod ui_sink;
 
 #[cfg(test)]
@@ -185,6 +186,21 @@ pub struct ChatCLI {
     /// [`ui_sink::LineSink`], which reproduces the historical stdout/stderr
     /// behavior byte-for-byte. Re-synced from the flags above each turn.
     ui: Box<dyn ui_sink::UiSink + Send>,
+    /// Cooperative cancel flag for the opt-in TUI (`--tui`). Under raw mode the
+    /// terminal's ISIG is disabled, so `tokio::signal::ctrl_c()` never fires;
+    /// the TUI render task sets this flag when the user presses Ctrl-C and the
+    /// agent loop observes it as an extra cancel branch. Cleared at the start
+    /// of each turn. In the normal (non-TUI) path this flag is never set, so
+    /// the cancel branch simply never fires and behavior is unchanged.
+    cancel: Arc<AtomicBool>,
+    /// Whether the interactive session is currently rendered through the
+    /// full-screen TUI (`--tui`). Toggled on for the duration of
+    /// [`run_tui`](Self::run_tui). Used to (a) auto-deny interactive tool
+    /// approval (a second stdin reader would fight the render task) and (b)
+    /// suppress the handful of raw `stdout` prints that would otherwise
+    /// scribble on the alternate screen. `false` in every non-TUI path, so
+    /// default behavior is byte-identical.
+    tui_active: bool,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -205,6 +221,10 @@ pub struct CliFlags {
     pub subprocess_subagent_mode: bool,
     pub max_agent_steps_override: Option<usize>,
     pub max_agent_time_cap_override: Option<Duration>,
+    /// Opt-in full-screen terminal UI (`--tui` / `CUBI_TUI=1`). Only honored
+    /// for interactive sessions on a TTY; headless / one-shot / JSON never
+    /// enter the TUI.
+    pub tui: bool,
 }
 
 impl Default for CliFlags {
@@ -225,6 +245,7 @@ impl Default for CliFlags {
             subprocess_subagent_mode: false,
             max_agent_steps_override: None,
             max_agent_time_cap_override: None,
+            tui: false,
         }
     }
 }
@@ -315,6 +336,8 @@ impl ChatCLI {
                 json: false,
                 markdown: flags.markdown,
             })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            tui_active: false,
         };
 
         if let Some(system_prompt) = flags.system_prompt {

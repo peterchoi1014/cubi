@@ -95,6 +95,16 @@ getrandom = "0.2"
 # Parse `bench/tasks/<id>/task.toml` definitions for `cubi bench`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
+# Opt-in full-screen terminal UI (Phase 2). `ratatui` owns layout/rendering;
+# its default backend targets the `crossterm` 0.29.x line, so we pin
+# `crossterm` to a matching `0.29` (deduped to a single version in the tree —
+# see `cargo tree -i crossterm`) and enable `event-stream` so the future
+# render task can consume input via an async `EventStream`. Using the latest
+# stable ratatui (0.30.x) also keeps the dependency tree free of the
+# unmaintained `paste` crate that older ratatui lines pulled in transitively.
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [

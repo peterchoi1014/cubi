@@ -24,6 +24,18 @@ pub(crate) fn resolve_tool_rationale(
     "(no description)".to_string()
 }
 
+/// Cooperative-cancel poll for the opt-in TUI. Resolves once `flag` becomes
+/// `true`. Under raw mode the terminal's ISIG is disabled, so
+/// `tokio::signal::ctrl_c()` never fires; the TUI render task sets this flag on
+/// Ctrl-C and this future lets `agent_turn`'s `select!` observe it as an extra
+/// cancel branch. In the non-TUI path the flag is never set, so the branch
+/// simply never resolves and behavior is unchanged.
+async fn wait_for_cancel(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn subprocess_step_cap_events(
     message: &str,
     steps_used: usize,
@@ -138,6 +150,17 @@ impl ChatCLI {
         if self.headless_mode {
             self.emit_status(format!(
                 "⚠ Tool `{}` wants to run; denying in headless mode.",
+                tool_name
+            ));
+            return false;
+        }
+        // In the full-screen TUI, an interactive stdin prompt would fight the
+        // render task (a second reader on the terminal) and corrupt the alt
+        // screen. Auto-deny using the same non-interactive path as headless;
+        // the notice is surfaced through the sink so it lands in the transcript.
+        if self.tui_active {
+            self.emit_status(format!(
+                "⚠ Tool `{}` wants to run; auto-denied in TUI mode (approval prompt unavailable).",
                 tool_name
             ));
             return false;
@@ -304,6 +327,13 @@ impl ChatCLI {
         // request than refuse silently.
         self.maybe_auto_compact().await;
 
+        // Reset the cooperative TUI cancel flag at the start of each turn so a
+        // stale Ctrl-C from a prior turn can't abort this one. No-op for the
+        // non-TUI path (the flag is only ever set by the TUI render task).
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let cancel = std::sync::Arc::clone(&self.cancel);
+
         // Hard stop: refuse to send when the estimated prompt would
         // still exceed the model's context window. Keeps the user's
         // last turn in history so they can /compact, /pin less, or
@@ -418,6 +448,7 @@ impl ChatCLI {
                     tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
+                        _ = wait_for_cancel(&cancel) => None,
                         _ = tokio::time::sleep_until(deadline) => {
                             hit_time_cap = true;
                             None
@@ -428,6 +459,7 @@ impl ChatCLI {
                     tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
+                        _ = wait_for_cancel(&cancel) => None,
                         r = stream_fut => Some(r),
                     }
                 };
@@ -441,6 +473,7 @@ impl ChatCLI {
                     tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
+                        _ = wait_for_cancel(&cancel) => None,
                         _ = tokio::time::sleep_until(deadline) => {
                             hit_time_cap = true;
                             None
@@ -451,6 +484,7 @@ impl ChatCLI {
                     tokio::select! {
                         biased;
                         _ = tokio::signal::ctrl_c() => None,
+                        _ = wait_for_cancel(&cancel) => None,
                         r = buf_fut => Some(r),
                     }
                 }
@@ -480,7 +514,7 @@ impl ChatCLI {
             // steps in this turn (if any) survive: use `/rewind` to undo
             // them.
             let Some(stream_result) = outcome else {
-                if got_token {
+                if got_token && !self.tui_active {
                     // Move past any partial output.
                     println!();
                 }
@@ -560,6 +594,10 @@ impl ChatCLI {
                         Self::emit_json_event(crate::json_events::token(&msg_content));
                     } else if headless_mode {
                         println!("{msg_content}");
+                    } else if self.tui_active {
+                        // Route through the sink so the fallback reply lands in
+                        // the transcript instead of scribbling on the alt screen.
+                        self.ui.assistant_final(&msg_content);
                     } else {
                         print!("{} ", "AI:".bright_blue().bold());
                         println!("{}", msg_content.bright_white());
@@ -591,8 +629,17 @@ impl ChatCLI {
                     if got_token {
                         println!();
                     }
+                } else if any_output && !json_enabled && self.tui_active {
+                    // TUI owns its own inter-turn spacing; a raw newline here
+                    // would land on the alternate screen.
                 } else if any_output && !json_enabled {
                     println!("\n");
+                } else if !any_output && !json_enabled && self.tui_active {
+                    // Surface the "no response" hint through the sink so it
+                    // reaches the transcript rather than raw stdout.
+                    self.ui.status(
+                        "(no response — try rephrasing, switching model, or running /usage to check the context budget)",
+                    );
                 } else if !any_output && !json_enabled && !headless_mode {
                     // The model returned no content and no tool calls.
                     // Without this, the REPL would silently re-prompt
@@ -620,7 +667,7 @@ impl ChatCLI {
             // The model asked us to run one or more tools. Visually break
             // the stream so the user can tell the tools apart from the
             // model's prose.
-            if any_output {
+            if any_output && !self.tui_active {
                 println!();
             }
 
@@ -713,10 +760,17 @@ impl ChatCLI {
                     // Tool spinner: gives users a visible heartbeat
                     // (with elapsed seconds) while a slow tool runs.
                     // Suppressed in JSON mode so machine-parsed event
-                    // streams stay clean.
+                    // streams stay clean, and in `--tui` mode where the
+                    // spinner would paint braille frames to stderr over
+                    // the alternate screen. In TUI mode tool activity is
+                    // still conveyed by the `⚙ tool:` line emitted above
+                    // via `self.emit_status(...)`, which flows through the
+                    // sink into the transcript. Passing `true` here yields
+                    // a no-op spinner, so the later `finish()` remains
+                    // valid. Non-TUI behavior is unchanged.
                     let sp = super::spinner::ToolSpinner::start_with_mode(
                         call.function.name.clone(),
-                        json_enabled,
+                        json_enabled || self.tui_active,
                     );
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
@@ -724,6 +778,7 @@ impl ChatCLI {
                         tokio::select! {
                             biased;
                             _ = tokio::signal::ctrl_c() => None,
+                            _ = wait_for_cancel(&cancel) => None,
                             _ = tokio::time::sleep_until(deadline) => {
                                 hit_time_cap = true;
                                 None
@@ -734,6 +789,7 @@ impl ChatCLI {
                         tokio::select! {
                             biased;
                             _ = tokio::signal::ctrl_c() => None,
+                            _ = wait_for_cancel(&cancel) => None,
                             r = &mut tool_fut => Some(r),
                         }
                     };
@@ -921,6 +977,7 @@ impl ChatCLI {
             && !self.headless_mode
             && !self.json_enabled
             && !self.quiet_mode
+            && !self.tui_active
             && !turn_stats.is_empty()
         {
             let pricing = crate::pricing::lookup(self.executor.get_model());

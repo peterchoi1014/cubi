@@ -1,0 +1,393 @@
+//! Opt-in full-screen terminal UI (Phase 2).
+//!
+//! Architecture: an opt-in ratatui + crossterm renderer runs on a dedicated
+//! **render task** that solely owns the `Terminal`, the [`AppState`], and the
+//! crossterm event stream. The [`TuiSink`] handed to the agent loop holds
+//! *only* an [`mpsc::UnboundedSender`](tokio::sync::mpsc::UnboundedSender) of
+//! [`RenderEvent`](super::ui_sink::RenderEvent)s (plus small `Copy` flags), so
+//! it is `Send` by construction and satisfies `ChatCLI`'s
+//! `ui: Box<dyn UiSink + Send>`. The sink never touches a `Terminal` or the
+//! `AppState`; it only sends events.
+//!
+//! Communication (all `Send`):
+//!   * `render_tx: UnboundedSender<RenderEvent>` (main → render), held inside a
+//!     [`TuiSink`]. `unbounded` so the sync token callback never blocks the
+//!     model stream.
+//!   * `action_tx: UnboundedSender<UserAction>` (render → main): how the idle
+//!     main loop receives the user's submitted line — this replaces
+//!     `rl.readline()` in TUI mode.
+//!   * `cancel: Arc<AtomicBool>`: set by the render task on Ctrl-C, observed by
+//!     `agent_turn`'s extra cancel branch (raw mode disables ISIG, so
+//!     `tokio::signal::ctrl_c()` never fires under the TUI).
+
+mod app;
+mod event;
+mod sink;
+mod term;
+mod widgets;
+
+use crate::cli::ChatCLI;
+use crate::cli::ui_sink::RenderEvent;
+use crate::commands::{self, Cmd};
+use anyhow::{Context, Result};
+use app::AppState;
+use crossterm::event::{Event, EventStream, KeyEventKind};
+use futures_util::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+use app::UserAction;
+use sink::TuiSink;
+
+/// Redraw tick — ~12fps, enough to animate a spinner without burning CPU.
+const TICK: Duration = Duration::from_millis(80);
+
+/// The dedicated render task. Sole owner of the `Terminal`, the [`AppState`],
+/// and the crossterm [`EventStream`]. Runs until the user quits (Ctrl-D) or
+/// either channel end closes.
+///
+/// The crossterm event source is injected as `events` so this loop is unit-
+/// testable with a synthetic stream (a real `EventStream` panics without a
+/// terminal reader). Production callers pass `EventStream::new()`.
+async fn render_task<B, S>(
+    mut terminal: ratatui::Terminal<B>,
+    mut state: AppState,
+    mut render_rx: UnboundedReceiver<RenderEvent>,
+    action_tx: UnboundedSender<UserAction>,
+    cancel: Arc<AtomicBool>,
+    mut events: S,
+) -> Result<(), B::Error>
+where
+    B: ratatui::backend::Backend,
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let mut tick = tokio::time::interval(TICK);
+    // Paint the initial frame (status row + empty composer) immediately.
+    terminal.draw(|f| widgets::draw(f, &state))?;
+
+    loop {
+        tokio::select! {
+            // Agent-loop output → fold into the view model and repaint.
+            maybe_ev = render_rx.recv() => {
+                match maybe_ev {
+                    Some(ev) => {
+                        state.apply(ev);
+                        terminal.draw(|f| widgets::draw(f, &state))?;
+                    }
+                    // Sender dropped (main restored its sink on shutdown).
+                    None => break,
+                }
+            }
+            // Local key input → edit / submit / cancel / quit.
+            maybe_key = events.next() => {
+                match maybe_key {
+                    Some(Ok(Event::Key(key))) => {
+                        // Ignore key *release* / *repeat* synthetic events
+                        // (Windows / kitty protocol) so a keypress isn't
+                        // processed twice.
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        match event::map_key(key) {
+                            event::Action::Edit(e) => {
+                                state.edit(e);
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            event::Action::Submit => {
+                                let line = state.take_composer();
+                                if !line.trim().is_empty() {
+                                    // Best-effort: if main is gone we exit next loop.
+                                    let _ = action_tx.send(UserAction::SubmitLine(line));
+                                }
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            event::Action::Cancel => {
+                                cancel.store(true, Ordering::SeqCst);
+                            }
+                            event::Action::Quit => {
+                                let _ = action_tx.send(UserAction::Quit);
+                                break;
+                            }
+                            event::Action::ScrollUp => {
+                                state.scroll_up(3);
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            event::Action::ScrollDown => {
+                                state.scroll_down(3);
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            event::Action::None => {}
+                        }
+                    }
+                    // Resize / focus / paste etc: repaint against current size.
+                    Some(Ok(_)) => {
+                        terminal.draw(|f| widgets::draw(f, &state))?;
+                    }
+                    Some(Err(_)) => {}
+                    // Event stream ended (stdin closed).
+                    None => break,
+                }
+            }
+            // Periodic repaint so the thinking indicator animates.
+            _ = tick.tick() => {
+                terminal.draw(|f| widgets::draw(f, &state))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ChatCLI {
+    /// Interactive entry point for the opt-in full-screen TUI (`--tui`).
+    ///
+    /// Spawns the render task, swaps `self.ui` to a [`TuiSink`] for the
+    /// session, and drives an idle main loop that receives submitted lines from
+    /// the render task (replacing `rl.readline()`). Restores the sink and
+    /// terminal on exit. Never entered for headless / one-shot / JSON runs;
+    /// falls back to [`run`](ChatCLI::run) when stdout is not a TTY.
+    pub async fn run_tui(&mut self) -> Result<()> {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            // Don't drive raw mode on a pipe; degrade to the standard REPL.
+            self.emit_status("cubi: --tui requires a TTY; using standard mode.");
+            return self.run().await;
+        }
+
+        // Lifecycle hooks + receipt, mirroring `run()` (interactive mode).
+        self.hooks.fire_session_start(self.executor.get_model());
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionStart {
+                model: self.executor.get_model().to_string(),
+                cwd: std::env::current_dir().unwrap_or_default(),
+            },
+            &serde_json::json!({
+                "model": self.executor.get_model(),
+                "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
+                "mode": "tui",
+            }),
+        );
+
+        // Enter raw mode + alt screen (belt) and install the panic-restore
+        // hook (suspenders). Both restore paths share one idempotent gate.
+        let guard = term::TerminalGuard::new().context("failed to initialize the TUI terminal")?;
+        term::install_panic_hook(guard.done_flag());
+
+        let terminal = match term::new_terminal() {
+            Ok(t) => t,
+            Err(e) => {
+                guard.restore();
+                return Err(anyhow::Error::from(e).context("failed to build the TUI terminal"));
+            }
+        };
+
+        // Wire the channels + the shared cancel flag.
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let cancel = Arc::clone(&self.cancel);
+        cancel.store(false, Ordering::SeqCst);
+        // A second handle on the render channel so the main task can push a
+        // fresh status snapshot after each turn without reaching into the sink.
+        let status_tx = render_tx.clone();
+
+        // Seed the initial view with a live status snapshot so the status row
+        // shows immediately.
+        let mut state = AppState::new();
+        state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
+
+        let render_handle = tokio::spawn(render_task(
+            terminal,
+            state,
+            render_rx,
+            action_tx,
+            Arc::clone(&cancel),
+            EventStream::new(),
+        ));
+
+        // Swap the sink for the whole session and mark the TUI active so tool
+        // approval auto-denies and raw stdout prints are suppressed.
+        let prev_ui = std::mem::replace(&mut self.ui, Box::new(TuiSink::new(render_tx)));
+        self.tui_active = true;
+
+        // Idle main loop: wait for the user's submitted line. Any non-submit
+        // outcome (explicit Quit, or the render channel closing) ends the loop.
+        while let Some(UserAction::SubmitLine(line)) = action_rx.recv().await {
+            if !self.tui_submit(&line).await {
+                break;
+            }
+            // Refresh the status row after each turn (tokens/cost move).
+            let _ = status_tx.send(RenderEvent::StatusSnapshot(self.status_snapshot()));
+        }
+
+        // Restore the sink, then reap the render task, then restore the
+        // terminal. Aborting + joining the render task BEFORE `guard.restore()`
+        // guarantees no tick-driven `terminal.draw()` can fire after
+        // `LeaveAlternateScreen`, which would otherwise paint a stray frame
+        // onto the normal screen.
+        self.ui = prev_ui;
+        self.tui_active = false;
+        render_handle.abort();
+        let _ = render_handle.await;
+        guard.restore();
+        drop(guard);
+
+        self.hooks.fire_stop();
+        self.emit_receipt(
+            crate::receipts::ReceiptEvent::SessionEnd,
+            &serde_json::json!({"mode": "tui"}),
+        );
+        Ok(())
+    }
+
+    /// Handle one submitted line from the TUI, replicating the REPL's
+    /// submission path (`@file` expansion, history push, journal bucket, agent
+    /// turn). Returns `false` when the session should quit. All user-visible
+    /// output flows through `self.ui` (never raw stdout) so it lands in the
+    /// transcript, not on the alt screen. Slash commands are gated to quit-only
+    /// in this preview (see the `input.starts_with('/')` branch) because the
+    /// REPL command handlers print via raw stdout.
+    async fn tui_submit(&mut self, input: &str) -> bool {
+        let input = input.trim();
+        if input.is_empty() {
+            return true;
+        }
+
+        if input.starts_with('/') {
+            // PROTOTYPE LIMITATION: `handle_command`/`try_user_command` print
+            // via raw `println!` by design (correct for the normal REPL), but
+            // that scribbles directly on the alternate screen here. Until that
+            // output is routed through the sink, the only slash command honored
+            // in `--tui` is quit. `commands::parse` gives us the same quit
+            // recognition as the REPL (`/quit`, `/exit`, and unambiguous
+            // prefixes like `/q`). Every other slash command is acknowledged
+            // via a status line so nothing reaches raw stdout.
+            if matches!(commands::parse(input), Some((Cmd::Quit, _))) {
+                return false; // clean TUI exit — same false/Quit path as run_tui
+            }
+            self.ui.status(
+                "slash commands are not yet available in --tui preview (use /quit to exit)",
+            );
+            return true;
+        }
+
+        // Echo the user's line into the transcript (the composer is cleared on
+        // submit, so without this the turn would appear context-less).
+        self.ui.status(&format!("› {input}"));
+
+        let expanded = crate::file_mentions::expand_file_mentions(input);
+        let turn_start = self.history.len();
+        self.history
+            .push(crate::ollama::Message::text("user", &expanded));
+        self.journal.start_turn();
+        if let Err(e) = self.agent_turn(turn_start).await {
+            self.ui.status(&format!("Error: {e}"));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod render_loop_tests {
+    use super::*;
+    use crate::cli::status::StatusState;
+    use crate::ollama::ChatStats;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn sample_status() -> StatusState {
+        StatusState {
+            model: "qwen3:8b".to_string(),
+            context_used: Some(1000),
+            context_window: Some(8000),
+            cwd: PathBuf::from("/tmp/project"),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cost: "$0.00 (local)".to_string(),
+        }
+    }
+
+    /// Drive the render-task *state-folding* path over the render channel with
+    /// synthetic events, using a headless `TestBackend` terminal (no tty). This
+    /// exercises the same `apply` + `draw` sequence the real loop runs, and
+    /// asserts a UserAction round-trips through the action channel. We stop the
+    /// task by dropping the render sender (recv → None → break).
+    #[tokio::test]
+    async fn render_task_folds_events_and_emits_actions() {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut state = AppState::new();
+        state.apply(RenderEvent::StatusSnapshot(sample_status()));
+
+        let handle = tokio::spawn(render_task(
+            terminal,
+            state,
+            render_rx,
+            action_tx.clone(),
+            Arc::clone(&cancel),
+            futures_util::stream::pending::<std::io::Result<Event>>(),
+        ));
+
+        // Feed a couple of events the task must fold + redraw without error.
+        render_tx
+            .send(RenderEvent::Status("session started".into()))
+            .unwrap();
+        render_tx
+            .send(RenderEvent::AssistantFinal("hello there".into()))
+            .unwrap();
+        render_tx
+            .send(RenderEvent::UsageFooter {
+                stats: ChatStats {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    elapsed_ms: 3,
+                },
+                window: Some(8000),
+            })
+            .unwrap();
+
+        // Simulate the render task handing a submitted line to main. (In the
+        // real loop this is produced by a key event; here we assert the channel
+        // wiring the main loop depends on.)
+        action_tx
+            .send(UserAction::SubmitLine("say hi".into()))
+            .unwrap();
+
+        // Confirm the action reaches the main-side receiver.
+        let got = action_rx.recv().await;
+        assert_eq!(got, Some(UserAction::SubmitLine("say hi".into())));
+
+        // Close the render channel → task's recv returns None → it breaks.
+        drop(render_tx);
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    /// The main loop relies on the render task ending cleanly when its render
+    /// channel closes. Assert that invariant (no panic, `Ok`).
+    #[tokio::test]
+    async fn render_task_exits_when_render_channel_closes() {
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = AppState::new();
+
+        let handle = tokio::spawn(render_task(
+            terminal,
+            state,
+            render_rx,
+            action_tx,
+            cancel,
+            futures_util::stream::pending::<std::io::Result<Event>>(),
+        ));
+        drop(render_tx);
+        let joined = handle.await.expect("join");
+        assert!(joined.is_ok());
+    }
+}
