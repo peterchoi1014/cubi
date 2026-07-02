@@ -23,8 +23,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,13 +61,26 @@ impl ReceiptEvent {
 struct Inner {
     seq: u64,
     prev_hash: String,
+    writer: Option<BufWriter<File>>,
+    pending_records: usize,
 }
+
+const RECEIPTS_BUFFER_CAPACITY: usize = 16 * 1024;
+const RECEIPTS_FLUSH_EVERY: usize = 16;
 
 /// Append-only writer for a hash-chained receipts log.
 ///
 /// Cheap to share across tasks: wrap in `Arc` and clone the `Arc` —
 /// the internal `Mutex<Inner>` serializes writes so chain entries
 /// can't interleave even if two tool calls finish concurrently.
+///
+/// JSONL appends are buffered to avoid a file open/write syscall for
+/// every receipt. A normal exit flushes on `SessionEnd` and `Drop`, and
+/// callers can force persistence with [`ReceiptsWriter::flush`]. This
+/// intentionally adds a small process-crash window for throughput: at
+/// most `RECEIPTS_FLUSH_EVERY - 1` successfully queued receipts remain
+/// only in userspace unless the byte buffer fills first. As before, a
+/// flush does not fsync, so OS-level crash durability is unchanged.
 #[derive(Debug)]
 pub struct ReceiptsWriter {
     path: PathBuf,
@@ -101,7 +114,12 @@ impl ReceiptsWriter {
             path,
             payload_dir,
             signing_key,
-            state: Mutex::new(Inner { seq, prev_hash }),
+            state: Mutex::new(Inner {
+                seq,
+                prev_hash,
+                writer: None,
+                pending_records: 0,
+            }),
             disabled: AtomicBool::new(false),
         })
     }
@@ -121,10 +139,16 @@ impl ReceiptsWriter {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("receipts writer mutex poisoned"))?;
+        if state.writer.is_none() {
+            state.writer = Some(BufWriter::with_capacity(
+                RECEIPTS_BUFFER_CAPACITY,
+                open_append_file(&self.path)?,
+            ));
+        }
         Ok(())
     }
 
@@ -139,6 +163,19 @@ impl ReceiptsWriter {
     /// single warning), `false` if it was already disabled.
     pub fn disable(&self) -> bool {
         !self.disabled.swap(true, Ordering::Relaxed)
+    }
+
+    /// Flush queued JSONL receipt entries to the operating system.
+    ///
+    /// This is intentionally additive: existing callers can keep using
+    /// `write`, while lifecycle code can call `flush` when it needs the
+    /// file to be immediately readable by `verify-receipts`.
+    pub fn flush(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("receipts writer mutex poisoned"))?;
+        self.flush_locked(&mut state)
     }
 
     /// Append one event. `payload` is the full data blob (tool args,
@@ -177,10 +214,9 @@ impl ReceiptsWriter {
             .state
             .lock()
             .map_err(|_| anyhow!("receipts writer mutex poisoned"))?;
-        // Compute the next sequence locally so a failed write doesn't
-        // leak a gap into the on-disk chain. We only commit
-        // `state.seq` / `state.prev_hash` after the line has been
-        // appended successfully.
+        // Compute the next sequence locally so a failed append attempt
+        // doesn't advance the in-memory chain. Buffered entries become
+        // visible to `verify-receipts` once flushed.
         let next_seq = state.seq + 1;
 
         // Build the base record (everything except this_hash + sig).
@@ -224,20 +260,66 @@ impl ReceiptsWriter {
 
         let line = serde_json::to_string(&Value::Object(record_map))
             .context("failed to serialize receipt line")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open receipts file {}", self.path.display()))?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write receipts line to {}", self.path.display()))?;
+        {
+            let writer = self.ensure_writer_locked(&mut state)?;
+            writeln!(writer, "{line}").with_context(|| {
+                format!("failed to write receipts line to {}", self.path.display())
+            })?;
+        }
 
         // Only commit the in-memory chain advance after the line has
-        // safely landed on disk.
+        // been successfully queued for the append-only JSONL stream.
         state.seq = next_seq;
         state.prev_hash = this_hash;
+        state.pending_records += 1;
+        let should_flush = matches!(event, ReceiptEvent::SessionEnd)
+            || state.pending_records >= RECEIPTS_FLUSH_EVERY;
+        if should_flush {
+            self.flush_locked(&mut state)?;
+        }
         Ok(())
     }
+
+    fn ensure_writer_locked<'a>(&self, state: &'a mut Inner) -> Result<&'a mut BufWriter<File>> {
+        if state.writer.is_none() {
+            let file = open_append_file(&self.path)
+                .with_context(|| format!("failed to open receipts file {}", self.path.display()))?;
+            state.writer = Some(BufWriter::with_capacity(RECEIPTS_BUFFER_CAPACITY, file));
+        }
+        Ok(state
+            .writer
+            .as_mut()
+            .expect("receipts writer initialized above"))
+    }
+
+    fn flush_locked(&self, state: &mut Inner) -> Result<()> {
+        if let Some(writer) = state.writer.as_mut() {
+            writer.flush().with_context(|| {
+                format!("failed to flush receipts file {}", self.path.display())
+            })?;
+            state.pending_records = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReceiptsWriter {
+    fn drop(&mut self) {
+        if self.flush().is_ok() {
+            return;
+        }
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(writer) = state.writer.as_mut() {
+            let _ = writer.flush();
+        }
+    }
+}
+
+fn open_append_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Canonical sorted-key JSON serialization. Objects iterate in
@@ -767,7 +849,16 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // Use the OS temp dir (stable, absolute) rather than the process
+        // current dir: other tests mutate the global cwd via
+        // set_current_dir into TempDirs that then get removed, which would
+        // make a cwd-relative path vanish between create_dir_all and open.
         std::env::temp_dir().join(format!("cubi-receipts-{label}-{nanos}.jsonl"))
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(sidecar_dir(path));
     }
 
     #[test]
@@ -783,13 +874,12 @@ mod tests {
     #[test]
     fn writer_chains_hashes_across_entries() {
         let path = tmp_path("chain");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
         let w = ReceiptsWriter::open(&path, None).unwrap();
         w.write(
             ReceiptEvent::SessionStart {
                 model: "qwen3:4b".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: PathBuf::from("."),
             },
             &json!({"model": "qwen3:4b"}),
         )
@@ -801,17 +891,71 @@ mod tests {
             &json!({"command": "true"}),
         )
         .unwrap();
+        w.flush().unwrap();
         let report = verify_file(&path, &VerifyOptions::default()).unwrap();
         assert_eq!(report.entries, 2);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        drop(w);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn explicit_flush_persists_buffered_records() {
+        let path = tmp_path("explicit-flush");
+        cleanup(&path);
+        let w = ReceiptsWriter::open(&path, None).unwrap();
+        w.write(ReceiptEvent::UserMessage, &json!({"text": "buffered"}))
+            .unwrap();
+
+        let before_flush = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            before_flush.trim().is_empty(),
+            "small receipt should remain buffered before explicit flush: {before_flush}"
+        );
+
+        w.flush().unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        let report = verify_file(&path, &VerifyOptions::default()).unwrap();
+        assert_eq!(report.entries, 1);
+        drop(w);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn session_end_flushes_buffered_records() {
+        let path = tmp_path("session-end-flush");
+        cleanup(&path);
+        let w = ReceiptsWriter::open(&path, None).unwrap();
+        w.write(ReceiptEvent::UserMessage, &json!({"text": "hi"}))
+            .unwrap();
+        w.write(ReceiptEvent::SessionEnd, &json!({"mode": "test"}))
+            .unwrap();
+
+        let report = verify_file(&path, &VerifyOptions::default()).unwrap();
+        assert_eq!(report.entries, 2);
+        drop(w);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_flushes_buffered_records() {
+        let path = tmp_path("drop-flush");
+        cleanup(&path);
+        {
+            let w = ReceiptsWriter::open(&path, None).unwrap();
+            w.write(ReceiptEvent::AssistantMessage, &json!({"text": "bye"}))
+                .unwrap();
+        }
+
+        let report = verify_file(&path, &VerifyOptions::default()).unwrap();
+        assert_eq!(report.entries, 1);
+        cleanup(&path);
     }
 
     #[test]
     fn verify_detects_payload_tamper() {
         let path = tmp_path("payload-tamper");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
         let w = ReceiptsWriter::open(&path, None).unwrap();
         w.write(
             ReceiptEvent::ToolCall {
@@ -820,6 +964,8 @@ mod tests {
             &json!({"command": "echo hi"}),
         )
         .unwrap();
+        w.flush().unwrap();
+        drop(w);
         // Overwrite the only payload sidecar with garbage.
         let dir = sidecar_dir(&path);
         let mut entries = std::fs::read_dir(&dir).unwrap();
@@ -830,20 +976,20 @@ mod tests {
             VerifyError::Tamper { seq, .. } => assert_eq!(seq, 1),
             other => panic!("expected tamper, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&path);
     }
 
     #[test]
     fn verify_detects_chain_tamper() {
         let path = tmp_path("chain-tamper");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
         let w = ReceiptsWriter::open(&path, None).unwrap();
         w.write(ReceiptEvent::UserMessage, &json!({"text": "hi"}))
             .unwrap();
         w.write(ReceiptEvent::AssistantMessage, &json!({"text": "hello"}))
             .unwrap();
+        w.flush().unwrap();
+        drop(w);
         // Replace one this_hash with the zero digest.
         let raw = std::fs::read_to_string(&path).unwrap();
         let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
@@ -856,15 +1002,13 @@ mod tests {
             VerifyError::Tamper { seq, .. } => assert_eq!(seq, 2),
             other => panic!("expected tamper, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
     }
 
     #[test]
     fn signing_round_trip_verifies() {
         let path = tmp_path("sign");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).unwrap();
         let sk = SigningKey::from_bytes(&seed);
@@ -879,6 +1023,7 @@ mod tests {
             &json!({"command": "true"}),
         )
         .unwrap();
+        w.flush().unwrap();
         let opts = VerifyOptions {
             verify_payloads: true,
             pub_key: Some(vk),
@@ -886,15 +1031,14 @@ mod tests {
         let report = verify_file(&path, &opts).unwrap();
         assert_eq!(report.entries, 2);
         assert_eq!(report.signed, 2);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        drop(w);
+        cleanup(&path);
     }
 
     #[test]
     fn signature_bit_flip_is_detected() {
         let path = tmp_path("sig-flip");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).unwrap();
         let sk = SigningKey::from_bytes(&seed);
@@ -902,6 +1046,8 @@ mod tests {
         let w = ReceiptsWriter::open(&path, Some(sk)).unwrap();
         w.write(ReceiptEvent::UserMessage, &json!({"text": "hi"}))
             .unwrap();
+        w.flush().unwrap();
+        drop(w);
         // Flip one bit in the base64 signature.
         let raw = std::fs::read_to_string(&path).unwrap();
         let mut v: Value = serde_json::from_str(raw.trim()).unwrap();
@@ -922,8 +1068,7 @@ mod tests {
             }
             other => panic!("expected tamper, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(sidecar_dir(&path));
+        cleanup(&path);
     }
 
     #[test]
