@@ -201,6 +201,10 @@ pub struct ChatCLI {
     /// scribble on the alternate screen. `false` in every non-TUI path, so
     /// default behavior is byte-identical.
     tui_active: bool,
+    /// Plain-text startup output (init/loading lines, tip) captured before the
+    /// TUI's alternate screen is entered, used to seed the `--tui` transcript
+    /// so it isn't empty on launch. Empty in every non-TUI path.
+    startup_transcript: Vec<String>,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -338,6 +342,7 @@ impl ChatCLI {
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             tui_active: false,
+            startup_transcript: Vec::new(),
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -4882,6 +4887,13 @@ impl ChatCLI {
         self.status_snapshot().render(width, color)
     }
 
+    /// Seed the plain-text startup transcript used by `--tui` to prefill the
+    /// scrollback (init/loading lines + tip), captured in `main` before the
+    /// alternate screen is entered. No effect outside `run_tui`.
+    pub(crate) fn set_startup_transcript(&mut self, lines: Vec<String>) {
+        self.startup_transcript = lines;
+    }
+
     /// Immutable snapshot of the fields the status line can display, built
     /// from live `ChatCLI` state. Rendering lives in `status::StatusState`.
     fn status_snapshot(&self) -> crate::cli::status::StatusState {
@@ -4897,6 +4909,19 @@ impl ChatCLI {
                 self.session_stats.prompt_tokens,
                 self.session_stats.completion_tokens,
             ),
+            session_details: {
+                let sessions = self
+                    .session_store
+                    .as_ref()
+                    .map(|s| s.status())
+                    .unwrap_or(crate::sessions::SessionStoreStatus::Missing);
+                format!(
+                    "{} · {} msgs · sessions {}",
+                    self.executor.provider_name(),
+                    self.history.len(),
+                    sessions.label()
+                )
+            },
         }
     }
 

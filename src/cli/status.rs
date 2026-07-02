@@ -24,6 +24,11 @@ pub struct StatusState {
     /// "$0.0123", "$0.00 (local)", or "—" (unknown). Member B computes it so
     /// this module has no dependency on pricing internals.
     pub cost: String,
+    /// Session details shown at the composer's top-right corner in `--tui`
+    /// (e.g. `"{provider} · {N} msgs · sessions {label}"`). Populated by the
+    /// caller; the single-line [`render`](StatusState::render) IGNORES this
+    /// field so the non-TUI status line is unchanged.
+    pub session_details: String,
 }
 
 /// Column separator used between status-line segments.
@@ -41,6 +46,47 @@ impl StatusState {
     pub fn render(&self, width: usize, color: bool) -> String {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         self.render_with_home(width, color, home.as_deref())
+    }
+
+    /// Home-abbreviated current working directory (e.g. `~/repos/cubi`), plain
+    /// text. Mirrors [`render`](StatusState::render)'s single `$HOME` touch.
+    /// Used for the composer's top-left corner in `--tui`.
+    pub fn path_display(&self) -> String {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        abbrev_home(&self.cwd, home.as_deref())
+    }
+
+    /// Model + context segment, plain text: `"{model} · ctx {used}/{window}
+    /// {pct}%"`, degrading exactly like [`render`](StatusState::render) — to
+    /// `"{model} · ctx {used}"` when the window is unknown, and to `"{model}"`
+    /// alone when the used count is unknown. Used for the composer's
+    /// bottom-left corner in `--tui`.
+    pub fn model_ctx_display(&self) -> String {
+        let pct = match (self.context_used, self.context_window) {
+            (Some(u), Some(w)) if w > 0 => Some((100.0 * u as f64 / w as f64).round() as usize),
+            _ => None,
+        };
+        match (self.context_used, self.context_window, pct) {
+            (Some(u), Some(w), Some(p)) => format!(
+                "{} · ctx {}/{} {p}%",
+                self.model,
+                abbrev(u as u64),
+                abbrev(w as u64)
+            ),
+            (Some(u), _, _) => format!("{} · ctx {}", self.model, abbrev(u as u64)),
+            _ => self.model.clone(),
+        }
+    }
+
+    /// Token + cost usage segment, plain text: `"tok {in} in/{out} out ·
+    /// {cost}"`. Used for the composer's bottom-right corner in `--tui`.
+    pub fn usage_display(&self) -> String {
+        format!(
+            "tok {} in/{} out · {}",
+            abbrev(self.prompt_tokens),
+            abbrev(self.completion_tokens),
+            self.cost
+        )
     }
 
     /// Pure formatter: identical to [`StatusState::render`] but with the home
@@ -303,6 +349,7 @@ mod tests {
             prompt_tokens: 41300,
             completion_tokens: 7800,
             cost: "$0.00 (local)".to_string(),
+            session_details: "ollama · 0 msgs · sessions ok".to_string(),
         }
     }
 
@@ -500,6 +547,64 @@ mod tests {
         assert_eq!(compact_cost("$0.00 (local)"), "$0.00");
         assert_eq!(compact_cost("$0.0123"), "$0.0123");
         assert_eq!(compact_cost("—"), "—");
+    }
+
+    #[test]
+    fn corner_helpers_are_plain_and_well_formed() {
+        let s = sample();
+        // path_display abbreviates a path under the machine's real $HOME only;
+        // for an absolute non-home path it stays absolute. Use a known path.
+        let mut outside = sample();
+        outside.cwd = PathBuf::from("/tmp/cubi-corner-test");
+        assert_eq!(outside.path_display(), "/tmp/cubi-corner-test");
+        assert!(!outside.path_display().contains('\x1b'));
+
+        // model_ctx_display: model · ctx used/window pct%.
+        assert_eq!(s.model_ctx_display(), "qwen3:8b · ctx 8.2k/32.8k 25%");
+        assert!(!s.model_ctx_display().contains('\x1b'));
+
+        // usage_display: tok in/out · cost.
+        assert_eq!(s.usage_display(), "tok 41.3k in/7.8k out · $0.00 (local)");
+        assert!(!s.usage_display().contains('\x1b'));
+    }
+
+    #[test]
+    fn model_ctx_display_example_row() {
+        // Mirrors the contract example: `qwen3:8b · ctx 35/128.0k 0%`.
+        let mut s = sample();
+        s.context_used = Some(35);
+        s.context_window = Some(128_000);
+        assert_eq!(s.model_ctx_display(), "qwen3:8b · ctx 35/128.0k 0%");
+    }
+
+    #[test]
+    fn model_ctx_display_degrades_when_ctx_unknown() {
+        // Window unknown → `{model} · ctx {used}`.
+        let mut s = sample();
+        s.context_window = None;
+        assert_eq!(s.model_ctx_display(), "qwen3:8b · ctx 8.2k");
+        // Used unknown → `{model}` alone.
+        let mut s = sample();
+        s.context_used = None;
+        assert_eq!(s.model_ctx_display(), "qwen3:8b");
+        // Zero window → treated as unknown pct → `{model} · ctx {used}`.
+        let mut s = sample();
+        s.context_window = Some(0);
+        assert_eq!(s.model_ctx_display(), "qwen3:8b · ctx 8.2k");
+    }
+
+    #[test]
+    fn session_details_does_not_leak_into_status_line() {
+        // The single-line render must ignore session_details entirely.
+        let mut s = sample();
+        s.session_details = "SHOULD-NOT-APPEAR".to_string();
+        for width in [120usize, 90, 70, 50, 30, 10] {
+            let got = s.render_with_home(width, false, home());
+            assert!(
+                !got.contains("SHOULD-NOT-APPEAR"),
+                "session_details leaked at width {width}: {got}"
+            );
+        }
     }
 
     #[test]

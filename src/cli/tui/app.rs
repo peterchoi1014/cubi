@@ -286,6 +286,7 @@ fn placeholder_status() -> StatusState {
         prompt_tokens: 0,
         completion_tokens: 0,
         cost: "—".to_string(),
+        session_details: String::new(),
     }
 }
 
@@ -303,6 +304,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 20,
             cost: "$0.00 (local)".to_string(),
+            session_details: "ollama · 0 msgs · sessions ok".to_string(),
         }
     }
 

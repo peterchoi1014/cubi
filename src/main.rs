@@ -1366,6 +1366,13 @@ async fn main() -> Result<()> {
     let model: &str = &model_owned;
     let cpu_workers = 6;
 
+    // Seed the TUI transcript with the normal startup output that the
+    // alternate screen would otherwise wipe. Capture is a no-op for every
+    // non-TUI path (default behavior is byte-identical).
+    if cli_flags.tui && !headless {
+        out::capture_start();
+    }
+
     status_line(
         headless,
         format!("{}", "Initializing Cubi...".bright_cyan()),
@@ -1563,7 +1570,7 @@ async fn main() -> Result<()> {
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
         if let Some(tip) = tips::tip_of_the_day() {
-            println!("{} {}", "💡 tip:".bright_yellow(), tip);
+            status_line(headless, format!("{} {}", "💡 tip:".bright_yellow(), tip));
         }
     }
 
@@ -1582,6 +1589,9 @@ async fn main() -> Result<()> {
         journal,
         cli_flags,
     );
+    // Hand the captured startup output to the CLI so `run_tui` can seed the
+    // transcript (no-op / empty for every non-TUI path).
+    cli.set_startup_transcript(out::capture_take());
     if let PrimaryCommand::Resume(target) = &primary {
         cli.resume_session(target);
     }

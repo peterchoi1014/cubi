@@ -149,11 +149,7 @@ impl McpManager {
             "✓".bright_green(),
             manager.builtin_tools.list_tools().len()
         );
-        if quiet_stdout {
-            eprintln!("{builtins_msg}");
-        } else {
-            println!("{builtins_msg}");
-        }
+        crate::out::status_line(quiet_stdout, builtins_msg);
 
         // Connect to configured MCP servers
         for (name, server_config) in config.mcp_servers {

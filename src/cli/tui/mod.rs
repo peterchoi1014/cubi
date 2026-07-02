@@ -191,9 +191,18 @@ impl ChatCLI {
         // fresh status snapshot after each turn without reaching into the sink.
         let status_tx = render_tx.clone();
 
-        // Seed the initial view with a live status snapshot so the status row
-        // shows immediately.
+        // Seed the initial view with the normal startup output (which the
+        // alternate screen would otherwise wipe) BEFORE the live status
+        // snapshot: first the captured init/loading lines + tip, then the
+        // welcome content (mascot + tagline + help-line + banner). Plain text
+        // (color=false) — the transcript renders its own styled spans.
         let mut state = AppState::new();
+        for line in &self.startup_transcript {
+            state.apply(RenderEvent::Status(line.clone()));
+        }
+        for line in self.welcome_lines(false) {
+            state.apply(RenderEvent::Status(line));
+        }
         state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
 
         let render_handle = tokio::spawn(render_task(
@@ -304,6 +313,7 @@ mod render_loop_tests {
             prompt_tokens: 10,
             completion_tokens: 20,
             cost: "$0.00 (local)".to_string(),
+            session_details: "ollama · 0 msgs · sessions ok".to_string(),
         }
     }
 
