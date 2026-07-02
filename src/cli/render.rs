@@ -318,28 +318,6 @@ impl ChatCLI {
         );
         println!("{}", line);
     }
-
-    /// Renders the model's final reply when streaming is off. When
-    /// markdown rendering is enabled and stdout is a TTY, runs the reply
-    /// through [`polish_markdown`] (fenced code blocks get a dim
-    /// language label, long blocks get line numbers, inline links are
-    /// underline+dim); otherwise prints the plain colored text the
-    /// streaming path uses.
-    pub(super) fn render_final_reply(&self, content: &str) {
-        if self.headless_mode {
-            println!("{content}");
-            return;
-        }
-        print!("{} ", "AI:".bright_blue().bold());
-        if self.markdown_enabled && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-            println!();
-            let color = std::env::var("NO_COLOR").is_err();
-            let rendered = polish_markdown(content, color);
-            print!("{}", rendered);
-        } else {
-            println!("{}", content.bright_white());
-        }
-    }
 }
 
 /// Prints a one-line dim footer summarizing token usage and wall time for

@@ -57,6 +57,7 @@ mod render;
 mod repl;
 mod spinner;
 mod status;
+mod ui_sink;
 
 #[cfg(test)]
 use render::welcome_banner_rows;
@@ -177,6 +178,13 @@ pub struct ChatCLI {
     /// resolved once from `CUBI_HISTORY_PAGE` at startup.
     pub(crate) history_cursor: usize,
     pub(crate) history_page_size: usize,
+    /// The single seam all dynamic per-turn interactive output flows through
+    /// (streamed tokens, buffered final reply, status lines, usage footer,
+    /// thinking spinner). Boxed as a trait object so a later phase can swap in
+    /// a full-screen TUI renderer without touching the agent loop. Defaults to
+    /// [`ui_sink::LineSink`], which reproduces the historical stdout/stderr
+    /// behavior byte-for-byte. Re-synced from the flags above each turn.
+    ui: Box<dyn ui_sink::UiSink + Send>,
 }
 
 /// Initial UX flags resolved from CLI argv in main.rs. Kept as a tiny POD
@@ -222,11 +230,11 @@ impl Default for CliFlags {
 }
 
 impl ChatCLI {
-    fn emit_status(&self, msg: impl std::fmt::Display) {
+    fn emit_status(&mut self, msg: impl std::fmt::Display) {
         if self.json_enabled && self.headless_mode {
             return;
         }
-        crate::out::status_line(self.headless_mode, msg);
+        self.ui.status(&msg.to_string());
     }
 
     fn emit_json_event(value: serde_json::Value) {
@@ -302,6 +310,11 @@ impl ChatCLI {
             explain_tools_enabled: flags.explain_tools,
             history_cursor: 0,
             history_page_size: resolve_history_page_size(),
+            ui: Box::new(ui_sink::LineSink::new(ui_sink::SinkFlags {
+                headless: false,
+                json: false,
+                markdown: flags.markdown,
+            })),
         };
 
         if let Some(system_prompt) = flags.system_prompt {
