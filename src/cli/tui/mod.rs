@@ -22,6 +22,7 @@
 
 mod app;
 mod event;
+mod markdown;
 mod sink;
 mod term;
 mod widgets;

@@ -18,8 +18,6 @@
 //! Wrapping is left to ratatui's `Paragraph::wrap` downstream; this renderer
 //! never hard-truncates. `width` is accepted for future wrapping decisions.
 
-#![allow(dead_code)]
-
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 

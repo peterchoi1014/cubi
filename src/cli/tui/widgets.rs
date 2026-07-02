@@ -145,16 +145,12 @@ fn compose_lines(composer: &str) -> Vec<Line<'static>> {
 /// The single seam every piece of transcript *prose* (user messages, finalized
 /// assistant replies, and the streaming `active_reply`) is routed through.
 ///
-/// Milestone-A initial body: plain default-fg rows split on `'\n'` — `width` is
-/// accepted for signature parity but not needed while wrapping is delegated to
-/// `Paragraph::wrap`. At integration the leader swaps this body to call
-/// `super::markdown::render(text, width)` (identical signature), which is the
-/// only wiring step required to light up markdown rendering.
+/// Render prose (assistant/user text) into styled rows via the TUI markdown
+/// renderer, so headings, bold/italic, inline code, lists, and fenced code
+/// blocks are legible in the transcript. `Paragraph::wrap` still wraps the
+/// returned rows to the viewport width.
 fn render_prose(text: &str, width: u16) -> Vec<Line<'static>> {
-    let _ = width;
-    text.split('\n')
-        .map(|row| Line::from(Span::raw(row.to_string())))
-        .collect()
+    super::markdown::render(text, width)
 }
 
 /// Compute the (column, row) caret position within the composer text for a
