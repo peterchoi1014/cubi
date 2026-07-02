@@ -602,6 +602,9 @@ async fn main() -> Result<()> {
             "--usage-footer" => {
                 cli_flags.usage_footer = true;
             }
+            "--tui" => {
+                cli_flags.tui = true;
+            }
             "--quiet" => {
                 cli_flags.quiet = true;
                 cli_flags.no_banner = true;
@@ -1049,6 +1052,13 @@ async fn main() -> Result<()> {
     {
         cli_flags.quiet = true;
         cli_flags.no_banner = true;
+    }
+    if !cli_flags.tui
+        && std::env::var("CUBI_TUI")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    {
+        cli_flags.tui = true;
     }
     if cli_flags.quiet {
         // Suppress the global "thinking…" / tool-call spinner via the
@@ -1558,6 +1568,10 @@ async fn main() -> Result<()> {
     }
 
     let json_output = cli_flags.json;
+    // Capture the TUI request before `cli_flags` is moved into the CLI. The
+    // TUI is only honored for interactive sessions (no one-shot prompt) and
+    // never in headless / JSON contexts.
+    let tui_requested = cli_flags.tui;
 
     // Create and run CLI
     let mut cli = ChatCLI::new_with_flags(
@@ -1641,6 +1655,10 @@ async fn main() -> Result<()> {
     }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
+    } else if tui_requested && !headless {
+        // Opt-in full-screen TUI for interactive sessions only. `run_tui`
+        // itself falls back to `run()` when stdout is not a TTY.
+        cli.run_tui().await
     } else {
         cli.run().await
     };

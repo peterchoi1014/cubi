@@ -38,6 +38,10 @@ pub enum RenderEvent {
     AssistantFinal(String),
     /// A status / info line (what `emit_status` prints today).
     Status(String),
+    /// A snapshot of the pinned status row's typed state. Consumed by the
+    /// Phase 2 TUI render task to repaint the one-line status row; not emitted
+    /// by the behavior-preserving [`LineSink`].
+    StatusSnapshot(crate::cli::status::StatusState),
     /// The post-turn usage footer.
     UsageFooter {
         stats: ChatStats,

@@ -10,7 +10,7 @@ documentation = "https://github.com/peterchoi1014/cubi#readme"
 readme = "README.md"
 keywords = ["ai", "cli", "ollama", "llm", "mcp"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.88"
 exclude = [
     ".copilot/*",
     ".github/*",
@@ -95,6 +95,16 @@ getrandom = "0.2"
 # Parse `bench/tasks/<id>/task.toml` definitions for `cubi bench`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
+# Opt-in full-screen terminal UI (Phase 2). `ratatui` owns layout/rendering;
+# its default backend targets the `crossterm` 0.29.x line, so we pin
+# `crossterm` to a matching `0.29` (deduped to a single version in the tree —
+# see `cargo tree -i crossterm`) and enable `event-stream` so the future
+# render task can consume input via an async `EventStream`. Using the latest
+# stable ratatui (0.30.x) also keeps the dependency tree free of the
+# unmaintained `paste` crate that older ratatui lines pulled in transitively.
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+
 [features]
 default = ["tree-sitter"]
 tree-sitter = [
@@ -142,3 +152,10 @@ opt-level = 0
 debug = true
 codegen-units = 256
 
+
+# The codebase predates clippy's `uninlined_format_args` lint being enabled by
+# default (it became a default warning again on the 1.88 toolchain used by CI).
+# The existing style uses `format!("{}", x)` throughout; allow it package-wide
+# rather than churning ~480 call sites. Applies to all targets (bin + tests).
+[lints.clippy]
+uninlined_format_args = "allow"
