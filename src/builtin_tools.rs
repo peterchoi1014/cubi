@@ -3480,7 +3480,10 @@ mod tests {
         assert_eq!(read_file_with_cap(small, 400, 50 * 1024), small);
 
         // Line cap: keep the first N lines and append a truncation notice.
-        let many: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        let mut many = String::new();
+        for i in 1..=20 {
+            many.push_str(&format!("line {i}\n"));
+        }
         let capped = read_file_with_cap(&many, 5, 50 * 1024);
         assert!(capped.contains("line 5"));
         assert!(!capped.contains("line 6\n"));
