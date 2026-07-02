@@ -22,6 +22,7 @@
 
 mod app;
 mod event;
+mod markdown;
 mod sink;
 mod term;
 mod widgets;
@@ -98,6 +99,11 @@ where
                             event::Action::Submit => {
                                 let line = state.take_composer();
                                 if !line.trim().is_empty() {
+                                    // Echo the submitted line as a `You` role
+                                    // block directly into the transcript (the
+                                    // render task owns `state`), so the live
+                                    // turn matches resumed history.
+                                    state.push_user_turn(line.trim());
                                     // Best-effort: if main is gone we exit next loop.
                                     let _ = action_tx.send(UserAction::SubmitLine(line));
                                 }
@@ -140,24 +146,25 @@ where
 }
 
 /// Replay prior conversation turns into the transcript when seeding a resumed
-/// (or otherwise preloaded) session. User and assistant messages are shown with
-/// `You:` / `AI:` prefixes; system, pinned, and tool messages are skipped, and
-/// assistant `<think>` blocks are stripped. Pure over `(state, history)` so it
-/// is unit-testable without a terminal.
+/// (or otherwise preloaded) session. User and assistant messages are shown as
+/// role-headed blocks (`You` / `Cubi` headers + prose), identical to live
+/// turns; system, pinned, and tool messages are skipped, and assistant
+/// `<think>` blocks are stripped. Pure over `(state, history)` so it is
+/// unit-testable without a terminal.
 fn seed_history(state: &mut AppState, history: &[crate::ollama::Message]) {
     for msg in history {
         match msg.role.as_str() {
             "user" => {
                 let text = msg.content.trim();
                 if !text.is_empty() {
-                    state.apply(RenderEvent::Status(format!("You: {text}")));
+                    state.push_user_turn(text);
                 }
             }
             "assistant" => {
                 let stripped = crate::thinking_filter::strip_thinking_blocks(&msg.content);
                 let text = stripped.trim();
                 if !text.is_empty() {
-                    state.apply(RenderEvent::AssistantFinal(format!("AI: {text}")));
+                    state.apply(RenderEvent::AssistantFinal(text.to_string()));
                 }
             }
             _ => {}
@@ -317,10 +324,9 @@ impl ChatCLI {
             return true;
         }
 
-        // Echo the user's line into the transcript (the composer is cleared on
-        // submit, so without this the turn would appear context-less).
-        self.ui.status(&format!("› {input}"));
-
+        // The user's line is echoed into the transcript as a `You` role block
+        // by the render task (see `render_task`'s Submit branch) before this
+        // runs, so we do not re-echo it here.
         let expanded = crate::file_mentions::expand_file_mentions(input);
         let turn_start = self.history.len();
         self.history
@@ -357,6 +363,7 @@ mod render_loop_tests {
     #[test]
     fn seed_history_replays_user_and_assistant_turns() {
         use crate::ollama::Message;
+        use app::LineKind;
         let history = vec![
             Message::text("system", "you are cubi"),
             Message::text("user", "pineapple castle marker"),
@@ -366,11 +373,24 @@ mod render_loop_tests {
         ];
         let mut state = AppState::new();
         seed_history(&mut state, &history);
-        let texts: Vec<&str> = state.transcript().iter().map(|l| l.text.as_str()).collect();
+        let kinds: Vec<LineKind> = state.transcript().iter().map(|l| l.kind).collect();
+        // Resumed turns use the SAME role-headed block model as live turns:
+        // `You` header + prose, a blank separator, then `Cubi` header + prose.
         // System, tool, and blank user messages are skipped.
         assert_eq!(
+            kinds,
+            vec![
+                LineKind::UserHeader,
+                LineKind::User,
+                LineKind::Blank,
+                LineKind::AssistantHeader,
+                LineKind::Assistant,
+            ]
+        );
+        let texts: Vec<&str> = state.transcript().iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
             texts,
-            vec!["You: pineapple castle marker", "AI: sure thing"]
+            vec!["You", "pineapple castle marker", "", "Cubi", "sure thing"]
         );
     }
 

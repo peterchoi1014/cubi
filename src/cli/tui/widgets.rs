@@ -34,23 +34,51 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     // --- Transcript -------------------------------------------------------
     let mut lines: Vec<Line> = Vec::new();
     for entry in state.transcript() {
-        let style = match entry.kind {
-            LineKind::Assistant => Style::default().fg(Color::White),
-            LineKind::Status => Style::default().fg(Color::Cyan),
-            LineKind::Footer => Style::default().add_modifier(Modifier::DIM),
-        };
-        for row in entry.text.split('\n') {
-            lines.push(Line::styled(row.to_string(), style));
+        match entry.kind {
+            // Bold role headers with their own accent colors.
+            LineKind::UserHeader => lines.push(Line::styled(
+                entry.text.clone(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            LineKind::AssistantHeader => lines.push(Line::styled(
+                entry.text.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            // A blank separator row between turns.
+            LineKind::Blank => lines.push(Line::from(String::new())),
+            // Prose (user + assistant bodies) flows through the render_prose
+            // seam the leader later rewires to the markdown renderer.
+            LineKind::User | LineKind::Assistant => {
+                lines.extend(render_prose(&entry.text, transcript_area.width));
+            }
+            // Status / footer keep their own styling.
+            LineKind::Status => {
+                for row in entry.text.split('\n') {
+                    lines.push(Line::styled(
+                        row.to_string(),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+            }
+            LineKind::Footer => {
+                for row in entry.text.split('\n') {
+                    lines.push(Line::styled(
+                        row.to_string(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
         }
     }
-    // The in-progress streamed reply, shown below the finalized scrollback.
+    // The in-progress streamed reply, shown below the finalized scrollback and
+    // under the `Cubi` header pushed when the turn began. Routed through the
+    // same prose seam so live streaming matches finalized replies.
     if !state.active_reply().is_empty() {
-        for row in state.active_reply().split('\n') {
-            lines.push(Line::styled(
-                row.to_string(),
-                Style::default().fg(Color::White),
-            ));
-        }
+        lines.extend(render_prose(state.active_reply(), transcript_area.width));
     }
     // Word-wrap long lines to the transcript width instead of truncating them.
     // `trim: false` preserves leading indentation (e.g. code blocks).
@@ -112,6 +140,17 @@ fn compose_lines(composer: &str) -> Vec<Line<'static>> {
         .split('\n')
         .map(|row| Line::from(Span::raw(row.to_string())))
         .collect()
+}
+
+/// The single seam every piece of transcript *prose* (user messages, finalized
+/// assistant replies, and the streaming `active_reply`) is routed through.
+///
+/// Render prose (assistant/user text) into styled rows via the TUI markdown
+/// renderer, so headings, bold/italic, inline code, lists, and fenced code
+/// blocks are legible in the transcript. `Paragraph::wrap` still wraps the
+/// returned rows to the viewport width.
+fn render_prose(text: &str, width: u16) -> Vec<Line<'static>> {
+    super::markdown::render(text, width)
 }
 
 /// Compute the (column, row) caret position within the composer text for a
@@ -235,6 +274,60 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert!(buffer_contains(buf, "session started"));
         assert!(buffer_contains(buf, "streaming"));
+        // The first streamed token surfaces a `Cubi` role header above it.
+        assert!(buffer_contains(buf, "Cubi"));
+    }
+
+    #[test]
+    fn render_prose_splits_lines_plainly() {
+        let rows = render_prose("first\nsecond", 40);
+        assert_eq!(rows.len(), 2);
+        // Plain default-fg content (no styling applied in the Milestone-A body).
+        let joined: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect();
+        assert_eq!(joined, "firstsecond");
+    }
+
+    #[test]
+    fn draw_renders_role_headers_and_prose_blocks() {
+        let mut state = AppState::new();
+        // A full user → assistant exchange.
+        state.push_user_turn("what is rust?");
+        state.apply(RenderEvent::AssistantFinal("a systems language".into()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Both role headers and both prose bodies must be visible.
+        assert!(buffer_contains(buf, "You"), "missing You header");
+        assert!(buffer_contains(buf, "Cubi"), "missing Cubi header");
+        assert!(buffer_contains(buf, "what is rust?"), "missing user prose");
+        assert!(
+            buffer_contains(buf, "a systems language"),
+            "missing assistant prose"
+        );
+
+        // A blank separator row exists between the user body and the assistant
+        // header (spacing between turns is preserved).
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| row_to_string(buf, y))
+            .collect();
+        let user_row = rows
+            .iter()
+            .position(|r| r.contains("what is rust?"))
+            .expect("user prose row");
+        let cubi_row = rows
+            .iter()
+            .position(|r| r.contains("Cubi"))
+            .expect("Cubi header row");
+        assert!(cubi_row > user_row, "Cubi header should follow user prose");
+        assert!(
+            rows[user_row + 1..cubi_row]
+                .iter()
+                .any(|r| r.trim().is_empty()),
+            "expected a blank separator row between turns"
+        );
     }
 
     #[test]
