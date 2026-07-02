@@ -624,6 +624,21 @@ async fn main() -> Result<()> {
                 let value = arg.trim_start_matches("--internal-max-steps=");
                 cli_flags.max_agent_steps_override = Some(parse_internal_max_steps(value));
             }
+            crate::proc_subagent::INTERNAL_TIME_CAP_MS_FLAG => {
+                i += 1;
+                let Some(value) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: {} requires a positive integer millisecond count.",
+                        crate::proc_subagent::INTERNAL_TIME_CAP_MS_FLAG
+                    );
+                    std::process::exit(2);
+                };
+                cli_flags.max_agent_time_cap_override = Some(parse_internal_time_cap_ms(value));
+            }
+            _ if arg.starts_with("--internal-time-cap-ms=") => {
+                let value = arg.trim_start_matches("--internal-time-cap-ms=");
+                cli_flags.max_agent_time_cap_override = Some(parse_internal_time_cap_ms(value));
+            }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
                 i += 1;
@@ -1773,6 +1788,19 @@ fn parse_internal_max_steps(value: &str) -> usize {
     }
 }
 
+fn parse_internal_time_cap_ms(value: &str) -> std::time::Duration {
+    match value.parse::<u64>() {
+        Ok(n) if n > 0 => std::time::Duration::from_millis(n),
+        _ => {
+            eprintln!(
+                "cubi: {} requires a positive integer millisecond count.",
+                crate::proc_subagent::INTERNAL_TIME_CAP_MS_FLAG
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Maps a legacy [`ExitCode`] back into the closest [`user_error::ErrorKind`]
 /// so existing `AppExit`-bearing errors can flow through the
 /// classified-error path uniformly.
@@ -2247,7 +2275,7 @@ fn print_help() {
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n  \
-         In the REPL, `/consensus ... --isolate --isolated-time-cap-secs <seconds> ...`\n  \
+         In the REPL, `/consensus ... --isolate --max-steps <n> --isolated-time-cap-secs <seconds> ...`\n  \
          runs tool-enabled consensus subagents in separate ephemeral worktrees.\n\n\
          Once inside the REPL, type /help to list slash commands.",
         env!("CARGO_PKG_VERSION")

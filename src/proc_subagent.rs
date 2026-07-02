@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const CHILD_KILL_GRACE: Duration = Duration::from_secs(5);
+const CHILD_COOPERATIVE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const CHILD_STDOUT_LIMIT: usize = 1024 * 1024;
@@ -19,6 +20,7 @@ const CHILD_STDERR_LIMIT: usize = 16 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 pub(crate) const INTERNAL_SUBAGENT_FLAG: &str = "--internal-subagent";
 pub(crate) const INTERNAL_MAX_STEPS_FLAG: &str = "--internal-max-steps";
+pub(crate) const INTERNAL_TIME_CAP_MS_FLAG: &str = "--internal-time-cap-ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcSubagentResult {
@@ -31,10 +33,10 @@ pub struct ProcSubagentResult {
     /// Zero when the subprocess never emitted `done`.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Best-effort step count: one `tool_call` event per intermediate
-    /// step, plus a final step for the report. Cosmetic only — the
-    /// exact per-step accounting lives inside the subprocess, which we
-    /// don't introspect beyond its JSON event stream.
+    /// Number of agent-loop steps reported by the subprocess JSON stream.
+    /// Modern children emit an exact top-level `steps_used` on `done`; legacy
+    /// streams fall back to one `tool_call` event per intermediate step plus a
+    /// final step for the report.
     pub steps_used: usize,
     /// Bounded stderr captured from the subprocess. Empty when the child
     /// did not write diagnostics to stderr.
@@ -171,7 +173,9 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
     let permissions = current_tool_permission_snapshot();
     seed_trust(home_dir.path(), trusted_root, &permissions).context("seed trusted root")?;
     seed_config(home_dir.path(), model).context("seed non-interactive cubi config")?;
-    let max_steps_arg = max_steps.to_string();
+    let max_steps_arg = max_steps.max(1).to_string();
+    let time_cap_arg = duration_millis_arg(time_cap);
+    let parent_time_cap = time_cap.saturating_add(CHILD_COOPERATIVE_TIMEOUT_GRACE);
 
     let raw = run_binary_isolated(
         cubi_bin,
@@ -179,6 +183,8 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
             INTERNAL_SUBAGENT_FLAG,
             INTERNAL_MAX_STEPS_FLAG,
             max_steps_arg.as_str(),
+            INTERNAL_TIME_CAP_MS_FLAG,
+            time_cap_arg.as_str(),
             "-p",
             goal,
             "--json",
@@ -199,7 +205,7 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
         ],
         home_dir.path(),
         workdir,
-        time_cap,
+        parent_time_cap,
     )
     .await?;
 
@@ -237,6 +243,11 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
             }
         }
     })
+}
+
+fn duration_millis_arg(duration: Duration) -> String {
+    let millis = duration.as_millis().clamp(1, u128::from(u64::MAX));
+    millis.to_string()
 }
 
 impl ProcSubagentResult {
@@ -570,17 +581,20 @@ fn truncate_diagnostic(s: &str) -> String {
 }
 
 fn token_stat(event: &Value, names: &[&str]) -> Option<u64> {
-    let stats = event
+    event
         .get("stats")
-        .or_else(|| event.get("usage"))
-        .unwrap_or(event);
-    names.iter().find_map(|name| {
-        stats.get(*name).and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        .into_iter()
+        .chain(event.get("usage"))
+        .chain(std::iter::once(event))
+        .find_map(|stats| {
+            names.iter().find_map(|name| {
+                stats.get(*name).and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+                })
+            })
         })
-    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -820,6 +834,25 @@ mod tests {
         let parsed = parse_subagent_stream(&stdout);
 
         assert_eq!(parsed.output, "done text");
+        assert_eq!(parsed.prompt_tokens, 5);
+        assert_eq!(parsed.completion_tokens, 8);
+        assert_eq!(parsed.steps_used, 1);
+    }
+
+    #[test]
+    fn parse_subagent_stream_prefers_explicit_done_steps_over_tool_call_heuristic() {
+        let stdout = r#"{"type":"tool_call","name":"read_file","arguments":{}}"#.to_string()
+            + "\n"
+            + r#"{"type":"tool_call","name":"grep","arguments":{}}"#
+            + "\n"
+            + r#"{"type":"token","value":"done"}"#
+            + "\n"
+            + r#"{"type":"done","stats":{"prompt_tokens":5,"completion_tokens":8},"steps_used":1}"#;
+
+        let parsed = parse_subagent_stream(&stdout);
+
+        assert_eq!(parsed.output, "done");
+        assert_eq!(parsed.tool_calls, 2);
         assert_eq!(parsed.prompt_tokens, 5);
         assert_eq!(parsed.completion_tokens, 8);
         assert_eq!(parsed.steps_used, 1);
@@ -1570,7 +1603,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_isolated_subagent_with_binary_forwards_max_steps_into_child_argv() {
+    async fn run_isolated_subagent_with_binary_forwards_caps_into_child_argv() {
         let bin_dir = tempfile::tempdir().unwrap();
         let fake_bin = write_argv_echo_script(bin_dir.path());
         let workdir = tempfile::tempdir().unwrap();
@@ -1593,6 +1626,8 @@ mod tests {
                 INTERNAL_SUBAGENT_FLAG,
                 INTERNAL_MAX_STEPS_FLAG,
                 "3",
+                INTERNAL_TIME_CAP_MS_FLAG,
+                "10000",
                 "-p",
                 "the goal",
                 "--json",
@@ -1601,7 +1636,43 @@ mod tests {
                 "--quiet",
             ],
             "run_isolated_subagent_with_binary must forward the requested \
-             max_steps as {INTERNAL_MAX_STEPS_FLAG} to the spawned child"
+             max_steps and time_cap to the spawned child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_isolated_subagent_with_binary_clamps_zero_max_steps_before_child_argv() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake_bin = write_argv_echo_script(bin_dir.path());
+        let workdir = tempfile::tempdir().unwrap();
+
+        let result = run_isolated_subagent_with_binary(
+            &fake_bin,
+            "test-model",
+            "the goal",
+            workdir.path(),
+            Duration::from_secs(10),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let argv: Vec<&str> = result.output.split("|||").collect();
+        let flag_index = argv
+            .iter()
+            .position(|arg| *arg == INTERNAL_MAX_STEPS_FLAG)
+            .expect("missing max steps flag in child argv");
+        assert_eq!(
+            argv.get(flag_index + 1),
+            Some(&"1"),
+            "zero max_steps must be clamped before spawning child: {argv:?}"
+        );
+        assert!(
+            !argv
+                .windows(2)
+                .any(|window| window == [INTERNAL_MAX_STEPS_FLAG, "0"]),
+            "child argv must not receive {INTERNAL_MAX_STEPS_FLAG} 0: {argv:?}"
         );
     }
 
@@ -1672,6 +1743,10 @@ mod tests {
             argv[2],
             crate::agent_loop::SUBAGENT_DEFAULT_STEPS.to_string(),
             "default max_steps must equal SUBAGENT_DEFAULT_STEPS"
+        );
+        assert_eq!(
+            argv[3], INTERNAL_TIME_CAP_MS_FLAG,
+            "expected {INTERNAL_TIME_CAP_MS_FLAG} flag at argv[3]"
         );
     }
 }

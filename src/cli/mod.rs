@@ -34,6 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Sentinel prefix used to tag system messages that should only influence the
 /// next assistant turn (e.g. `/ask`). After the model responds once, any
@@ -153,6 +154,11 @@ pub struct ChatCLI {
     /// Optional hidden step cap for isolated consensus subprocesses. Clamped
     /// at the normal agent-loop cap before use.
     pub(crate) max_agent_steps_override: Option<usize>,
+    /// Optional hidden wall-clock cap for isolated consensus subprocesses.
+    /// The parent process still keeps its own timeout as a backstop; this
+    /// child-side cap lets the agent loop emit structured JSON and unwind
+    /// before the parent has to kill it.
+    pub(crate) max_agent_time_cap_override: Option<Duration>,
     /// Optional structured event tap (`--events <path>`). Writes every
     /// internal event (turn boundaries, tool calls, rationales, MCP
     /// transitions, errors) as JSONL. `None` when the flag is unset.
@@ -189,6 +195,7 @@ pub struct CliFlags {
     pub quiet: bool,
     pub subprocess_subagent_mode: bool,
     pub max_agent_steps_override: Option<usize>,
+    pub max_agent_time_cap_override: Option<Duration>,
 }
 
 impl Default for CliFlags {
@@ -208,6 +215,7 @@ impl Default for CliFlags {
             quiet: false,
             subprocess_subagent_mode: false,
             max_agent_steps_override: None,
+            max_agent_time_cap_override: None,
         }
     }
 }
@@ -287,6 +295,7 @@ impl ChatCLI {
             quiet_mode: flags.quiet,
             subprocess_subagent_mode: flags.subprocess_subagent_mode,
             max_agent_steps_override: flags.max_agent_steps_override,
+            max_agent_time_cap_override: flags.max_agent_time_cap_override,
             event_sink: None,
             receipts: None,
             explain_tools_enabled: flags.explain_tools,
@@ -5087,7 +5096,7 @@ impl ChatCLI {
         );
     }
 
-    /// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`
+    /// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`
     ///
     /// Drives a multi-model consensus run and prints a per-model
     /// summary table plus the winning output. Subagent token usage is
@@ -5195,8 +5204,9 @@ impl ChatCLI {
                 format!("error: {err}").bright_red().to_string()
             } else {
                 format!(
-                    "(steps: {}, tokens: {})",
+                    "(steps: {}, tool calls: {}, tokens: {})",
                     sub.steps_used,
+                    sub.tool_calls,
                     sub.prompt_tokens + sub.completion_tokens
                 )
             };
@@ -5624,10 +5634,10 @@ impl ChatCLI {
     }
 }
 
-const CONSENSUS_SLASH_USAGE: &str = "/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>";
+const CONSENSUS_SLASH_USAGE: &str = "/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>";
 
 /// Parses the args of
-/// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`.
+/// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`.
 ///
 /// Grammar (whitespace-delimited):
 ///   1. `<strategy>` — one of `vote`, `best-of-n`, `judge`.
@@ -5636,14 +5646,16 @@ const CONSENSUS_SLASH_USAGE: &str = "/consensus <strategy> <model1,model2,...> [
 ///   4. Optional `isolate`/`--isolate` token to run tool-enabled subagents
 ///      in parallel, each in its own throwaway git worktree (implies
 ///      `tools`).
-///   5. Optional `--max-steps <n>`, `--max-steps=<n>`, or
+///   5. Optional `concurrency:<n>` or `c:<n>` token to cap concurrent
+///      subagents (`0` keeps the dispatcher default).
+///   6. Optional `--max-steps <n>`, `--max-steps=<n>`, or
 ///      `max_steps:<n>` token to cap each subagent's agent-loop steps.
-///   6. Optional `--isolated-time-cap-secs <seconds>`,
+///   7. Optional `--isolated-time-cap-secs <seconds>`,
 ///      `--isolated-time-cap-secs=<seconds>`, or
 ///      `isolated_time_cap_secs:<seconds>` token to cap each isolated
 ///      subagent.
-///   7. Optional `judge:<model>` token (required when strategy != vote).
-///   8. Everything that remains is the `<goal>` text (verbatim).
+///   8. Optional `judge:<model>` token (required when strategy != vote).
+///   9. Everything that remains is the `<goal>` text (verbatim).
 fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -5670,6 +5682,8 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
     let mut judge_model: Option<String> = None;
     let mut use_tools = false;
     let mut isolate = false;
+    let mut concurrency = 0;
+    let mut saw_concurrency = false;
     let mut isolated_time_cap_secs = 0;
     let mut max_steps_per_subagent = crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS;
     let mut saw_max_steps = false;
@@ -5705,6 +5719,18 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
                 return Err("duplicate isolated time-cap token".to_string());
             }
             isolated_time_cap_secs = parse_consensus_isolated_time_cap_secs(rest)?;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok
+            .strip_prefix("concurrency:")
+            .or_else(|| tok.strip_prefix("c:"))
+        {
+            if saw_concurrency {
+                return Err("duplicate concurrency token".to_string());
+            }
+            concurrency = parse_consensus_concurrency(rest)?;
+            saw_concurrency = true;
             next = iter.next();
             continue;
         }
@@ -5809,7 +5835,7 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
         models,
         strategy,
         max_steps_per_subagent,
-        concurrency: 0,
+        concurrency,
         use_tools,
         isolate,
         isolated_time_cap_secs,
@@ -5828,6 +5854,12 @@ fn parse_consensus_max_steps(raw: &str) -> Result<usize, String> {
         Ok(n) if n > 0 => Ok(n),
         _ => Err("max steps must be a positive integer".to_string()),
     }
+}
+
+fn parse_consensus_concurrency(raw: &str) -> Result<usize, String> {
+    raw.trim()
+        .parse::<usize>()
+        .map_err(|_| "concurrency must be a non-negative integer".to_string())
 }
 
 /// Event sink that fans consensus events out to both the headless JSON
@@ -5867,13 +5899,17 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
     }
 
     fn subagent_result(&self, sub: &crate::consensus::SubagentOutput) {
+        let stats = crate::ollama::ChatStats {
+            prompt_tokens: sub.prompt_tokens,
+            completion_tokens: sub.completion_tokens,
+            elapsed_ms: sub.elapsed_ms,
+        };
         let payload = crate::json_events::consensus_subagent_result(
             &sub.model,
             sub.ok(),
             sub.steps_used,
-            sub.elapsed_ms,
-            sub.prompt_tokens,
-            sub.completion_tokens,
+            sub.tool_calls,
+            stats,
             sub.error.as_deref(),
         );
         crate::json_events::emit(self.json_enabled, &payload);
@@ -7019,6 +7055,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_consensus_accepts_concurrency_forms() {
+        let req = parse_consensus_args("vote m1,m2 concurrency:2 do thing").unwrap();
+        assert_eq!(req.concurrency, 2);
+        assert_eq!(req.goal, "do thing");
+
+        let req = parse_consensus_args("vote m1,m2 c:1 do thing").unwrap();
+        assert_eq!(req.concurrency, 1);
+
+        let req = parse_consensus_args("vote m1,m2 do thing").unwrap();
+        assert_eq!(req.concurrency, 0);
+    }
+
+    #[test]
+    fn parse_consensus_rejects_invalid_or_duplicate_concurrency() {
+        let err = parse_consensus_args("vote m1,m2 concurrency:nope do thing").unwrap_err();
+        assert!(err.contains("non-negative integer"), "got: {err}");
+
+        let err = parse_consensus_args("vote m1,m2 concurrency:1 c:2 do thing").unwrap_err();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
     fn parse_consensus_rejects_invalid_or_duplicate_max_steps() {
         let err = parse_consensus_args("vote m1,m2 --max-steps nope do thing").unwrap_err();
         assert!(err.contains("positive integer"), "got: {err}");
@@ -7142,6 +7200,11 @@ mod tests {
         assert!(spec.usage.contains("--isolate"), "usage: {}", spec.usage);
         assert!(spec.usage.contains("--max-steps"), "usage: {}", spec.usage);
         assert!(
+            spec.usage.contains("concurrency:<n>"),
+            "usage: {}",
+            spec.usage
+        );
+        assert!(
             spec.usage.contains("--isolated-time-cap-secs"),
             "usage: {}",
             spec.usage
@@ -7156,6 +7219,7 @@ mod tests {
         assert!(
             CONSENSUS_SLASH_USAGE.contains("--isolate")
                 && CONSENSUS_SLASH_USAGE.contains("--max-steps")
+                && CONSENSUS_SLASH_USAGE.contains("concurrency:<n>")
                 && CONSENSUS_SLASH_USAGE.contains("--isolated-time-cap-secs"),
             "slash usage: {CONSENSUS_SLASH_USAGE}"
         );

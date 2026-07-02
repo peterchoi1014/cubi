@@ -31,8 +31,8 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   comparison does this natively. On single-GPU setups, pass
   `concurrency: 1` to the `consensus_run` tool to serialize the subagent
   inference calls. Tool-enabled consensus is sequential by default to
-  avoid shared-worktree edit races; add `isolate: true` plus
-  `isolated_time_cap_secs` (or `/consensus ... --isolate --max-steps 8
+  avoid shared-worktree edit races; add `use_tools: true, isolate: true`
+  plus `isolated_time_cap_secs` (or `/consensus ... --isolate --max-steps 8
   --isolated-time-cap-secs 300 ...`) to give each tool-using subagent
   its own ephemeral git worktree and run them in parallel safely with an
   optional per-subprocess wall-clock cap. Isolated tool consensus runs from

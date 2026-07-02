@@ -189,6 +189,7 @@ pub struct SubagentRunResult {
     pub output: String,
     pub stats: ChatStats,
     pub steps_used: usize,
+    pub tool_calls: usize,
 }
 
 /// Runs a subagent loop with a fresh context. Returns the subagent's final
@@ -232,6 +233,7 @@ pub async fn run_subagent_with_model(
         Message::text("user", goal),
     ];
     let mut total_stats = ChatStats::default();
+    let mut tool_calls = 0usize;
 
     for step in 0..max_steps {
         let (msg, stats) = match model {
@@ -261,6 +263,7 @@ pub async fn run_subagent_with_model(
             }
         }
         let calls = msg.tool_calls.clone().unwrap_or_default();
+        tool_calls += calls.len();
         let content = msg.content.clone();
         history.push(msg);
 
@@ -275,6 +278,7 @@ pub async fn run_subagent_with_model(
                 output,
                 stats: total_stats,
                 steps_used,
+                tool_calls,
             });
         }
 
@@ -325,6 +329,7 @@ pub async fn run_subagent_with_model(
                 ),
                 stats: total_stats,
                 steps_used,
+                tool_calls,
             });
         }
     }
@@ -334,6 +339,7 @@ pub async fn run_subagent_with_model(
         output: String::new(),
         stats: total_stats,
         steps_used: 0,
+        tool_calls,
     })
 }
 

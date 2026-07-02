@@ -14,7 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 const BRANCH_PREFIX: &str = "cubi-consensus";
-const WORKTREE_PARENT_DIR: &str = "cubi-worktrees";
 const WORKTREE_DIR_PREFIX: &str = "cubi-consensus-";
 const MAX_NAME_COMPONENT_LEN: usize = 48;
 
@@ -23,6 +22,7 @@ pub struct WorktreeSession {
     path: PathBuf,
     branch: String,
     repo_dir: PathBuf,
+    _parent_dir: tempfile::TempDir,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,10 +127,11 @@ fn create_in_checked(repo_dir: &Path, base_ref: &str, label: &str) -> Result<Wor
             repo_dir.display()
         )
     })?;
-    let names = session_names(label, &unique_suffix());
+    let names = session_names(label, base_ref, &unique_suffix());
+    let git_top_level = resolve_git_toplevel(&repo_dir)?;
     let git_common_dir = resolve_git_common_dir(&repo_dir)?;
-    let parent_dir = create_worktree_parent(&git_common_dir)?;
-    let path = parent_dir.join(&names.worktree_dir);
+    let parent_dir = create_worktree_parent(&git_top_level, &git_common_dir)?;
+    let path = parent_dir.path().join(&names.worktree_dir);
 
     let output = run_git(
         &repo_dir,
@@ -166,6 +167,7 @@ fn create_in_checked(repo_dir: &Path, base_ref: &str, label: &str) -> Result<Wor
         path,
         branch: names.branch,
         repo_dir,
+        _parent_dir: parent_dir,
     })
 }
 
@@ -180,9 +182,10 @@ struct SessionNames {
     worktree_dir: String,
 }
 
-fn session_names(label: &str, suffix: &str) -> SessionNames {
+fn session_names(label: &str, base_ref: &str, suffix: &str) -> SessionNames {
     let label = sanitize_label(label);
-    let stem = format!("{label}-{suffix}");
+    let base_ref = sanitize_base_ref(base_ref);
+    let stem = format!("{label}-{base_ref}-{suffix}");
 
     SessionNames {
         branch: format!("{BRANCH_PREFIX}/{stem}"),
@@ -212,7 +215,11 @@ fn remove_empty_worktree_dirs(path: &Path) {
     let _ = fs::remove_dir(path);
 
     if let Some(parent) = path.parent() {
-        if parent.file_name() == Some(OsStr::new(WORKTREE_PARENT_DIR)) {
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(WORKTREE_DIR_PREFIX))
+        {
             let _ = fs::remove_dir(parent);
         }
     }
@@ -306,23 +313,28 @@ fn resolve_git_common_dir(repo_dir: &Path) -> Result<PathBuf> {
     })
 }
 
-fn create_worktree_parent(git_common_dir: &Path) -> Result<PathBuf> {
+fn create_worktree_parent(
+    _git_top_level: &Path,
+    git_common_dir: &Path,
+) -> Result<tempfile::TempDir> {
     let git_common_dir = git_common_dir.canonicalize().with_context(|| {
         format!(
             "Could not resolve git common directory `{}`",
             git_common_dir.display()
         )
     })?;
-    let parent_dir = git_common_dir.join(WORKTREE_PARENT_DIR);
-    fs::create_dir_all(&parent_dir).with_context(|| {
-        format!(
-            "Could not create worktree parent directory `{}` under git common directory `{}`",
-            parent_dir.display(),
-            git_common_dir.display(),
-        )
-    })?;
+    let parent_dir = tempfile::Builder::new()
+        .prefix(WORKTREE_DIR_PREFIX)
+        .tempdir_in(&git_common_dir)
+        .with_context(|| {
+            format!(
+                "Could not create temporary worktree parent under git common directory `{}`",
+                git_common_dir.display()
+            )
+        })?;
 
-    ensure_worktree_parent_under_git_common_dir(&parent_dir, &git_common_dir)
+    ensure_worktree_parent_under_git_common_dir(parent_dir.path(), &git_common_dir)?;
+    Ok(parent_dir)
 }
 
 fn ensure_worktree_parent_under_git_common_dir(
@@ -401,6 +413,10 @@ fn sanitize_label(label: &str) -> String {
     sanitize_component(label, "session")
 }
 
+fn sanitize_base_ref(base_ref: &str) -> String {
+    sanitize_component(base_ref, "ref")
+}
+
 fn sanitize_component(input: &str, fallback: &str) -> String {
     let mut sanitized = String::new();
 
@@ -466,29 +482,29 @@ mod tests {
         let branch = session.branch().to_string();
 
         assert!(
-            branch.starts_with("cubi-consensus/test-"),
+            branch.starts_with("cubi-consensus/test-head-"),
             "unexpected temporary branch name: {branch}"
         );
         assert!(
-            !branch.contains("head"),
-            "base ref leaked into temporary branch name: {branch}"
+            branch.contains("head"),
+            "sanitized base ref missing from temporary branch name: {branch}"
         );
         assert!(
             worktree_path
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("cubi-consensus-test-"),
+                .starts_with("cubi-consensus-test-head-"),
             "worktree path did not use sanitized session name: {}",
             worktree_path.display()
         );
         assert!(
-            !worktree_path
+            worktree_path
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .contains("head"),
-            "base ref leaked into temporary worktree path: {}",
+            "sanitized base ref missing from temporary worktree path: {}",
             worktree_path.display()
         );
         assert!(worktree_path.is_dir());
@@ -538,25 +554,25 @@ mod tests {
 
         assert_ne!(first_branch, second_branch);
         assert_ne!(first_path, second_path);
-        assert_eq!(first_parent, second_parent);
-        assert_safe_session_name(&first_branch, "cubi-consensus/review-model-a-");
-        assert_safe_session_name(&second_branch, "cubi-consensus/review-model-a-");
+        assert_ne!(first_parent, second_parent);
+        assert_safe_session_name(&first_branch, "cubi-consensus/review-model-a-origin-main-");
+        assert_safe_session_name(&second_branch, "cubi-consensus/review-model-a-origin-main-");
         assert_safe_session_name(
             &first_path.file_name().unwrap().to_string_lossy(),
-            "cubi-consensus-review-model-a-",
+            "cubi-consensus-review-model-a-origin-main-",
         );
         assert_safe_session_name(
             &second_path.file_name().unwrap().to_string_lossy(),
-            "cubi-consensus-review-model-a-",
+            "cubi-consensus-review-model-a-origin-main-",
         );
         assert!(
-            !first_branch.contains("origin-main") && !second_branch.contains("origin-main"),
-            "base ref leaked into temporary branch names: {first_branch}, {second_branch}"
+            first_branch.contains("origin-main") && second_branch.contains("origin-main"),
+            "sanitized base ref missing from temporary branch names: {first_branch}, {second_branch}"
         );
         assert!(
-            !first_path.to_string_lossy().contains("origin-main")
-                && !second_path.to_string_lossy().contains("origin-main"),
-            "base ref leaked into temporary worktree paths: {}, {}",
+            first_path.to_string_lossy().contains("origin-main")
+                && second_path.to_string_lossy().contains("origin-main"),
+            "sanitized base ref missing from temporary worktree paths: {}, {}",
             first_path.display(),
             second_path.display()
         );
@@ -656,13 +672,15 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         let nested = nested.canonicalize().unwrap();
         let git_common_dir = resolve_git_common_dir(&nested).unwrap();
-        let parent = git_common_dir.join(WORKTREE_PARENT_DIR);
-        fs::create_dir_all(&parent).unwrap();
+        let parent = tempfile::Builder::new()
+            .prefix("cubi-consensus-allowed-")
+            .tempdir_in(&git_common_dir)
+            .unwrap();
 
         let resolved =
-            ensure_worktree_parent_under_git_common_dir(&parent, &git_common_dir).unwrap();
+            ensure_worktree_parent_under_git_common_dir(parent.path(), &git_common_dir).unwrap();
 
-        assert_eq!(resolved, parent.canonicalize().unwrap());
+        assert_eq!(resolved, parent.path().canonicalize().unwrap());
     }
 
     #[test]
@@ -682,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_parent_guard_rejects_parent_outside_git_common_dir() {
+    fn worktree_parent_guard_rejects_parent_inside_repo() {
         let repo = new_test_temp_dir();
         init_repo(repo.path());
         let git_common_dir = resolve_git_common_dir(repo.path()).unwrap();
@@ -743,14 +761,30 @@ mod tests {
     }
 
     #[test]
-    fn session_names_include_label_and_suffix_without_base_ref() {
-        let names = session_names("Consensus ✓ Run", "abc123");
+    fn sanitize_base_ref_replaces_unsafe_chars_and_falls_back() {
+        assert_eq!(sanitize_base_ref("origin/main"), "origin-main");
+        assert_eq!(
+            sanitize_base_ref("refs/heads/Feature.X"),
+            "refs-heads-feature-x"
+        );
+        assert_eq!(sanitize_base_ref("@{"), "ref");
+    }
 
-        assert_eq!(names.branch, "cubi-consensus/consensus-run-abc123");
-        assert_eq!(names.worktree_dir, "cubi-consensus-consensus-run-abc123");
+    #[test]
+    fn session_names_include_label_base_ref_and_suffix() {
+        let names = session_names("Consensus ✓ Run", "origin/main", "abc123");
+
+        assert_eq!(
+            names.branch,
+            "cubi-consensus/consensus-run-origin-main-abc123"
+        );
+        assert_eq!(
+            names.worktree_dir,
+            "cubi-consensus-consensus-run-origin-main-abc123"
+        );
         assert!(
-            !names.branch.contains("origin-main") && !names.worktree_dir.contains("origin-main"),
-            "base refs must not be part of session names"
+            names.branch.contains("origin-main") && names.worktree_dir.contains("origin-main"),
+            "sanitized base refs must be part of session names"
         );
     }
 
@@ -834,9 +868,8 @@ mod tests {
     }
 
     fn assert_session_path_under_git_common_dir(repo_dir: &Path, worktree_path: &Path) -> PathBuf {
-        let repo_dir = repo_dir.canonicalize().unwrap();
-        let common_dir = resolve_git_common_dir(&repo_dir).unwrap();
-        let expected_parent_path = common_dir.join(WORKTREE_PARENT_DIR).canonicalize().unwrap();
+        let repo_root = resolve_git_toplevel(&repo_dir.canonicalize().unwrap()).unwrap();
+        let common_dir = resolve_git_common_dir(&repo_root).unwrap();
         let canonical_worktree_path = worktree_path.canonicalize().unwrap();
         let worktree_parent_path = worktree_path.parent().unwrap().canonicalize().unwrap();
 
@@ -858,10 +891,6 @@ mod tests {
             worktree_parent_path.display(),
             common_dir.display()
         );
-        assert_eq!(
-            worktree_parent_path, expected_parent_path,
-            "worktree parent did not use expected git-common-dir parent"
-        );
         assert!(
             worktree_parent_path != common_dir,
             "worktree parent `{}` must not be the git common dir itself `{}`",
@@ -873,12 +902,14 @@ mod tests {
             "worktree parent `{}` did not exist",
             worktree_parent_path.display(),
         );
-        assert_eq!(
-            worktree_parent_path.file_name().unwrap(),
-            OsStr::new(WORKTREE_PARENT_DIR),
-            "worktree parent `{}` did not use expected directory `{}`",
+        assert!(
+            worktree_parent_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(WORKTREE_DIR_PREFIX)),
+            "worktree parent `{}` did not use expected prefix `{}`",
             worktree_parent_path.display(),
-            WORKTREE_PARENT_DIR
+            WORKTREE_DIR_PREFIX
         );
 
         worktree_parent_path
@@ -900,11 +931,21 @@ mod tests {
         );
 
         let common_dir = resolve_git_common_dir(repo_dir).unwrap();
-        let leftover_parent_dir = common_dir.join(WORKTREE_PARENT_DIR);
+        let leftover_temp_dirs = fs::read_dir(&common_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WORKTREE_DIR_PREFIX)
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
         assert!(
-            !leftover_parent_dir.exists(),
-            "temporary worktree parent directory was left behind: `{}`",
-            leftover_parent_dir.display()
+            leftover_temp_dirs.is_empty(),
+            "temporary worktree parent directories were left behind: {:?}",
+            leftover_temp_dirs
         );
     }
 

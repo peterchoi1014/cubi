@@ -51,8 +51,8 @@
 //! ([`crate::proc_subagent::run_isolated_subagent`]), like the
 //! `bench`/`swebench` harnesses. Because no two subagents ever touch the
 //! same working tree, `run_isolated_tool_subagents` dispatches them with
-//! the same `FuturesUnordered` + semaphore pattern as the LLM-only path,
-//! respecting [`ConsensusRequest::concurrency`]. Each worktree (and its
+//! a low-default, capped `FuturesUnordered` + semaphore pattern respecting
+//! [`ConsensusRequest::concurrency`]. Each worktree (and its
 //! branch) is torn down once its subagent finishes, so only the winner's
 //! *text* answer survives — losing candidates' file edits are discarded
 //! along with their worktrees. This is real isolated best-of-N execution.
@@ -95,6 +95,9 @@ const CONSENSUS_SYSTEM_PROMPT: &str = "You are one of several focused worker sub
 /// and the dispatcher agree on the same default.
 pub const CONSENSUS_DEFAULT_MAX_STEPS: usize = 8;
 
+const CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY: usize = 1;
+const CONSENSUS_ISOLATED_MAX_CONCURRENCY: usize = 2;
+
 /// Normalize caller-supplied per-subagent step caps before dispatch.
 ///
 /// Shared in-process subagents already clamp to at least one step in
@@ -104,6 +107,15 @@ pub const CONSENSUS_DEFAULT_MAX_STEPS: usize = 8;
 /// it can emit the structured JSON final/error/done events the parent expects.
 pub(crate) fn normalize_max_steps_per_subagent(max_steps: usize) -> usize {
     max_steps.max(1)
+}
+
+fn isolated_permits(concurrency: usize, models: usize) -> usize {
+    let requested = if concurrency == 0 {
+        CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY
+    } else {
+        concurrency.min(CONSENSUS_ISOLATED_MAX_CONCURRENCY)
+    };
+    requested.min(models.max(1)).max(1)
 }
 
 /// Arbitration strategy used by [`run`] to pick a winner.
@@ -129,8 +141,9 @@ pub struct ConsensusRequest {
     /// Per-subagent step cap. LLM-only consensus uses a single call;
     /// tool-enabled consensus clamps this into the subagent loop cap.
     pub max_steps_per_subagent: usize,
-    /// Maximum number of subagents in flight at once. `0` means
-    /// `models.len()` — i.e. fully parallel. `1` is sequential.
+    /// Maximum number of subagents in flight at once. In LLM-only mode,
+    /// `0` means `models.len()`; isolated tool mode uses its own safer
+    /// default and cap.
     pub concurrency: usize,
     /// When false (the default), each subagent is a single LLM-only call.
     /// When true, each subagent may use tools and runs sequentially
@@ -167,6 +180,9 @@ pub struct SubagentOutput {
     pub model: String,
     pub output: String,
     pub steps_used: usize,
+    /// Tool calls observed for this subagent. LLM-only subagents report `0`;
+    /// tool-enabled subagents report the runner's observed tool-call count.
+    pub tool_calls: usize,
     pub elapsed_ms: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -237,7 +253,7 @@ pub fn consensus_run_spec() -> ToolSpec {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 2,
-                        "description": "Models to consult. LLM-only mode may run them in parallel; tool mode runs sequentially."
+                        "description": "Models to consult. LLM-only mode may run them in parallel; shared-tree tool mode runs sequentially; isolated tool mode uses capped `concurrency`."
                     },
                     "strategy": {
                         "type": "string",
@@ -257,17 +273,17 @@ pub fn consensus_run_spec() -> ToolSpec {
                     "concurrency": {
                         "type": "integer",
                         "default": 0,
-                        "description": "0 = parallel (len(models)); 1 = sequential. In shared-tree tool mode (use_tools=true, isolate=false), subagents are forced sequential regardless of this value. Isolated tool mode respects this limit."
+                        "description": format!("0 = LLM-only parallel (len(models)); 1 = sequential. In shared-tree tool mode (use_tools=true, isolate=false), subagents are forced sequential regardless of this value. WARNING: isolated tool mode spawns a full model-driving `cubi` subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
                     },
                     "use_tools": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Opt in to tool-enabled subagents. Defaults to false. When true and `isolate` is false, subagents run SEQUENTIALLY and their tool actions are side-effecting: every subagent (including losing candidates) mutates the shared working tree. Consensus still selects one text answer; it is not isolated best-of-N execution. Set `isolate=true` to run tool-enabled subagents in parallel, each confined to its own throwaway git worktree."
+                        "description": "Opt in to tool-enabled subagents. Defaults to false. When true and `isolate` is false, subagents run SEQUENTIALLY and their tool actions are side-effecting: every subagent (including losing candidates) mutates the shared working tree. Consensus still selects one text answer; it is not isolated best-of-N execution. Set `isolate=true` to confine each tool-enabled subagent to its own throwaway git worktree."
                     },
                     "isolate": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Requires use_tools=true. Runs each tool-enabled subagent in its own ephemeral git worktree via a headless `cubi` subprocess, so subagents can run in PARALLEL (respecting `concurrency`) without their tool actions interleaving on a shared working tree. Losing candidates' worktrees are discarded, so only the winner's reasoning (not its file edits) survives — this is isolated best-of-N execution, unlike the shared-tree sequential mode."
+                        "description": format!("Requires use_tools=true. Runs each tool-enabled subagent in its own ephemeral git worktree via a headless `cubi` subprocess, so subagents can run without their tool actions interleaving on a shared working tree. WARNING: isolate mode spawns a full model-driving subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}. Losing candidates' worktrees are discarded, so only the winner's reasoning (not its file edits) survives — this is isolated best-of-N execution, unlike the shared-tree sequential mode.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
                     },
                     "isolated_time_cap_secs": {
                         "type": "integer",
@@ -304,9 +320,9 @@ impl ConsensusEventSink for NullSink {
 /// subagents in parallel (limited by [`ConsensusRequest::concurrency`]),
 /// arbitrates the outputs, and returns a [`ConsensusResult`].
 ///
-/// If [`ConsensusRequest::use_tools`] is true, call [`run_with_tools`]
-/// instead so the live MCP manager can be threaded through the sequential
-/// tool loop.
+/// If [`ConsensusRequest::use_tools`] is true without isolation, call
+/// [`run_with_tools`] instead so the live MCP manager can be threaded
+/// through the sequential shared-tree tool loop.
 ///
 /// Errors in individual subagents are recorded with `error: Some(...)`
 /// and excluded from arbitration; only a wholesale failure (no model
@@ -322,9 +338,12 @@ pub async fn run(
 /// Drives a consensus run that may opt in to tool-enabled subagents.
 ///
 /// When [`ConsensusRequest::use_tools`] is false this delegates to the
-/// unchanged LLM-only path. When it is true, subagents are run
-/// sequentially regardless of [`ConsensusRequest::concurrency`] because
-/// tool execution needs a single live mutable [`McpManager`].
+/// unchanged LLM-only path. When it is true and
+/// [`ConsensusRequest::isolate`] is false, subagents are run sequentially
+/// regardless of [`ConsensusRequest::concurrency`] because tool execution
+/// uses one live mutable [`McpManager`] and one shared working tree. Isolated
+/// tool mode ignores the MCP manager and runs subprocess subagents in
+/// throwaway worktrees, bounded by `concurrency`.
 pub async fn run_with_tools(
     req: ConsensusRequest,
     executor: &AIExecutor,
@@ -480,6 +499,7 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                         model,
                         output: String::new(),
                         steps_used: 0,
+                        tool_calls: 0,
                         elapsed_ms,
                         prompt_tokens: 0,
                         completion_tokens: 0,
@@ -498,6 +518,7 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                     model: model.clone(),
                     output: msg.content,
                     steps_used: 1,
+                    tool_calls: 0,
                     elapsed_ms: elapsed_ms.max(stats.elapsed_ms),
                     prompt_tokens: stats.prompt_tokens,
                     completion_tokens: stats.completion_tokens,
@@ -507,6 +528,7 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                     model: model.clone(),
                     output: String::new(),
                     steps_used: 0,
+                    tool_calls: 0,
                     elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -556,6 +578,7 @@ async fn run_tool_subagents(
                 model: model.clone(),
                 output: result.output,
                 steps_used: result.steps_used,
+                tool_calls: result.tool_calls,
                 elapsed_ms: elapsed_ms.max(result.stats.elapsed_ms),
                 prompt_tokens: result.stats.prompt_tokens,
                 completion_tokens: result.stats.completion_tokens,
@@ -565,6 +588,7 @@ async fn run_tool_subagents(
                 model: model.clone(),
                 output: String::new(),
                 steps_used: 0,
+                tool_calls: 0,
                 elapsed_ms,
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -635,25 +659,22 @@ async fn run_isolated_tool_subagents_with_runner(
     req: &ConsensusRequest,
     runner: IsolatedSubagentRunner,
 ) -> Vec<SubagentOutput> {
-    let permits = if req.concurrency == 0 {
-        req.models.len()
-    } else {
-        req.concurrency.min(req.models.len())
-    };
-    let semaphore = Arc::new(Semaphore::new(permits.max(1)));
+    let permits = isolated_permits(req.concurrency, req.models.len());
+    let semaphore = Arc::new(Semaphore::new(permits));
     let time_cap_secs = if req.isolated_time_cap_secs == 0 {
         CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS
     } else {
         req.isolated_time_cap_secs
     };
     let time_cap = std::time::Duration::from_secs(time_cap_secs);
+    let max_steps_per_subagent = normalize_max_steps_per_subagent(req.max_steps_per_subagent);
 
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     for (idx, model) in req.models.iter().cloned().enumerate() {
         let sem = Arc::clone(&semaphore);
         let runner = Arc::clone(&runner);
         let goal = req.goal.clone();
-        let max_steps = req.max_steps_per_subagent;
+        let max_steps = max_steps_per_subagent;
         let fut = async move {
             // Permit is dropped when the closure returns, releasing the
             // slot for the next queued subagent.
@@ -666,6 +687,7 @@ async fn run_isolated_tool_subagents_with_runner(
                         model,
                         output: String::new(),
                         steps_used: 0,
+                        tool_calls: 0,
                         elapsed_ms,
                         prompt_tokens: 0,
                         completion_tokens: 0,
@@ -680,6 +702,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: String::new(),
                     steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
                     elapsed_ms,
                     prompt_tokens: proc.prompt_tokens,
                     completion_tokens: proc.completion_tokens,
@@ -692,6 +715,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: String::new(),
                     steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
                     elapsed_ms,
                     prompt_tokens: proc.prompt_tokens,
                     completion_tokens: proc.completion_tokens,
@@ -704,6 +728,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: String::new(),
                     steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
                     elapsed_ms,
                     prompt_tokens: proc.prompt_tokens,
                     completion_tokens: proc.completion_tokens,
@@ -716,6 +741,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: String::new(),
                     steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
                     elapsed_ms,
                     prompt_tokens: proc.prompt_tokens,
                     completion_tokens: proc.completion_tokens,
@@ -731,6 +757,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: proc.output,
                     steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
                     elapsed_ms,
                     prompt_tokens: proc.prompt_tokens,
                     completion_tokens: proc.completion_tokens,
@@ -740,6 +767,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     model: model.clone(),
                     output: String::new(),
                     steps_used: 0,
+                    tool_calls: 0,
                     elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -1492,6 +1520,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn isolated_permits_defaults_and_caps() {
+        assert_eq!(isolated_permits(0, 5), 1);
+        assert_eq!(isolated_permits(99, 5), 2);
+        assert_eq!(isolated_permits(2, 1), 1);
+        assert_eq!(isolated_permits(1, 5), 1);
+    }
+
     async fn run_with_fake_isolated_runner(req: ConsensusRequest) -> Result<ConsensusResult> {
         let mut no_mcp = None;
         run_inner_with_isolated_runner(
@@ -1834,6 +1870,11 @@ fn main() {
         );
         assert_eq!(r.subagent_outputs.len(), 3);
         assert!(r.subagent_outputs.iter().all(|s| s.ok()));
+        assert!(
+            r.subagent_outputs.iter().all(|s| s.tool_calls == 0),
+            "LLM-only subagents must report zero tool calls: {:?}",
+            r.subagent_outputs
+        );
     }
 
     #[tokio::test]
@@ -2228,6 +2269,7 @@ fn main() {
         assert_eq!(outputs[1].output, "final B");
         assert!(outputs.iter().all(|s| s.error.is_none()));
         assert!(outputs.iter().all(|s| s.steps_used == 2));
+        assert!(outputs.iter().all(|s| s.tool_calls == 1));
         assert!(outputs.iter().all(|s| s.prompt_tokens == 2));
         assert!(outputs.iter().all(|s| s.completion_tokens == 2));
     }
@@ -2290,6 +2332,13 @@ fn main() {
                 .iter()
                 .all(|s| s.completion_tokens == 13)
         );
+        assert!(
+            result.subagent_outputs.iter().all(|s| s.tool_calls == 1),
+            "isolated subprocess tool calls were not propagated: {:?}",
+            result.subagent_outputs
+        );
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(serialized["subagent_outputs"][0]["tool_calls"], 1);
     }
 
     #[tokio::test]
@@ -2336,6 +2385,29 @@ fn main() {
         let result = run_with_fake_isolated_runner(req).await.unwrap();
         let capped = result
             .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-max-steps")
+            .unwrap();
+
+        assert_eq!(capped.output, "max_steps=1");
+        assert_eq!(capped.steps_used, 1);
+    }
+
+    #[tokio::test]
+    async fn isolated_dispatch_clamps_zero_step_cap_before_invoking_runner() {
+        let req = ConsensusRequest {
+            goal: "check direct dispatch cap".into(),
+            models: vec!["isolated-max-steps".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 0,
+            concurrency: 1,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 7,
+        };
+
+        let outputs = run_isolated_tool_subagents_with_runner(&req, fake_isolated_runner()).await;
+        let capped = outputs
             .iter()
             .find(|s| s.model == "isolated-max-steps")
             .unwrap();
@@ -2604,7 +2676,10 @@ fn main() {
         assert_eq!(result.subagent_outputs.len(), 2);
         assert!(result.subagent_outputs.iter().all(SubagentOutput::ok));
         assert!(result.subagent_outputs.iter().all(|sub| {
-            sub.steps_used == 4 && sub.prompt_tokens == 21 && sub.completion_tokens == 34
+            sub.steps_used == 4
+                && sub.tool_calls == 3
+                && sub.prompt_tokens == 21
+                && sub.completion_tokens == 34
         }));
         assert!(
             result

@@ -561,8 +561,8 @@ pub enum DeleteSessionResult {
 }
 
 /// Returns the home directory Cubi should use for per-user state, preferring
-/// [`CUBI_HOME_ENV`], then the `HOME` environment variable (and `USERPROFILE`
-/// on Windows), before falling back to the platform lookup.
+/// [`CUBI_HOME_ENV`], then the platform's historical home-directory
+/// precedence.
 ///
 /// On Windows, `dirs::home_dir()` uses `SHGetKnownFolderPath`, which ignores
 /// the process environment. Checking `CUBI_HOME` first lets isolated
@@ -572,11 +572,13 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     if let Some(path) = absolute_env_path(CUBI_HOME_ENV) {
         return Some(path);
     }
+    #[cfg(not(windows))]
     if let Some(path) = absolute_env_path("HOME") {
         return Some(path);
     }
     #[cfg(windows)]
     if let Some(path) = absolute_env_path("USERPROFILE") {
+        // Windows must ignore HOME here to match historical dirs::home_dir() behavior.
         return Some(path);
     }
     dirs::home_dir()
@@ -947,6 +949,46 @@ mod tests {
             sessions_root().as_deref(),
             Some(expected_sessions_root.as_path())
         );
+
+        restore_home(old_cubi_home, old_home, old_userprofile);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_dir_prefers_home_over_userprofile_on_non_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("non-windows-home");
+        let userprofile = isolated_home("non-windows-userprofile");
+        unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &userprofile);
+        }
+
+        assert_eq!(home_dir().as_deref(), Some(home.as_path()));
+
+        restore_home(old_cubi_home, old_home, old_userprofile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_dir_ignores_home_and_prefers_userprofile_on_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("windows-home");
+        let userprofile = isolated_home("windows-userprofile");
+        unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &userprofile);
+        }
+
+        assert_eq!(home_dir().as_deref(), Some(userprofile.as_path()));
 
         restore_home(old_cubi_home, old_home, old_userprofile);
     }

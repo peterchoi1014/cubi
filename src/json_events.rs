@@ -180,9 +180,8 @@ pub fn consensus_subagent_result(
     model: &str,
     ok: bool,
     steps_used: usize,
-    elapsed_ms: u64,
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    tool_calls: usize,
+    stats: ChatStats,
     error: Option<&str>,
 ) -> Value {
     let mut v = json!({
@@ -190,9 +189,10 @@ pub fn consensus_subagent_result(
         "model": model,
         "ok": ok,
         "steps_used": steps_used,
-        "elapsed_ms": elapsed_ms,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
+        "tool_calls": tool_calls,
+        "elapsed_ms": stats.elapsed_ms,
+        "prompt_tokens": stats.prompt_tokens,
+        "completion_tokens": stats.completion_tokens,
     });
     if let Some(err) = error {
         if let Some(obj) = v.as_object_mut() {
@@ -316,16 +316,39 @@ mod tests {
 
     #[test]
     fn consensus_subagent_result_omits_error_when_ok() {
-        let v = consensus_subagent_result("m1", true, 1, 42, 10, 20, None);
+        let v = consensus_subagent_result(
+            "m1",
+            true,
+            1,
+            2,
+            ChatStats {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                elapsed_ms: 42,
+            },
+            None,
+        );
         assert_eq!(v["type"], "consensus_subagent_result");
         assert_eq!(v["ok"], true);
+        assert_eq!(v["tool_calls"], 2);
         assert_eq!(v["prompt_tokens"], 10);
         assert!(v.get("error").is_none());
     }
 
     #[test]
     fn consensus_subagent_result_includes_error_when_failed() {
-        let v = consensus_subagent_result("m1", false, 0, 5, 0, 0, Some("boom"));
+        let v = consensus_subagent_result(
+            "m1",
+            false,
+            0,
+            0,
+            ChatStats {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                elapsed_ms: 5,
+            },
+            Some("boom"),
+        );
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], "boom");
     }

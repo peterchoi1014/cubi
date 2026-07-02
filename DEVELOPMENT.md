@@ -113,10 +113,10 @@ cubi/
   `/consensus` slash command: spawns N subagents in parallel against
   caller-supplied models, then arbitrates via `vote`, `best-of-n`, or
   `judge`. LLM-only subagents run in parallel. Tool-enabled subagents run
-  sequentially in-process unless `isolate` is set, in which case each
-  subagent is driven through a headless `cubi` subprocess in its own
+  sequentially in-process unless `isolate` is set with `use_tools`, in which
+  case each subagent is driven through a headless `cubi` subprocess in its own
   ephemeral git worktree with optional per-subagent
-  `max_steps_per_subagent` / `--max-steps` and per-subprocess
+  `max_steps` / `--max-steps` and per-subprocess
   `isolated_time_cap_secs` / `--isolated-time-cap-secs` caps. Isolated tool
   consensus resolves the parent repo top-level plus relative cwd so children
   run from the matching subdirectory in each worktree; it inherits the

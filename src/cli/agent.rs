@@ -40,11 +40,29 @@ fn subprocess_step_cap_events(
         "steps_used": steps_used,
         "error": true,
     });
+    let done = subprocess_done_event(stats, window, steps_used);
+    vec![final_event, error, done]
+}
+
+fn format_time_cap(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis >= 1000 && millis % 1000 == 0 {
+        format!("{}s", millis / 1000)
+    } else {
+        format!("{millis}ms")
+    }
+}
+
+fn subprocess_done_event(
+    stats: &ChatStats,
+    window: Option<usize>,
+    steps_used: usize,
+) -> serde_json::Value {
     let mut done = crate::json_events::done_with_window(stats, window);
     if let Some(obj) = done.as_object_mut() {
         obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
     }
-    vec![final_event, error, done]
+    done
 }
 
 impl ChatCLI {
@@ -60,6 +78,23 @@ impl ChatCLI {
         self.max_agent_steps_override
             .unwrap_or(MAX_AGENT_STEPS)
             .clamp(1, MAX_AGENT_STEPS)
+    }
+
+    fn subprocess_time_cap_error(
+        &self,
+        cap: Duration,
+        steps_used: usize,
+        stats: &ChatStats,
+        json_enabled: bool,
+    ) -> anyhow::Error {
+        let message = format!("subagent time cap reached after {}", format_time_cap(cap));
+        if self.subprocess_subagent_mode && json_enabled {
+            let window = crate::llm::context_window_for_model(self.executor.get_model());
+            for event in subprocess_step_cap_events(&message, steps_used, stats, window) {
+                Self::emit_json_event(event);
+            }
+        }
+        exit_code::err(ExitCode::Tool, format!("cubi: {message}"))
     }
 
     fn meta_tool_blocked_in_subagent_mode(&self, tool_name: &str) -> Option<String> {
@@ -323,7 +358,23 @@ impl ChatCLI {
         // (turn_start was captured before the user message was pushed.)
 
         let max_agent_steps = self.agent_step_cap();
+        let subprocess_time_cap = if self.subprocess_subagent_mode {
+            self.max_agent_time_cap_override
+        } else {
+            None
+        };
+        let subprocess_deadline = subprocess_time_cap.map(|cap| tokio::time::Instant::now() + cap);
         for step in 0..max_agent_steps {
+            if let (Some(deadline), Some(cap)) = (subprocess_deadline, subprocess_time_cap) {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(self.subprocess_time_cap_error(
+                        cap,
+                        step,
+                        &turn_stats,
+                        json_enabled,
+                    ));
+                }
+            }
             // Show a spinner while we wait for the model's first token.
             // Label differs by step so the user can tell "first response"
             // from "reacting to tool output".
@@ -353,6 +404,7 @@ impl ChatCLI {
             // when the user has /stream off (markdown mode is buffered-only).
             // Cancellation: SIGINT (Ctrl-C) interrupts the in-flight model
             // call; tool dispatch below is also cancellable between awaits.
+            let mut hit_time_cap = false;
             let outcome: Option<Result<(Message, ChatStats)>> = if self.stream_enabled {
                 let stream_fut =
                     self.executor
@@ -376,24 +428,61 @@ impl ChatCLI {
                             }
                             got_token = true;
                         });
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => None,
-                    r = stream_fut => Some(r),
+                if let Some(deadline) = subprocess_deadline {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            hit_time_cap = true;
+                            None
+                        },
+                        r = stream_fut => Some(r),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        r = stream_fut => Some(r),
+                    }
                 }
             } else {
                 let buf_fut = self
                     .executor
                     .chat_with_tools(self.history.clone(), tools.clone());
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => None,
-                    r = buf_fut => Some(r),
+                if let Some(deadline) = subprocess_deadline {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            hit_time_cap = true;
+                            None
+                        },
+                        r = buf_fut => Some(r),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        r = buf_fut => Some(r),
+                    }
                 }
             };
             // Always retire the spinner before we print anything else.
             stop_flag.store(true, Ordering::SeqCst);
             spinner.stop().await;
+
+            if hit_time_cap {
+                if got_token && headless_mode && !json_enabled {
+                    println!();
+                }
+                let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
+                return Err(self.subprocess_time_cap_error(
+                    cap,
+                    step + 1,
+                    &turn_stats,
+                    json_enabled,
+                ));
+            }
 
             // None == user pressed Ctrl-C mid-call. Truncate the history
             // back to the pre-turn snapshot so the conversation has no
@@ -497,10 +586,12 @@ impl ChatCLI {
                     any_output = true;
                 }
                 let window = crate::llm::context_window_for_model(self.executor.get_model());
-                Self::emit_json_event_if(
-                    json_enabled,
-                    crate::json_events::done_with_window(&turn_stats, window),
-                );
+                let done = if self.subprocess_subagent_mode {
+                    subprocess_done_event(&turn_stats, window, step + 1)
+                } else {
+                    crate::json_events::done_with_window(&turn_stats, window)
+                };
+                Self::emit_json_event_if(json_enabled, done);
                 if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
@@ -626,6 +717,7 @@ impl ChatCLI {
                     (Arc::clone(t), id, std::time::Instant::now())
                 });
 
+                let mut hit_time_cap = false;
                 let result_text = {
                     // Tool spinner: gives users a visible heartbeat
                     // (with elapsed seconds) while a slow tool runs.
@@ -637,10 +729,22 @@ impl ChatCLI {
                     );
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
-                    let r = tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => None,
-                        r = &mut tool_fut => Some(r),
+                    let r = if let Some(deadline) = subprocess_deadline {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => None,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                hit_time_cap = true;
+                                None
+                            },
+                            r = &mut tool_fut => Some(r),
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => None,
+                            r = &mut tool_fut => Some(r),
+                        }
                     };
                     sp.finish().await;
                     r
@@ -656,6 +760,15 @@ impl ChatCLI {
                         );
                     }
                     self.cancel_tool_calls(turn_start, &calls, idx);
+                    if hit_time_cap {
+                        let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
+                        return Err(self.subprocess_time_cap_error(
+                            cap,
+                            step + 1,
+                            &turn_stats,
+                            json_enabled,
+                        ));
+                    }
                     if headless_mode {
                         return Err(exit_code::err(
                             ExitCode::Cancelled,
@@ -998,7 +1111,7 @@ impl ChatCLI {
             "↳".bright_magenta(),
             models.len(),
             if isolate {
-                " (tools, isolated parallel)"
+                " (tools, isolated)"
             } else if use_tools {
                 " (tools, sequential)"
             } else {
@@ -1038,9 +1151,10 @@ impl ChatCLI {
                 report.push_str(&format!("- {} ✗ {}\n", sub.model, err));
             } else {
                 report.push_str(&format!(
-                    "- {} ✓ ({} tokens, {} ms)\n",
+                    "- {} ✓ ({} tokens, {} tool calls, {} ms)\n",
                     sub.model,
                     sub.prompt_tokens + sub.completion_tokens,
+                    sub.tool_calls,
                     sub.elapsed_ms
                 ));
             }
@@ -1076,5 +1190,22 @@ mod tests {
         assert_eq!(events[2]["stats"]["prompt_tokens"], 3);
         assert_eq!(events[2]["stats"]["completion_tokens"], 4);
         assert_eq!(events[2]["steps_used"], 2);
+    }
+
+    #[test]
+    fn subprocess_done_event_includes_exact_success_steps() {
+        let stats = ChatStats {
+            prompt_tokens: 6,
+            completion_tokens: 7,
+            elapsed_ms: 8,
+        };
+
+        let event = subprocess_done_event(&stats, Some(200), 1);
+
+        assert_eq!(event["type"], "done");
+        assert_eq!(event["stats"]["prompt_tokens"], 6);
+        assert_eq!(event["stats"]["completion_tokens"], 7);
+        assert_eq!(event["window"], 200);
+        assert_eq!(event["steps_used"], 1);
     }
 }

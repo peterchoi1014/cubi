@@ -104,8 +104,11 @@ Event types currently emitted:
   (or the `/consensus` slash command) starts a run. `strategy` is one
   of `vote`, `best-of-n`, `judge`.
 - `consensus_subagent_result` — `{type, ts, model, ok, steps_used,
-  elapsed_ms, prompt_tokens, completion_tokens, error?}`. One event per
-  subagent. `error` is present and non-null only when `ok` is false.
+  tool_calls, elapsed_ms, prompt_tokens, completion_tokens, error?}`. One
+  event per subagent. `tool_calls` is `0` for LLM-only subagents; tool-enabled
+  subagents report their observed tool-call count, with isolated mode using
+  the child subprocess JSONL count. `error` is present and non-null only when
+  `ok` is false.
 - `consensus_decision` — `{type, ts, winner_model, decision_reason}`
   after arbitration completes. `decision_reason` is free-form text
   (e.g. "majority vote 2/3", "judge `qwen3:8b` picked `devstral`: …",
@@ -116,9 +119,9 @@ Tool-enabled `consensus_run` is sequential unless called with both
 subagent as a headless `cubi --json --no-stream --quiet` subprocess in
 its own throwaway git worktree, so the same JSON event stream is parsed
 without leaking losing candidates' file edits into the caller's checkout.
-Before launching those subprocesses, the parent applies the same trust and
-plan-mode gate used by non-isolated tool consensus: the parent cwd must be a
-trusted project and `/plan` must be off. The parent also resolves the repo
+Before launching those subprocesses, the parent applies a preflight trust and
+plan-mode gate: the parent cwd must be a trusted project and `/plan` must be
+off. The parent also resolves the repo
 top-level plus the relative cwd and starts each child in the matching
 worktree subdirectory. Because children branch from `HEAD`, isolated mode
 requires a clean git status (commit, stash, or discard changes first) rather
@@ -126,7 +129,7 @@ than trying to copy uncommitted or untracked state into every worktree.
 The parent also sets `CUBI_HOME` for each child so Cubi state
 (`.cubi/config.json`, trust store, sessions, MCP config, etc.) is rooted in
 the child temp home rather than the real user profile.
-Use `max_steps_per_subagent` and `isolated_time_cap_secs` on the meta-tool
+Use `max_steps` and `isolated_time_cap_secs` on the meta-tool
 (or `/consensus ... --isolate --max-steps <n>
 --isolated-time-cap-secs <seconds> ...`) to set each subagent's step budget
 and isolated subprocess wall-clock cap; timeouts are reported as
