@@ -263,36 +263,8 @@ impl ChatCLI {
         );
 
         // Leave the user with a clear hint on how to pick a chat back up.
-        // Three cases:
-        //   1. We have an on-disk checkpoint for *this* chat → point at it
-        //      directly with /resume <id>.
-        //   2. No current session, but other checkpoints exist in this
-        //      cwd → mention /sessions so they can still find them.
-        //   3. Nothing on disk at all → say nothing; a hint would just
-        //      be noise.
-        let resume_hint = self.session_store.as_ref().and_then(|store| {
-            if let Some(session) = self.current_session.as_ref() {
-                if !store.exists(&session.id) {
-                    return None;
-                }
-                Some(format!(
-                    "\n{} To pick this chat back up, run {}",
-                    "↩".bright_cyan(),
-                    format!("cubi --resume {}", session.id).bright_cyan()
-                ))
-            } else if store.list().map(|l| !l.is_empty()).unwrap_or(false) {
-                Some(format!(
-                    "\n{} Run {} to jump back into your most recent chat, or {} for a list.",
-                    "↩".bright_cyan(),
-                    "cubi --resume".bright_cyan(),
-                    "cubi  →  /sessions".bright_cyan()
-                ))
-            } else {
-                None
-            }
-        });
-        if let Some(hint) = resume_hint {
-            println!("{}", hint);
+        if let Some(hint) = self.resume_hint() {
+            println!("\n{hint}");
         }
 
         Ok(())

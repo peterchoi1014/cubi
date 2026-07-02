@@ -121,21 +121,6 @@ where
                             event::Action::None => {}
                         }
                     }
-                    // Mouse wheel → scroll the transcript.
-                    Some(Ok(Event::Mouse(me))) => {
-                        use crossterm::event::MouseEventKind;
-                        match me.kind {
-                            MouseEventKind::ScrollUp => {
-                                state.scroll_up(3);
-                                terminal.draw(|f| widgets::draw(f, &state))?;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                state.scroll_down(3);
-                                terminal.draw(|f| widgets::draw(f, &state))?;
-                            }
-                            _ => {}
-                        }
-                    }
                     // Resize / focus / paste etc: repaint against current size.
                     Some(Ok(_)) => {
                         terminal.draw(|f| widgets::draw(f, &state))?;
@@ -291,6 +276,13 @@ impl ChatCLI {
             crate::receipts::ReceiptEvent::SessionEnd,
             &serde_json::json!({"mode": "tui"}),
         );
+
+        // Now that the terminal is back on the normal screen, print the
+        // resume hint (with the session id) so the user can copy it — the
+        // same hint the standard REPL shows on exit.
+        if let Some(hint) = self.resume_hint() {
+            println!("\n{hint}");
+        }
         Ok(())
     }
 

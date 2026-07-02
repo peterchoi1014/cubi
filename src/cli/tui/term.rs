@@ -9,14 +9,21 @@
 //! clean screen) and the subsequent unwinding `Drop` becomes a no-op.
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use std::io::{self, Stdout, stdout};
+use std::io::{self, Stdout, Write, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// DECSET 1007 (xterm "Alternate Scroll"): while the alternate screen is
+/// active, the terminal translates mouse-wheel motion into arrow-key presses
+/// instead of sending mouse events. This lets the wheel scroll the transcript
+/// (we map Up/Down to scroll) WITHOUT capturing the mouse, so the terminal's
+/// native click-drag text selection and copy keep working.
+const ENABLE_ALT_SCROLL: &str = "\x1b[?1007h";
+const DISABLE_ALT_SCROLL: &str = "\x1b[?1007l";
 
 /// Run `restore` at most once, guarded by `done`. Returns `true` iff this call
 /// actually executed the closure (i.e. it had not run before). Kept generic
@@ -34,7 +41,9 @@ pub(super) fn run_once(done: &AtomicBool, restore: impl FnOnce()) -> bool {
 /// step is best-effort: teardown must never itself panic or short-circuit.
 fn real_restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
+    let mut out = stdout();
+    let _ = out.write_all(DISABLE_ALT_SCROLL.as_bytes());
+    let _ = execute!(out, LeaveAlternateScreen, Show);
 }
 
 /// Owns the "we entered raw mode + alt screen" state for the lifetime of a
@@ -48,13 +57,16 @@ impl TerminalGuard {
     /// rolled back before returning so we never leave the terminal wedged.
     pub(super) fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        // Enable mouse capture so the wheel scrolls the transcript. Trade-off:
-        // the terminal's native click-drag text selection is intercepted while
-        // the TUI runs (hold Shift/Option in most terminals to bypass).
-        if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(e);
         }
+        // Request alternate-scroll mode so the wheel scrolls via arrow keys
+        // without capturing the mouse (preserving native selection/copy).
+        // Best-effort: terminals that don't support it simply ignore it.
+        let mut out = stdout();
+        let _ = out.write_all(ENABLE_ALT_SCROLL.as_bytes());
+        let _ = out.flush();
         Ok(Self {
             done: Arc::new(AtomicBool::new(false)),
         })
