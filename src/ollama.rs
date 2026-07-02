@@ -4,12 +4,14 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
-/// Strip `<think>...</think>` blocks from an assistant message's
-/// content before handing it back to the host. Some Ollama versions
-/// expose a separate `thinking` field that already strips these
-/// server-side; in that case the call is a no-op.
-fn strip_message_thinking(mut m: Message) -> Message {
+const DEFAULT_OLLAMA_NUM_CTX_CAP: usize = 32_768;
+
+/// Normalize assistant content before handing it back to the host.
+/// Some Ollama versions expose a separate `thinking` field that already
+/// strips `<think>...</think>` server-side; in that case this is a no-op.
+fn normalize_assistant_message(mut m: Message) -> Message {
     m.content = strip_thinking_blocks(&m.content);
+    synthesize_tool_call_from_content(&mut m);
     m
 }
 
@@ -24,6 +26,14 @@ pub struct ChatRequest {
     /// older models will silently ignore the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSpec>>,
+    /// Runtime options for Ollama's `/api/chat` endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<ChatOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatOptions {
+    pub num_ctx: usize,
 }
 
 /// Native tool definition forwarded to Ollama. Mirrors the OpenAI-compatible
@@ -115,6 +125,121 @@ pub struct ToolCallFunction {
     /// Ollama returns arguments as a JSON object; older clients sometimes
     /// stringify it. Accept both via `serde_json::Value`.
     pub arguments: serde_json::Value,
+}
+
+fn chat_options_for_model(model: &str) -> Option<ChatOptions> {
+    resolve_num_ctx(model, current_num_ctx_override()).map(|num_ctx| ChatOptions { num_ctx })
+}
+
+fn current_num_ctx_override() -> Option<usize> {
+    std::env::var("CUBI_NUM_CTX")
+        .ok()
+        .and_then(|raw| parse_positive_usize(&raw))
+}
+
+fn parse_positive_usize(raw: &str) -> Option<usize> {
+    let value = raw.trim().parse::<usize>().ok()?;
+    (value > 0).then_some(value)
+}
+
+fn resolve_num_ctx(model: &str, env_override: Option<usize>) -> Option<usize> {
+    let env_override = env_override.filter(|value| *value > 0);
+    let cap = env_override.unwrap_or(DEFAULT_OLLAMA_NUM_CTX_CAP);
+    match crate::llm::context_window_for_model(model) {
+        Some(model_window) => Some(model_window.min(cap)),
+        None => env_override,
+    }
+}
+
+fn synthesize_tool_call_from_content(message: &mut Message) -> bool {
+    if message.role != "assistant"
+        || message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        return false;
+    }
+
+    let Some(tool_call) = parse_tool_call_content(&message.content) else {
+        return false;
+    };
+
+    message.content.clear();
+    message.tool_calls = Some(vec![tool_call]);
+    true
+}
+
+fn parse_tool_call_content(content: &str) -> Option<ToolCall> {
+    let json = extract_tool_call_json(content)?.trim();
+    if !(json.starts_with('{') && json.ends_with('}')) {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let object = value.as_object()?;
+
+    let (name, arguments) = if let Some(function) = object.get("function") {
+        let function = function.as_object()?;
+        (
+            non_empty_string(function.get("name")?)?,
+            parse_tool_arguments(function.get("arguments")?)?,
+        )
+    } else {
+        (
+            non_empty_string(object.get("name")?)?,
+            parse_tool_arguments(object.get("arguments")?)?,
+        )
+    };
+
+    Some(ToolCall {
+        id: object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        call_type: Some(
+            object
+                .get("type")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("function")
+                .to_string(),
+        ),
+        function: ToolCallFunction { name, arguments },
+    })
+}
+
+fn extract_tool_call_json(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with("```") {
+        return Some(trimmed);
+    }
+
+    let without_closing = trimmed.strip_suffix("```")?;
+    let (opening, body) = without_closing.split_once('\n')?;
+    if opening.trim_end_matches('\r').trim() != "```json" || body.contains("```") {
+        return None;
+    }
+    Some(body.trim())
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<String> {
+    let value = value.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_tool_arguments(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(_) => Some(value.clone()),
+        serde_json::Value::String(raw) => {
+            let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+            parsed.is_object().then_some(parsed)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +385,7 @@ impl OllamaClient {
                 messages: messages.clone(),
                 stream: false,
                 tools: tools.clone(),
+                options: chat_options_for_model(model),
             };
             async move {
                 tracing::debug!(target: "cubi::llm::ollama", model = %model, "ollama chat request");
@@ -292,7 +418,7 @@ impl OllamaClient {
                         .unwrap_or(0),
                 };
 
-                Ok((strip_message_thinking(chat_response.message), stats))
+                Ok((normalize_assistant_message(chat_response.message), stats))
             }
         })
         .await
@@ -325,6 +451,7 @@ impl OllamaClient {
                 messages: messages.clone(),
                 stream: true,
                 tools: tools.clone(),
+                options: chat_options_for_model(model),
             };
             async move {
                 let response = self
@@ -429,8 +556,10 @@ impl OllamaClient {
             );
         }
 
-        let msg = final_msg
-            .ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))?;
+        let msg = normalize_assistant_message(
+            final_msg
+                .ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))?,
+        );
         Ok((msg, stats))
     }
 
@@ -538,5 +667,156 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments["command"], "ls");
+    }
+
+    #[test]
+    fn resolve_num_ctx_uses_model_window_when_below_cap() {
+        assert_eq!(resolve_num_ctx("llama2", None), Some(4_096));
+    }
+
+    #[test]
+    fn resolve_num_ctx_clamps_large_model_to_default_cap() {
+        assert_eq!(
+            resolve_num_ctx("qwen3-coder:30b", None),
+            Some(DEFAULT_OLLAMA_NUM_CTX_CAP)
+        );
+    }
+
+    #[test]
+    fn resolve_num_ctx_respects_env_override_cap() {
+        assert_eq!(
+            resolve_num_ctx("qwen3-coder:30b", Some(65_536)),
+            Some(65_536)
+        );
+        assert_eq!(resolve_num_ctx("llama2", Some(2_048)), Some(2_048));
+    }
+
+    #[test]
+    fn resolve_num_ctx_uses_override_for_unknown_model_only_when_present() {
+        assert_eq!(resolve_num_ctx("unknown-model", None), None);
+        assert_eq!(resolve_num_ctx("unknown-model", Some(8_192)), Some(8_192));
+        assert_eq!(resolve_num_ctx("unknown-model", Some(0)), None);
+    }
+
+    #[test]
+    fn chat_request_serializes_num_ctx_options() {
+        let request = ChatRequest {
+            model: "llama2".to_string(),
+            messages: vec![],
+            stream: false,
+            tools: None,
+            options: Some(ChatOptions { num_ctx: 4_096 }),
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["options"]["num_ctx"], 4_096);
+    }
+
+    #[test]
+    fn bare_tool_call_json_synthesizes_tool_call() {
+        let mut message = Message::text(
+            "assistant",
+            r#"{"name":"write_file","arguments":{"path":"a.txt","content":"hi"}}"#,
+        );
+
+        assert!(synthesize_tool_call_from_content(&mut message));
+        assert_eq!(message.content, "");
+        let calls = message.tool_calls.as_ref().expect("tool call synthesized");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        assert_eq!(calls[0].function.arguments["path"], "a.txt");
+        assert_eq!(calls[0].function.arguments["content"], "hi");
+    }
+
+    #[test]
+    fn function_tool_call_json_synthesizes_tool_call() {
+        let mut message = Message::text(
+            "assistant",
+            r#"{"function":{"name":"read_file","arguments":{"path":"src/lib.rs"}}}"#,
+        );
+
+        assert!(synthesize_tool_call_from_content(&mut message));
+        let calls = message.tool_calls.as_ref().expect("tool call synthesized");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments["path"], "src/lib.rs");
+        assert_eq!(message.content, "");
+    }
+
+    #[test]
+    fn tool_call_json_string_arguments_are_parsed() {
+        let content = serde_json::json!({
+            "name": "write_file",
+            "arguments": "{\"path\":\"a.txt\",\"content\":\"hi\"}"
+        })
+        .to_string();
+        let mut message = Message::text("assistant", content);
+
+        assert!(synthesize_tool_call_from_content(&mut message));
+        let calls = message.tool_calls.as_ref().expect("tool call synthesized");
+        assert_eq!(calls[0].function.name, "write_file");
+        assert_eq!(calls[0].function.arguments["path"], "a.txt");
+        assert_eq!(calls[0].function.arguments["content"], "hi");
+    }
+
+    #[test]
+    fn fenced_tool_call_json_synthesizes_tool_call() {
+        let mut message = Message::text(
+            "assistant",
+            "```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"src/main.rs\"}}\n```",
+        );
+
+        assert!(synthesize_tool_call_from_content(&mut message));
+        let calls = message.tool_calls.as_ref().expect("tool call synthesized");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn normal_prose_does_not_synthesize_tool_call() {
+        let content = "I should inspect the file before making changes.";
+        let mut message = Message::text("assistant", content);
+
+        assert!(!synthesize_tool_call_from_content(&mut message));
+        assert_eq!(message.content, content);
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn prose_that_mentions_json_does_not_synthesize_tool_call() {
+        let content = r#"Use this JSON object: {"name":"write_file","arguments":{"path":"a.txt"}}"#;
+        let mut message = Message::text("assistant", content);
+
+        assert!(!synthesize_tool_call_from_content(&mut message));
+        assert_eq!(message.content, content);
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn existing_structured_tool_calls_are_untouched() {
+        let content = r#"{"name":"write_file","arguments":{"path":"a.txt"}}"#;
+        let mut message = Message {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_existing".to_string()),
+                call_type: Some("function".to_string()),
+                function: ToolCallFunction {
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                },
+            }]),
+            tool_name: None,
+            tool_call_id: None,
+        };
+
+        assert!(!synthesize_tool_call_from_content(&mut message));
+        assert_eq!(message.content, content);
+        let calls = message
+            .tool_calls
+            .as_ref()
+            .expect("existing call preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call_existing"));
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments["command"], "pwd");
     }
 }
