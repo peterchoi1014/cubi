@@ -54,9 +54,16 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     }
     // Word-wrap long lines to the transcript width instead of truncating them.
     // `trim: false` preserves leading indentation (e.g. code blocks).
-    let transcript = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((state.scroll(), 0));
+    let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Scroll is measured from the bottom so the view auto-follows the newest
+    // output. Clamp against the wrapped line count (which respects the same
+    // `Wrap` setting) so PageUp/PageDown/mouse-wheel can't scroll into blank
+    // space, and `scroll_from_bottom == 0` always pins to the last line.
+    let total_rows = transcript.line_count(transcript_area.width) as u16;
+    let max_offset = total_rows.saturating_sub(transcript_area.height);
+    let from_bottom = state.scroll_from_bottom().min(max_offset);
+    let top = max_offset.saturating_sub(from_bottom);
+    let transcript = transcript.scroll((top, 0));
     frame.render_widget(transcript, transcript_area);
 
     // --- Composer (bordered, info at the four corners) --------------------
@@ -228,5 +235,50 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert!(buffer_contains(buf, "session started"));
         assert!(buffer_contains(buf, "streaming"));
+    }
+
+    #[test]
+    fn transcript_auto_follows_bottom_and_scroll_up_reveals_older() {
+        // More transcript lines than the small viewport can show at once.
+        let mut state = AppState::new();
+        for i in 0..40 {
+            state.apply(RenderEvent::Status(format!("line-{i:02}")));
+        }
+        // Tiny terminal so only a few transcript rows are visible.
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+
+        // Default (scroll_from_bottom == 0): the newest line must be visible
+        // and the oldest must be scrolled off.
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        {
+            let buf = terminal.backend().buffer();
+            assert!(buffer_contains(buf, "line-39"), "bottom not auto-followed");
+            assert!(
+                !buffer_contains(buf, "line-00"),
+                "oldest line should be scrolled off at the bottom"
+            );
+        }
+
+        // Scrolling up far enough reveals the oldest line (clamped to the top).
+        state.scroll_up(100);
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        {
+            let buf = terminal.backend().buffer();
+            assert!(
+                buffer_contains(buf, "line-00"),
+                "scroll_up did not reveal the oldest line"
+            );
+        }
+
+        // Scrolling back down returns to the bottom (auto-follow).
+        state.scroll_down(100);
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        {
+            let buf = terminal.backend().buffer();
+            assert!(
+                buffer_contains(buf, "line-39"),
+                "scroll_down did not return to the bottom"
+            );
+        }
     }
 }

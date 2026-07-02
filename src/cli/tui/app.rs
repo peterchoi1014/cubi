@@ -75,8 +75,12 @@ pub struct AppState {
     /// Cursor position as a **byte** offset into `composer` (always on a UTF-8
     /// char boundary).
     cursor: usize,
-    /// Vertical scroll offset (rows) into the transcript region.
-    scroll: u16,
+    /// How many rows the view is scrolled up from the bottom of the
+    /// transcript. `0` means "pinned to the bottom" so the newest output is
+    /// always visible (auto-follow); larger values reveal older content. The
+    /// widgets layer clamps this to the scrollable range at render time using
+    /// the wrapped line count, so it never needs to know the viewport size.
+    scroll_from_bottom: u16,
     /// The current pinned status snapshot rendered on the status row.
     status: StatusState,
     /// Whether the model is currently "thinking" (spinner analogue).
@@ -94,7 +98,7 @@ impl AppState {
             active_reply: String::new(),
             composer: String::new(),
             cursor: 0,
-            scroll: 0,
+            scroll_from_bottom: 0,
             status: placeholder_status(),
             thinking: false,
             thinking_label: String::new(),
@@ -119,8 +123,9 @@ impl AppState {
         self.cursor
     }
 
-    pub fn scroll(&self) -> u16 {
-        self.scroll
+    /// Rows the view is scrolled up from the bottom (0 = pinned to newest).
+    pub fn scroll_from_bottom(&self) -> u16 {
+        self.scroll_from_bottom
     }
 
     pub fn status(&self) -> &StatusState {
@@ -226,14 +231,17 @@ impl AppState {
         std::mem::take(&mut self.composer)
     }
 
-    /// Scroll the transcript up by `n` rows (toward older content).
+    /// Scroll the transcript up by `n` rows (toward older content). Moving away
+    /// from the bottom disables auto-follow until the view returns to the
+    /// bottom.
     pub fn scroll_up(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_sub(n);
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(n);
     }
 
-    /// Scroll the transcript down by `n` rows (toward newer content).
+    /// Scroll the transcript down by `n` rows (toward newer content). Reaching
+    /// the bottom (0) re-enables auto-follow.
     pub fn scroll_down(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_add(n);
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(n);
     }
 }
 
