@@ -152,3 +152,10 @@ opt-level = 0
 debug = true
 codegen-units = 256
 
+
+# The codebase predates clippy's `uninlined_format_args` lint being enabled by
+# default (it became a default warning again on the 1.88 toolchain used by CI).
+# The existing style uses `format!("{}", x)` throughout; allow it package-wide
+# rather than churning ~480 call sites. Applies to all targets (bin + tests).
+[lints.clippy]
+uninlined_format_args = "allow"
