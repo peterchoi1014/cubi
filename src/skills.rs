@@ -52,5 +52,19 @@ pub fn load_skills() -> Vec<Skill> {
 }
 
 pub fn skills_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cubi").join("skills"))
+    crate::sessions::cubi_dir().map(|d| d.join("skills"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skills_dir_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = skills_dir().expect("skills dir");
+            assert_eq!(path, cubi_home.join(".cubi").join("skills"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 }

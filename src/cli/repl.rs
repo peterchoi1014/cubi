@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn repl_history_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".cubi").join("history"))
+    crate::sessions::cubi_dir().map(|dir| dir.join("history"))
 }
 
 /// Drops cached session / plugin / MCP suggestion lists when the user
@@ -281,5 +281,19 @@ impl ChatCLI {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repl_history_path_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = repl_history_path().expect("history path");
+            assert_eq!(path, cubi_home.join(".cubi").join("history"));
+            assert!(!path.starts_with(other_home));
+        });
     }
 }

@@ -24,12 +24,113 @@ pub(crate) fn resolve_tool_rationale(
     "(no description)".to_string()
 }
 
+fn subprocess_step_cap_events(
+    message: &str,
+    steps_used: usize,
+    stats: &ChatStats,
+    window: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let mut error = crate::json_events::error(message);
+    if let Some(obj) = error.as_object_mut() {
+        obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
+    }
+    let final_event = serde_json::json!({
+        "type": "final",
+        "value": message,
+        "steps_used": steps_used,
+        "error": true,
+    });
+    let done = subprocess_done_event(stats, window, steps_used);
+    vec![final_event, error, done]
+}
+
+fn format_time_cap(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis >= 1000 && millis % 1000 == 0 {
+        format!("{}s", millis / 1000)
+    } else {
+        format!("{millis}ms")
+    }
+}
+
+fn subprocess_done_event(
+    stats: &ChatStats,
+    window: Option<usize>,
+    steps_used: usize,
+) -> serde_json::Value {
+    let mut done = crate::json_events::done_with_window(stats, window);
+    if let Some(obj) = done.as_object_mut() {
+        obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
+    }
+    done
+}
+
 impl ChatCLI {
+    pub(crate) fn build_turn_tool_specs(&self) -> Option<Vec<crate::ollama::ToolSpec>> {
+        let tools = self
+            .mcp_manager
+            .as_ref()
+            .and_then(agent_loop::build_tool_specs);
+        Self::filter_turn_tool_specs_for_subagent_mode(self.subprocess_subagent_mode, tools)
+    }
+
+    pub(crate) fn agent_step_cap(&self) -> usize {
+        self.max_agent_steps_override
+            .unwrap_or(MAX_AGENT_STEPS)
+            .clamp(1, MAX_AGENT_STEPS)
+    }
+
+    fn subprocess_time_cap_error(
+        &self,
+        cap: Duration,
+        steps_used: usize,
+        stats: &ChatStats,
+        json_enabled: bool,
+    ) -> anyhow::Error {
+        let message = format!("subagent time cap reached after {}", format_time_cap(cap));
+        if self.subprocess_subagent_mode && json_enabled {
+            let window = crate::llm::context_window_for_model(self.executor.get_model());
+            for event in subprocess_step_cap_events(&message, steps_used, stats, window) {
+                Self::emit_json_event(event);
+            }
+        }
+        exit_code::err(ExitCode::Tool, format!("cubi: {message}"))
+    }
+
+    fn meta_tool_blocked_in_subagent_mode(&self, tool_name: &str) -> Option<String> {
+        if !self.subprocess_subagent_mode {
+            return None;
+        }
+        match tool_name {
+            AGENT_TOOL_NAME => Some("[tool error] nested `agent_run` is not allowed".to_string()),
+            crate::agent_loop::CONSENSUS_TOOL_NAME => {
+                Some("[tool error] nested `consensus_run` is not allowed".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn filter_turn_tool_specs_for_subagent_mode(
+        subprocess_subagent_mode: bool,
+        tools: Option<Vec<crate::ollama::ToolSpec>>,
+    ) -> Option<Vec<crate::ollama::ToolSpec>> {
+        if subprocess_subagent_mode {
+            agent_loop::without_meta_tools(tools)
+        } else {
+            tools
+        }
+    }
+
     fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
         let cwd = std::env::current_dir().ok();
         let trusted = cwd
             .as_deref()
-            .map(|path| self.permissions.lock().unwrap().contains(path))
+            .map(|path| {
+                self.permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(path)
+            })
             .unwrap_or(false);
         if trusted || self.approved_tools.contains(tool_name) {
             return true;
@@ -85,7 +186,7 @@ impl ChatCLI {
         } else if !self
             .permissions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .check_tool_allowed(&call.function.name)
         {
             format!(
@@ -97,6 +198,11 @@ impl ChatCLI {
                 "[tool denied] user declined approval for `{}`",
                 call.function.name
             )
+        } else if call.function.name == AGENT_TOOL_NAME && agent_loop::meta_tools_disabled_by_env()
+        {
+            "[tool error] nested `agent_run` is not allowed".to_string()
+        } else if let Some(error) = self.meta_tool_blocked_in_subagent_mode(&call.function.name) {
+            error
         } else if call.function.name == AGENT_TOOL_NAME {
             // Meta-tool: spawn a focused subagent with fresh context. Handled
             // here (not in `McpManager`) because it needs the executor to
@@ -134,6 +240,10 @@ impl ChatCLI {
                     Err(e) => format!("[tool error] subagent failed: {e}"),
                 }
             }
+        } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME
+            && agent_loop::meta_tools_disabled_by_env()
+        {
+            "[tool error] nested `consensus_run` is not allowed".to_string()
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME {
             // Meta-tool: spawn N consensus subagents in parallel. The
             // subagent token usage is folded into `session_stats` here
@@ -207,10 +317,7 @@ impl ChatCLI {
 
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
-        let tools = self
-            .mcp_manager
-            .as_ref()
-            .and_then(agent_loop::build_tool_specs);
+        let tools = self.build_turn_tool_specs();
 
         // Track whether we've printed visible content on this turn so we
         // can choose when to add separating blank lines.
@@ -250,7 +357,26 @@ impl ChatCLI {
         // cancel: we leave file edits in place but pop the history.
         // (turn_start was captured before the user message was pushed.)
 
-        for step in 0..MAX_AGENT_STEPS {
+        let max_agent_steps = self.agent_step_cap();
+        let subprocess_time_cap = if self.subprocess_subagent_mode {
+            self.max_agent_time_cap_override
+        } else {
+            None
+        };
+        let subprocess_deadline = subprocess_time_cap.map(|cap| tokio::time::Instant::now() + cap);
+        for step in 0..max_agent_steps {
+            if let Some(deadline) = subprocess_deadline {
+                if let Some(cap) = subprocess_time_cap {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(self.subprocess_time_cap_error(
+                            cap,
+                            step,
+                            &turn_stats,
+                            json_enabled,
+                        ));
+                    }
+                }
+            }
             // Show a spinner while we wait for the model's first token.
             // Label differs by step so the user can tell "first response"
             // from "reacting to tool output".
@@ -280,6 +406,7 @@ impl ChatCLI {
             // when the user has /stream off (markdown mode is buffered-only).
             // Cancellation: SIGINT (Ctrl-C) interrupts the in-flight model
             // call; tool dispatch below is also cancellable between awaits.
+            let mut hit_time_cap = false;
             let outcome: Option<Result<(Message, ChatStats)>> = if self.stream_enabled {
                 let stream_fut =
                     self.executor
@@ -303,24 +430,61 @@ impl ChatCLI {
                             }
                             got_token = true;
                         });
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => None,
-                    r = stream_fut => Some(r),
+                if let Some(deadline) = subprocess_deadline {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            hit_time_cap = true;
+                            None
+                        },
+                        r = stream_fut => Some(r),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        r = stream_fut => Some(r),
+                    }
                 }
             } else {
                 let buf_fut = self
                     .executor
                     .chat_with_tools(self.history.clone(), tools.clone());
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => None,
-                    r = buf_fut => Some(r),
+                if let Some(deadline) = subprocess_deadline {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            hit_time_cap = true;
+                            None
+                        },
+                        r = buf_fut => Some(r),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => None,
+                        r = buf_fut => Some(r),
+                    }
                 }
             };
             // Always retire the spinner before we print anything else.
             stop_flag.store(true, Ordering::SeqCst);
             spinner.stop().await;
+
+            if hit_time_cap {
+                if got_token && headless_mode && !json_enabled {
+                    println!();
+                }
+                let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
+                return Err(self.subprocess_time_cap_error(
+                    cap,
+                    step + 1,
+                    &turn_stats,
+                    json_enabled,
+                ));
+            }
 
             // None == user pressed Ctrl-C mid-call. Truncate the history
             // back to the pre-turn snapshot so the conversation has no
@@ -424,10 +588,12 @@ impl ChatCLI {
                     any_output = true;
                 }
                 let window = crate::llm::context_window_for_model(self.executor.get_model());
-                Self::emit_json_event_if(
-                    json_enabled,
-                    crate::json_events::done_with_window(&turn_stats, window),
-                );
+                let done = if self.subprocess_subagent_mode {
+                    subprocess_done_event(&turn_stats, window, step + 1)
+                } else {
+                    crate::json_events::done_with_window(&turn_stats, window)
+                };
+                Self::emit_json_event_if(json_enabled, done);
                 if any_output && headless_mode && !json_enabled {
                     // Streaming prints tokens via `print!` with no
                     // trailing newline; emit exactly one for piping.
@@ -553,6 +719,7 @@ impl ChatCLI {
                     (Arc::clone(t), id, std::time::Instant::now())
                 });
 
+                let mut hit_time_cap = false;
                 let result_text = {
                     // Tool spinner: gives users a visible heartbeat
                     // (with elapsed seconds) while a slow tool runs.
@@ -564,10 +731,22 @@ impl ChatCLI {
                     );
                     let tool_fut = self.execute_tool_call(call);
                     tokio::pin!(tool_fut);
-                    let r = tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => None,
-                        r = &mut tool_fut => Some(r),
+                    let r = if let Some(deadline) = subprocess_deadline {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => None,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                hit_time_cap = true;
+                                None
+                            },
+                            r = &mut tool_fut => Some(r),
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => None,
+                            r = &mut tool_fut => Some(r),
+                        }
                     };
                     sp.finish().await;
                     r
@@ -583,6 +762,15 @@ impl ChatCLI {
                         );
                     }
                     self.cancel_tool_calls(turn_start, &calls, idx);
+                    if hit_time_cap {
+                        let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
+                        return Err(self.subprocess_time_cap_error(
+                            cap,
+                            step + 1,
+                            &turn_stats,
+                            json_enabled,
+                        ));
+                    }
                     if headless_mode {
                         return Err(exit_code::err(
                             ExitCode::Cancelled,
@@ -706,13 +894,23 @@ impl ChatCLI {
             // Diagnostic if we hit the cap mid-loop. The body of the loop
             // executed the tools for this step; if `step + 1 == MAX`, the
             // next call_stream is what we're skipping, so warn here.
-            if step + 1 == MAX_AGENT_STEPS {
-                eprintln!(
-                    "{} agent loop hit step cap ({}); stopping. Ask me to continue \
-                     if you want me to keep going.",
-                    "Warn:".bright_yellow(),
-                    MAX_AGENT_STEPS
+            if step + 1 == max_agent_steps {
+                let message = format!(
+                    "agent loop hit step cap ({max_agent_steps}) with pending tool calls; \
+                     stopping before a final assistant reply"
                 );
+                eprintln!("{} {}", "Warn:".bright_yellow(), message);
+                if self.subprocess_subagent_mode && json_enabled {
+                    let window = crate::llm::context_window_for_model(self.executor.get_model());
+                    for event in subprocess_step_cap_events(
+                        &format!("subagent {message}"),
+                        max_agent_steps,
+                        &turn_stats,
+                        window,
+                    ) {
+                        Self::emit_json_event(event);
+                    }
+                }
             }
         }
 
@@ -824,7 +1022,10 @@ impl ChatCLI {
     /// the model's JSON, drives [`consensus::run`], folds subagent
     /// stats into `session_stats`, and returns a text report for the
     /// model to consume on the next turn.
-    async fn execute_consensus_tool_call(&mut self, call: &ToolCall) -> anyhow::Result<String> {
+    pub(super) async fn execute_consensus_tool_call(
+        &mut self,
+        call: &ToolCall,
+    ) -> anyhow::Result<String> {
         let args = &call.function.arguments;
         let goal = args
             .get("goal")
@@ -873,6 +1074,7 @@ impl ChatCLI {
             .get("max_steps")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
+            .map(crate::consensus::normalize_max_steps_per_subagent)
             .unwrap_or(crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS);
         let concurrency = args
             .get("concurrency")
@@ -883,6 +1085,14 @@ impl ChatCLI {
             .get("use_tools")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let isolate = args
+            .get("isolate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let isolated_time_cap_secs = args
+            .get("isolated_time_cap_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let req = crate::consensus::ConsensusRequest {
             goal: goal.clone(),
@@ -891,13 +1101,20 @@ impl ChatCLI {
             max_steps_per_subagent: max_steps,
             concurrency,
             use_tools,
+            isolate,
+            isolated_time_cap_secs,
         };
+        if let Some(reason) = self.isolated_tool_consensus_policy_error(&req) {
+            anyhow::bail!(reason);
+        }
 
         self.emit_status(format!(
             "  {} consensus over {} models{}: {}",
             "↳".bright_magenta(),
             models.len(),
-            if use_tools {
+            if isolate {
+                " (tools, isolated)"
+            } else if use_tools {
                 " (tools, sequential)"
             } else {
                 ""
@@ -936,9 +1153,10 @@ impl ChatCLI {
                 report.push_str(&format!("- {} ✗ {}\n", sub.model, err));
             } else {
                 report.push_str(&format!(
-                    "- {} ✓ ({} tokens, {} ms)\n",
+                    "- {} ✓ ({} tokens, {} tool calls, {} ms)\n",
                     sub.model,
                     sub.prompt_tokens + sub.completion_tokens,
+                    sub.tool_calls,
                     sub.elapsed_ms
                 ));
             }
@@ -946,5 +1164,50 @@ impl ChatCLI {
         report.push_str("\n--- winning output ---\n");
         report.push_str(&result.winner_output);
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subprocess_step_cap_events_include_final_error_done_and_steps() {
+        let stats = ChatStats {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            elapsed_ms: 5,
+        };
+
+        let events = subprocess_step_cap_events("subagent hit cap", 2, &stats, Some(100));
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "final");
+        assert_eq!(events[0]["value"], "subagent hit cap");
+        assert_eq!(events[0]["steps_used"], 2);
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["message"], "subagent hit cap");
+        assert_eq!(events[1]["steps_used"], 2);
+        assert_eq!(events[2]["type"], "done");
+        assert_eq!(events[2]["stats"]["prompt_tokens"], 3);
+        assert_eq!(events[2]["stats"]["completion_tokens"], 4);
+        assert_eq!(events[2]["steps_used"], 2);
+    }
+
+    #[test]
+    fn subprocess_done_event_includes_exact_success_steps() {
+        let stats = ChatStats {
+            prompt_tokens: 6,
+            completion_tokens: 7,
+            elapsed_ms: 8,
+        };
+
+        let event = subprocess_done_event(&stats, Some(200), 1);
+
+        assert_eq!(event["type"], "done");
+        assert_eq!(event["stats"]["prompt_tokens"], 6);
+        assert_eq!(event["stats"]["completion_tokens"], 7);
+        assert_eq!(event["window"], 200);
+        assert_eq!(event["steps_used"], 1);
     }
 }

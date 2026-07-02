@@ -84,14 +84,14 @@ pub fn promote_legacy_env() {
 /// Returns the resolved path to the new config directory (`~/.cubi/`),
 /// or `None` if the home directory can't be determined.
 pub fn cubi_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cubi"))
+    crate::sessions::cubi_dir()
 }
 
 /// Legacy config directory from the pre-rebrand era (`~/.ai-chat-cli/`).
 /// Returned for migration purposes; production code should not read from
 /// this path directly.
 pub fn legacy_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".ai-chat-cli"))
+    Some(crate::sessions::home_dir()?.join(".ai-chat-cli"))
 }
 
 /// Rename `~/.ai-chat-cli/` → `~/.cubi/` exactly once, when the new
@@ -120,8 +120,80 @@ pub fn migrate_config_dir() {
 }
 
 #[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        old: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                old: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.old {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn with_cubi_home<T>(f: impl FnOnce(&Path, &Path) -> T) -> T {
+        let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
+        let cubi_home = tempfile::tempdir().expect("cubi home tempdir");
+        let other_home = tempfile::tempdir().expect("other home tempdir");
+        let _restore = EnvRestore::capture(&[
+            crate::sessions::CUBI_HOME_ENV,
+            "HOME",
+            "USERPROFILE",
+            "CUBI_OAUTH_FILE",
+            "CUBI_PLUGINS_DIR",
+        ]);
+        unsafe {
+            std::env::set_var(crate::sessions::CUBI_HOME_ENV, cubi_home.path());
+            std::env::set_var("HOME", other_home.path());
+            std::env::set_var("USERPROFILE", other_home.path());
+            std::env::remove_var("CUBI_OAUTH_FILE");
+            std::env::remove_var("CUBI_PLUGINS_DIR");
+        }
+
+        f(cubi_home.path(), other_home.path())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_dirs_use_cubi_home_before_platform_home() {
+        test_env::with_cubi_home(|cubi_home, other_home| {
+            let cubi = cubi_dir().expect("cubi dir");
+            let legacy = legacy_dir().expect("legacy dir");
+
+            assert_eq!(cubi, cubi_home.join(".cubi"));
+            assert_eq!(legacy, cubi_home.join(".ai-chat-cli"));
+            assert!(!cubi.starts_with(other_home));
+            assert!(!legacy.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn rename_table_has_no_duplicates() {

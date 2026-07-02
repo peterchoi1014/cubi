@@ -120,8 +120,8 @@ pub fn load_user_commands() -> Vec<UserCommand> {
     }
 
     // Global: ~/.cubi/commands/
-    if let Some(home) = dirs::home_dir() {
-        let global_dir = home.join(".cubi").join("commands");
+    if let Some(cubi_dir) = crate::sessions::cubi_dir() {
+        let global_dir = cubi_dir.join("commands");
         load_commands_from_dir(&global_dir, &mut commands, &mut seen_names);
     }
 
@@ -162,6 +162,35 @@ fn load_commands_from_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_user_commands_use_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let name = format!(
+                "cubi-home-path-probe-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let global_dir = cubi_home.join(".cubi").join("commands");
+            fs::create_dir_all(&global_dir).unwrap();
+            fs::write(
+                global_dir.join(format!("{name}.md")),
+                "# Probe\nUse Cubi home.",
+            )
+            .unwrap();
+
+            let commands = load_user_commands();
+            let command = commands
+                .iter()
+                .find(|command| command.name == name)
+                .expect("command loaded from CUBI_HOME");
+
+            assert!(command.path.starts_with(&global_dir));
+            assert!(!command.path.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn extract_mentions_finds_file_paths() {

@@ -35,7 +35,7 @@ pub fn is_enabled() -> bool {
 }
 
 fn log_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cubi").join("telemetry.log"))
+    Some(crate::sessions::cubi_dir()?.join("telemetry.log"))
 }
 
 /// Append one event. Silently no-ops when telemetry is disabled or the
@@ -88,6 +88,15 @@ pub fn record_tool_call(ev: ToolCallEvent<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_path_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = log_path().expect("log path");
+            assert_eq!(path, cubi_home.join(".cubi").join("telemetry.log"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn record_event_is_silent_when_disabled() {

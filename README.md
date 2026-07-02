@@ -10,7 +10,7 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 
 <div align="center">
 
-![Rust](https://img.shields.io/badge/rust-1.92.0-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.85-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
@@ -30,8 +30,15 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   arbitrate via vote, best-of-n, or judge. No other agent in the
   comparison does this natively. On single-GPU setups, pass
   `concurrency: 1` to the `consensus_run` tool to serialize the subagent
-  inference calls (the `/consensus` slash command always runs fully
-  parallel).
+  inference calls. Tool-enabled consensus is sequential by default to
+  avoid shared-worktree edit races; add `use_tools: true, isolate: true`
+  plus `isolated_time_cap_secs` (or `/consensus ... --isolate --max-steps 8
+  --isolated-time-cap-secs 300 ...`) to give each tool-using subagent
+  its own ephemeral git worktree and run them in parallel safely with an
+  optional per-subprocess wall-clock cap. Isolated tool consensus runs from
+  the matching relative subdirectory inside each worktree, but it still
+  requires the parent cwd to be trusted, refuses while `/plan` mode is on, and
+  requires a clean git status (commit, stash, or discard changes first).
 - 🔌 **MCP support** — load external Model Context Protocol servers from
   `~/.cubi/mcp.json` and call their tools alongside built-ins
 - 🧰 **MCP registry** — `cubi mcp search/install/uninstall` for one-command
@@ -113,7 +120,7 @@ A few common ones to get started:
 | `/plan` | Toggle plan mode (read-only) |
 | `/diff` / `/commit <msg>` / `/review` | Git workflow shortcuts |
 | `/repomap` | Print a tree-sitter outline of the current repo |
-| `/consensus <strategy> <m1,m2,...> [judge:<model>] <goal>` | Run a goal under multiple models and arbitrate (`vote` / `best-of-n` / `judge`) |
+| `/consensus <strategy> <m1,m2,...> [tools\|--tools] [isolate\|--isolate] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>` | Run a goal under multiple models and arbitrate; `--isolate` enables parallel tool worktrees and requires trusted, clean cwd with `/plan` off |
 | `/doctor` | Run environment health checks |
 | `/quit` | Exit |
 

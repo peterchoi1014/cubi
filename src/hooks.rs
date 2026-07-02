@@ -150,8 +150,7 @@ impl HookRegistry {
 
         // Global: ~/.cubi/hooks.json (only used when no local config exists)
         if !found_local {
-            if let Some(home) = dirs::home_dir() {
-                let global_path = home.join(".cubi").join("hooks.json");
+            if let Some(global_path) = global_hooks_path() {
                 if let Some(cfg) = Self::load_file(&global_path) {
                     hooks.extend(cfg.hooks);
                 }
@@ -349,7 +348,7 @@ pub fn save_global(hooks: &[HookDef]) -> Result<()> {
 /// Path to the global hooks config.
 #[allow(dead_code)]
 pub fn global_hooks_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cubi").join("hooks.json"))
+    crate::sessions::cubi_dir().map(|d| d.join("hooks.json"))
 }
 
 /// Path to the project-local hooks config.
@@ -363,6 +362,15 @@ pub fn local_hooks_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_hooks_path_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = global_hooks_path().expect("global hooks path");
+            assert_eq!(path, cubi_home.join(".cubi").join("hooks.json"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn matches_tool_exact() {

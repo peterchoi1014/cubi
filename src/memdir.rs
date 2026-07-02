@@ -188,8 +188,11 @@ impl Memdir {
 
     /// Resolves the path to `~/.cubi/memdir/memories.json`.
     fn storage_path() -> Option<PathBuf> {
-        let home = dirs::home_dir()?;
-        Some(home.join(".cubi").join("memdir").join("memories.json"))
+        Some(
+            crate::sessions::cubi_dir()?
+                .join("memdir")
+                .join("memories.json"),
+        )
     }
 }
 
@@ -197,6 +200,18 @@ impl Memdir {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn storage_path_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = Memdir::storage_path().expect("storage path");
+            assert_eq!(
+                path,
+                cubi_home.join(".cubi").join("memdir").join("memories.json")
+            );
+            assert!(!path.starts_with(other_home));
+        });
+    }
 
     fn tmp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()

@@ -154,9 +154,8 @@ impl TodoList {
 /// Computes the on-disk path for a given working directory's todos.
 /// Returns `None` if the home directory cannot be resolved.
 fn storage_path_for(cwd: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
     Some(
-        home.join(".cubi")
+        crate::sessions::cubi_dir()?
             .join("todos")
             .join(format!("{}.json", cwd_key(cwd))),
     )

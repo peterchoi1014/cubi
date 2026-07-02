@@ -112,10 +112,19 @@ cubi/
 - **Consensus** (`consensus.rs`) — backs the `consensus_run` meta-tool and
   `/consensus` slash command: spawns N subagents in parallel against
   caller-supplied models, then arbitrates via `vote`, `best-of-n`, or
-  `judge`. Subagents are LLM-only (no tools) in the MVP so the parallel
-  dispatch needs no shared-mutable `McpManager` state. Anti-recursion
-  is enforced via `agent_loop::without_meta_tools`, which strips both
-  meta-tools in lockstep so neither can be invoked from a subagent.
+  `judge`. LLM-only subagents run in parallel. Tool-enabled subagents run
+  sequentially in-process unless `isolate` is set with `use_tools`, in which
+  case each subagent is driven through a headless `cubi` subprocess in its own
+  ephemeral git worktree with optional per-subagent
+  `max_steps` / `--max-steps` and per-subprocess
+  `isolated_time_cap_secs` / `--isolated-time-cap-secs` caps. Isolated tool
+  consensus resolves the parent repo top-level plus relative cwd so children
+  run from the matching subdirectory in each worktree; it inherits the
+  parent's trusted-cwd and `/plan` gate and requires a clean git status before
+  any subprocess is launched.
+  Anti-recursion is enforced via
+  `agent_loop::without_meta_tools`, which strips both meta-tools in
+  lockstep so neither can be invoked from a subagent.
 - **Built-in tools** (`builtin_tools.rs`) — shell, filesystem, web, REPL,
   notebook, git worktree, and LSP code-intel implementations.
 - **Headless browser** (`browser_tool.rs`, feature `browser`) —

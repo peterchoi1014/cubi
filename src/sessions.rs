@@ -28,6 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ollama::Message;
 use crate::todos::cwd_key;
 
+/// Env override for Cubi's logical home/config root. Used by isolated
+/// subprocess subagents so their trust/config/session files stay inside the
+/// temporary home prepared for that child process.
+pub const CUBI_HOME_ENV: &str = "CUBI_HOME";
+
 /// Persisted shape of a single session checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
@@ -555,32 +560,45 @@ pub enum DeleteSessionResult {
     Ambiguous(Vec<SessionMeta>),
 }
 
-/// Returns the home directory, preferring the `HOME` environment variable
-/// (and `USERPROFILE` on Windows) over the platform lookup.
+/// Returns the home directory Cubi should use for per-user state, preferring
+/// [`CUBI_HOME_ENV`], then the platform's historical home-directory
+/// precedence.
 ///
 /// On Windows, `dirs::home_dir()` uses `SHGetKnownFolderPath`, which ignores
-/// the process environment. Checking the env vars first lets integration tests
-/// redirect session storage to a temporary directory by setting `HOME` /
-/// `USERPROFILE` on the child process.
+/// the process environment. Checking `CUBI_HOME` first lets isolated
+/// subprocesses redirect all Cubi state to a temporary directory without
+/// touching the developer's real profile.
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("HOME") {
-        let path = PathBuf::from(p);
-        if path.is_absolute() {
-            return Some(path);
-        }
+    if let Some(path) = absolute_env_path(CUBI_HOME_ENV) {
+        return Some(path);
+    }
+    #[cfg(not(windows))]
+    if let Some(path) = absolute_env_path("HOME") {
+        return Some(path);
     }
     #[cfg(windows)]
-    if let Ok(p) = std::env::var("USERPROFILE") {
-        let path = PathBuf::from(p);
-        if path.is_absolute() {
-            return Some(path);
-        }
+    if let Some(path) = absolute_env_path("USERPROFILE") {
+        // Windows must ignore HOME here to match historical dirs::home_dir() behavior.
+        return Some(path);
     }
     dirs::home_dir()
 }
 
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() { Some(path) } else { None }
+}
+
+pub fn cubi_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(".cubi"))
+}
+
 pub(crate) fn sessions_root() -> Option<PathBuf> {
-    Some(home_dir()?.join(".cubi").join("sessions"))
+    Some(cubi_dir()?.join("sessions"))
 }
 
 fn is_managed_session_dir(dir: &Path) -> bool {
@@ -885,8 +903,17 @@ mod tests {
         Message::text("assistant", text)
     }
 
-    fn restore_home(home: Option<std::ffi::OsString>, userprofile: Option<std::ffi::OsString>) {
+    fn restore_home(
+        cubi_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+    ) {
         unsafe {
+            if let Some(value) = cubi_home {
+                std::env::set_var(CUBI_HOME_ENV, value);
+            } else {
+                std::env::remove_var(CUBI_HOME_ENV);
+            }
             if let Some(value) = home {
                 std::env::set_var("HOME", value);
             } else {
@@ -898,6 +925,72 @@ mod tests {
                 std::env::remove_var("USERPROFILE");
             }
         }
+    }
+
+    #[test]
+    fn cubi_home_env_overrides_platform_home_for_state_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let cubi_home = tempfile::tempdir().unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(CUBI_HOME_ENV, cubi_home.path());
+            std::env::set_var("HOME", other_home.path());
+            std::env::set_var("USERPROFILE", other_home.path());
+        }
+
+        assert_eq!(home_dir().as_deref(), Some(cubi_home.path()));
+        let expected_cubi_dir = cubi_home.path().join(".cubi");
+        let expected_sessions_root = expected_cubi_dir.join("sessions");
+        assert_eq!(cubi_dir().as_deref(), Some(expected_cubi_dir.as_path()));
+        assert_eq!(
+            sessions_root().as_deref(),
+            Some(expected_sessions_root.as_path())
+        );
+
+        restore_home(old_cubi_home, old_home, old_userprofile);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_dir_prefers_home_over_userprofile_on_non_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("non-windows-home");
+        let userprofile = isolated_home("non-windows-userprofile");
+        unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &userprofile);
+        }
+
+        assert_eq!(home_dir().as_deref(), Some(home.as_path()));
+
+        restore_home(old_cubi_home, old_home, old_userprofile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_dir_ignores_home_and_prefers_userprofile_on_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let home = isolated_home("windows-home");
+        let userprofile = isolated_home("windows-userprofile");
+        unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &userprofile);
+        }
+
+        assert_eq!(home_dir().as_deref(), Some(userprofile.as_path()));
+
+        restore_home(old_cubi_home, old_home, old_userprofile);
     }
 
     fn isolated_home(label: &str) -> PathBuf {
@@ -1046,10 +1139,12 @@ mod tests {
     #[test]
     fn save_then_list_uses_sidecar_index() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
         let home = isolated_home("sidecar");
         unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
             std::env::set_var("HOME", &home);
             std::env::set_var("USERPROFILE", &home);
         }
@@ -1072,17 +1167,19 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, session.id);
         assert_eq!(list[0].preview, "indexed preview");
-        restore_home(old_home, old_userprofile);
+        restore_home(old_cubi_home, old_home, old_userprofile);
         fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn resume_prefers_last_used_session_for_cwd() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
         let home = isolated_home("last-used");
         unsafe {
+            std::env::remove_var(CUBI_HOME_ENV);
             std::env::set_var("HOME", &home);
             std::env::set_var("USERPROFILE", &home);
         }
@@ -1107,7 +1204,7 @@ mod tests {
 
         let resumed = store.latest_for_current_dir_preferred().unwrap().unwrap();
         assert_eq!(resumed.id, first.id);
-        restore_home(old_home, old_userprofile);
+        restore_home(old_cubi_home, old_home, old_userprofile);
         fs::remove_dir_all(&home).ok();
     }
 

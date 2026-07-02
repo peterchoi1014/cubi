@@ -828,8 +828,8 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/consensus",
-        usage: "/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>",
-        help: "Run a goal under N models in parallel and arbitrate (vote|best-of-n|judge)",
+        usage: "/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>",
+        help: "Run N-model consensus; --isolate uses tool worktrees (trusted clean cwd, /plan off), c:<n> capped at 2",
         cmd: Cmd::Consensus,
     },
 ];
@@ -1123,5 +1123,16 @@ mod tests {
                 "missing core command in registry: {must}"
             );
         }
+    }
+
+    #[test]
+    fn consensus_help_mentions_isolated_tool_worktrees() {
+        let spec = find_command("/consensus").expect("consensus command is registered");
+        assert!(spec.usage.contains("[isolate|--isolate]"));
+        assert!(spec.usage.contains("concurrency:<n>"));
+        assert!(spec.usage.contains("--max-steps"));
+        assert!(spec.usage.contains("--isolated-time-cap-secs"));
+        assert!(spec.help.contains("tool worktrees"));
+        assert!(spec.help.contains("c:<n> capped at 2"));
     }
 }

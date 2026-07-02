@@ -49,7 +49,7 @@ impl OAuthStore {
                 return Some(PathBuf::from(p));
             }
         }
-        Some(dirs::home_dir()?.join(".cubi").join("oauth.json"))
+        Some(crate::sessions::cubi_dir()?.join("oauth.json"))
     }
 
     pub fn load() -> Self {
@@ -234,6 +234,15 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn storage_path_uses_cubi_home_when_no_oauth_override() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = OAuthStore::storage_path().expect("storage path");
+            assert_eq!(path, cubi_home.join(".cubi").join("oauth.json"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn parse_login_args_basic() {

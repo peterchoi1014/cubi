@@ -19,9 +19,10 @@
 //! the user message and a short focusing system prompt. Tool access is
 //! strictly opt-in via [`ConsensusRequest::use_tools`]. Tool-enabled
 //! consensus runs subagents sequentially through the standard subagent
-//! loop so the live `McpManager` is never shared concurrently.
+//! loop (sharing the live `McpManager` and working tree) *unless*
+//! [`ConsensusRequest::isolate`] is also set — see the isolated mode below.
 //!
-//! ## Why tool mode is sequential (do not "optimize" into parallelism)
+//! ## Why in-process tool mode is sequential (do not "optimize" into parallelism)
 //!
 //! It is tempting to parallelize tool-enabled subagents (as the LLM-only
 //! path does) by wrapping the single `McpManager` in an async mutex and
@@ -31,29 +32,47 @@
 //! working tree, so their `edit_file`/`write_file`/`bash` effects
 //! interleave (A reads a file, B rewrites it, A edits a stale view, B
 //! runs tests against A's half-applied change …). That is a logical
-//! filesystem race the mutex cannot prevent. Real parallelism would
-//! require per-subagent workspace isolation, which the process-global
-//! current directory makes impossible in-process — it needs a subprocess
-//! (or worktree) per subagent, like the `bench`/`swebench` harnesses.
-//! That is scoped as future work; here, sequential is the correct design.
+//! filesystem race the mutex cannot prevent. Real parallelism requires
+//! per-subagent workspace isolation, which the process-global current
+//! directory makes impossible in-process.
 //!
-//! Note that tool mode is therefore **side-effecting**: every subagent's
-//! tool actions (including losing candidates') persist in the working
-//! tree. Consensus selects one *text* answer; it is not isolated
+//! Note that in-process tool mode is therefore **side-effecting**: every
+//! subagent's tool actions (including losing candidates') persist in the
+//! working tree. Consensus selects one *text* answer; it is not isolated
 //! best-of-N execution.
+//!
+//! ## Isolated tool mode (`isolate: true`)
+//!
+//! Setting [`ConsensusRequest::isolate`] (requires `use_tools: true`)
+//! sidesteps the shared-working-tree constraint above entirely: each
+//! subagent gets its own throwaway git worktree
+//! ([`crate::worktree_session`]) and runs inside it via a headless `cubi`
+//! subprocess with an isolated `HOME`
+//! ([`crate::proc_subagent::run_isolated_subagent`]), like the
+//! `bench`/`swebench` harnesses. Because no two subagents ever touch the
+//! same working tree, `run_isolated_tool_subagents` dispatches them with
+//! a low-default, capped `FuturesUnordered` + semaphore pattern respecting
+//! [`ConsensusRequest::concurrency`]. Each worktree (and its
+//! branch) is torn down once its subagent finishes, so only the winner's
+//! *text* answer survives — losing candidates' file edits are discarded
+//! along with their worktrees. This is real isolated best-of-N execution.
 //!
 //! ## Anti-recursion
 //!
-//! `consensus_run` is stripped from every subagent's tool list (both
-//! `agent_run` subagents and opt-in tool-enabled consensus subagents).
-//! The same [`agent_loop::without_meta_tools`] helper strips both
-//! `agent_run` and `consensus_run` so they can't drift apart.
+//! `consensus_run` is stripped from every subagent's tool list. In-process
+//! subagents use [`agent_loop::without_meta_tools`]; isolated subprocess
+//! subagents set [`agent_loop::DISABLE_META_TOOLS_ENV`] before starting the
+//! child so the top-level tool builder omits `agent_run` and `consensus_run`
+//! too. Both paths also reject explicit nested meta-tool calls defensively.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use anyhow::Result;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::json;
@@ -75,6 +94,29 @@ const CONSENSUS_SYSTEM_PROMPT: &str = "You are one of several focused worker sub
 /// Default per-subagent step cap. Kept as a constant so the tool spec
 /// and the dispatcher agree on the same default.
 pub const CONSENSUS_DEFAULT_MAX_STEPS: usize = 8;
+
+const CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY: usize = 1;
+const CONSENSUS_ISOLATED_MAX_CONCURRENCY: usize = 2;
+
+/// Normalize caller-supplied per-subagent step caps before dispatch.
+///
+/// Shared in-process subagents already clamp to at least one step in
+/// [`crate::agent_loop::run_subagent_with_model`]. Isolated subprocess
+/// subagents must receive the same positive lower bound before the hidden CLI
+/// argument is built; `--internal-max-steps 0` exits during flag parsing before
+/// it can emit the structured JSON final/error/done events the parent expects.
+pub(crate) fn normalize_max_steps_per_subagent(max_steps: usize) -> usize {
+    max_steps.max(1)
+}
+
+fn isolated_permits(concurrency: usize, models: usize) -> usize {
+    let requested = if concurrency == 0 {
+        CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY
+    } else {
+        concurrency.min(CONSENSUS_ISOLATED_MAX_CONCURRENCY)
+    };
+    requested.min(models.max(1)).max(1)
+}
 
 /// Arbitration strategy used by [`run`] to pick a winner.
 #[derive(Debug, Clone)]
@@ -99,13 +141,36 @@ pub struct ConsensusRequest {
     /// Per-subagent step cap. LLM-only consensus uses a single call;
     /// tool-enabled consensus clamps this into the subagent loop cap.
     pub max_steps_per_subagent: usize,
-    /// Maximum number of subagents in flight at once. `0` means
-    /// `models.len()` — i.e. fully parallel. `1` is sequential.
+    /// Maximum number of subagents in flight at once. In LLM-only mode,
+    /// `0` means `models.len()`; isolated tool mode uses its own safer
+    /// default and cap.
     pub concurrency: usize,
     /// When false (the default), each subagent is a single LLM-only call.
-    /// When true, each subagent may use tools and runs sequentially.
+    /// When true, each subagent may use tools and runs sequentially
+    /// (unless `isolate` is also set — see below).
     pub use_tools: bool,
+    /// Opt in to per-subagent workspace isolation for tool-enabled
+    /// consensus. Ignored unless `use_tools` is also true (validated in
+    /// [`run_inner`]). When true, each subagent runs in its own ephemeral
+    /// git worktree ([`crate::worktree_session`]) driven by a headless
+    /// `cubi` subprocess with an isolated `HOME`
+    /// ([`crate::proc_subagent::run_isolated_subagent`]) instead of the
+    /// shared in-process `McpManager`. Because each subagent's tool
+    /// actions are confined to its own worktree, subagents can run in
+    /// parallel (respecting `concurrency`) without the interleaved-edit
+    /// race described in the module docs above. This is the isolation
+    /// scoped as "future work" in that note.
+    pub isolate: bool,
+    /// Wall-clock cap per isolated subprocess subagent. Ignored unless
+    /// `isolate` is true. `0` is clamped to
+    /// [`CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS`].
+    pub isolated_time_cap_secs: u64,
 }
+
+/// Default wall-clock budget for one isolated (worktree + subprocess)
+/// tool-enabled subagent, used when
+/// [`ConsensusRequest::isolated_time_cap_secs`] is `0`.
+pub const CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS: u64 = 300;
 
 /// One subagent's output. Recorded for every model in `models` —
 /// successes and failures alike — so the caller can show a per-model
@@ -115,6 +180,9 @@ pub struct SubagentOutput {
     pub model: String,
     pub output: String,
     pub steps_used: usize,
+    /// Tool calls observed for this subagent. LLM-only subagents report `0`;
+    /// tool-enabled subagents report the runner's observed tool-call count.
+    pub tool_calls: usize,
     pub elapsed_ms: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -135,6 +203,8 @@ pub struct ConsensusResult {
     pub winner_output: String,
     pub subagent_outputs: Vec<SubagentOutput>,
     pub decision_reason: String,
+    #[serde(skip_serializing_if = "ChatStats::is_empty")]
+    pub arbitration_stats: ChatStats,
     /// Strategy the caller asked for. Recorded so display and report
     /// code don't have to infer the strategy back out of
     /// `decision_reason` (which is fragile — a `Vote` run that
@@ -147,7 +217,7 @@ impl ConsensusResult {
     /// Folded into the parent turn's `ChatStats` by the dispatcher so
     /// `/cost` and the usage footer include consensus traffic.
     pub fn aggregate_stats(&self) -> ChatStats {
-        let mut s = ChatStats::default();
+        let mut s = self.arbitration_stats.clone();
         for sub in &self.subagent_outputs {
             s.prompt_tokens += sub.prompt_tokens;
             s.completion_tokens += sub.completion_tokens;
@@ -169,7 +239,8 @@ pub fn consensus_run_spec() -> ToolSpec {
                           Useful when you want a more reliable answer than any single model \
                           can provide. Cannot be called from within a subagent (anti-recursion). \
                           By default subagents are LLM-only and may run in parallel. Set \
-                          use_tools=true to let subagents use tools; tool mode is sequential."
+                          use_tools=true to let subagents use tools; add isolate=true for \
+                          parallel tool use in throwaway git worktrees."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -182,7 +253,7 @@ pub fn consensus_run_spec() -> ToolSpec {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 2,
-                        "description": "Models to consult. LLM-only mode may run them in parallel; tool mode runs sequentially."
+                        "description": "Models to consult. LLM-only mode may run them in parallel; shared-tree tool mode runs sequentially; isolated tool mode uses capped `concurrency`."
                     },
                     "strategy": {
                         "type": "string",
@@ -195,17 +266,29 @@ pub fn consensus_run_spec() -> ToolSpec {
                     },
                     "max_steps": {
                         "type": "integer",
-                        "default": CONSENSUS_DEFAULT_MAX_STEPS
+                        "minimum": 1,
+                        "default": CONSENSUS_DEFAULT_MAX_STEPS,
+                        "description": "Positive per-subagent agent-loop step cap (default 8)."
                     },
                     "concurrency": {
                         "type": "integer",
                         "default": 0,
-                        "description": "0 = parallel (len(models)); 1 = sequential. Ignored when use_tools=true because tool mode is always sequential."
+                        "description": format!("0 = LLM-only parallel (len(models)); 1 = sequential. In shared-tree tool mode (use_tools=true, isolate=false), subagents are forced sequential regardless of this value. WARNING: isolated tool mode spawns a full model-driving `cubi` subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
                     },
                     "use_tools": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Opt in to tool-enabled subagents. Defaults to false. When true, subagents run SEQUENTIALLY and their tool actions are side-effecting: every subagent (including losing candidates) mutates the shared working tree. Consensus still selects one text answer; it is not isolated best-of-N execution."
+                        "description": "Opt in to tool-enabled subagents. Defaults to false. When true and `isolate` is false, subagents run SEQUENTIALLY and their tool actions are side-effecting: every subagent (including losing candidates) mutates the shared working tree. Consensus still selects one text answer; it is not isolated best-of-N execution. Set `isolate=true` to confine each tool-enabled subagent to its own throwaway git worktree."
+                    },
+                    "isolate": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": format!("Requires use_tools=true. Runs each tool-enabled subagent in its own ephemeral git worktree via a headless `cubi` subprocess, so subagents can run without their tool actions interleaving on a shared working tree. WARNING: isolate mode spawns a full model-driving subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}. Losing candidates' worktrees are discarded, so only the winner's reasoning (not its file edits) survives — this is isolated best-of-N execution, unlike the shared-tree sequential mode.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
+                    },
+                    "isolated_time_cap_secs": {
+                        "type": "integer",
+                        "default": CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS,
+                        "description": "Ignored unless `isolate` is true. Wall-clock cap per isolated subprocess subagent; the subagent is killed and recorded as a timeout error if exceeded."
                     }
                 },
                 "required": ["goal", "models"]
@@ -237,9 +320,9 @@ impl ConsensusEventSink for NullSink {
 /// subagents in parallel (limited by [`ConsensusRequest::concurrency`]),
 /// arbitrates the outputs, and returns a [`ConsensusResult`].
 ///
-/// If [`ConsensusRequest::use_tools`] is true, call [`run_with_tools`]
-/// instead so the live MCP manager can be threaded through the sequential
-/// tool loop.
+/// If [`ConsensusRequest::use_tools`] is true without isolation, call
+/// [`run_with_tools`] instead so the live MCP manager can be threaded
+/// through the sequential shared-tree tool loop.
 ///
 /// Errors in individual subagents are recorded with `error: Some(...)`
 /// and excluded from arbitration; only a wholesale failure (no model
@@ -255,9 +338,12 @@ pub async fn run(
 /// Drives a consensus run that may opt in to tool-enabled subagents.
 ///
 /// When [`ConsensusRequest::use_tools`] is false this delegates to the
-/// unchanged LLM-only path. When it is true, subagents are run
-/// sequentially regardless of [`ConsensusRequest::concurrency`] because
-/// tool execution needs a single live mutable [`McpManager`].
+/// unchanged LLM-only path. When it is true and
+/// [`ConsensusRequest::isolate`] is false, subagents are run sequentially
+/// regardless of [`ConsensusRequest::concurrency`] because tool execution
+/// uses one live mutable [`McpManager`] and one shared working tree. Isolated
+/// tool mode ignores the MCP manager and runs subprocess subagents in
+/// throwaway worktrees, bounded by `concurrency`.
 pub async fn run_with_tools(
     req: ConsensusRequest,
     executor: &AIExecutor,
@@ -273,13 +359,30 @@ async fn run_inner(
     sink: &dyn ConsensusEventSink,
     mcp: Option<&mut Option<McpManager>>,
 ) -> Result<ConsensusResult> {
+    run_inner_with_isolated_runner(req, executor, sink, mcp, None).await
+}
+
+async fn run_inner_with_isolated_runner(
+    mut req: ConsensusRequest,
+    executor: &AIExecutor,
+    sink: &dyn ConsensusEventSink,
+    mcp: Option<&mut Option<McpManager>>,
+    isolated_runner: Option<IsolatedSubagentRunner>,
+) -> Result<ConsensusResult> {
+    req.max_steps_per_subagent = normalize_max_steps_per_subagent(req.max_steps_per_subagent);
     if req.models.len() < 2 {
         anyhow::bail!(
             "consensus_run requires at least 2 models, got {}",
             req.models.len()
         );
     }
-    if req.use_tools {
+    if req.isolate && !req.use_tools {
+        anyhow::bail!(
+            "consensus_run: `isolate` requires `use_tools=true` (LLM-only mode has no \
+             side effects to isolate)"
+        );
+    }
+    if req.use_tools && !req.isolate {
         match mcp.as_ref() {
             None => {
                 anyhow::bail!(
@@ -304,8 +407,16 @@ async fn run_inner(
         req.max_steps_per_subagent,
     );
 
-    let subagent_outputs = if req.use_tools {
-        let mcp = mcp.expect("tool-enabled consensus requires MCP manager");
+    let subagent_outputs = if req.use_tools && req.isolate {
+        if let Some(runner) = isolated_runner {
+            run_isolated_tool_subagents_with_runner(&req, runner).await
+        } else {
+            run_isolated_tool_subagents(&req).await?
+        }
+    } else if req.use_tools {
+        let Some(mcp) = mcp else {
+            anyhow::bail!("tool-enabled consensus requires an MCP manager; call run_with_tools");
+        };
         run_tool_subagents(&req, executor, mcp).await
     } else {
         run_llm_subagents(&req, executor).await
@@ -317,9 +428,24 @@ async fn run_inner(
 
     let successes: Vec<&SubagentOutput> = subagent_outputs.iter().filter(|s| s.ok()).collect();
     if successes.is_empty() {
+        let details = subagent_outputs
+            .iter()
+            .filter_map(|sub| {
+                sub.error
+                    .as_ref()
+                    .map(|err| format!("{}: {err}", sub.model))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let suffix = if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", truncate(&details, 1000))
+        };
         anyhow::bail!(
-            "consensus_run: every subagent failed ({} models)",
-            subagent_outputs.len()
+            "consensus_run: every subagent failed ({} models){}",
+            subagent_outputs.len(),
+            suffix
         );
     }
     if successes.len() == 1 {
@@ -331,19 +457,20 @@ async fn run_inner(
             winner_output: only.output,
             subagent_outputs,
             decision_reason: reason,
+            arbitration_stats: ChatStats::default(),
             requested_strategy: strategy_label.to_string(),
         });
     }
 
-    let (winner_idx, decision_reason) =
-        arbitrate(&req, executor, &subagent_outputs, &successes).await;
-    let winner = &subagent_outputs[winner_idx];
-    sink.decision(&winner.model, &decision_reason);
+    let decision = arbitrate(&req, executor, &subagent_outputs, &successes).await;
+    let winner = &subagent_outputs[decision.winner_idx];
+    sink.decision(&winner.model, &decision.reason);
     Ok(ConsensusResult {
         winner_model: winner.model.clone(),
         winner_output: winner.output.clone(),
         subagent_outputs: subagent_outputs.clone(),
-        decision_reason,
+        decision_reason: decision.reason,
+        arbitration_stats: decision.stats,
         requested_strategy: strategy_label.to_string(),
     })
 }
@@ -363,8 +490,23 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
         let fut = async move {
             // Permit is dropped when the closure returns, releasing the
             // slot for the next queued subagent.
-            let _permit = sem.acquire_owned().await.expect("semaphore closed");
             let started = Instant::now();
+            let Ok(_permit) = sem.acquire_owned().await else {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return (
+                    idx,
+                    SubagentOutput {
+                        model,
+                        output: String::new(),
+                        steps_used: 0,
+                        tool_calls: 0,
+                        elapsed_ms,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        error: Some("consensus dispatcher semaphore closed".to_string()),
+                    },
+                );
+            };
             let messages = vec![
                 Message::text("system", CONSENSUS_SYSTEM_PROMPT),
                 Message::text("user", goal.as_str()),
@@ -376,6 +518,7 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                     model: model.clone(),
                     output: msg.content,
                     steps_used: 1,
+                    tool_calls: 0,
                     elapsed_ms: elapsed_ms.max(stats.elapsed_ms),
                     prompt_tokens: stats.prompt_tokens,
                     completion_tokens: stats.completion_tokens,
@@ -385,6 +528,7 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                     model: model.clone(),
                     output: String::new(),
                     steps_used: 0,
+                    tool_calls: 0,
                     elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -434,6 +578,7 @@ async fn run_tool_subagents(
                 model: model.clone(),
                 output: result.output,
                 steps_used: result.steps_used,
+                tool_calls: result.tool_calls,
                 elapsed_ms: elapsed_ms.max(result.stats.elapsed_ms),
                 prompt_tokens: result.stats.prompt_tokens,
                 completion_tokens: result.stats.completion_tokens,
@@ -443,6 +588,7 @@ async fn run_tool_subagents(
                 model: model.clone(),
                 output: String::new(),
                 steps_used: 0,
+                tool_calls: 0,
                 elapsed_ms,
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -454,13 +600,517 @@ async fn run_tool_subagents(
     subagent_outputs
 }
 
-/// Returns `(winner_index_in_subagent_outputs, decision_reason)`.
+/// Run tool-enabled consensus subagents **in parallel**, each confined to
+/// its own ephemeral git worktree and driven by a headless `cubi`
+/// subprocess with an isolated `HOME` (see [`crate::worktree_session`] and
+/// [`crate::proc_subagent`]). Unlike [`run_tool_subagents`], parallelism
+/// here is safe because no two subagents ever touch the same working
+/// tree — this is the isolation the module-level "Why tool mode is
+/// sequential" note scopes as future work.
+///
+/// Per-model failures (worktree provisioning, subprocess spawn, timeout,
+/// non-zero exit, empty output) are recorded as
+/// `SubagentOutput { error: Some(_), .. }`
+/// rather than aborting the whole run, matching the LLM-only and
+/// sequential-tool paths.
+type IsolatedSubagentRunner = Arc<
+    dyn Fn(
+            String,
+            String,
+            Duration,
+            usize,
+        ) -> BoxFuture<'static, Result<crate::proc_subagent::ProcSubagentResult>>
+        + Send
+        + Sync,
+>;
+
+fn real_isolated_subagent_runner(context: IsolatedRepoContext) -> IsolatedSubagentRunner {
+    Arc::new(move |model, goal, time_cap, max_steps| {
+        let context = context.clone();
+        Box::pin(async move {
+            run_one_isolated_subagent_in_repo_with_trust_root(
+                &context.repo_top,
+                &context.relative_cwd,
+                &context.trusted_root_relative,
+                "HEAD",
+                &model,
+                &goal,
+                time_cap,
+                max_steps,
+            )
+            .await
+        })
+    })
+}
+
+#[derive(Debug, Clone)]
+struct IsolatedRepoContext {
+    repo_top: PathBuf,
+    relative_cwd: PathBuf,
+    trusted_root_relative: PathBuf,
+}
+
+async fn run_isolated_tool_subagents(req: &ConsensusRequest) -> Result<Vec<SubagentOutput>> {
+    let context = prepare_isolated_repo_context().await?;
+    Ok(run_isolated_tool_subagents_with_runner(req, real_isolated_subagent_runner(context)).await)
+}
+
+async fn run_isolated_tool_subagents_with_runner(
+    req: &ConsensusRequest,
+    runner: IsolatedSubagentRunner,
+) -> Vec<SubagentOutput> {
+    let permits = isolated_permits(req.concurrency, req.models.len());
+    let semaphore = Arc::new(Semaphore::new(permits));
+    let time_cap_secs = if req.isolated_time_cap_secs == 0 {
+        CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS
+    } else {
+        req.isolated_time_cap_secs
+    };
+    let time_cap = std::time::Duration::from_secs(time_cap_secs);
+    let max_steps_per_subagent = normalize_max_steps_per_subagent(req.max_steps_per_subagent);
+
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    for (idx, model) in req.models.iter().cloned().enumerate() {
+        let sem = Arc::clone(&semaphore);
+        let runner = Arc::clone(&runner);
+        let goal = req.goal.clone();
+        let max_steps = max_steps_per_subagent;
+        let fut = async move {
+            // Permit is dropped when the closure returns, releasing the
+            // slot for the next queued subagent.
+            let started = Instant::now();
+            let Ok(_permit) = sem.acquire_owned().await else {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return (
+                    idx,
+                    SubagentOutput {
+                        model,
+                        output: String::new(),
+                        steps_used: 0,
+                        tool_calls: 0,
+                        elapsed_ms,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        error: Some("isolated consensus dispatcher semaphore closed".to_string()),
+                    },
+                );
+            };
+            let res = (runner)(model.clone(), goal, time_cap, max_steps).await;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let sub = match res {
+                Ok(proc) if proc.timed_out => SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
+                    elapsed_ms,
+                    prompt_tokens: proc.prompt_tokens,
+                    completion_tokens: proc.completion_tokens,
+                    error: Some(proc_error_message(
+                        format!("isolated subagent timed out after {time_cap_secs}s"),
+                        &proc,
+                    )),
+                },
+                Ok(proc) if proc.error.is_some() => SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
+                    elapsed_ms,
+                    prompt_tokens: proc.prompt_tokens,
+                    completion_tokens: proc.completion_tokens,
+                    error: Some(proc_error_message(
+                        "isolated subagent reported error".to_string(),
+                        &proc,
+                    )),
+                },
+                Ok(proc) if proc.exit_code != Some(0) => SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
+                    elapsed_ms,
+                    prompt_tokens: proc.prompt_tokens,
+                    completion_tokens: proc.completion_tokens,
+                    error: Some(proc_error_message(
+                        format!("isolated subagent exited with status {:?}", proc.exit_code),
+                        &proc,
+                    )),
+                },
+                Ok(proc) if proc.output.trim().is_empty() => SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
+                    elapsed_ms,
+                    prompt_tokens: proc.prompt_tokens,
+                    completion_tokens: proc.completion_tokens,
+                    error: Some(proc_error_message(
+                        format!(
+                            "isolated subagent produced empty output (exit code {:?})",
+                            proc.exit_code
+                        ),
+                        &proc,
+                    )),
+                },
+                Ok(proc) => SubagentOutput {
+                    model: model.clone(),
+                    output: proc.output,
+                    steps_used: proc.steps_used,
+                    tool_calls: proc.tool_calls,
+                    elapsed_ms,
+                    prompt_tokens: proc.prompt_tokens,
+                    completion_tokens: proc.completion_tokens,
+                    error: None,
+                },
+                Err(e) => SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: 0,
+                    tool_calls: 0,
+                    elapsed_ms,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    error: Some(truncate(&e.to_string(), 400)),
+                },
+            };
+            (idx, sub)
+        };
+        in_flight.push(fut);
+    }
+
+    let mut indexed: Vec<(usize, SubagentOutput)> = Vec::with_capacity(req.models.len());
+    while let Some((idx, sub)) = in_flight.next().await {
+        indexed.push((idx, sub));
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    indexed.into_iter().map(|(_, o)| o).collect()
+}
+
+fn proc_error_message(base: String, proc: &crate::proc_subagent::ProcSubagentResult) -> String {
+    let diagnostics = proc.diagnostics();
+    if diagnostics.trim().is_empty() {
+        truncate(&base, 1000)
+    } else {
+        truncate(&format!("{base}: {diagnostics}"), 1000)
+    }
+}
+
+async fn prepare_isolated_repo_context() -> Result<IsolatedRepoContext> {
+    tokio::task::spawn_blocking(|| {
+        let cwd =
+            std::env::current_dir().context("read current directory for isolated subagent")?;
+        let context = crate::worktree_session::resolve_repo_context(&cwd)?;
+        let permissions = crate::permissions::Permissions::load();
+        let trusted_root_relative =
+            translated_isolated_trust_root_relative(&cwd, &context.top_level, &permissions)?;
+        crate::worktree_session::ensure_clean_worktree(&context.top_level).with_context(|| {
+            format!(
+                "Refusing isolated tool consensus from `{}`",
+                context.top_level.display()
+            )
+        })?;
+        Ok::<_, anyhow::Error>(IsolatedRepoContext {
+            repo_top: context.top_level,
+            relative_cwd: context.relative_cwd,
+            trusted_root_relative,
+        })
+    })
+    .await
+    .context("join isolated repository preflight task")?
+}
+
+fn translated_isolated_trust_root_relative(
+    cwd: &Path,
+    repo_top: &Path,
+    permissions: &crate::permissions::Permissions,
+) -> Result<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("canonicalize cwd `{}`", cwd.display()))?;
+    let repo_top = std::fs::canonicalize(repo_top)
+        .with_context(|| format!("canonicalize git top-level `{}`", repo_top.display()))?;
+
+    let mut best: Option<(usize, PathBuf)> = None;
+    for trusted_root in permissions.trusted_roots() {
+        let Ok(trusted_root) = std::fs::canonicalize(trusted_root) else {
+            continue;
+        };
+        if !cwd.starts_with(&trusted_root) {
+            continue;
+        }
+        let translated = if trusted_root.starts_with(&repo_top) {
+            trusted_root
+                .strip_prefix(&repo_top)
+                .with_context(|| {
+                    format!(
+                        "translate trusted root `{}` under git top-level `{}`",
+                        trusted_root.display(),
+                        repo_top.display()
+                    )
+                })?
+                .to_path_buf()
+        } else if repo_top.starts_with(&trusted_root) {
+            PathBuf::new()
+        } else {
+            continue;
+        };
+        let depth = trusted_root.components().count();
+        match &mut best {
+            Some((best_depth, best_path)) if depth < *best_depth => {
+                *best_depth = depth;
+                *best_path = translated;
+            }
+            None => best = Some((depth, translated)),
+            _ => {}
+        }
+    }
+
+    best.map(|(_, relative)| relative).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Refusing isolated tool consensus: `{}` is not under a trusted root that can be \
+             translated into git worktree `{}`. Run `/trust` in the project directory to \
+             approve it.",
+            cwd.display(),
+            repo_top.display()
+        )
+    })
+}
+
+#[allow(dead_code)]
+async fn run_one_isolated_subagent_in_repo(
+    repo_dir: &Path,
+    relative_cwd: &Path,
+    base_ref: &str,
+    model: &str,
+    goal: &str,
+    time_cap: Duration,
+    max_steps: usize,
+) -> Result<crate::proc_subagent::ProcSubagentResult> {
+    run_one_isolated_subagent_in_repo_with_trust_root(
+        repo_dir,
+        relative_cwd,
+        relative_cwd,
+        base_ref,
+        model,
+        goal,
+        time_cap,
+        max_steps,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_isolated_subagent_in_repo_with_trust_root(
+    repo_dir: &Path,
+    relative_cwd: &Path,
+    trusted_root_relative: &Path,
+    base_ref: &str,
+    model: &str,
+    goal: &str,
+    time_cap: Duration,
+    max_steps: usize,
+) -> Result<crate::proc_subagent::ProcSubagentResult> {
+    let cubi_bin = crate::proc_subagent::resolve_cubi_binary();
+    run_one_isolated_subagent_in_repo_with_binary_and_trust_root(
+        repo_dir,
+        relative_cwd,
+        trusted_root_relative,
+        base_ref,
+        model,
+        goal,
+        time_cap,
+        max_steps,
+        &cubi_bin,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+async fn run_one_isolated_subagent_in_repo_with_binary(
+    repo_dir: &Path,
+    relative_cwd: &Path,
+    base_ref: &str,
+    model: &str,
+    goal: &str,
+    time_cap: Duration,
+    max_steps: usize,
+    cubi_bin: &Path,
+) -> Result<crate::proc_subagent::ProcSubagentResult> {
+    run_one_isolated_subagent_in_repo_with_binary_and_trust_root(
+        repo_dir,
+        relative_cwd,
+        relative_cwd,
+        base_ref,
+        model,
+        goal,
+        time_cap,
+        max_steps,
+        cubi_bin,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_isolated_subagent_in_repo_with_binary_and_trust_root(
+    repo_dir: &Path,
+    relative_cwd: &Path,
+    trusted_root_relative: &Path,
+    base_ref: &str,
+    model: &str,
+    goal: &str,
+    time_cap: Duration,
+    max_steps: usize,
+    cubi_bin: &Path,
+) -> Result<crate::proc_subagent::ProcSubagentResult> {
+    let label = model.to_string();
+    let repo_dir = repo_dir.to_path_buf();
+    let base_ref = base_ref.to_string();
+    // `worktree_session::create` shells out to `git` synchronously; run it
+    // on a blocking thread so it doesn't stall the async executor.
+    let session = tokio::task::spawn_blocking(move || {
+        crate::worktree_session::create_in(&repo_dir, &base_ref, &label)
+    })
+    .await
+    .context("join worktree provisioning task")??;
+    // Wrap in a cancel-safe guard: if this `.await` below is dropped before
+    // completing (e.g. a caller races this future against Ctrl-C/timeout
+    // and drops the loser), the guard's `Drop` schedules teardown onto a
+    // blocking thread instead of running synchronous `git` commands inline
+    // on whatever thread is driving cancellation. See `CancelSafeWorktreeSession`.
+    let mut session = CancelSafeWorktreeSession::new(session);
+
+    let child_workdir = session.path()?.join(relative_cwd);
+    if !child_workdir.is_dir() {
+        let missing = child_workdir.display().to_string();
+        session.cleanup().await?;
+        anyhow::bail!(
+            "isolated worktree does not contain requested cwd `{}`; \
+             ensure the current directory is committed before using isolated consensus",
+            missing
+        );
+    }
+    let child_trusted_root = session.path()?.join(trusted_root_relative);
+    if !child_trusted_root.is_dir() {
+        let missing = child_trusted_root.display().to_string();
+        session.cleanup().await?;
+        anyhow::bail!(
+            "isolated worktree does not contain translated trusted root `{}`; \
+             ensure the trusted project root is committed before using isolated consensus",
+            missing
+        );
+    }
+
+    let result = crate::proc_subagent::run_isolated_subagent_with_binary_and_trust_root(
+        cubi_bin,
+        model,
+        goal,
+        &child_workdir,
+        &child_trusted_root,
+        time_cap,
+        max_steps,
+    )
+    .await;
+
+    // Happy path (success, error, or timeout all return normally from the
+    // call above): tear the worktree down on a blocking thread and await
+    // completion so the worktree/branch are gone before we return.
+    session.cleanup().await?;
+
+    result
+}
+
+/// Guards a [`crate::worktree_session::WorktreeSession`] so that cancelling
+/// the future holding it (e.g. dropping it out of a `select!`/`abort()`)
+/// never runs the session's blocking `git worktree remove`/`git branch -D`
+/// teardown inline on the thread driving the drop. That thread is often a
+/// Tokio worker thread, and blocking it stalls every other task on the
+/// runtime until the git commands finish.
+///
+/// Call [`CancelSafeWorktreeSession::cleanup`] on the normal/happy path to
+/// await teardown on a blocking thread before returning. If the guard is
+/// instead dropped without calling `cleanup` (cancellation), teardown is
+/// scheduled best-effort via `spawn_blocking` and not waited on. If no Tokio
+/// runtime is available at drop time (e.g. in a plain synchronous context),
+/// this falls back to inline synchronous cleanup — there is no runtime to
+/// offload the blocking work to.
+struct CancelSafeWorktreeSession(Option<crate::worktree_session::WorktreeSession>);
+
+impl CancelSafeWorktreeSession {
+    fn new(session: crate::worktree_session::WorktreeSession) -> Self {
+        Self(Some(session))
+    }
+
+    fn path(&self) -> Result<&Path> {
+        self.0
+            .as_ref()
+            .map(crate::worktree_session::WorktreeSession::path)
+            .context("CancelSafeWorktreeSession used after cleanup")
+    }
+
+    /// Explicit async cleanup for the happy path. Takes the session out (so
+    /// `Drop` becomes a no-op afterwards, avoiding double cleanup), tears it
+    /// down on a blocking thread, and awaits completion.
+    async fn cleanup(&mut self) -> Result<()> {
+        if let Some(session) = self.0.take() {
+            tokio::task::spawn_blocking(move || drop(session))
+                .await
+                .context("join worktree teardown task")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CancelSafeWorktreeSession {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Best-effort: fire-and-forget the blocking teardown. We're in
+            // `Drop`, so we cannot `.await` here even if we wanted to.
+            Ok(handle) => {
+                handle.spawn_blocking(move || drop(session));
+            }
+            // No runtime to offload to (e.g. this guard outlived the async
+            // runtime). Fall back to inline synchronous cleanup — there is
+            // no worker thread being blocked in this case.
+            Err(_) => drop(session),
+        }
+    }
+}
+
+struct ArbitrationDecision {
+    winner_idx: usize,
+    reason: String,
+    stats: ChatStats,
+}
+
+impl ArbitrationDecision {
+    fn new(winner_idx: usize, reason: String) -> Self {
+        Self {
+            winner_idx,
+            reason,
+            stats: ChatStats::default(),
+        }
+    }
+
+    fn with_stats(winner_idx: usize, reason: String, stats: ChatStats) -> Self {
+        Self {
+            winner_idx,
+            reason,
+            stats,
+        }
+    }
+}
+
+/// Returns the winning index, reason, and any LLM usage spent arbitrating.
 async fn arbitrate(
     req: &ConsensusRequest,
     executor: &AIExecutor,
     all: &[SubagentOutput],
     successes: &[&SubagentOutput],
-) -> (usize, String) {
+) -> ArbitrationDecision {
     match &req.strategy {
         ConsensusStrategy::Vote => vote(all, successes, &req.models, executor, &req.goal).await,
         ConsensusStrategy::BestOfN { judge_model } => {
@@ -478,15 +1128,16 @@ async fn vote(
     models: &[String],
     executor: &AIExecutor,
     goal: &str,
-) -> (usize, String) {
+) -> ArbitrationDecision {
     let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
     for sub in successes {
         let key = hash_normalized(&sub.output);
-        let global_idx = all
+        if let Some(global_idx) = all
             .iter()
             .position(|s| std::ptr::eq::<SubagentOutput>(s, *sub))
-            .expect("success is from same slice");
-        buckets.entry(key).or_default().push(global_idx);
+        {
+            buckets.entry(key).or_default().push(global_idx);
+        }
     }
     let max_count = buckets.values().map(|v| v.len()).max().unwrap_or(0);
     let top: Vec<&Vec<usize>> = buckets.values().filter(|v| v.len() == max_count).collect();
@@ -494,17 +1145,27 @@ async fn vote(
     if top.len() == 1 {
         let winner_idx = top[0][0];
         let total = successes.len();
-        return (winner_idx, format!("majority vote {max_count}/{total}"));
+        return ArbitrationDecision::new(winner_idx, format!("majority vote {max_count}/{total}"));
+    }
+    if top.is_empty() {
+        return ArbitrationDecision::new(
+            0,
+            "vote had no indexable successful candidates".to_string(),
+        );
     }
     // Tie: escalate to a Judge call using the first model in `models`.
     let judge_model = models
         .first()
         .cloned()
         .unwrap_or_else(|| executor.get_model().to_string());
-    let (idx, reason) = judge(all, successes, &judge_model, executor, goal).await;
-    (
-        idx,
-        format!("vote tie ({max_count}-way); escalated to judge `{judge_model}`: {reason}"),
+    let decision = judge(all, successes, &judge_model, executor, goal).await;
+    ArbitrationDecision::with_stats(
+        decision.winner_idx,
+        format!(
+            "vote tie ({max_count}-way); escalated to judge `{judge_model}`: {}",
+            decision.reason
+        ),
+        decision.stats,
     )
 }
 
@@ -514,7 +1175,7 @@ async fn best_of_n(
     judge_model: &str,
     executor: &AIExecutor,
     goal: &str,
-) -> (usize, String) {
+) -> ArbitrationDecision {
     let prompt = build_best_of_n_prompt(goal, successes);
     let messages = vec![
         Message::text(
@@ -525,17 +1186,20 @@ async fn best_of_n(
         ),
         Message::text("user", prompt),
     ];
-    let raw = match executor.chat_with_model(judge_model, messages).await {
-        Ok((msg, _)) => msg.content,
+    let (raw, stats) = match executor.chat_with_model(judge_model, messages).await {
+        Ok((msg, stats)) => (msg.content, stats),
         Err(e) => {
-            // Judge failed → fall back to Vote with no escalation.
-            let (idx, vote_reason) =
+            // Judge failed → fall back to Vote; if Vote needs its own
+            // tie-breaker, preserve that arbitration usage too.
+            let vote_decision =
                 vote(all, successes, &[judge_model.to_string()], executor, goal).await;
-            return (
-                idx,
+            return ArbitrationDecision::with_stats(
+                vote_decision.winner_idx,
                 format!(
-                    "best-of-n judge `{judge_model}` failed ({e}); fell back to vote: {vote_reason}"
+                    "best-of-n judge `{judge_model}` failed ({e}); fell back to vote: {}",
+                    vote_decision.reason
                 ),
+                vote_decision.stats,
             );
         }
     };
@@ -549,13 +1213,14 @@ async fn best_of_n(
     let winner_idx = all
         .iter()
         .position(|s| std::ptr::eq::<SubagentOutput>(s, successes[i]))
-        .expect("success is from same slice");
-    (
+        .unwrap_or(0);
+    ArbitrationDecision::with_stats(
         winner_idx,
         format!(
             "best-of-n: `{}` scored {score} (judge `{judge_model}`)",
             successes[i].model
         ),
+        stats,
     )
 }
 
@@ -565,7 +1230,7 @@ async fn judge(
     judge_model: &str,
     executor: &AIExecutor,
     goal: &str,
-) -> (usize, String) {
+) -> ArbitrationDecision {
     let prompt = build_judge_prompt(goal, successes);
     let messages = vec![
         Message::text(
@@ -575,8 +1240,8 @@ async fn judge(
         ),
         Message::text("user", prompt),
     ];
-    let raw = match executor.chat_with_model(judge_model, messages).await {
-        Ok((msg, _)) => msg.content,
+    let (raw, stats) = match executor.chat_with_model(judge_model, messages).await {
+        Ok((msg, stats)) => (msg.content, stats),
         Err(e) => {
             // Judge unavailable → fall back to plain vote (no recursion
             // into vote() with the judge as model, to avoid endless
@@ -587,10 +1252,10 @@ async fn judge(
                 .map(|s| {
                     all.iter()
                         .position(|x| std::ptr::eq::<SubagentOutput>(x, *s))
-                        .expect("success is from same slice")
+                        .unwrap_or(0)
                 })
                 .unwrap_or(0);
-            return (
+            return ArbitrationDecision::new(
                 winner,
                 format!(
                     "judge `{judge_model}` failed ({e}); fell back to first successful subagent of {max_count}"
@@ -602,13 +1267,14 @@ async fn judge(
     let winner_idx = all
         .iter()
         .position(|s| std::ptr::eq::<SubagentOutput>(s, successes[pick]))
-        .expect("success is from same slice");
-    (
+        .unwrap_or(0);
+    ArbitrationDecision::with_stats(
         winner_idx,
         format!(
             "judge `{judge_model}` picked `{}`: {reason}",
             successes[pick].model
         ),
+        stats,
     )
 }
 
@@ -741,11 +1407,13 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn unsafe_unset_all() {
         // SAFETY: tests are serialized by the outer mutex `lock()`
         // before touching env vars.
         unsafe {
+            std::env::remove_var("CUBI_FAKE_LLM");
             std::env::remove_var("CUBI_FAKE_LLM_MODEL_RESPONSES");
             std::env::remove_var("CUBI_FAKE_LLM_RESPONSE");
             std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL");
@@ -777,6 +1445,402 @@ mod tests {
         M.get_or_init(|| Mutex::new(())).lock().await
     }
 
+    static TEST_ISOLATED_ACTIVE_SUBAGENTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static TEST_ISOLATED_MAX_SUBAGENTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn fake_isolated_runner() -> IsolatedSubagentRunner {
+        Arc::new(|model, goal, _time_cap, max_steps| {
+            Box::pin(async move {
+                if model == "isolated-error" {
+                    anyhow::bail!("test isolated subprocess failure");
+                }
+                if model.starts_with("isolated-slow") {
+                    let active = TEST_ISOLATED_ACTIVE_SUBAGENTS
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    update_test_isolated_max(active);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    TEST_ISOLATED_ACTIVE_SUBAGENTS
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let exit_code = if model == "isolated-exit" {
+                    Some(2)
+                } else {
+                    Some(0)
+                };
+                Ok(crate::proc_subagent::ProcSubagentResult {
+                    output: if model == "isolated-empty" {
+                        String::new()
+                    } else if model == "isolated-max-steps" {
+                        format!("max_steps={max_steps}")
+                    } else if model == "isolated-json-error" {
+                        "partial structured failure".to_string()
+                    } else {
+                        goal
+                    },
+                    exit_code,
+                    timed_out: model == "isolated-timeout",
+                    tool_calls: 1,
+                    prompt_tokens: 11,
+                    completion_tokens: 13,
+                    steps_used: if model == "isolated-max-steps" {
+                        max_steps
+                    } else {
+                        2
+                    },
+                    stderr: if model == "isolated-json-error" || model == "isolated-exit" {
+                        "child stderr diagnostic".to_string()
+                    } else {
+                        String::new()
+                    },
+                    error: if model == "isolated-json-error" {
+                        Some("error: structured child failure".to_string())
+                    } else {
+                        None
+                    },
+                })
+            })
+        })
+    }
+
+    fn update_test_isolated_max(active: usize) {
+        let mut current = TEST_ISOLATED_MAX_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst);
+        while active > current {
+            match TEST_ISOLATED_MAX_SUBAGENTS.compare_exchange(
+                current,
+                active,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_permits_defaults_and_caps() {
+        assert_eq!(isolated_permits(0, 5), 1);
+        assert_eq!(isolated_permits(99, 5), 2);
+        assert_eq!(isolated_permits(2, 1), 1);
+        assert_eq!(isolated_permits(1, 5), 1);
+    }
+
+    async fn run_with_fake_isolated_runner(req: ConsensusRequest) -> Result<ConsensusResult> {
+        let mut no_mcp = None;
+        run_inner_with_isolated_runner(
+            req,
+            &executor(),
+            &NullSink,
+            Some(&mut no_mcp),
+            Some(fake_isolated_runner()),
+        )
+        .await
+    }
+
+    fn init_temp_git_repo(repo: &Path) {
+        run_test_git(repo, &["init"]);
+        run_test_git(repo, &["config", "user.email", "cubi@example.invalid"]);
+        run_test_git(repo, &["config", "user.name", "Cubi Test"]);
+        std::fs::write(repo.join("tracked.txt"), "tracked\n").unwrap();
+        run_test_git(repo, &["add", "tracked.txt"]);
+        run_test_git(repo, &["commit", "-m", "init"]);
+    }
+
+    fn run_test_git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn isolated_trust_translation_maps_repo_root_trust_to_worktree_root_for_nested_cwd() {
+        let repo = tempfile::tempdir().unwrap();
+        let nested = repo.path().join("nested/deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut permissions = crate::permissions::Permissions::default();
+        permissions.trust_dir(repo.path()).unwrap();
+
+        let relative =
+            translated_isolated_trust_root_relative(&nested, repo.path(), &permissions).unwrap();
+
+        assert_eq!(relative, PathBuf::new());
+    }
+
+    #[test]
+    fn isolated_trust_translation_preserves_trusted_subdir_scope() {
+        let repo = tempfile::tempdir().unwrap();
+        let trusted = repo.path().join("nested");
+        let cwd = trusted.join("deeper");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut permissions = crate::permissions::Permissions::default();
+        permissions.trust_dir(&trusted).unwrap();
+
+        let relative =
+            translated_isolated_trust_root_relative(&cwd, repo.path(), &permissions).unwrap();
+
+        assert_eq!(relative, PathBuf::from("nested"));
+    }
+
+    fn compile_offline_subprocess_helper(dir: &Path) -> PathBuf {
+        let source = dir.join("offline_subagent_helper.rs");
+        let exe = dir.join(if cfg!(windows) {
+            "offline_subagent_helper.exe"
+        } else {
+            "offline_subagent_helper"
+        });
+        std::fs::write(
+            &source,
+            r##"
+use std::{env, fs, path::PathBuf, process};
+
+fn find_worktree_root(mut dir: PathBuf) -> Option<PathBuf> {
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if !args.iter().any(|arg| arg == "--internal-subagent") {
+        eprintln!("missing internal subagent flag: {args:?}");
+        process::exit(10);
+    }
+    let max_steps = args
+        .windows(2)
+        .find(|window| window[0] == "--internal-max-steps")
+        .and_then(|window| window[1].parse::<usize>().ok())
+        .unwrap_or(0);
+    if max_steps == 0 {
+        eprintln!("missing internal max-step cap: {args:?}");
+        process::exit(11);
+    }
+
+    let cubi_home = env::var("CUBI_HOME").expect("CUBI_HOME set by parent");
+    if env::var("HOME").as_deref() != Ok(cubi_home.as_str()) {
+        eprintln!("HOME did not match CUBI_HOME");
+        process::exit(12);
+    }
+    if env::var("USERPROFILE").as_deref() != Ok(cubi_home.as_str()) {
+        eprintln!("USERPROFILE did not match CUBI_HOME");
+        process::exit(13);
+    }
+    if env::var("CUBI_DISABLE_META_TOOLS").as_deref() != Ok("1") {
+        eprintln!("missing CUBI_DISABLE_META_TOOLS=1");
+        process::exit(14);
+    }
+
+    let cwd = env::current_dir().expect("current dir");
+    let cwd_marker = if cwd.join("subdir_marker.txt").is_file() {
+        "subdir"
+    } else if cwd.join("tracked.txt").is_file() {
+        "root"
+    } else {
+        eprintln!("helper did not start in isolated worktree: {}", cwd.display());
+        process::exit(15);
+    };
+    let trust_raw = fs::read_to_string(
+        PathBuf::from(&cubi_home).join(".cubi").join("trusted_dirs.json")
+    )
+    .unwrap_or_default();
+    let canonical_cwd = fs::canonicalize(&cwd).expect("canonical cwd");
+    let worktree_root =
+        find_worktree_root(canonical_cwd.clone()).unwrap_or_else(|| canonical_cwd.clone());
+    let canonical_root = fs::canonicalize(&worktree_root).unwrap_or(worktree_root);
+    // trusted_dirs.json is JSON, so backslashes in Windows paths are escaped
+    // (`\\`). Escape the needles the same way so the substring match works on
+    // Windows; on Unix paths have no backslashes, so this is a no-op.
+    let root_needle = format!("\"{}\"", canonical_root.to_string_lossy().replace('\\', "\\\\"));
+    let cwd_needle = format!("\"{}\"", canonical_cwd.to_string_lossy().replace('\\', "\\\\"));
+    let trust_marker = if trust_raw.contains(&root_needle) {
+        "root"
+    } else if trust_raw.contains(&cwd_needle) {
+        "cwd"
+    } else {
+        "missing"
+    };
+
+    for _ in 0..max_steps {
+        println!("{}", r#"{"type":"tool_call","name":"read_file","arguments":{}}"#);
+    }
+    let model = env::var("CUBI_MODEL").unwrap_or_else(|_| "missing-model".to_string());
+    println!(
+        "{}",
+        format!(
+            r#"{{"type":"token","value":"helper output from {model} with max_steps={max_steps} cwd_marker={cwd_marker} trust_marker={trust_marker}"}}"#
+        )
+    );
+    println!("{}", r#"{"type":"done","stats":{"prompt_tokens":21,"completion_tokens":34}}"#);
+}
+"##,
+        )
+        .unwrap();
+        let output = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to invoke rustc for helper: {err}"));
+        assert!(
+            output.status.success(),
+            "rustc helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        exe
+    }
+
+    fn assert_no_consensus_worktree_artifacts(repo: &Path) {
+        let worktrees = run_test_git(repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.contains("cubi-consensus-"),
+            "temporary consensus worktree was not cleaned up:\n{worktrees}"
+        );
+        let branches = run_test_git(repo, &["branch", "--list", "cubi-consensus/*"]);
+        assert!(
+            branches.trim().is_empty(),
+            "temporary consensus branch was not cleaned up:\n{branches}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn has_consensus_worktree_artifacts(repo: &Path) -> bool {
+        let worktrees = run_test_git(repo, &["worktree", "list", "--porcelain"]);
+        if worktrees.contains("cubi-consensus-") {
+            return true;
+        }
+        let branches = run_test_git(repo, &["branch", "--list", "cubi-consensus/*"]);
+        !branches.trim().is_empty()
+    }
+
+    /// Writes a tiny shell script that ignores its arguments and sleeps
+    /// well past the test's own cancellation window, standing in for the
+    /// headless `cubi` subprocess. Unix-only: relies on a `#!/bin/sh`
+    /// shebang and executable bit rather than a compiled binary, so the
+    /// cancellation test below doesn't pay `rustc`'s cost just to prove a
+    /// child process was in flight when cancelled.
+    #[cfg(unix)]
+    fn write_sleepy_subprocess_helper(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("sleepy_subagent_helper.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    /// Polls (without blocking the async runtime) until `predicate` returns
+    /// true or `timeout` elapses. Returns whether the predicate succeeded.
+    #[cfg(unix)]
+    async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if predicate() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // Regression test for the worktree-isolated subprocess consensus
+    // cancellation-cleanup defect: dropping/aborting the future driving
+    // `run_one_isolated_subagent_in_repo_with_binary` used to run
+    // `WorktreeSession::drop`'s blocking `git worktree remove`/`git branch
+    // -D` inline on whatever thread was driving the cancellation (e.g. a
+    // Tokio worker thread servicing a `select!` that lost a race). This
+    // proves cancellation (a) returns promptly instead of blocking on git,
+    // and (b) still cleans the worktree/branch up, just asynchronously.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_in_flight_isolated_subagent_cleans_up_worktree_without_blocking() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let repo = tempfile::tempdir().unwrap();
+        init_temp_git_repo(repo.path());
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper = write_sleepy_subprocess_helper(helper_dir.path());
+        let repo_path = repo.path().to_path_buf();
+
+        let task = tokio::spawn(async move {
+            run_one_isolated_subagent_in_repo_with_binary(
+                &repo_path,
+                Path::new(""),
+                "HEAD",
+                "helper-model",
+                "cancel me mid-flight",
+                Duration::from_secs(300),
+                4,
+                &helper,
+            )
+            .await
+        });
+
+        // Don't cancel until the subagent is genuinely in flight: wait for
+        // its throwaway worktree to actually show up in `git worktree
+        // list`. This proves we're cancelling a live worktree + running
+        // child process, not a future that never got past provisioning.
+        let provisioned = wait_until(Duration::from_secs(10), || {
+            has_consensus_worktree_artifacts(repo.path())
+        })
+        .await;
+        assert!(
+            provisioned,
+            "isolated subagent's worktree never appeared within the wait window"
+        );
+
+        // Cancel the in-flight future. Aborting must return promptly: it
+        // must NOT block on the guard's synchronous git teardown running
+        // inline on this (or any runtime worker) thread.
+        let abort_started = Instant::now();
+        task.abort();
+        let joined = task.await;
+        let abort_elapsed = abort_started.elapsed();
+        assert!(
+            joined.is_err(),
+            "expected the aborted task's join to observe cancellation, got: {joined:?}"
+        );
+        assert!(
+            abort_elapsed < Duration::from_secs(5),
+            "aborting the in-flight isolated subagent took too long \
+             (likely blocked on synchronous git cleanup): {abort_elapsed:?}"
+        );
+
+        // Cleanup after cancellation is scheduled best-effort on a
+        // blocking thread (see `CancelSafeWorktreeSession::drop`), so it
+        // may finish slightly after `task.abort()` returns. Give it a
+        // bounded window to complete rather than asserting it's instant.
+        let cleaned_up = wait_until(Duration::from_secs(10), || {
+            !has_consensus_worktree_artifacts(repo.path())
+        })
+        .await;
+        assert!(
+            cleaned_up,
+            "temporary consensus worktree/branch was not cleaned up after cancellation"
+        );
+    }
+
     #[tokio::test]
     async fn vote_picks_majority() {
         let _g = lock().await;
@@ -792,6 +1856,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -807,6 +1873,11 @@ mod tests {
         );
         assert_eq!(r.subagent_outputs.len(), 3);
         assert!(r.subagent_outputs.iter().all(|s| s.ok()));
+        assert!(
+            r.subagent_outputs.iter().all(|s| s.tool_calls == 0),
+            "LLM-only subagents must report zero tool calls: {:?}",
+            r.subagent_outputs
+        );
     }
 
     #[tokio::test]
@@ -824,6 +1895,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -850,6 +1923,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_model, "m2");
@@ -878,6 +1953,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_model, "m2");
@@ -904,6 +1981,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_output, "A");
@@ -931,6 +2010,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 1,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let req_par = ConsensusRequest {
             concurrency: 0,
@@ -960,6 +2041,8 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -981,12 +2064,103 @@ mod tests {
             max_steps_per_subagent: 1,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         let agg = r.aggregate_stats();
         // Fake stats are 1/1/1 each, two successful calls → 2/2.
         assert_eq!(agg.prompt_tokens, 2);
         assert_eq!(agg.completion_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn aggregate_stats_includes_best_of_n_judge_usage() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        unsafe_set(
+            "CUBI_FAKE_LLM_MODEL_RESPONSES",
+            r#"{"m1":"A","m2":"B","judge":"1: 4\n2: 9"}"#,
+        );
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::BestOfN {
+                judge_model: "judge".into(),
+            },
+            max_steps_per_subagent: 1,
+            concurrency: 0,
+            use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
+        };
+
+        let r = run(req, &executor(), &NullSink).await.unwrap();
+        let agg = r.aggregate_stats();
+
+        assert_eq!(r.arbitration_stats.prompt_tokens, 1);
+        assert_eq!(r.arbitration_stats.completion_tokens, 1);
+        assert_eq!(agg.prompt_tokens, 3);
+        assert_eq!(agg.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn aggregate_stats_includes_judge_strategy_usage() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        unsafe_set(
+            "CUBI_FAKE_LLM_MODEL_RESPONSES",
+            r#"{"m1":"A","m2":"B","judge":"pick: 2\nclear and concise"}"#,
+        );
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Judge {
+                judge_model: "judge".into(),
+            },
+            max_steps_per_subagent: 1,
+            concurrency: 0,
+            use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
+        };
+
+        let r = run(req, &executor(), &NullSink).await.unwrap();
+        let agg = r.aggregate_stats();
+
+        assert_eq!(r.arbitration_stats.prompt_tokens, 1);
+        assert_eq!(r.arbitration_stats.completion_tokens, 1);
+        assert_eq!(agg.prompt_tokens, 3);
+        assert_eq!(agg.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn aggregate_stats_includes_vote_tie_break_judge_usage() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        unsafe_set(
+            "CUBI_FAKE_LLM_MODEL_RESPONSES",
+            r#"{"m1":"pick: 2\ngood","m2":"B"}"#,
+        );
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 1,
+            concurrency: 0,
+            use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
+        };
+
+        let r = run(req, &executor(), &NullSink).await.unwrap();
+        let agg = r.aggregate_stats();
+
+        assert!(r.decision_reason.contains("tie"));
+        assert_eq!(r.arbitration_stats.prompt_tokens, 1);
+        assert_eq!(r.arbitration_stats.completion_tokens, 1);
+        assert_eq!(agg.prompt_tokens, 3);
+        assert_eq!(agg.completion_tokens, 3);
     }
 
     #[tokio::test]
@@ -1001,6 +2175,8 @@ mod tests {
             max_steps_per_subagent: 8,
             concurrency: 0,
             use_tools: false,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let direct = run(req.clone(), &executor(), &NullSink).await.unwrap();
         let mut no_mcp = None;
@@ -1052,6 +2228,8 @@ mod tests {
             max_steps_per_subagent: 8,
             concurrency: 0,
             use_tools: true,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
         let err = run_with_tools(req, &executor(), &NullSink, &mut no_mcp)
@@ -1080,6 +2258,8 @@ mod tests {
             max_steps_per_subagent: 8,
             concurrency: 99,
             use_tools: true,
+            isolate: false,
+            isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
         let outputs = run_tool_subagents(&req, &executor(), &mut no_mcp).await;
@@ -1092,8 +2272,428 @@ mod tests {
         assert_eq!(outputs[1].output, "final B");
         assert!(outputs.iter().all(|s| s.error.is_none()));
         assert!(outputs.iter().all(|s| s.steps_used == 2));
+        assert!(outputs.iter().all(|s| s.tool_calls == 1));
         assert!(outputs.iter().all(|s| s.prompt_tokens == 2));
         assert!(outputs.iter().all(|s| s.completion_tokens == 2));
+    }
+
+    #[tokio::test]
+    async fn isolate_requires_use_tools() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 0,
+            use_tools: false,
+            isolate: true,
+            isolated_time_cap_secs: 0,
+        };
+
+        let err = run(req, &executor(), &NullSink)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("isolate` requires `use_tools=true"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_tool_mode_does_not_require_mcp_and_accounts_proc_metadata() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "same isolated answer".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 2,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 7,
+        };
+        let result = run_with_fake_isolated_runner(req).await.unwrap();
+
+        assert_eq!(result.winner_output, "same isolated answer");
+        assert_eq!(result.subagent_outputs.len(), 2);
+        assert!(result.subagent_outputs.iter().all(|s| s.error.is_none()));
+        assert!(result.subagent_outputs.iter().all(|s| s.steps_used == 2));
+        assert!(
+            result
+                .subagent_outputs
+                .iter()
+                .all(|s| s.prompt_tokens == 11)
+        );
+        assert!(
+            result
+                .subagent_outputs
+                .iter()
+                .all(|s| s.completion_tokens == 13)
+        );
+        assert!(
+            result.subagent_outputs.iter().all(|s| s.tool_calls == 1),
+            "isolated subprocess tool calls were not propagated: {:?}",
+            result.subagent_outputs
+        );
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(serialized["subagent_outputs"][0]["tool_calls"], 1);
+    }
+
+    #[tokio::test]
+    async fn isolated_tool_mode_forwards_requested_step_cap_to_runner() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "check cap".into(),
+            models: vec!["isolated-max-steps".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 5,
+            concurrency: 1,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 7,
+        };
+
+        let result = run_with_fake_isolated_runner(req).await.unwrap();
+        let capped = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-max-steps")
+            .unwrap();
+
+        assert_eq!(capped.output, "max_steps=5");
+        assert_eq!(capped.steps_used, 5);
+    }
+
+    #[tokio::test]
+    async fn isolated_tool_mode_clamps_zero_step_cap_before_dispatch() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "check cap".into(),
+            models: vec!["isolated-max-steps".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 0,
+            concurrency: 1,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 7,
+        };
+
+        let result = run_with_fake_isolated_runner(req).await.unwrap();
+        let capped = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-max-steps")
+            .unwrap();
+
+        assert_eq!(capped.output, "max_steps=1");
+        assert_eq!(capped.steps_used, 1);
+    }
+
+    #[tokio::test]
+    async fn isolated_dispatch_clamps_zero_step_cap_before_invoking_runner() {
+        let req = ConsensusRequest {
+            goal: "check direct dispatch cap".into(),
+            models: vec!["isolated-max-steps".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 0,
+            concurrency: 1,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 7,
+        };
+
+        let outputs = run_isolated_tool_subagents_with_runner(&req, fake_isolated_runner()).await;
+        let capped = outputs
+            .iter()
+            .find(|s| s.model == "isolated-max-steps")
+            .unwrap();
+
+        assert_eq!(capped.output, "max_steps=1");
+        assert_eq!(capped.steps_used, 1);
+    }
+
+    #[tokio::test]
+    async fn isolated_tool_mode_records_timeout_empty_output_and_spawn_errors() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "survivor".into(),
+            models: vec![
+                "m1".into(),
+                "isolated-timeout".into(),
+                "isolated-empty".into(),
+                "isolated-exit".into(),
+                "isolated-json-error".into(),
+                "isolated-error".into(),
+            ],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 0,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 9,
+        };
+        let result = run_with_fake_isolated_runner(req).await.unwrap();
+
+        assert_eq!(result.winner_model, "m1");
+        assert_eq!(result.decision_reason, "only successful subagent");
+        let timeout = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-timeout")
+            .unwrap();
+        assert!(
+            timeout
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("timed out after 9s")),
+            "timeout error: {:?}",
+            timeout.error
+        );
+        let empty = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-empty")
+            .unwrap();
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("empty output")),
+            "empty error: {:?}",
+            empty.error
+        );
+        let failed = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-exit")
+            .unwrap();
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("exited with status Some(2)")
+                    && e.contains("child stderr diagnostic")),
+            "exit error: {:?}",
+            failed.error
+        );
+        let failed = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-json-error")
+            .unwrap();
+        assert_eq!(failed.steps_used, 2);
+        assert!(
+            failed.error.as_deref().is_some_and(|e| {
+                e.contains("reported error")
+                    && e.contains("structured child failure")
+                    && e.contains("child stderr diagnostic")
+            }),
+            "json error: {:?}",
+            failed.error
+        );
+        let failed = result
+            .subagent_outputs
+            .iter()
+            .find(|s| s.model == "isolated-error")
+            .unwrap();
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("test isolated subprocess failure")),
+            "failure error: {:?}",
+            failed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_tool_mode_respects_concurrency_limit() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        TEST_ISOLATED_ACTIVE_SUBAGENTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        TEST_ISOLATED_MAX_SUBAGENTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let req = ConsensusRequest {
+            goal: "same answer".into(),
+            models: vec![
+                "isolated-slow-a".into(),
+                "isolated-slow-b".into(),
+                "isolated-slow-c".into(),
+            ],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 2,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 3,
+        };
+        let result = run_with_fake_isolated_runner(req).await.unwrap();
+
+        assert_eq!(result.subagent_outputs.len(), 3);
+        assert!(result.subagent_outputs.iter().all(|s| s.error.is_none()));
+        assert_eq!(
+            TEST_ISOLATED_MAX_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_subagent_real_worktree_subprocess_forwards_cap_and_cleans_up() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let repo = tempfile::tempdir().unwrap();
+        init_temp_git_repo(repo.path());
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper = compile_offline_subprocess_helper(helper_dir.path());
+
+        let result = run_one_isolated_subagent_in_repo_with_binary(
+            repo.path(),
+            Path::new(""),
+            "HEAD",
+            "helper-model",
+            "offline isolated subprocess",
+            Duration::from_secs(20),
+            4,
+            &helper,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+        assert_eq!(result.tool_calls, 4);
+        assert_eq!(result.steps_used, 5);
+        assert_eq!(result.prompt_tokens, 21);
+        assert_eq!(result.completion_tokens, 34);
+        assert!(
+            result.output.contains("helper output from helper-model")
+                && result.output.contains("max_steps=4"),
+            "unexpected helper output: {}",
+            result.output
+        );
+        assert_no_consensus_worktree_artifacts(repo.path());
+    }
+
+    #[tokio::test]
+    async fn isolated_subagent_translates_repo_root_trust_while_running_from_subdir() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let repo = tempfile::tempdir().unwrap();
+        init_temp_git_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("nested/deeper")).unwrap();
+        std::fs::write(
+            repo.path().join("nested/deeper/subdir_marker.txt"),
+            "subdir\n",
+        )
+        .unwrap();
+        run_test_git(repo.path(), &["add", "nested/deeper/subdir_marker.txt"]);
+        run_test_git(repo.path(), &["commit", "-m", "nested"]);
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper = compile_offline_subprocess_helper(helper_dir.path());
+
+        let result = run_one_isolated_subagent_in_repo_with_binary_and_trust_root(
+            repo.path(),
+            Path::new("nested/deeper"),
+            Path::new(""),
+            "HEAD",
+            "helper-model",
+            "offline isolated subprocess from subdir",
+            Duration::from_secs(20),
+            2,
+            &helper,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            result.output.contains("cwd_marker=subdir"),
+            "subprocess did not run in matching worktree subdir: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("trust_marker=root"),
+            "isolated trust root was not translated to the worktree root: {}",
+            result.output
+        );
+        assert_eq!(result.tool_calls, 2);
+        assert_eq!(result.steps_used, 3);
+        assert_no_consensus_worktree_artifacts(repo.path());
+    }
+
+    #[tokio::test]
+    async fn isolated_consensus_real_worktrees_subprocesses_forward_caps_and_clean_up() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let repo = tempfile::tempdir().unwrap();
+        init_temp_git_repo(repo.path());
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper = compile_offline_subprocess_helper(helper_dir.path());
+        let repo_path = repo.path().to_path_buf();
+        let runner: IsolatedSubagentRunner = Arc::new(move |model, goal, time_cap, max_steps| {
+            let repo_path = repo_path.clone();
+            let helper = helper.clone();
+            Box::pin(async move {
+                run_one_isolated_subagent_in_repo_with_binary(
+                    &repo_path,
+                    Path::new(""),
+                    "HEAD",
+                    &model,
+                    &goal,
+                    time_cap,
+                    max_steps,
+                    &helper,
+                )
+                .await
+            })
+        });
+        let req = ConsensusRequest {
+            goal: "offline isolated subprocess".into(),
+            models: vec!["helper-model".into(), "helper-model".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 3,
+            concurrency: 2,
+            use_tools: true,
+            isolate: true,
+            isolated_time_cap_secs: 20,
+        };
+        let mut no_mcp = None;
+
+        let result = run_inner_with_isolated_runner(
+            req,
+            &executor(),
+            &NullSink,
+            Some(&mut no_mcp),
+            Some(runner),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.subagent_outputs.len(), 2);
+        assert!(result.subagent_outputs.iter().all(SubagentOutput::ok));
+        assert!(result.subagent_outputs.iter().all(|sub| {
+            sub.steps_used == 4
+                && sub.tool_calls == 3
+                && sub.prompt_tokens == 21
+                && sub.completion_tokens == 34
+        }));
+        assert!(
+            result
+                .subagent_outputs
+                .iter()
+                .all(|sub| sub.output.contains("helper output from helper-model")
+                    && sub.output.contains("max_steps=3")),
+            "outputs: {:?}",
+            result.subagent_outputs
+        );
+        assert_no_consensus_worktree_artifacts(repo.path());
     }
 
     #[test]
@@ -1133,10 +2733,33 @@ mod tests {
             spec.function.parameters["properties"]["models"]["minItems"],
             2
         );
+        assert_eq!(
+            spec.function.parameters["properties"]["max_steps"]["minimum"],
+            1
+        );
+        assert_eq!(
+            spec.function.parameters["properties"]["max_steps"]["default"],
+            CONSENSUS_DEFAULT_MAX_STEPS
+        );
         assert!(
             !spec.function.parameters["properties"]["use_tools"]["default"]
                 .as_bool()
                 .unwrap_or(true)
+        );
+        assert!(
+            !spec.function.parameters["properties"]["isolate"]["default"]
+                .as_bool()
+                .unwrap_or(true)
+        );
+        assert_eq!(
+            spec.function.parameters["properties"]["isolated_time_cap_secs"]["default"],
+            CONSENSUS_ISOLATED_DEFAULT_TIME_CAP_SECS
+        );
+        assert!(
+            spec.function.parameters["properties"]
+                .get("time_cap_seconds")
+                .is_none(),
+            "tool schema should expose isolated_time_cap_secs, not time_cap_seconds"
         );
         assert!(
             spec.function.parameters["required"]

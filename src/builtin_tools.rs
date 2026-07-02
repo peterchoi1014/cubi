@@ -118,6 +118,11 @@ pub struct BuiltinToolRegistry {
 /// so concurrent reads from different sessions can't be confused.
 struct ReplSession {
     stdin: ChildStdin,
+    /// Parent-process cwd that passed the trust gate when the REPL was
+    /// started. A live bash session keeps its own cwd; later changes to
+    /// Cubi's process-wide cwd do not change where this existing child shell
+    /// executes.
+    trusted_start_cwd: PathBuf,
     /// Captures stdout *and* stderr (the child is spawned with stderr
     /// redirected to stdout) one line at a time. The reader task ends
     /// when the child exits.
@@ -917,6 +922,10 @@ impl BuiltinToolRegistry {
                         "type": "string",
                         "description": "Worktree path (required for add/remove)"
                     },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional trusted git repository directory to run from. Defaults to Cubi's current working directory."
+                    },
                     "branch": {
                         "type": "string",
                         "description": "Branch name for `add` (optional)"
@@ -931,15 +940,22 @@ impl BuiltinToolRegistry {
         let action = args["action"]
             .as_str()
             .context("Missing 'action' parameter")?;
+        let cwd_override = args["cwd"].as_str();
 
         if matches!(action, "add" | "remove") && self.plan_mode.load(Ordering::SeqCst) {
             return Ok(ToolResult::error(Self::plan_mode_refusal("worktree")));
         }
 
+        let git_cwd = match cwd_override {
+            Some(raw) => PathBuf::from(raw),
+            None => std::env::current_dir().context("Could not read cwd")?,
+        };
+
         // Mutating worktree operations need a trusted cwd, same as `bash`.
-        if matches!(action, "add" | "remove") {
-            let cwd = std::env::current_dir().context("Could not read cwd")?;
-            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+        // An explicit `cwd` also needs trust even for read-only `list`, so a
+        // model cannot point the tool at arbitrary unapproved repositories.
+        if cwd_override.is_some() || matches!(action, "add" | "remove") {
+            if let Err(e) = self.permissions.lock().unwrap().check_exec(&git_cwd) {
                 return Ok(ToolResult::error(format!("{}", e)));
             }
         }
@@ -947,6 +963,7 @@ impl BuiltinToolRegistry {
         match action {
             "list" => {
                 let out = Command::new("git")
+                    .current_dir(&git_cwd)
                     .args(["worktree", "list", "--porcelain"])
                     .output()
                     .context("Failed to run git worktree list")?;
@@ -969,6 +986,7 @@ impl BuiltinToolRegistry {
                     .as_str()
                     .context("Missing 'path' parameter for `add`")?;
                 let mut cmd = Command::new("git");
+                cmd.current_dir(&git_cwd);
                 cmd.args(["worktree", "add", path]);
                 if let Some(branch) = args["branch"].as_str() {
                     cmd.arg(branch);
@@ -1014,6 +1032,7 @@ impl BuiltinToolRegistry {
                     .as_str()
                     .context("Missing 'path' parameter for `remove`")?;
                 let out = Command::new("git")
+                    .current_dir(&git_cwd)
                     .args(["worktree", "remove", path])
                     .output()
                     .context("Failed to run git worktree remove")?;
@@ -1230,9 +1249,10 @@ impl BuiltinToolRegistry {
             .as_str()
             .context("Missing 'session_id' parameter")?
             .to_string();
-        if let Some(err) = self.repl_preflight("repl_start") {
-            return Ok(err);
-        }
+        let trusted_start_cwd = match self.repl_preflight("repl_start") {
+            Ok(cwd) => cwd,
+            Err(err) => return Ok(err),
+        };
 
         let mut sessions = self.repls.lock().await;
         if sessions.contains_key(&session_id) {
@@ -1305,6 +1325,7 @@ impl BuiltinToolRegistry {
             session_id.clone(),
             ReplSession {
                 stdin,
+                trusted_start_cwd,
                 reader,
                 sentinel,
                 _child: child,
@@ -1324,8 +1345,8 @@ impl BuiltinToolRegistry {
         let code = args["code"].as_str().context("Missing 'code' parameter")?;
         let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
 
-        if let Some(err) = self.repl_preflight("repl_eval") {
-            return Ok(err);
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolResult::error(Self::plan_mode_refusal("repl_eval")));
         }
 
         let mut sessions = self.repls.lock().await;
@@ -1337,6 +1358,14 @@ impl BuiltinToolRegistry {
                 )));
             }
         };
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap()
+            .check_exec(&session.trusted_start_cwd)
+        {
+            return Ok(ToolResult::error(format!("{e}")));
+        }
 
         // Write the code, then a sentinel echo that includes the exit
         // status of the *last* command (`$?` after the user code). The
@@ -1429,18 +1458,18 @@ impl BuiltinToolRegistry {
     }
 
     /// Shared plan-mode + cwd-trust check for the REPL tools.
-    fn repl_preflight(&self, tool: &str) -> Option<ToolResult> {
+    fn repl_preflight(&self, tool: &str) -> std::result::Result<PathBuf, ToolResult> {
         if self.plan_mode.load(Ordering::SeqCst) {
-            return Some(ToolResult::error(Self::plan_mode_refusal(tool)));
+            return Err(ToolResult::error(Self::plan_mode_refusal(tool)));
         }
         let cwd = match std::env::current_dir() {
             Ok(c) => c,
-            Err(e) => return Some(ToolResult::error(format!("Could not read cwd: {e}"))),
+            Err(e) => return Err(ToolResult::error(format!("Could not read cwd: {e}"))),
         };
         if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
-            return Some(ToolResult::error(format!("{e}")));
+            return Err(ToolResult::error(format!("{e}")));
         }
-        None
+        Ok(cwd)
     }
 
     // ---- Notebook tool (.ipynb cell-level edits) ----
@@ -2546,7 +2575,7 @@ fn app_home_dir() -> Option<PathBuf> {
     }
     #[cfg(not(test))]
     {
-        dirs::home_dir()
+        crate::sessions::home_dir()
     }
 }
 
@@ -3708,11 +3737,27 @@ mod tests {
 
     #[tokio::test]
     async fn worktree_list_runs_in_a_git_repo() {
-        // We're inside the cubi repo, so `git worktree list` works.
-        let dir = std::env::current_dir().unwrap();
-        let registry = registry_with_trust(&dir, false);
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "git init failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let registry = registry_with_trust(repo.path(), false);
         let result = registry
-            .execute("worktree", json!({ "action": "list" }))
+            .execute(
+                "worktree",
+                json!({
+                    "action": "list",
+                    "cwd": repo.path().to_string_lossy()
+                }),
+            )
             .await
             .expect("call ok");
         assert!(result.is_error.is_none(), "got {:?}", result);

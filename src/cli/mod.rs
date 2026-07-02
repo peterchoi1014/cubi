@@ -34,6 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Sentinel prefix used to tag system messages that should only influence the
 /// next assistant turn (e.g. `/ask`). After the model responds once, any
@@ -146,6 +147,18 @@ pub struct ChatCLI {
     /// assistant output, slash command output, errors, `--events`, or
     /// `--trace-tools`. `--quiet` also implies `--no-banner`.
     pub(crate) quiet_mode: bool,
+    /// Hidden mode used by isolated consensus subprocesses. Strips Cubi
+    /// meta-tools from the advertised tool list and rejects any emitted
+    /// meta-tool call so subagents cannot recursively spawn agents.
+    pub(crate) subprocess_subagent_mode: bool,
+    /// Optional hidden step cap for isolated consensus subprocesses. Clamped
+    /// at the normal agent-loop cap before use.
+    pub(crate) max_agent_steps_override: Option<usize>,
+    /// Optional hidden wall-clock cap for isolated consensus subprocesses.
+    /// The parent process still keeps its own timeout as a backstop; this
+    /// child-side cap lets the agent loop emit structured JSON and unwind
+    /// before the parent has to kill it.
+    pub(crate) max_agent_time_cap_override: Option<Duration>,
     /// Optional structured event tap (`--events <path>`). Writes every
     /// internal event (turn boundaries, tool calls, rationales, MCP
     /// transitions, errors) as JSONL. `None` when the flag is unset.
@@ -180,6 +193,9 @@ pub struct CliFlags {
     pub usage_footer: bool,
     pub explain_tools: bool,
     pub quiet: bool,
+    pub subprocess_subagent_mode: bool,
+    pub max_agent_steps_override: Option<usize>,
+    pub max_agent_time_cap_override: Option<Duration>,
 }
 
 impl Default for CliFlags {
@@ -197,6 +213,9 @@ impl Default for CliFlags {
             usage_footer: false,
             explain_tools: false,
             quiet: false,
+            subprocess_subagent_mode: false,
+            max_agent_steps_override: None,
+            max_agent_time_cap_override: None,
         }
     }
 }
@@ -274,6 +293,9 @@ impl ChatCLI {
             usage_history: Vec::new(),
             usage_footer_enabled: flags.usage_footer,
             quiet_mode: flags.quiet,
+            subprocess_subagent_mode: flags.subprocess_subagent_mode,
+            max_agent_steps_override: flags.max_agent_steps_override,
+            max_agent_time_cap_override: flags.max_agent_time_cap_override,
             event_sink: None,
             receipts: None,
             explain_tools_enabled: flags.explain_tools,
@@ -412,7 +434,7 @@ impl ChatCLI {
                 "mode": "headless",
             }),
         );
-        let expanded = file_mentions::expand_file_mentions(prompt);
+        let expanded = prepare_one_shot_user_message(self.subprocess_subagent_mode, prompt);
         let turn_start = self.history.len();
         self.history.push(Message::text("user", expanded));
         self.journal.start_turn();
@@ -1743,7 +1765,10 @@ impl ChatCLI {
             .map(|m| m.list_tools().len())
             .unwrap_or(0);
         let cwd = std::env::current_dir().ok();
-        let perms = self.permissions.lock().unwrap();
+        let perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
         let trusted_count = perms.trusted_count();
         drop(perms);
@@ -2002,7 +2027,7 @@ impl ChatCLI {
         }
 
         // 2. Config directory writable.
-        match dirs::home_dir().map(|h| h.join(".cubi")) {
+        match crate::sessions::cubi_dir() {
             Some(dir) => match fs::create_dir_all(&dir) {
                 Ok(()) => {
                     // Use a unique probe filename and `create_new` so we never
@@ -2152,7 +2177,10 @@ impl ChatCLI {
     /// entries, session checkpoint count, todo count.
     fn show_env(&self) {
         let cwd = std::env::current_dir().ok();
-        let perms = self.permissions.lock().unwrap();
+        let perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let trusted_here = cwd.as_deref().map(|p| perms.contains(p)).unwrap_or(false);
         let trusted_count = perms.trusted_count();
         drop(perms);
@@ -2276,13 +2304,16 @@ impl ChatCLI {
     /// `/permissions` — list trusted directories and the built-in tools
     /// gated by the trust store.
     fn show_permissions(&self) {
-        let perms = self.permissions.lock().unwrap();
+        let perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let roots: Vec<_> = perms.trusted_roots().cloned().collect();
         let allowed: Vec<_> = perms.allowed_tools().cloned().collect();
         let denied: Vec<_> = perms.denied_tools().cloned().collect();
         drop(perms);
 
-        let store_path = dirs::home_dir().map(|h| h.join(".cubi").join("trusted_dirs.json"));
+        let store_path = crate::sessions::cubi_dir().map(|dir| dir.join("trusted_dirs.json"));
 
         println!("\n{}", "Permissions:".bright_yellow().bold());
         if let Some(p) = &store_path {
@@ -2366,7 +2397,10 @@ impl ChatCLI {
             println!("{} Usage: /tool-allow <name>", "Info:".bright_yellow());
             return;
         }
-        let mut perms = self.permissions.lock().unwrap();
+        let mut perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         perms.allow_tool(tool);
         match perms.save() {
             Ok(()) => println!("{} Allowed tool {}", "✓".bright_green(), tool.bright_cyan()),
@@ -2384,7 +2418,10 @@ impl ChatCLI {
             println!("{} Usage: /tool-deny <name>", "Info:".bright_yellow());
             return;
         }
-        let mut perms = self.permissions.lock().unwrap();
+        let mut perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         perms.deny_tool(tool);
         match perms.save() {
             Ok(()) => println!("{} Denied tool {}", "✓".bright_green(), tool.bright_cyan()),
@@ -2642,7 +2679,10 @@ impl ChatCLI {
                 return;
             }
         };
-        let mut perms = self.permissions.lock().unwrap();
+        let mut perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = match args.trim() {
             "" | "add" => perms.trust_dir(&cwd).map(|added| (added, true)),
             "revoke" | "remove" | "rm" => perms.revoke_dir(&cwd).map(|removed| (removed, false)),
@@ -3056,7 +3096,12 @@ impl ChatCLI {
                 return;
             }
         };
-        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .check_exec(&cwd)
+        {
             eprintln!("{} {}", "Error:".bright_red(), e);
             return;
         }
@@ -3119,7 +3164,12 @@ impl ChatCLI {
                 return;
             }
         };
-        if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .check_exec(&cwd)
+        {
             eprintln!("{} {}", "Error:".bright_red(), e);
             return;
         }
@@ -3343,7 +3393,12 @@ impl ChatCLI {
                     return;
                 }
             };
-            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            if let Err(e) = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .check_exec(&cwd)
+            {
                 eprintln!("{} {}", "Error:".bright_red(), e);
                 return;
             }
@@ -3379,7 +3434,10 @@ impl ChatCLI {
             // Auto-trust the new worktree path, matching the `worktree`
             // builtin tool's behavior.
             let trust_msg = {
-                let mut perms = self.permissions.lock().unwrap();
+                let mut perms = self
+                    .permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match perms.trust_dir(Path::new(path)) {
                     Ok(true) => match perms.save() {
                         Ok(()) => " (auto-trusted)".to_string(),
@@ -3444,7 +3502,12 @@ impl ChatCLI {
                     return;
                 }
             };
-            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            if let Err(e) = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .check_exec(&cwd)
+            {
                 eprintln!("{} {}", "Error:".bright_red(), e);
                 return;
             }
@@ -3517,7 +3580,12 @@ impl ChatCLI {
                     return;
                 }
             };
-            if let Err(e) = self.permissions.lock().unwrap().check_exec(&cwd) {
+            if let Err(e) = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .check_exec(&cwd)
+            {
                 eprintln!("{} {}", "Error:".bright_red(), e);
                 return;
             }
@@ -3609,7 +3677,10 @@ impl ChatCLI {
             );
             return;
         }
-        let mut perms = self.permissions.lock().unwrap();
+        let mut perms = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match perms.trust_dir(&canonical) {
             Ok(added) => {
                 if let Err(e) = perms.save() {
@@ -4553,7 +4624,12 @@ impl ChatCLI {
             return;
         }
         let candidate = PathBuf::from(path);
-        if let Err(e) = self.permissions.lock().unwrap().check_exec(&candidate) {
+        if let Err(e) = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .check_exec(&candidate)
+        {
             eprintln!("{} {}", "Error:".bright_red(), e);
             return;
         }
@@ -5020,7 +5096,7 @@ impl ChatCLI {
         );
     }
 
-    /// `/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>`
+    /// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`
     ///
     /// Drives a multi-model consensus run and prints a per-model
     /// summary table plus the winning output. Subagent token usage is
@@ -5034,12 +5110,15 @@ impl ChatCLI {
                     "{} {}\n  usage: {}",
                     "Error:".bright_red(),
                     e,
-                    "/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>"
-                        .bright_cyan()
+                    CONSENSUS_SLASH_USAGE.bright_cyan()
                 );
                 return;
             }
         };
+        if let Some(reason) = self.isolated_tool_consensus_policy_error(&req) {
+            eprintln!("{} {}", "Error:".bright_red(), reason);
+            return;
+        }
 
         let sink = CliConsensusSink {
             json_enabled: self.json_enabled && self.headless_mode,
@@ -5061,6 +5140,43 @@ impl ChatCLI {
             Err(e) => {
                 eprintln!("{} {}", "Error:".bright_red(), e);
             }
+        }
+    }
+
+    fn isolated_tool_consensus_policy_error(
+        &self,
+        req: &crate::consensus::ConsensusRequest,
+    ) -> Option<String> {
+        if !(req.use_tools && req.isolate) {
+            return None;
+        }
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return Some(
+                "Plan mode is on — refusing isolated tool consensus. Toggle off with /plan first."
+                    .to_string(),
+            );
+        }
+
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                return Some(format!(
+                    "Could not read cwd for isolated tool consensus policy check: {e}"
+                ));
+            }
+        };
+        let permissions = match self.permissions.lock() {
+            Ok(permissions) => permissions,
+            Err(_) => {
+                return Some(
+                    "Could not read permissions for isolated tool consensus policy check"
+                        .to_string(),
+                );
+            }
+        };
+        match permissions.check_exec(&cwd) {
+            Ok(()) => None,
+            Err(e) => Some(format!("Refusing isolated tool consensus: {e}")),
         }
     }
 
@@ -5088,8 +5204,9 @@ impl ChatCLI {
                 format!("error: {err}").bright_red().to_string()
             } else {
                 format!(
-                    "(steps: {}, tokens: {})",
+                    "(steps: {}, tool calls: {}, tokens: {})",
                     sub.steps_used,
+                    sub.tool_calls,
                     sub.prompt_tokens + sub.completion_tokens
                 )
             };
@@ -5517,15 +5634,28 @@ impl ChatCLI {
     }
 }
 
+const CONSENSUS_SLASH_USAGE: &str = "/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>";
+
 /// Parses the args of
-/// `/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>`.
+/// `/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>`.
 ///
 /// Grammar (whitespace-delimited):
 ///   1. `<strategy>` — one of `vote`, `best-of-n`, `judge`.
 ///   2. `<models>`  — comma-separated, no internal whitespace.
 ///   3. Optional `tools`/`--tools` token to enable sequential tool mode.
-///   4. Optional `judge:<model>` token (required when strategy != vote).
-///   5. Everything that remains is the `<goal>` text (verbatim).
+///   4. Optional `isolate`/`--isolate` token to run tool-enabled subagents
+///      in parallel, each in its own throwaway git worktree (implies
+///      `tools`).
+///   5. Optional `concurrency:<n>` or `c:<n>` token to cap concurrent
+///      subagents (`0` keeps the dispatcher default).
+///   6. Optional `--max-steps <n>`, `--max-steps=<n>`, or
+///      `max_steps:<n>` token to cap each subagent's agent-loop steps.
+///   7. Optional `--isolated-time-cap-secs <seconds>`,
+///      `--isolated-time-cap-secs=<seconds>`, or
+///      `isolated_time_cap_secs:<seconds>` token to cap each isolated
+///      subagent.
+///   8. Optional `judge:<model>` token (required when strategy != vote).
+///   9. Everything that remains is the `<goal>` text (verbatim).
 fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -5551,10 +5681,100 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
     // string, so reject them at the parse layer.
     let mut judge_model: Option<String> = None;
     let mut use_tools = false;
+    let mut isolate = false;
+    let mut concurrency = 0;
+    let mut saw_concurrency = false;
+    let mut isolated_time_cap_secs = 0;
+    let mut max_steps_per_subagent = crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS;
+    let mut saw_max_steps = false;
     let mut next = iter.next();
     while let Some(tok) = next {
         if tok == "tools" || tok == "--tools" {
             use_tools = true;
+            next = iter.next();
+            continue;
+        }
+        if tok == "isolate" || tok == "--isolate" {
+            use_tools = true;
+            isolate = true;
+            next = iter.next();
+            continue;
+        }
+        if tok == "--isolated-time-cap-secs" {
+            let Some(value) = iter.next() else {
+                return Err(
+                    "--isolated-time-cap-secs requires a positive integer number of seconds"
+                        .to_string(),
+                );
+            };
+            if isolated_time_cap_secs != 0 {
+                return Err("duplicate isolated time-cap token".to_string());
+            }
+            isolated_time_cap_secs = parse_consensus_isolated_time_cap_secs(value)?;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix("--isolated-time-cap-secs=") {
+            if isolated_time_cap_secs != 0 {
+                return Err("duplicate isolated time-cap token".to_string());
+            }
+            isolated_time_cap_secs = parse_consensus_isolated_time_cap_secs(rest)?;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok
+            .strip_prefix("concurrency:")
+            .or_else(|| tok.strip_prefix("c:"))
+        {
+            if saw_concurrency {
+                return Err("duplicate concurrency token".to_string());
+            }
+            concurrency = parse_consensus_concurrency(rest)?;
+            saw_concurrency = true;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok
+            .strip_prefix("isolated_time_cap_secs:")
+            .or_else(|| tok.strip_prefix("isolated-time-cap-secs:"))
+        {
+            if isolated_time_cap_secs != 0 {
+                return Err("duplicate isolated time-cap token".to_string());
+            }
+            isolated_time_cap_secs = parse_consensus_isolated_time_cap_secs(rest)?;
+            next = iter.next();
+            continue;
+        }
+        if tok == "--max-steps" {
+            let Some(value) = iter.next() else {
+                return Err("--max-steps requires a positive integer step count".to_string());
+            };
+            if saw_max_steps {
+                return Err("duplicate max-steps token".to_string());
+            }
+            max_steps_per_subagent = parse_consensus_max_steps(value)?;
+            saw_max_steps = true;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix("--max-steps=") {
+            if saw_max_steps {
+                return Err("duplicate max-steps token".to_string());
+            }
+            max_steps_per_subagent = parse_consensus_max_steps(rest)?;
+            saw_max_steps = true;
+            next = iter.next();
+            continue;
+        }
+        if let Some(rest) = tok
+            .strip_prefix("max_steps:")
+            .or_else(|| tok.strip_prefix("max-steps:"))
+        {
+            if saw_max_steps {
+                return Err("duplicate max-steps token".to_string());
+            }
+            max_steps_per_subagent = parse_consensus_max_steps(rest)?;
+            saw_max_steps = true;
             next = iter.next();
             continue;
         }
@@ -5587,6 +5807,9 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
     if goal.is_empty() {
         return Err("missing <goal> text".to_string());
     }
+    if isolated_time_cap_secs != 0 && !isolate {
+        return Err("--isolated-time-cap-secs requires isolate/--isolate".to_string());
+    }
 
     let strategy = match strategy_str {
         "vote" => crate::consensus::ConsensusStrategy::Vote,
@@ -5611,10 +5834,32 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
         goal,
         models,
         strategy,
-        max_steps_per_subagent: crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS,
-        concurrency: 0,
+        max_steps_per_subagent,
+        concurrency,
         use_tools,
+        isolate,
+        isolated_time_cap_secs,
     })
+}
+
+fn parse_consensus_isolated_time_cap_secs(raw: &str) -> Result<u64, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("time cap must be a positive integer number of seconds".to_string()),
+    }
+}
+
+fn parse_consensus_max_steps(raw: &str) -> Result<usize, String> {
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("max steps must be a positive integer".to_string()),
+    }
+}
+
+fn parse_consensus_concurrency(raw: &str) -> Result<usize, String> {
+    raw.trim()
+        .parse::<usize>()
+        .map_err(|_| "concurrency must be a non-negative integer".to_string())
 }
 
 /// Event sink that fans consensus events out to both the headless JSON
@@ -5654,13 +5899,17 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
     }
 
     fn subagent_result(&self, sub: &crate::consensus::SubagentOutput) {
+        let stats = crate::ollama::ChatStats {
+            prompt_tokens: sub.prompt_tokens,
+            completion_tokens: sub.completion_tokens,
+            elapsed_ms: sub.elapsed_ms,
+        };
         let payload = crate::json_events::consensus_subagent_result(
             &sub.model,
             sub.ok(),
             sub.steps_used,
-            sub.elapsed_ms,
-            sub.prompt_tokens,
-            sub.completion_tokens,
+            sub.tool_calls,
+            stats,
             sub.error.as_deref(),
         );
         crate::json_events::emit(self.json_enabled, &payload);
@@ -5978,6 +6227,20 @@ fn check_overwrite_allowed(filename: &str, force: bool, cmd: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// Build the user message for `-p` / one-shot mode.
+///
+/// Normal user one-shots keep the convenience `@file` expansion. Hidden
+/// subprocess subagents receive model-supplied goals, not direct user input;
+/// expanding `@/absolute/path` or `@../../...` there would let a parent model
+/// read files before the child reaches the normal tool permission checks.
+fn prepare_one_shot_user_message(subprocess_subagent_mode: bool, prompt: &str) -> String {
+    if subprocess_subagent_mode {
+        prompt.to_string()
+    } else {
+        file_mentions::expand_file_mentions(prompt)
+    }
 }
 
 /// Parses the argument list of `/export` and `/save` into a `(force, filename)`
@@ -6336,6 +6599,75 @@ mod tests {
     fn rationale_falls_back_to_no_description_when_all_empty() {
         let r = super::agent::resolve_tool_rationale("   ", "bash", None);
         assert_eq!(r, "(no description)");
+    }
+
+    #[test]
+    fn subprocess_subagent_mode_strips_meta_tools_from_turn_specs() {
+        let specs = Some(vec![
+            agent_loop::agent_run_spec(),
+            crate::consensus::consensus_run_spec(),
+            crate::ollama::ToolSpec {
+                tool_type: "function".into(),
+                function: crate::ollama::ToolFunction {
+                    name: "read_file".into(),
+                    description: "read".into(),
+                    parameters: serde_json::json!({}),
+                },
+            },
+        ]);
+
+        let filtered = ChatCLI::filter_turn_tool_specs_for_subagent_mode(true, specs.clone())
+            .expect("tool list should remain present");
+        let names: Vec<_> = filtered
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+
+        let unfiltered = ChatCLI::filter_turn_tool_specs_for_subagent_mode(false, specs)
+            .expect("tool list should remain present");
+        let names: Vec<_> = unfiltered
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+        assert!(names.contains(&agent_loop::AGENT_TOOL_NAME));
+        assert!(names.contains(&agent_loop::CONSENSUS_TOOL_NAME));
+    }
+
+    #[test]
+    fn subprocess_subagent_step_cap_is_clamped_to_agent_loop_bounds() {
+        let mut cli = new_test_cli();
+        assert_eq!(cli.agent_step_cap(), MAX_AGENT_STEPS);
+
+        cli.max_agent_steps_override = Some(0);
+        assert_eq!(cli.agent_step_cap(), 1);
+
+        cli.max_agent_steps_override = Some(MAX_AGENT_STEPS + 99);
+        assert_eq!(cli.agent_step_cap(), MAX_AGENT_STEPS);
+
+        cli.max_agent_steps_override = Some(3);
+        assert_eq!(cli.agent_step_cap(), 3);
+    }
+
+    #[test]
+    fn subprocess_subagent_one_shot_keeps_file_mentions_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_path = dir.path().join("outside-worktree-secret.txt");
+        std::fs::write(&secret_path, "sensitive contents\n").expect("write secret");
+        let prompt = format!("summarize @{}", secret_path.display());
+
+        let expanded = prepare_one_shot_user_message(false, &prompt);
+        assert!(
+            expanded.contains("sensitive contents"),
+            "normal user one-shot should still expand file mentions: {expanded}"
+        );
+
+        let subprocess_goal = prepare_one_shot_user_message(true, &prompt);
+        assert_eq!(subprocess_goal, prompt);
+        assert!(
+            !subprocess_goal.contains("sensitive contents"),
+            "internal subprocess subagent goals must not read @file mentions"
+        );
     }
 
     #[test]
@@ -6713,13 +7045,109 @@ mod tests {
     fn parse_consensus_accepts_tools_flag() {
         let req = parse_consensus_args("vote m1,m2 --tools do thing").unwrap();
         assert!(req.use_tools);
+        assert!(!req.isolate);
         assert_eq!(req.goal, "do thing");
+    }
+
+    #[test]
+    fn parse_consensus_accepts_isolate_flag_and_implies_tools() {
+        let req = parse_consensus_args("vote m1,m2 --isolate do thing").unwrap();
+        assert!(req.use_tools);
+        assert!(req.isolate);
+        assert_eq!(req.goal, "do thing");
+        assert_eq!(req.isolated_time_cap_secs, 0);
+    }
+
+    #[test]
+    fn parse_consensus_accepts_isolated_time_cap_forms() {
+        let req = parse_consensus_args("vote m1,m2 --isolate --isolated-time-cap-secs 42 do thing")
+            .unwrap();
+        assert!(req.use_tools);
+        assert!(req.isolate);
+        assert_eq!(req.isolated_time_cap_secs, 42);
+        assert_eq!(req.goal, "do thing");
+
+        let req = parse_consensus_args("vote m1,m2 --isolate --isolated-time-cap-secs=17 do thing")
+            .unwrap();
+        assert_eq!(req.isolated_time_cap_secs, 17);
+
+        let req = parse_consensus_args("vote m1,m2 --isolate isolated_time_cap_secs:19 do thing")
+            .unwrap();
+        assert_eq!(req.isolated_time_cap_secs, 19);
+    }
+
+    #[test]
+    fn parse_consensus_accepts_max_steps_forms() {
+        let req = parse_consensus_args("vote m1,m2 --max-steps 7 do thing").unwrap();
+        assert_eq!(req.max_steps_per_subagent, 7);
+        assert_eq!(req.goal, "do thing");
+
+        let req = parse_consensus_args("vote m1,m2 --max-steps=8 do thing").unwrap();
+        assert_eq!(req.max_steps_per_subagent, 8);
+
+        let req = parse_consensus_args("vote m1,m2 max_steps:9 do thing").unwrap();
+        assert_eq!(req.max_steps_per_subagent, 9);
+    }
+
+    #[test]
+    fn parse_consensus_accepts_concurrency_forms() {
+        let req = parse_consensus_args("vote m1,m2 concurrency:2 do thing").unwrap();
+        assert_eq!(req.concurrency, 2);
+        assert_eq!(req.goal, "do thing");
+
+        let req = parse_consensus_args("vote m1,m2 c:1 do thing").unwrap();
+        assert_eq!(req.concurrency, 1);
+
+        let req = parse_consensus_args("vote m1,m2 do thing").unwrap();
+        assert_eq!(req.concurrency, 0);
+    }
+
+    #[test]
+    fn parse_consensus_rejects_invalid_or_duplicate_concurrency() {
+        let err = parse_consensus_args("vote m1,m2 concurrency:nope do thing").unwrap_err();
+        assert!(err.contains("non-negative integer"), "got: {err}");
+
+        let err = parse_consensus_args("vote m1,m2 concurrency:1 c:2 do thing").unwrap_err();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_consensus_rejects_invalid_or_duplicate_max_steps() {
+        let err = parse_consensus_args("vote m1,m2 --max-steps nope do thing").unwrap_err();
+        assert!(err.contains("positive integer"), "got: {err}");
+
+        let err = parse_consensus_args("vote m1,m2 --max-steps 0 do thing").unwrap_err();
+        assert!(err.contains("positive integer"), "got: {err}");
+
+        let err =
+            parse_consensus_args("vote m1,m2 --max-steps 1 --max-steps 2 do thing").unwrap_err();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_consensus_rejects_isolated_time_cap_without_isolate() {
+        let err =
+            parse_consensus_args("vote m1,m2 --isolated-time-cap-secs 42 do thing").unwrap_err();
+        assert!(err.contains("requires isolate"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_consensus_rejects_invalid_isolated_time_cap() {
+        let err =
+            parse_consensus_args("vote m1,m2 --isolate --isolated-time-cap-secs nope do thing")
+                .unwrap_err();
+        assert!(err.contains("positive integer"), "got: {err}");
+
+        let err = parse_consensus_args("vote m1,m2 --isolate --isolated-time-cap-secs 0 do thing")
+            .unwrap_err();
+        assert!(err.contains("positive integer"), "got: {err}");
     }
 
     #[test]
     fn parse_consensus_accepts_tools_keyword_before_judge() {
         let req = parse_consensus_args("judge m1,m2 tools judge:m3 do thing").unwrap();
         assert!(req.use_tools);
+        assert!(!req.isolate);
         assert_eq!(req.goal, "do thing");
         match req.strategy {
             crate::consensus::ConsensusStrategy::Judge { judge_model } => {
@@ -6727,6 +7155,133 @@ mod tests {
             }
             other => panic!("expected Judge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn consensus_policy_guard_rejects_isolated_tool_request_in_plan_mode() {
+        let cli = new_test_cli();
+        cli.plan_mode.store(true, Ordering::SeqCst);
+        let isolated = parse_consensus_args("vote m1,m2 --isolate do thing").unwrap();
+
+        let err = cli.isolated_tool_consensus_policy_error(&isolated).unwrap();
+
+        assert!(err.contains("Plan mode is on"), "got: {err}");
+
+        let shared_tool = parse_consensus_args("vote m1,m2 --tools do thing").unwrap();
+        assert!(
+            cli.isolated_tool_consensus_policy_error(&shared_tool)
+                .is_none()
+        );
+
+        let llm_only = parse_consensus_args("vote m1,m2 do thing").unwrap();
+        assert!(
+            cli.isolated_tool_consensus_policy_error(&llm_only)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn consensus_policy_guard_requires_trusted_cwd_for_isolated_tool_request() {
+        let cli = new_test_cli();
+        let isolated = parse_consensus_args("vote m1,m2 --isolate do thing").unwrap();
+
+        let err = cli.isolated_tool_consensus_policy_error(&isolated).unwrap();
+
+        assert!(err.contains("not a trusted directory"), "got: {err}");
+    }
+
+    #[test]
+    fn consensus_policy_guard_allows_trusted_cwd_for_isolated_tool_request() {
+        let cli = new_test_cli();
+        let cwd = std::env::current_dir().unwrap();
+        cli.permissions.lock().unwrap().trust_dir(&cwd).unwrap();
+        let isolated = parse_consensus_args("vote m1,m2 --isolate do thing").unwrap();
+
+        let err = cli.isolated_tool_consensus_policy_error(&isolated);
+
+        assert!(err.is_none(), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn consensus_meta_tool_rejects_isolated_tool_request_in_plan_mode() {
+        let mut cli = new_test_cli();
+        cli.plan_mode.store(true, Ordering::SeqCst);
+        let call = crate::ollama::ToolCall {
+            id: None,
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: agent_loop::CONSENSUS_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({
+                    "goal": "do thing",
+                    "models": ["m1", "m2"],
+                    "use_tools": true,
+                    "isolate": true
+                }),
+            },
+        };
+
+        let err = cli
+            .execute_consensus_tool_call(&call)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Plan mode is on"), "got: {err}");
+    }
+
+    #[test]
+    fn consensus_usage_docs_mention_isolate_and_isolated_time_cap() {
+        let spec = commands::find_command("/consensus").expect("registered");
+        assert!(spec.usage.contains("--isolate"), "usage: {}", spec.usage);
+        assert!(spec.usage.contains("--max-steps"), "usage: {}", spec.usage);
+        assert!(
+            spec.usage.contains("concurrency:<n>"),
+            "usage: {}",
+            spec.usage
+        );
+        assert!(
+            spec.usage.contains("--isolated-time-cap-secs"),
+            "usage: {}",
+            spec.usage
+        );
+        assert!(
+            spec.help.contains("trusted")
+                && spec.help.contains("clean")
+                && spec.help.contains("/plan"),
+            "help must mention isolated trust/clean/plan caveats: {}",
+            spec.help
+        );
+        assert!(
+            CONSENSUS_SLASH_USAGE.contains("--isolate")
+                && CONSENSUS_SLASH_USAGE.contains("--max-steps")
+                && CONSENSUS_SLASH_USAGE.contains("concurrency:<n>")
+                && CONSENSUS_SLASH_USAGE.contains("--isolated-time-cap-secs"),
+            "slash usage: {CONSENSUS_SLASH_USAGE}"
+        );
+        assert!(
+            include_str!("../../README.md").contains("[--max-steps <n>]"),
+            "README /consensus usage must mention --max-steps"
+        );
+        assert!(
+            include_str!("../../docs/headless.md").contains("isolated_time_cap_secs"),
+            "headless docs must mention consensus meta-tool isolated_time_cap_secs"
+        );
+        assert!(
+            include_str!("../../DEVELOPMENT.md").contains("--max-steps"),
+            "development docs must mention consensus max steps"
+        );
+        let docs = [
+            include_str!("../../README.md"),
+            include_str!("../../docs/headless.md"),
+            include_str!("../../DEVELOPMENT.md"),
+        ]
+        .join("\n");
+        assert!(docs.contains("trusted"), "docs must mention trusted cwd");
+        assert!(docs.contains("/plan"), "docs must mention /plan caveat");
+        assert!(
+            docs.contains("clean"),
+            "docs must mention clean checkout rule"
+        );
     }
 
     #[test]
@@ -6738,8 +7293,47 @@ mod tests {
             winner_output: "out".into(),
             subagent_outputs: vec![],
             decision_reason: "vote tie (2-way); escalated to judge `m1`: pick: 1".into(),
+            arbitration_stats: ChatStats::default(),
             requested_strategy: "vote".into(),
         };
         assert_eq!(CliConsensusSink::strategy_label(&r), "vote");
+    }
+
+    #[test]
+    fn consensus_sink_preserves_tool_calls_in_event_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "cubi-consensus-tool-calls-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::remove_file(&path).ok();
+        let event_sink = Arc::new(crate::event_sink::EventSink::new(path.clone()));
+        let sink = CliConsensusSink {
+            json_enabled: false,
+            event_sink: Some(event_sink),
+        };
+        let sub = crate::consensus::SubagentOutput {
+            model: "m1".into(),
+            output: "ok".into(),
+            steps_used: 4,
+            tool_calls: 7,
+            elapsed_ms: 12,
+            prompt_tokens: 3,
+            completion_tokens: 5,
+            error: None,
+        };
+
+        crate::consensus::ConsensusEventSink::subagent_result(&sink, &sub);
+
+        let raw = std::fs::read_to_string(&path).expect("event file");
+        let payload: serde_json::Value =
+            serde_json::from_str(raw.lines().next().expect("one event line")).expect("json event");
+        assert_eq!(payload["type"], "consensus_subagent_result");
+        assert_eq!(payload["tool_calls"], 7);
+        assert_eq!(payload["steps_used"], 4);
+        assert_eq!(payload["prompt_tokens"], 3);
+        std::fs::remove_file(path).ok();
     }
 }
