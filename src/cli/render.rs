@@ -290,14 +290,12 @@ pub(crate) fn format_mcp_health_segment(ok: usize, failed: usize, not_loaded: us
 }
 
 impl ChatCLI {
-    pub(super) fn print_welcome(&self) {
-        // Show the mascot + command grid first so a fresh REPL is
-        // immediately self-describing, then drop the concise one-line
-        // status line that summarizes model / MCP / sessions state.
-        let color = crate::style::should_color();
-        for row in welcome_banner_rows(color) {
-            println!("{}", row);
-        }
+    /// The full welcome content as plain rows, without printing: the mascot +
+    /// tagline + help-line ([`welcome_banner_rows`]) followed by the composed
+    /// one-line status banner. Reused by [`print_welcome`](Self::print_welcome)
+    /// (REPL) and by `run_tui` to seed the transcript.
+    pub(super) fn welcome_lines(&self, color: bool) -> Vec<String> {
+        let mut rows = welcome_banner_rows(color);
         let model = self.executor.get_model();
         let provider = self.executor.provider_name();
         let sessions = self
@@ -306,7 +304,7 @@ impl ChatCLI {
             .map(|s| s.status())
             .unwrap_or(crate::sessions::SessionStoreStatus::Missing);
         let (mcp_ok, mcp_failed, mcp_not_loaded) = self.mcp_counts;
-        let line = format_banner(
+        rows.push(format_banner(
             env!("CARGO_PKG_VERSION"),
             model,
             provider,
@@ -315,8 +313,17 @@ impl ChatCLI {
             mcp_not_loaded,
             sessions,
             color,
-        );
-        println!("{}", line);
+        ));
+        rows
+    }
+
+    pub(super) fn print_welcome(&self) {
+        // Show the mascot + command grid first so a fresh REPL is
+        // immediately self-describing, then drop the concise one-line
+        // status line that summarizes model / MCP / sessions state.
+        for row in self.welcome_lines(crate::style::should_color()) {
+            println!("{}", row);
+        }
     }
 }
 

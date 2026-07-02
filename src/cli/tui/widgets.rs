@@ -11,28 +11,25 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
-/// Maximum rows the composer region may occupy before it stops growing.
+/// Maximum rows the composer *text* region may occupy before it stops growing
+/// (borders are added on top of this).
 const MAX_COMPOSER_ROWS: u16 = 6;
 
 /// Render `state` into `frame`. Regions, top to bottom:
-///   1. scrollable transcript (`Constraint::Min(1)`),
-///   2. one-line pinned status row (`Constraint::Length(1)`),
-///   3. multi-line composer pinned at the bottom (`Constraint::Length(n)`).
+///   1. scrollable, word-wrapped transcript (`Constraint::Min(1)`),
+///   2. a fully-bordered composer pinned at the bottom
+///      (`Constraint::Length(n)`), whose border carries status info at its
+///      four corners.
 pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
 
     let composer_rows = composer_height(state.composer());
-    let chunks = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(composer_rows),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(composer_rows)]).split(area);
     let transcript_area = chunks[0];
-    let status_area = chunks[1];
-    let composer_area = chunks[2];
+    let composer_area = chunks[1];
 
     // --- Transcript -------------------------------------------------------
     let mut lines: Vec<Line> = Vec::new();
@@ -55,27 +52,37 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
             ));
         }
     }
-    let transcript = Paragraph::new(lines).scroll((state.scroll(), 0));
+    // Word-wrap long lines to the transcript width instead of truncating them.
+    // `trim: false` preserves leading indentation (e.g. code blocks).
+    let transcript = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll(), 0));
     frame.render_widget(transcript, transcript_area);
 
-    // --- Status row -------------------------------------------------------
-    // Render plain (no ANSI): the buffer stores styled cells, not escapes.
-    let status_text = state.status().render(status_area.width as usize, false);
-    let mut status_line = status_text;
-    if state.thinking() && !state.thinking_label().is_empty() {
-        status_line = format!("{} {}", state.thinking_label(), status_line);
-    }
-    let status =
-        Paragraph::new(Line::from(status_line)).style(Style::default().add_modifier(Modifier::DIM));
-    frame.render_widget(status, status_area);
+    // --- Composer (bordered, info at the four corners) --------------------
+    let status = state.status();
+    let top_left = status.path_display();
+    let top_right = status.session_details.clone();
+    let bottom_left = status.model_ctx_display();
+    let progress = if state.thinking() && !state.thinking_label().is_empty() {
+        state.thinking_label().to_string()
+    } else {
+        "ready".to_string()
+    };
+    let bottom_right = format!("{progress} · {}", status.usage_display());
 
-    // --- Composer ---------------------------------------------------------
-    let composer_block = Block::default().borders(Borders::TOP);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let composer_block = Block::bordered()
+        .title_top(Line::from(Span::styled(top_left, dim)).left_aligned())
+        .title_top(Line::from(Span::styled(top_right, dim)).right_aligned())
+        .title_bottom(Line::from(Span::styled(bottom_left, dim)).left_aligned())
+        .title_bottom(Line::from(Span::styled(bottom_right, dim)).right_aligned());
     let inner = composer_block.inner(composer_area);
     let composer = Paragraph::new(compose_lines(state.composer())).block(composer_block);
     frame.render_widget(composer, composer_area);
 
-    // Place the terminal cursor at the composer caret position.
+    // Place the terminal cursor at the composer caret position, inside the
+    // block's inner area (which now accounts for all four borders).
     let (cx, cy) = caret_position(state.composer(), state.cursor());
     let cursor_x = inner.x.saturating_add(cx);
     let cursor_y = inner.y.saturating_add(cy);
@@ -86,10 +93,10 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
 }
 
 /// The composer's height in rows: one row per logical line, at least 1, capped
-/// at [`MAX_COMPOSER_ROWS`], plus one row for the top border.
+/// at [`MAX_COMPOSER_ROWS`], plus two rows for the top and bottom borders.
 fn composer_height(composer: &str) -> u16 {
     let logical = composer.split('\n').count().max(1) as u16;
-    logical.min(MAX_COMPOSER_ROWS).saturating_add(1)
+    logical.min(MAX_COMPOSER_ROWS).saturating_add(2)
 }
 
 /// Split the composer text into styled lines for the paragraph.
@@ -145,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_places_composer_text_on_a_bottom_row() {
+    fn draw_places_composer_text_on_an_inner_row() {
         let mut state = AppState::new();
         for c in "hello world".chars() {
             state.edit(super::super::app::EditAction::InsertChar(c));
@@ -153,16 +160,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal.draw(|f| draw(f, &state)).unwrap();
         let buf = terminal.backend().buffer();
-        // Composer text should appear on the last row.
-        let last = row_to_string(buf, 9);
+        // Composer text sits on the inner row (row 8): the last row (9) is now
+        // the bottom border, the top border is above it.
+        let inner = row_to_string(buf, 8);
         assert!(
-            last.contains("hello world"),
-            "composer text missing from bottom row: {last:?}"
+            inner.contains("hello world"),
+            "composer text missing from inner row: {inner:?}"
         );
     }
 
     #[test]
-    fn draw_renders_status_content_on_status_row() {
+    fn draw_renders_corner_status_on_the_border() {
         let mut state = AppState::new();
         state.apply(RenderEvent::StatusSnapshot(
             crate::cli::status::StatusState {
@@ -173,16 +181,40 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 cost: "$0.00 (local)".to_string(),
+                session_details: "ollama · 0 msgs · sessions ok".to_string(),
             },
         ));
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal.draw(|f| draw(f, &state)).unwrap();
         let buf = terminal.backend().buffer();
-        // The status row is the row just above the composer region.
-        // Regardless of exact placement, the model id must be somewhere.
+        // The model id now rides the composer's bottom border (bottom-left
+        // corner), and the path rides the top border (top-left corner).
         assert!(
             buffer_contains(buf, "qwen3:8b"),
             "status model id missing from buffer"
+        );
+        // With an empty composer, composer_rows = 3 → rows 7 (top border),
+        // 8 (text), 9 (bottom border). The path is on the top border row.
+        let top_border = row_to_string(buf, 7);
+        assert!(
+            top_border.contains("/tmp/project"),
+            "path missing from top border row: {top_border:?}"
+        );
+    }
+
+    #[test]
+    fn draw_wraps_long_transcript_lines() {
+        let mut state = AppState::new();
+        // A line far wider than the 30-col transcript must wrap, not truncate:
+        // its tail token should still be present somewhere in the buffer.
+        let long = "start ".to_string() + &"word ".repeat(30) + "END_TAIL";
+        state.apply(RenderEvent::Status(long));
+        let mut terminal = Terminal::new(TestBackend::new(30, 20)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buf, "END_TAIL"),
+            "long line was truncated instead of wrapped"
         );
     }
 
