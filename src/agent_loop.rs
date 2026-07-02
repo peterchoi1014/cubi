@@ -24,7 +24,7 @@ use serde_json::json;
 
 use crate::executor::AIExecutor;
 use crate::mcp_manager::McpManager;
-use crate::ollama::{Message, ToolFunction, ToolSpec};
+use crate::ollama::{ChatStats, Message, ToolFunction, ToolSpec};
 
 /// Maximum number of "model → tool → model" iterations per user turn before
 /// the loop bails out with a diagnostic. Generous enough for realistic
@@ -171,6 +171,14 @@ pub fn render_tool_result(result: &crate::mcp_client::ToolCallResult) -> String 
     buf
 }
 
+/// Final report and accounting from a subagent loop.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentRunResult {
+    pub output: String,
+    pub stats: ChatStats,
+    pub steps_used: usize,
+}
+
 /// Runs a subagent loop with a fresh context. Returns the subagent's final
 /// assistant message text. Used by the top-level agent loop in response to
 /// an `agent_run` tool call from the parent model.
@@ -185,6 +193,22 @@ pub async fn run_subagent(
     goal: &str,
     requested_max_steps: usize,
 ) -> Result<String> {
+    Ok(
+        run_subagent_with_model(executor, mcp, None, goal, requested_max_steps)
+            .await?
+            .output,
+    )
+}
+
+/// Runs the same subagent loop as [`run_subagent`] but optionally overrides
+/// the model for each chat call and returns token/step accounting.
+pub async fn run_subagent_with_model(
+    executor: &AIExecutor,
+    mcp: &mut Option<McpManager>,
+    model: Option<&str>,
+    goal: &str,
+    requested_max_steps: usize,
+) -> Result<SubagentRunResult> {
     // Hard-cap the caller's budget so the parent can't be tricked into
     // burning unbounded budget via a large `max_steps`.
     let max_steps = requested_max_steps.clamp(1, SUBAGENT_MAX_STEPS);
@@ -195,11 +219,23 @@ pub async fn run_subagent(
         Message::text("system", SUBAGENT_SYSTEM_PROMPT),
         Message::text("user", goal),
     ];
+    let mut total_stats = ChatStats::default();
 
     for step in 0..max_steps {
-        let (msg, _stats) = executor
-            .chat_with_tools(history.clone(), tools.clone())
-            .await?;
+        let (msg, stats) = match model {
+            Some(model) => {
+                executor
+                    .chat_with_model_and_tools(model, history.clone(), tools.clone())
+                    .await?
+            }
+            None => {
+                executor
+                    .chat_with_tools(history.clone(), tools.clone())
+                    .await?
+            }
+        };
+        total_stats.add(&stats);
+        let steps_used = step + 1;
         // Some backends (older Ollama) don't supply an `id` on each
         // tool_call. Synthesize a stable, position-based id so the
         // assistant message and its tool-result messages reference the
@@ -218,10 +254,15 @@ pub async fn run_subagent(
 
         if calls.is_empty() {
             // No more tools to run — this is the subagent's final report.
-            return Ok(if content.is_empty() {
+            let output = if content.is_empty() {
                 "[subagent returned empty report]".to_string()
             } else {
                 content
+            };
+            return Ok(SubagentRunResult {
+                output,
+                stats: total_stats,
+                steps_used,
             });
         }
 
@@ -266,14 +307,22 @@ pub async fn run_subagent(
                 .find(|m| m.role == "assistant" && !m.content.is_empty())
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
-            return Ok(format!(
-                "[subagent hit step cap of {max_steps}; partial result:]\n{last_text}"
-            ));
+            return Ok(SubagentRunResult {
+                output: format!(
+                    "[subagent hit step cap of {max_steps}; partial result:]\n{last_text}"
+                ),
+                stats: total_stats,
+                steps_used,
+            });
         }
     }
     // Unreachable: the `step + 1 == max_steps` branch above always returns
     // on the final iteration. Kept as a safety net.
-    Ok(String::new())
+    Ok(SubagentRunResult {
+        output: String::new(),
+        stats: total_stats,
+        steps_used: 0,
+    })
 }
 
 #[cfg(test)]

@@ -60,14 +60,25 @@ impl AIExecutor {
     /// stored default model for a single call. Used by the consensus
     /// dispatcher to run the same goal under several models without
     /// mutating the executor's global `model` field (which would race
-    /// with concurrent subagents). No tools are forwarded; consensus
-    /// subagents are intentionally tool-less in the MVP.
+    /// with concurrent subagents).
     pub async fn chat_with_model(
         &self,
         model: &str,
         messages: Vec<Message>,
     ) -> Result<(Message, ChatStats)> {
         self.backend.chat_with_tools(model, messages, None).await
+    }
+
+    /// Variant of [`chat_with_model`] that forwards a tool list to the
+    /// backend while still overriding the executor's default model for
+    /// just this call.
+    pub async fn chat_with_model_and_tools(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<(Message, ChatStats)> {
+        self.backend.chat_with_tools(model, messages, tools).await
     }
 
     pub fn get_model(&self) -> &str {

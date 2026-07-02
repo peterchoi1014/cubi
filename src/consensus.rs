@@ -1,8 +1,8 @@
 //! Multi-model consensus.
 //!
 //! `consensus_run` (and the `/consensus` slash command) spawns N
-//! subagents in parallel against a caller-supplied list of models,
-//! then arbitrates the candidate outputs via one of three strategies:
+//! subagents against a caller-supplied list of models, then arbitrates
+//! the candidate outputs via one of three strategies:
 //!
 //!   * [`ConsensusStrategy::Vote`] — plurality of normalized outputs.
 //!   * [`ConsensusStrategy::BestOfN`] — judge model scores each output.
@@ -13,24 +13,20 @@
 //! arbitration natively. This module is the load-bearing implementation
 //! of that differentiator.
 //!
-//! ## Scope (MVP)
+//! ## Scope
 //!
-//! Consensus subagents perform a **single LLM call** with the goal as
-//! the user message and a short focusing system prompt. They do **not**
-//! have access to tools. That keeps the parallel dispatch trivially
-//! safe (no shared `McpManager` state to lock), keeps the cost of an
-//! N-way consensus bounded to N model calls, and matches the intuitive
-//! "ask N models the same question" mental model. Tool-using consensus
-//! is a future extension that requires shared-mutable `McpManager`
-//! access; see DEVELOPMENT.md for the design notes.
+//! Consensus subagents default to a **single LLM call** with the goal as
+//! the user message and a short focusing system prompt. Tool access is
+//! strictly opt-in via [`ConsensusRequest::use_tools`]. Tool-enabled
+//! consensus runs subagents sequentially through the standard subagent
+//! loop so the live `McpManager` is never shared concurrently.
 //!
 //! ## Anti-recursion
 //!
 //! `consensus_run` is stripped from every subagent's tool list (both
-//! `agent_run` subagents and consensus subagents themselves — which in
-//! the MVP have no tools at all). The same [`agent_loop::without_meta_tools`]
-//! helper strips both `agent_run` and `consensus_run` so they can't
-//! drift apart.
+//! `agent_run` subagents and opt-in tool-enabled consensus subagents).
+//! The same [`agent_loop::without_meta_tools`] helper strips both
+//! `agent_run` and `consensus_run` so they can't drift apart.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,11 +39,13 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 use crate::executor::AIExecutor;
+use crate::mcp_manager::McpManager;
 use crate::ollama::{ChatStats, Message, ToolFunction, ToolSpec};
 
-/// System prompt for every consensus subagent. Mirrors the focused tone
-/// of `agent_loop::SUBAGENT_SYSTEM_PROMPT` but emphasises that the
-/// reply is a single self-contained answer (no tools, no follow-up).
+/// System prompt for every LLM-only consensus subagent. Mirrors the
+/// focused tone of `agent_loop::SUBAGENT_SYSTEM_PROMPT` but emphasises
+/// that the reply is a single self-contained answer (no tools, no
+/// follow-up).
 const CONSENSUS_SYSTEM_PROMPT: &str = "You are one of several focused worker subagents answering the SAME goal in \
      parallel under different models. Produce a single concise, self-contained \
      final answer. Do not ask clarifying questions — make a reasonable assumption \
@@ -77,13 +75,15 @@ pub struct ConsensusRequest {
     pub goal: String,
     pub models: Vec<String>,
     pub strategy: ConsensusStrategy,
-    /// Per-subagent step cap. The MVP only runs a single LLM call per
-    /// subagent, so this is retained as future-proofing; it's surfaced
-    /// in the `consensus_start` event so consumers can already key off it.
+    /// Per-subagent step cap. LLM-only consensus uses a single call;
+    /// tool-enabled consensus clamps this into the subagent loop cap.
     pub max_steps_per_subagent: usize,
     /// Maximum number of subagents in flight at once. `0` means
     /// `models.len()` — i.e. fully parallel. `1` is sequential.
     pub concurrency: usize,
+    /// When false (the default), each subagent is a single LLM-only call.
+    /// When true, each subagent may use tools and runs sequentially.
+    pub use_tools: bool,
 }
 
 /// One subagent's output. Recorded for every model in `models` —
@@ -144,10 +144,11 @@ pub fn consensus_run_spec() -> ToolSpec {
         tool_type: "function".to_string(),
         function: ToolFunction {
             name: crate::agent_loop::CONSENSUS_TOOL_NAME.to_string(),
-            description: "Run the same goal in parallel under multiple models and arbitrate. \
+            description: "Run the same goal under multiple models and arbitrate. \
                           Useful when you want a more reliable answer than any single model \
                           can provide. Cannot be called from within a subagent (anti-recursion). \
-                          MVP scope: subagents make a single LLM call with no tool access."
+                          By default subagents are LLM-only and may run in parallel. Set \
+                          use_tools=true to let subagents use tools; tool mode is sequential."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -160,7 +161,7 @@ pub fn consensus_run_spec() -> ToolSpec {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 2,
-                        "description": "Models to consult in parallel."
+                        "description": "Models to consult. LLM-only mode may run them in parallel; tool mode runs sequentially."
                     },
                     "strategy": {
                         "type": "string",
@@ -178,7 +179,12 @@ pub fn consensus_run_spec() -> ToolSpec {
                     "concurrency": {
                         "type": "integer",
                         "default": 0,
-                        "description": "0 = parallel (len(models)); 1 = sequential. Use 1 on single-GPU setups."
+                        "description": "0 = parallel (len(models)); 1 = sequential. Ignored when use_tools=true because tool mode is always sequential."
+                    },
+                    "use_tools": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Opt in to tool-enabled subagents. Defaults to false; when true, subagents run sequentially with the live tool manager."
                     }
                 },
                 "required": ["goal", "models"]
@@ -206,9 +212,13 @@ impl ConsensusEventSink for NullSink {
     fn decision(&self, _: &str, _: &str) {}
 }
 
-/// Drives a consensus run: launches N subagents in parallel (limited
-/// by [`ConsensusRequest::concurrency`]), arbitrates the outputs, and
-/// returns a [`ConsensusResult`].
+/// Drives a consensus run using the default LLM-only mode: launches N
+/// subagents in parallel (limited by [`ConsensusRequest::concurrency`]),
+/// arbitrates the outputs, and returns a [`ConsensusResult`].
+///
+/// If [`ConsensusRequest::use_tools`] is true, call [`run_with_tools`]
+/// instead so the live MCP manager can be threaded through the sequential
+/// tool loop.
 ///
 /// Errors in individual subagents are recorded with `error: Some(...)`
 /// and excluded from arbitration; only a wholesale failure (no model
@@ -218,11 +228,48 @@ pub async fn run(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
 ) -> Result<ConsensusResult> {
+    run_inner(req, executor, sink, None).await
+}
+
+/// Drives a consensus run that may opt in to tool-enabled subagents.
+///
+/// When [`ConsensusRequest::use_tools`] is false this delegates to the
+/// unchanged LLM-only path. When it is true, subagents are run
+/// sequentially regardless of [`ConsensusRequest::concurrency`] because
+/// tool execution needs a single live mutable [`McpManager`].
+pub async fn run_with_tools(
+    req: ConsensusRequest,
+    executor: &AIExecutor,
+    sink: &dyn ConsensusEventSink,
+    mcp: &mut Option<McpManager>,
+) -> Result<ConsensusResult> {
+    run_inner(req, executor, sink, Some(mcp)).await
+}
+
+async fn run_inner(
+    req: ConsensusRequest,
+    executor: &AIExecutor,
+    sink: &dyn ConsensusEventSink,
+    mcp: Option<&mut Option<McpManager>>,
+) -> Result<ConsensusResult> {
     if req.models.len() < 2 {
         anyhow::bail!(
             "consensus_run requires at least 2 models, got {}",
             req.models.len()
         );
+    }
+    if req.use_tools {
+        match mcp.as_ref() {
+            None => {
+                anyhow::bail!(
+                    "tool-enabled consensus requires an MCP manager; call run_with_tools"
+                );
+            }
+            Some(slot) if slot.is_none() => {
+                anyhow::bail!("tool-enabled consensus requires an active MCP manager");
+            }
+            Some(_) => {}
+        }
     }
     let strategy_label = match &req.strategy {
         ConsensusStrategy::Vote => "vote",
@@ -236,6 +283,51 @@ pub async fn run(
         req.max_steps_per_subagent,
     );
 
+    let subagent_outputs = if req.use_tools {
+        let mcp = mcp.expect("tool-enabled consensus requires MCP manager");
+        run_tool_subagents(&req, executor, mcp).await
+    } else {
+        run_llm_subagents(&req, executor).await
+    };
+
+    for sub in &subagent_outputs {
+        sink.subagent_result(sub);
+    }
+
+    let successes: Vec<&SubagentOutput> = subagent_outputs.iter().filter(|s| s.ok()).collect();
+    if successes.is_empty() {
+        anyhow::bail!(
+            "consensus_run: every subagent failed ({} models)",
+            subagent_outputs.len()
+        );
+    }
+    if successes.len() == 1 {
+        let only: SubagentOutput = (*successes[0]).clone();
+        let reason = "only successful subagent".to_string();
+        sink.decision(&only.model, &reason);
+        return Ok(ConsensusResult {
+            winner_model: only.model,
+            winner_output: only.output,
+            subagent_outputs,
+            decision_reason: reason,
+            requested_strategy: strategy_label.to_string(),
+        });
+    }
+
+    let (winner_idx, decision_reason) =
+        arbitrate(&req, executor, &subagent_outputs, &successes).await;
+    let winner = &subagent_outputs[winner_idx];
+    sink.decision(&winner.model, &decision_reason);
+    Ok(ConsensusResult {
+        winner_model: winner.model.clone(),
+        winner_output: winner.output.clone(),
+        subagent_outputs: subagent_outputs.clone(),
+        decision_reason,
+        requested_strategy: strategy_label.to_string(),
+    })
+}
+
+async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec<SubagentOutput> {
     let permits = if req.concurrency == 0 {
         req.models.len()
     } else {
@@ -288,43 +380,49 @@ pub async fn run(
         indexed.push((idx, sub));
     }
     indexed.sort_by_key(|(i, _)| *i);
-    let subagent_outputs: Vec<SubagentOutput> = indexed.into_iter().map(|(_, o)| o).collect();
+    indexed.into_iter().map(|(_, o)| o).collect()
+}
 
-    for sub in &subagent_outputs {
-        sink.subagent_result(sub);
+async fn run_tool_subagents(
+    req: &ConsensusRequest,
+    executor: &AIExecutor,
+    mcp: &mut Option<McpManager>,
+) -> Vec<SubagentOutput> {
+    let mut subagent_outputs = Vec::with_capacity(req.models.len());
+    for model in &req.models {
+        let started = Instant::now();
+        let res = crate::agent_loop::run_subagent_with_model(
+            executor,
+            mcp,
+            Some(model.as_str()),
+            &req.goal,
+            req.max_steps_per_subagent,
+        )
+        .await;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let sub = match res {
+            Ok(result) => SubagentOutput {
+                model: model.clone(),
+                output: result.output,
+                steps_used: result.steps_used,
+                elapsed_ms: elapsed_ms.max(result.stats.elapsed_ms),
+                prompt_tokens: result.stats.prompt_tokens,
+                completion_tokens: result.stats.completion_tokens,
+                error: None,
+            },
+            Err(e) => SubagentOutput {
+                model: model.clone(),
+                output: String::new(),
+                steps_used: 0,
+                elapsed_ms,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                error: Some(truncate(&e.to_string(), 400)),
+            },
+        };
+        subagent_outputs.push(sub);
     }
-
-    let successes: Vec<&SubagentOutput> = subagent_outputs.iter().filter(|s| s.ok()).collect();
-    if successes.is_empty() {
-        anyhow::bail!(
-            "consensus_run: every subagent failed ({} models)",
-            subagent_outputs.len()
-        );
-    }
-    if successes.len() == 1 {
-        let only: SubagentOutput = (*successes[0]).clone();
-        let reason = "only successful subagent".to_string();
-        sink.decision(&only.model, &reason);
-        return Ok(ConsensusResult {
-            winner_model: only.model,
-            winner_output: only.output,
-            subagent_outputs,
-            decision_reason: reason,
-            requested_strategy: strategy_label.to_string(),
-        });
-    }
-
-    let (winner_idx, decision_reason) =
-        arbitrate(&req, executor, &subagent_outputs, &successes).await;
-    let winner = &subagent_outputs[winner_idx];
-    sink.decision(&winner.model, &decision_reason);
-    Ok(ConsensusResult {
-        winner_model: winner.model.clone(),
-        winner_output: winner.output.clone(),
-        subagent_outputs: subagent_outputs.clone(),
-        decision_reason,
-        requested_strategy: strategy_label.to_string(),
-    })
+    subagent_outputs
 }
 
 /// Returns `(winner_index_in_subagent_outputs, decision_reason)`.
@@ -622,6 +720,7 @@ mod tests {
             std::env::remove_var("CUBI_FAKE_LLM_MODEL_RESPONSES");
             std::env::remove_var("CUBI_FAKE_LLM_RESPONSE");
             std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL");
+            std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT");
             std::env::remove_var("CUBI_FAKE_LLM_FAIL_MODELS");
         }
     }
@@ -663,6 +762,7 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -694,6 +794,7 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -719,6 +820,7 @@ mod tests {
             },
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_model, "m2");
@@ -746,6 +848,7 @@ mod tests {
             },
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_model, "m2");
@@ -771,6 +874,7 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert_eq!(r.winner_output, "A");
@@ -797,6 +901,7 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 1,
+            use_tools: false,
         };
         let req_par = ConsensusRequest {
             concurrency: 0,
@@ -825,6 +930,7 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         assert!(
@@ -845,12 +951,120 @@ mod tests {
             strategy: ConsensusStrategy::Vote,
             max_steps_per_subagent: 1,
             concurrency: 0,
+            use_tools: false,
         };
         let r = run(req, &executor(), &NullSink).await.unwrap();
         let agg = r.aggregate_stats();
         // Fake stats are 1/1/1 each, two successful calls → 2/2.
         assert_eq!(agg.prompt_tokens, 2);
         assert_eq!(agg.completion_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn use_tools_false_keeps_llm_only_path_with_tools_entrypoint() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        unsafe_set("CUBI_FAKE_LLM_MODEL_RESPONSES", r#"{"m1":"A","m2":"A"}"#);
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 0,
+            use_tools: false,
+        };
+        let direct = run(req.clone(), &executor(), &NullSink).await.unwrap();
+        let mut no_mcp = None;
+        let via_tools_entrypoint = run_with_tools(req, &executor(), &NullSink, &mut no_mcp)
+            .await
+            .unwrap();
+
+        assert_eq!(via_tools_entrypoint.winner_model, direct.winner_model);
+        assert_eq!(via_tools_entrypoint.winner_output, direct.winner_output);
+        assert_eq!(via_tools_entrypoint.decision_reason, direct.decision_reason);
+        assert_eq!(
+            via_tools_entrypoint.requested_strategy,
+            direct.requested_strategy
+        );
+        assert_eq!(
+            via_tools_entrypoint
+                .subagent_outputs
+                .iter()
+                .map(|s| (
+                    &s.model,
+                    &s.output,
+                    s.steps_used,
+                    s.prompt_tokens,
+                    s.completion_tokens
+                ))
+                .collect::<Vec<_>>(),
+            direct
+                .subagent_outputs
+                .iter()
+                .map(|s| (
+                    &s.model,
+                    &s.output,
+                    s.steps_used,
+                    s.prompt_tokens,
+                    s.completion_tokens
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_mode_requires_active_mcp_manager() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 0,
+            use_tools: true,
+        };
+        let mut no_mcp = None;
+        let err = run_with_tools(req, &executor(), &NullSink, &mut no_mcp)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("active MCP manager"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn tool_mode_runner_is_sequential_and_accounts_steps() {
+        let _g = lock().await;
+        unsafe_unset_all();
+        unsafe_set(
+            "CUBI_FAKE_LLM_MODEL_RESPONSES",
+            r#"{"m1":"final A","m2":"final B"}"#,
+        );
+        unsafe_set(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"id":"call_meta","type":"function","function":{"name":"agent_run","arguments":{"goal":"nested work"}}}"#,
+        );
+        let req = ConsensusRequest {
+            goal: "x".into(),
+            models: vec!["m1".into(), "m2".into()],
+            strategy: ConsensusStrategy::Vote,
+            max_steps_per_subagent: 8,
+            concurrency: 99,
+            use_tools: true,
+        };
+        let mut no_mcp = None;
+        let outputs = run_tool_subagents(&req, &executor(), &mut no_mcp).await;
+
+        assert_eq!(
+            outputs.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert_eq!(outputs[0].output, "final A");
+        assert_eq!(outputs[1].output, "final B");
+        assert!(outputs.iter().all(|s| s.error.is_none()));
+        assert!(outputs.iter().all(|s| s.steps_used == 2));
+        assert!(outputs.iter().all(|s| s.prompt_tokens == 2));
+        assert!(outputs.iter().all(|s| s.completion_tokens == 2));
     }
 
     #[test]
@@ -889,6 +1103,11 @@ mod tests {
         assert_eq!(
             spec.function.parameters["properties"]["models"]["minItems"],
             2
+        );
+        assert!(
+            !spec.function.parameters["properties"]["use_tools"]["default"]
+                .as_bool()
+                .unwrap_or(true)
         );
         assert!(
             spec.function.parameters["required"]
