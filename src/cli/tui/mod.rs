@@ -121,6 +121,21 @@ where
                             event::Action::None => {}
                         }
                     }
+                    // Mouse wheel → scroll the transcript.
+                    Some(Ok(Event::Mouse(me))) => {
+                        use crossterm::event::MouseEventKind;
+                        match me.kind {
+                            MouseEventKind::ScrollUp => {
+                                state.scroll_up(3);
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                state.scroll_down(3);
+                                terminal.draw(|f| widgets::draw(f, &state))?;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Resize / focus / paste etc: repaint against current size.
                     Some(Ok(_)) => {
                         terminal.draw(|f| widgets::draw(f, &state))?;
@@ -137,6 +152,32 @@ where
         }
     }
     Ok(())
+}
+
+/// Replay prior conversation turns into the transcript when seeding a resumed
+/// (or otherwise preloaded) session. User and assistant messages are shown with
+/// `You:` / `AI:` prefixes; system, pinned, and tool messages are skipped, and
+/// assistant `<think>` blocks are stripped. Pure over `(state, history)` so it
+/// is unit-testable without a terminal.
+fn seed_history(state: &mut AppState, history: &[crate::ollama::Message]) {
+    for msg in history {
+        match msg.role.as_str() {
+            "user" => {
+                let text = msg.content.trim();
+                if !text.is_empty() {
+                    state.apply(RenderEvent::Status(format!("You: {text}")));
+                }
+            }
+            "assistant" => {
+                let stripped = crate::thinking_filter::strip_thinking_blocks(&msg.content);
+                let text = stripped.trim();
+                if !text.is_empty() {
+                    state.apply(RenderEvent::AssistantFinal(format!("AI: {text}")));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl ChatCLI {
@@ -203,6 +244,10 @@ impl ChatCLI {
         for line in self.welcome_lines(false) {
             state.apply(RenderEvent::Status(line));
         }
+        // On resume (or any preloaded history), replay the prior user/assistant
+        // turns into the transcript so the TUI shows the conversation being
+        // continued rather than opening on just the banner.
+        seed_history(&mut state, &self.history);
         state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
 
         let render_handle = tokio::spawn(render_task(
@@ -315,6 +360,26 @@ mod render_loop_tests {
             cost: "$0.00 (local)".to_string(),
             session_details: "ollama · 0 msgs · sessions ok".to_string(),
         }
+    }
+
+    #[test]
+    fn seed_history_replays_user_and_assistant_turns() {
+        use crate::ollama::Message;
+        let history = vec![
+            Message::text("system", "you are cubi"),
+            Message::text("user", "pineapple castle marker"),
+            Message::text("assistant", "<think>ponder</think>sure thing"),
+            Message::text("tool", "{\"result\":1}"),
+            Message::text("user", "   "), // whitespace-only: skipped
+        ];
+        let mut state = AppState::new();
+        seed_history(&mut state, &history);
+        let texts: Vec<&str> = state.transcript().iter().map(|l| l.text.as_str()).collect();
+        // System, tool, and blank user messages are skipped.
+        assert_eq!(
+            texts,
+            vec!["You: pineapple castle marker", "AI: sure thing"]
+        );
     }
 
     /// Drive the render-task *state-folding* path over the render channel with

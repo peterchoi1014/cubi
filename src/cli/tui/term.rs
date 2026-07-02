@@ -9,6 +9,7 @@
 //! clean screen) and the subsequent unwinding `Drop` becomes a no-op.
 
 use crossterm::cursor::Show;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -33,7 +34,7 @@ pub(super) fn run_once(done: &AtomicBool, restore: impl FnOnce()) -> bool {
 /// step is best-effort: teardown must never itself panic or short-circuit.
 fn real_restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
 }
 
 /// Owns the "we entered raw mode + alt screen" state for the lifetime of a
@@ -47,7 +48,10 @@ impl TerminalGuard {
     /// rolled back before returning so we never leave the terminal wedged.
     pub(super) fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
+        // Enable mouse capture so the wheel scrolls the transcript. Trade-off:
+        // the terminal's native click-drag text selection is intercepted while
+        // the TUI runs (hold Shift/Option in most terminals to bypass).
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(e);
         }
