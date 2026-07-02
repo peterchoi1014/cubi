@@ -40,6 +40,7 @@ mod pricing;
 mod project_memory;
 mod receipts;
 mod repomap;
+mod proc_subagent;
 mod schemas;
 mod script;
 mod sessions;
@@ -57,6 +58,7 @@ mod todos;
 mod trace_tools;
 #[allow(dead_code)]
 mod user_error;
+mod worktree_session;
 
 use crate::style::CubiStyle;
 use anyhow::{Context, Result};
