@@ -44,6 +44,11 @@ pub(super) fn map_key(ev: KeyEvent) -> Action {
         KeyCode::Backspace => Action::Edit(EditAction::Backspace),
         KeyCode::Left => Action::Edit(EditAction::MoveLeft),
         KeyCode::Right => Action::Edit(EditAction::MoveRight),
+        // Up/Down scroll the transcript. Under alternate-scroll mode the mouse
+        // wheel is delivered as Up/Down key presses, so this also drives
+        // wheel scrolling without capturing the mouse.
+        KeyCode::Up => Action::ScrollUp,
+        KeyCode::Down => Action::ScrollDown,
         KeyCode::PageUp => Action::ScrollUp,
         KeyCode::PageDown => Action::ScrollDown,
         _ => Action::None,
@@ -114,11 +119,12 @@ mod tests {
             Action::None
         );
         assert_eq!(map_key(key(KeyCode::Esc)), Action::None);
-        assert_eq!(map_key(key(KeyCode::Up)), Action::None);
     }
 
     #[test]
-    fn page_keys_scroll() {
+    fn arrow_and_page_keys_scroll() {
+        assert_eq!(map_key(key(KeyCode::Up)), Action::ScrollUp);
+        assert_eq!(map_key(key(KeyCode::Down)), Action::ScrollDown);
         assert_eq!(map_key(key(KeyCode::PageUp)), Action::ScrollUp);
         assert_eq!(map_key(key(KeyCode::PageDown)), Action::ScrollDown);
     }

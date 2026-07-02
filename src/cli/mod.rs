@@ -3041,6 +3041,37 @@ impl ChatCLI {
     /// Lazily allocates a new session on first call. Failures are
     /// logged as warnings but never abort the chat — the user always
     /// has the in-memory copy and can `/save` manually.
+    /// Build the on-exit "resume this chat" hint shown by both the standard
+    /// REPL and the TUI. Three cases: an on-disk checkpoint for THIS chat →
+    /// point at `--resume <id>`; else other checkpoints exist in this cwd →
+    /// mention `--resume` / `/sessions`; else nothing on disk → no hint.
+    /// Returns `None` when suppressed by `--quiet`.
+    pub(crate) fn resume_hint(&self) -> Option<String> {
+        if self.quiet_mode {
+            return None;
+        }
+        let store = self.session_store.as_ref()?;
+        if let Some(session) = self.current_session.as_ref() {
+            if !store.exists(&session.id) {
+                return None;
+            }
+            Some(format!(
+                "{} To pick this chat back up, run {}",
+                "↩".bright_cyan(),
+                format!("cubi --resume {}", session.id).bright_cyan()
+            ))
+        } else if store.list().map(|l| !l.is_empty()).unwrap_or(false) {
+            Some(format!(
+                "{} Run {} to jump back into your most recent chat, or {} for a list.",
+                "↩".bright_cyan(),
+                "cubi --resume".bright_cyan(),
+                "cubi  →  /sessions".bright_cyan()
+            ))
+        } else {
+            None
+        }
+    }
+
     fn checkpoint_session(&mut self) {
         let Some(store) = &self.session_store else {
             return;
