@@ -10,7 +10,7 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 
 <div align="center">
 
-![Rust](https://img.shields.io/badge/rust-1.92.0-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.85-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 

@@ -434,7 +434,7 @@ impl ChatCLI {
                 "mode": "headless",
             }),
         );
-        let expanded = file_mentions::expand_file_mentions(prompt);
+        let expanded = prepare_one_shot_user_message(self.subprocess_subagent_mode, prompt);
         let turn_start = self.history.len();
         self.history.push(Message::text("user", expanded));
         self.journal.start_turn();
@@ -6229,6 +6229,20 @@ fn check_overwrite_allowed(filename: &str, force: bool, cmd: &str) -> Result<()>
     Ok(())
 }
 
+/// Build the user message for `-p` / one-shot mode.
+///
+/// Normal user one-shots keep the convenience `@file` expansion. Hidden
+/// subprocess subagents receive model-supplied goals, not direct user input;
+/// expanding `@/absolute/path` or `@../../...` there would let a parent model
+/// read files before the child reaches the normal tool permission checks.
+fn prepare_one_shot_user_message(subprocess_subagent_mode: bool, prompt: &str) -> String {
+    if subprocess_subagent_mode {
+        prompt.to_string()
+    } else {
+        file_mentions::expand_file_mentions(prompt)
+    }
+}
+
 /// Parses the argument list of `/export` and `/save` into a `(force, filename)`
 /// pair. Accepts the `-f` flag in either position:
 ///
@@ -6633,6 +6647,27 @@ mod tests {
 
         cli.max_agent_steps_override = Some(3);
         assert_eq!(cli.agent_step_cap(), 3);
+    }
+
+    #[test]
+    fn subprocess_subagent_one_shot_keeps_file_mentions_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_path = dir.path().join("outside-worktree-secret.txt");
+        std::fs::write(&secret_path, "sensitive contents\n").expect("write secret");
+        let prompt = format!("summarize @{}", secret_path.display());
+
+        let expanded = prepare_one_shot_user_message(false, &prompt);
+        assert!(
+            expanded.contains("sensitive contents"),
+            "normal user one-shot should still expand file mentions: {expanded}"
+        );
+
+        let subprocess_goal = prepare_one_shot_user_message(true, &prompt);
+        assert_eq!(subprocess_goal, prompt);
+        assert!(
+            !subprocess_goal.contains("sensitive contents"),
+            "internal subprocess subagent goals must not read @file mentions"
+        );
     }
 
     #[test]
@@ -7262,5 +7297,43 @@ mod tests {
             requested_strategy: "vote".into(),
         };
         assert_eq!(CliConsensusSink::strategy_label(&r), "vote");
+    }
+
+    #[test]
+    fn consensus_sink_preserves_tool_calls_in_event_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "cubi-consensus-tool-calls-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::remove_file(&path).ok();
+        let event_sink = Arc::new(crate::event_sink::EventSink::new(path.clone()));
+        let sink = CliConsensusSink {
+            json_enabled: false,
+            event_sink: Some(event_sink),
+        };
+        let sub = crate::consensus::SubagentOutput {
+            model: "m1".into(),
+            output: "ok".into(),
+            steps_used: 4,
+            tool_calls: 7,
+            elapsed_ms: 12,
+            prompt_tokens: 3,
+            completion_tokens: 5,
+            error: None,
+        };
+
+        crate::consensus::ConsensusEventSink::subagent_result(&sink, &sub);
+
+        let raw = std::fs::read_to_string(&path).expect("event file");
+        let payload: serde_json::Value =
+            serde_json::from_str(raw.lines().next().expect("one event line")).expect("json event");
+        assert_eq!(payload["type"], "consensus_subagent_result");
+        assert_eq!(payload["tool_calls"], 7);
+        assert_eq!(payload["steps_used"], 4);
+        assert_eq!(payload["prompt_tokens"], 3);
+        std::fs::remove_file(path).ok();
     }
 }

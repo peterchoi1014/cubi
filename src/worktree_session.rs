@@ -40,8 +40,7 @@ pub fn create_in(repo_dir: &Path, base_ref: &str, label: &str) -> Result<Worktre
 }
 
 pub fn resolve_repo_context(cwd: &Path) -> Result<RepoContext> {
-    let cwd = cwd
-        .canonicalize()
+    let cwd = canonicalize_portable(cwd)
         .with_context(|| format!("Could not resolve cwd `{}`", cwd.display()))?;
     let top_level = resolve_git_toplevel(&cwd)?;
     let relative_cwd = cwd.strip_prefix(&top_level).with_context(|| {
@@ -56,6 +55,33 @@ pub fn resolve_repo_context(cwd: &Path) -> Result<RepoContext> {
         top_level,
         relative_cwd: relative_cwd.to_path_buf(),
     })
+}
+
+/// Canonicalize `path`, stripping Windows' extended-length (verbatim) prefix so
+/// the result is a path accepted by git. On non-Windows this is a plain
+/// canonicalize.
+fn canonicalize_portable(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    Ok(strip_verbatim_prefix(canonical))
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let stripped = {
+        let path_string = path.as_os_str().to_string_lossy();
+        if let Some(rest) = path_string.strip_prefix(r"\\?\UNC\") {
+            Some(PathBuf::from(format!(r"\\{rest}")))
+        } else {
+            path_string.strip_prefix(r"\\?\").map(PathBuf::from)
+        }
+    };
+
+    stripped.unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 pub fn ensure_clean_worktree(repo_dir: &Path) -> Result<()> {
@@ -121,7 +147,7 @@ impl WorktreeSession {
 }
 
 fn create_in_checked(repo_dir: &Path, base_ref: &str, label: &str) -> Result<WorktreeSession> {
-    let repo_dir = repo_dir.canonicalize().with_context(|| {
+    let repo_dir = canonicalize_portable(repo_dir).with_context(|| {
         format!(
             "Could not resolve repository directory `{}`",
             repo_dir.display()
@@ -261,7 +287,7 @@ fn resolve_git_toplevel(repo_dir: &Path) -> Result<PathBuf> {
         repo_dir.join(top_level)
     };
 
-    top_level.canonicalize().with_context(|| {
+    canonicalize_portable(&top_level).with_context(|| {
         format!(
             "Could not resolve git top-level directory `{}`",
             top_level.display()
@@ -305,7 +331,7 @@ fn resolve_git_common_dir(repo_dir: &Path) -> Result<PathBuf> {
         repo_dir.join(common_dir)
     };
 
-    common_dir.canonicalize().with_context(|| {
+    canonicalize_portable(&common_dir).with_context(|| {
         format!(
             "Could not resolve git common directory `{}`",
             common_dir.display()
@@ -317,7 +343,7 @@ fn create_worktree_parent(
     _git_top_level: &Path,
     git_common_dir: &Path,
 ) -> Result<tempfile::TempDir> {
-    let git_common_dir = git_common_dir.canonicalize().with_context(|| {
+    let git_common_dir = canonicalize_portable(git_common_dir).with_context(|| {
         format!(
             "Could not resolve git common directory `{}`",
             git_common_dir.display()
@@ -351,13 +377,13 @@ fn ensure_worktree_parent_under_git_common_dir(
         );
     }
 
-    let parent_dir = parent_dir.canonicalize().with_context(|| {
+    let parent_dir = canonicalize_portable(parent_dir).with_context(|| {
         format!(
             "Could not resolve worktree parent directory `{}`",
             parent_dir.display()
         )
     })?;
-    let git_common_dir = git_common_dir.canonicalize().with_context(|| {
+    let git_common_dir = canonicalize_portable(git_common_dir).with_context(|| {
         format!(
             "Could not resolve git common directory `{}`",
             git_common_dir.display()
@@ -645,7 +671,7 @@ mod tests {
 
         let top_level = resolve_git_toplevel(&nested).unwrap();
 
-        assert_eq!(top_level, repo.path().canonicalize().unwrap());
+        assert_eq!(top_level, canonicalize_portable(repo.path()).unwrap());
     }
 
     #[test]
@@ -660,7 +686,10 @@ mod tests {
 
         let context = resolve_repo_context(&nested).unwrap();
 
-        assert_eq!(context.top_level, repo.path().canonicalize().unwrap());
+        assert_eq!(
+            context.top_level,
+            canonicalize_portable(repo.path()).unwrap()
+        );
         assert_eq!(context.relative_cwd, PathBuf::from("nested/deeper"));
     }
 
@@ -670,7 +699,7 @@ mod tests {
         init_repo(repo.path());
         let nested = repo.path().join("nested").join("deeper");
         fs::create_dir_all(&nested).unwrap();
-        let nested = nested.canonicalize().unwrap();
+        let nested = canonicalize_portable(&nested).unwrap();
         let git_common_dir = resolve_git_common_dir(&nested).unwrap();
         let parent = tempfile::Builder::new()
             .prefix("cubi-consensus-allowed-")
@@ -680,7 +709,7 @@ mod tests {
         let resolved =
             ensure_worktree_parent_under_git_common_dir(parent.path(), &git_common_dir).unwrap();
 
-        assert_eq!(resolved, parent.path().canonicalize().unwrap());
+        assert_eq!(resolved, canonicalize_portable(parent.path()).unwrap());
     }
 
     #[test]
@@ -868,10 +897,10 @@ mod tests {
     }
 
     fn assert_session_path_under_git_common_dir(repo_dir: &Path, worktree_path: &Path) -> PathBuf {
-        let repo_root = resolve_git_toplevel(&repo_dir.canonicalize().unwrap()).unwrap();
+        let repo_root = resolve_git_toplevel(&canonicalize_portable(repo_dir).unwrap()).unwrap();
         let common_dir = resolve_git_common_dir(&repo_root).unwrap();
-        let canonical_worktree_path = worktree_path.canonicalize().unwrap();
-        let worktree_parent_path = worktree_path.parent().unwrap().canonicalize().unwrap();
+        let canonical_worktree_path = canonicalize_portable(worktree_path).unwrap();
+        let worktree_parent_path = canonicalize_portable(worktree_path.parent().unwrap()).unwrap();
 
         assert!(
             canonical_worktree_path.starts_with(&worktree_parent_path),

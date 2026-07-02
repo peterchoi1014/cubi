@@ -365,14 +365,16 @@ impl ChatCLI {
         };
         let subprocess_deadline = subprocess_time_cap.map(|cap| tokio::time::Instant::now() + cap);
         for step in 0..max_agent_steps {
-            if let (Some(deadline), Some(cap)) = (subprocess_deadline, subprocess_time_cap) {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(self.subprocess_time_cap_error(
-                        cap,
-                        step,
-                        &turn_stats,
-                        json_enabled,
-                    ));
+            if let Some(deadline) = subprocess_deadline {
+                if let Some(cap) = subprocess_time_cap {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(self.subprocess_time_cap_error(
+                            cap,
+                            step,
+                            &turn_stats,
+                            json_enabled,
+                        ));
+                    }
                 }
             }
             // Show a spinner while we wait for the model's first token.

@@ -14,9 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 const CHILD_KILL_GRACE: Duration = Duration::from_secs(5);
 const CHILD_COOPERATIVE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(5);
-const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const CHILD_STDOUT_LIMIT: usize = 1024 * 1024;
-const CHILD_STDERR_LIMIT: usize = 16 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 pub(crate) const INTERNAL_SUBAGENT_FLAG: &str = "--internal-subagent";
 pub(crate) const INTERNAL_MAX_STEPS_FLAG: &str = "--internal-max-steps";
@@ -38,8 +36,8 @@ pub struct ProcSubagentResult {
     /// streams fall back to one `tool_call` event per intermediate step plus a
     /// final step for the report.
     pub steps_used: usize,
-    /// Bounded stderr captured from the subprocess. Empty when the child
-    /// did not write diagnostics to stderr.
+    /// Stderr is intentionally discarded for isolated subprocesses, so this
+    /// remains empty for subprocess-backed subagents.
     pub stderr: String,
     /// Structured failure parsed from `"error"` / `"budget_error"` JSON
     /// events in the subprocess stream.
@@ -303,7 +301,7 @@ async fn run_binary_isolated(
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     cmd.kill_on_drop(true);
     for (key, value) in extra_envs {
         if *key == "CUBI_POLICY_FILE" {
@@ -328,34 +326,27 @@ async fn run_binary_isolated(
             .await
             .context("read child stdout")
     });
-    let stderr = child.stderr.take().context("capture child stderr")?;
-    let stderr_task = tokio::spawn(async move {
-        read_bounded(stderr, CHILD_STDERR_LIMIT, "stderr")
-            .await
-            .context("read child stderr")
-    });
-
     let status = match tokio::time::timeout(time_cap, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
             kill_child(&mut child).await;
             abort_reader_task(stdout_task).await;
-            abort_reader_task(stderr_task).await;
             return Err(e).with_context(|| format!("wait for subprocess {}", binary.display()));
         }
         Err(_) => {
             kill_child(&mut child).await;
             let stdout = collect_lossy_or_empty(stdout_task, STDOUT_DRAIN_GRACE).await;
-            let stderr = collect_lossy_or_empty(stderr_task, STDERR_DRAIN_GRACE).await;
-            return Ok(RawRunResult::TimedOut { stdout, stderr });
+            return Ok(RawRunResult::TimedOut {
+                stdout,
+                stderr: String::new(),
+            });
         }
     };
 
     let stdout = collect_reader(stdout_task, STDOUT_DRAIN_GRACE, "stdout").await?;
-    let stderr = collect_reader(stderr_task, STDERR_DRAIN_GRACE, "stderr").await?;
     Ok(RawRunResult::Completed {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stderr: String::new(),
         exit_code: status.code(),
     })
 }
@@ -1561,7 +1552,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_isolated_subagent_with_binary_captures_stderr_and_json_error() {
+    async fn run_isolated_subagent_with_binary_nulls_stderr_and_json_error() {
         let bin_dir = tempfile::tempdir().unwrap();
         let fake_bin = write_json_error_script(bin_dir.path());
         let workdir = tempfile::tempdir().unwrap();
@@ -1589,14 +1580,10 @@ mod tests {
             "structured error missing: {:?}",
             result.error
         );
+        assert_eq!(result.stderr, "");
         assert!(
-            result.stderr.contains("child stderr diagnostic"),
-            "stderr missing: {}",
-            result.stderr
-        );
-        assert!(
-            result.diagnostics().contains("child stderr diagnostic"),
-            "diagnostics missing stderr: {}",
+            !result.diagnostics().contains("child stderr diagnostic"),
+            "diagnostics should not include nulled stderr: {}",
             result.diagnostics()
         );
     }
