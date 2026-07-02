@@ -57,6 +57,12 @@ pub const AGENT_TOOL_NAME: &str = "agent_run";
 /// in one place.
 pub const CONSENSUS_TOOL_NAME: &str = "consensus_run";
 
+/// Environment flag used by isolated subprocess subagents to suppress
+/// top-level meta-tools. The subprocess is already a subagent, so exposing
+/// `agent_run` or `consensus_run` inside it would re-enable unbounded nested
+/// subagent/consensus spawning.
+pub const DISABLE_META_TOOLS_ENV: &str = "CUBI_DISABLE_META_TOOLS";
+
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
 /// it focused on the single goal and discourage it from chatting back.
@@ -89,9 +95,15 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
             },
         })
         .collect();
-    specs.push(agent_run_spec());
-    specs.push(crate::consensus::consensus_run_spec());
+    if !meta_tools_disabled_by_env() {
+        specs.push(agent_run_spec());
+        specs.push(crate::consensus::consensus_run_spec());
+    }
     Some(specs)
+}
+
+pub fn meta_tools_disabled_by_env() -> bool {
+    std::env::var_os(DISABLE_META_TOOLS_ENV).is_some()
 }
 
 /// `ToolSpec` for the [`AGENT_TOOL_NAME`] meta-tool. Kept in this module so

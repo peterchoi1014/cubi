@@ -87,9 +87,9 @@ impl McpConfig {
     }
 
     pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Could not find home directory")?;
+        let cubi_dir = crate::sessions::cubi_dir().context("Could not find home directory")?;
 
-        Ok(home.join(".cubi").join("mcp.json"))
+        Ok(cubi_dir.join("mcp.json"))
     }
 
     // Allow dead_code as these may be used for future CLI commands
@@ -101,5 +101,19 @@ impl McpConfig {
     #[allow(dead_code)]
     pub fn remove_server(&mut self, name: &str) -> bool {
         self.mcp_servers.remove(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_path_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = McpConfig::config_path().expect("config path");
+            assert_eq!(path, cubi_home.join(".cubi").join("mcp.json"));
+            assert!(!path.starts_with(other_home));
+        });
     }
 }

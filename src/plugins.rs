@@ -133,7 +133,7 @@ pub fn plugins_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    dirs::home_dir().map(|h| h.join(".cubi").join("plugins"))
+    crate::sessions::cubi_dir().map(|d| d.join("plugins"))
 }
 
 /// Reload all plugin bundles from disk. Always returns a (possibly
@@ -593,6 +593,15 @@ mod tests {
         }
         plugins.sort_by(|a, b| a.name.cmp(&b.name));
         plugins
+    }
+
+    #[test]
+    fn plugins_dir_uses_cubi_home_when_no_override() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = plugins_dir().expect("plugins dir");
+            assert_eq!(path, cubi_home.join(".cubi").join("plugins"));
+            assert!(!path.starts_with(other_home));
+        });
     }
 
     #[test]

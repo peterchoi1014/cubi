@@ -69,7 +69,7 @@ impl Policy {
                 return Some(system);
             }
         }
-        let user = dirs::home_dir()?.join(".cubi").join("policy.json");
+        let user = crate::sessions::cubi_dir()?.join("policy.json");
         if user.exists() { Some(user) } else { None }
     }
 

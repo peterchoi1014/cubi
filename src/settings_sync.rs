@@ -16,9 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn settings_root() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".cubi"))
-        .context("Could not resolve home directory")
+    crate::sessions::cubi_dir().context("Could not resolve home directory")
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
@@ -119,4 +117,18 @@ pub fn status() -> Result<String> {
         remote,
         dirty_count
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_root_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = settings_root().expect("settings root");
+            assert_eq!(path, cubi_home.join(".cubi"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 }

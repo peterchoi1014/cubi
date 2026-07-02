@@ -37,10 +37,10 @@ mod permissions;
 pub mod plugins;
 mod policy;
 mod pricing;
+mod proc_subagent;
 mod project_memory;
 mod receipts;
 mod repomap;
-mod proc_subagent;
 mod schemas;
 mod script;
 mod sessions;
@@ -605,6 +605,24 @@ async fn main() -> Result<()> {
             "--quiet" => {
                 cli_flags.quiet = true;
                 cli_flags.no_banner = true;
+            }
+            crate::proc_subagent::INTERNAL_SUBAGENT_FLAG => {
+                cli_flags.subprocess_subagent_mode = true;
+            }
+            crate::proc_subagent::INTERNAL_MAX_STEPS_FLAG => {
+                i += 1;
+                let Some(value) = argv.get(i).and_then(|a| a.to_str()) else {
+                    eprintln!(
+                        "cubi: {} requires a positive integer.",
+                        crate::proc_subagent::INTERNAL_MAX_STEPS_FLAG
+                    );
+                    std::process::exit(2);
+                };
+                cli_flags.max_agent_steps_override = Some(parse_internal_max_steps(value));
+            }
+            _ if arg.starts_with("--internal-max-steps=") => {
+                let value = arg.trim_start_matches("--internal-max-steps=");
+                cli_flags.max_agent_steps_override = Some(parse_internal_max_steps(value));
             }
             "--print-config" => set_primary(&mut primary, PrimaryCommand::PrintConfig),
             "run" => {
@@ -1742,6 +1760,19 @@ fn set_primary(slot: &mut PrimaryCommand, value: PrimaryCommand) {
     *slot = value;
 }
 
+fn parse_internal_max_steps(value: &str) -> usize {
+    match value.parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            eprintln!(
+                "cubi: {} requires a positive integer.",
+                crate::proc_subagent::INTERNAL_MAX_STEPS_FLAG
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Maps a legacy [`ExitCode`] back into the closest [`user_error::ErrorKind`]
 /// so existing `AppExit`-bearing errors can flow through the
 /// classified-error path uniformly.
@@ -2215,7 +2246,9 @@ fn print_help() {
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
-         pass --stream to stream tokens.\n\n\
+         pass --stream to stream tokens.\n  \
+         In the REPL, `/consensus ... --isolate --isolated-time-cap-secs <seconds> ...`\n  \
+         runs tool-enabled consensus subagents in separate ephemeral worktrees.\n\n\
          Once inside the REPL, type /help to list slash commands.",
         env!("CARGO_PKG_VERSION")
     );

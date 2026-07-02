@@ -28,7 +28,7 @@ const BUILTIN_TIPS: &[&str] = &[
 ];
 
 pub fn tips_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cubi").join("tips"))
+    crate::sessions::cubi_dir().map(|d| d.join("tips"))
 }
 
 /// Returns the tip for today, or `None` if no tips are available. The
@@ -66,6 +66,15 @@ pub fn tip_of_the_day() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tips_dir_uses_cubi_home() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, other_home| {
+            let path = tips_dir().expect("tips dir");
+            assert_eq!(path, cubi_home.join(".cubi").join("tips"));
+            assert!(!path.starts_with(other_home));
+        });
+    }
 
     #[test]
     fn builtin_tip_is_returned_when_no_user_dir() {

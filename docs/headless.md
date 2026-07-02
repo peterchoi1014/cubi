@@ -98,7 +98,8 @@ Event types currently emitted:
   MCP server transition during a turn.
 - `turn_end` — `{type, ts, usage, model}`. `usage` carries
   `{prompt_tokens, completion_tokens, elapsed_ms}`.
-- `consensus_start` — `{type, ts, goal, models, strategy}`. Emitted
+- `consensus_start` — `{type, ts, goal, models, strategy,
+  max_steps_per_subagent}`. Emitted
   before any subagent dispatches when the `consensus_run` meta-tool
   (or the `/consensus` slash command) starts a run. `strategy` is one
   of `vote`, `best-of-n`, `judge`.
@@ -109,6 +110,27 @@ Event types currently emitted:
   after arbitration completes. `decision_reason` is free-form text
   (e.g. "majority vote 2/3", "judge `qwen3:8b` picked `devstral`: …",
   "best-of-n: `devstral` scored 9 (judge `…`)").
+
+Tool-enabled `consensus_run` is sequential unless called with both
+`use_tools: true` and `isolate: true`. Isolated mode launches each
+subagent as a headless `cubi --json --no-stream --quiet` subprocess in
+its own throwaway git worktree, so the same JSON event stream is parsed
+without leaking losing candidates' file edits into the caller's checkout.
+Before launching those subprocesses, the parent applies the same trust and
+plan-mode gate used by non-isolated tool consensus: the parent cwd must be a
+trusted project and `/plan` must be off. The parent also resolves the repo
+top-level plus the relative cwd and starts each child in the matching
+worktree subdirectory. Because children branch from `HEAD`, isolated mode
+requires a clean git status (commit, stash, or discard changes first) rather
+than trying to copy uncommitted or untracked state into every worktree.
+The parent also sets `CUBI_HOME` for each child so Cubi state
+(`.cubi/config.json`, trust store, sessions, MCP config, etc.) is rooted in
+the child temp home rather than the real user profile.
+Use `max_steps_per_subagent` and `isolated_time_cap_secs` on the meta-tool
+(or `/consensus ... --isolate --max-steps <n>
+--isolated-time-cap-secs <seconds> ...`) to set each subagent's step budget
+and isolated subprocess wall-clock cap; timeouts are reported as
+per-subagent errors instead of aborting the whole consensus run.
 
 `--trace-tools <path>` still produces its original `tool_start` /
 `tool_complete` record shape for back-compat, but new integrations
@@ -157,4 +179,3 @@ canonical-serialization algorithm.
 >   never committed or uploaded.
 > - Rotate or scrub them before sharing a session log with anyone
 >   else.
-

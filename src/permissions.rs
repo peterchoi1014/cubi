@@ -10,7 +10,8 @@
 //!
 //! The model here is intentionally simple:
 //!
-//! * A **trust store** at `~/.cubi/trusted_dirs.json` records the
+//! * A **trust store** at `$CUBI_HOME/.cubi/trusted_dirs.json` (falling
+//!   back to `~/.cubi/trusted_dirs.json`) records the
 //!   set of directory roots the user has explicitly approved. Approval is a
 //!   conscious one-time act per project (`/trust` slash command, or the
 //!   prompt shown by the first-run wizard).
@@ -82,7 +83,7 @@ impl Permissions {
     }
 
     fn storage_path() -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".cubi").join("trusted_dirs.json"))
+        Some(crate::sessions::cubi_dir()?.join("trusted_dirs.json"))
     }
 
     /// Persists the current trust set. Errors are surfaced so callers can
@@ -256,7 +257,48 @@ fn absolutize(p: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        cubi_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self {
+                cubi_home: std::env::var_os(crate::sessions::CUBI_HOME_ENV),
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.cubi_home {
+                    std::env::set_var(crate::sessions::CUBI_HOME_ENV, value);
+                } else {
+                    std::env::remove_var(crate::sessions::CUBI_HOME_ENV);
+                }
+                if let Some(value) = &self.home {
+                    std::env::set_var("HOME", value);
+                } else {
+                    std::env::remove_var("HOME");
+                }
+                if let Some(value) = &self.userprofile {
+                    std::env::set_var("USERPROFILE", value);
+                } else {
+                    std::env::remove_var("USERPROFILE");
+                }
+            }
+        }
+    }
 
     fn unique_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -312,6 +354,46 @@ mod tests {
 
         fs::remove_dir_all(&trusted).ok();
         fs::remove_dir_all(&untrusted).ok();
+    }
+
+    #[test]
+    fn cubi_home_env_overrides_platform_home_for_trust_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::capture();
+        let cubi_home = tempfile::tempdir().unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        let other_cubi = other_home.path().join(".cubi");
+        fs::create_dir_all(&other_cubi).unwrap();
+        fs::write(
+            other_cubi.join("trusted_dirs.json"),
+            r#"{"allowed_tools":["from-home"]}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(crate::sessions::CUBI_HOME_ENV, cubi_home.path());
+            std::env::set_var("HOME", other_home.path());
+            std::env::set_var("USERPROFILE", other_home.path());
+        }
+
+        let mut saved = Permissions::default();
+        saved.allow_tool("from-cubi-home");
+        saved.save().unwrap();
+
+        let cubi_trust_path = cubi_home.path().join(".cubi").join("trusted_dirs.json");
+        assert_eq!(
+            Permissions::storage_path().as_deref(),
+            Some(cubi_trust_path.as_path())
+        );
+        assert!(cubi_trust_path.exists());
+        assert!(
+            fs::read_to_string(other_cubi.join("trusted_dirs.json"))
+                .unwrap()
+                .contains("from-home"),
+            "HOME trust store should be left untouched when CUBI_HOME is set"
+        );
+        let loaded = Permissions::load();
+        assert!(loaded.check_tool_allowed("from-cubi-home"));
+        assert!(!loaded.check_tool_allowed("from-home"));
     }
 
     #[test]

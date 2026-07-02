@@ -24,12 +24,78 @@ pub(crate) fn resolve_tool_rationale(
     "(no description)".to_string()
 }
 
+fn subprocess_step_cap_events(
+    message: &str,
+    steps_used: usize,
+    stats: &ChatStats,
+    window: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let mut error = crate::json_events::error(message);
+    if let Some(obj) = error.as_object_mut() {
+        obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
+    }
+    let final_event = serde_json::json!({
+        "type": "final",
+        "value": message,
+        "steps_used": steps_used,
+        "error": true,
+    });
+    let mut done = crate::json_events::done_with_window(stats, window);
+    if let Some(obj) = done.as_object_mut() {
+        obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
+    }
+    vec![final_event, error, done]
+}
+
 impl ChatCLI {
+    pub(crate) fn build_turn_tool_specs(&self) -> Option<Vec<crate::ollama::ToolSpec>> {
+        let tools = self
+            .mcp_manager
+            .as_ref()
+            .and_then(agent_loop::build_tool_specs);
+        Self::filter_turn_tool_specs_for_subagent_mode(self.subprocess_subagent_mode, tools)
+    }
+
+    pub(crate) fn agent_step_cap(&self) -> usize {
+        self.max_agent_steps_override
+            .unwrap_or(MAX_AGENT_STEPS)
+            .clamp(1, MAX_AGENT_STEPS)
+    }
+
+    fn meta_tool_blocked_in_subagent_mode(&self, tool_name: &str) -> Option<String> {
+        if !self.subprocess_subagent_mode {
+            return None;
+        }
+        match tool_name {
+            AGENT_TOOL_NAME => Some("[tool error] nested `agent_run` is not allowed".to_string()),
+            crate::agent_loop::CONSENSUS_TOOL_NAME => {
+                Some("[tool error] nested `consensus_run` is not allowed".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn filter_turn_tool_specs_for_subagent_mode(
+        subprocess_subagent_mode: bool,
+        tools: Option<Vec<crate::ollama::ToolSpec>>,
+    ) -> Option<Vec<crate::ollama::ToolSpec>> {
+        if subprocess_subagent_mode {
+            agent_loop::without_meta_tools(tools)
+        } else {
+            tools
+        }
+    }
+
     fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
         let cwd = std::env::current_dir().ok();
         let trusted = cwd
             .as_deref()
-            .map(|path| self.permissions.lock().unwrap().contains(path))
+            .map(|path| {
+                self.permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(path)
+            })
             .unwrap_or(false);
         if trusted || self.approved_tools.contains(tool_name) {
             return true;
@@ -85,7 +151,7 @@ impl ChatCLI {
         } else if !self
             .permissions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .check_tool_allowed(&call.function.name)
         {
             format!(
@@ -97,6 +163,11 @@ impl ChatCLI {
                 "[tool denied] user declined approval for `{}`",
                 call.function.name
             )
+        } else if call.function.name == AGENT_TOOL_NAME && agent_loop::meta_tools_disabled_by_env()
+        {
+            "[tool error] nested `agent_run` is not allowed".to_string()
+        } else if let Some(error) = self.meta_tool_blocked_in_subagent_mode(&call.function.name) {
+            error
         } else if call.function.name == AGENT_TOOL_NAME {
             // Meta-tool: spawn a focused subagent with fresh context. Handled
             // here (not in `McpManager`) because it needs the executor to
@@ -134,6 +205,10 @@ impl ChatCLI {
                     Err(e) => format!("[tool error] subagent failed: {e}"),
                 }
             }
+        } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME
+            && agent_loop::meta_tools_disabled_by_env()
+        {
+            "[tool error] nested `consensus_run` is not allowed".to_string()
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME {
             // Meta-tool: spawn N consensus subagents in parallel. The
             // subagent token usage is folded into `session_stats` here
@@ -207,10 +282,7 @@ impl ChatCLI {
 
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
-        let tools = self
-            .mcp_manager
-            .as_ref()
-            .and_then(agent_loop::build_tool_specs);
+        let tools = self.build_turn_tool_specs();
 
         // Track whether we've printed visible content on this turn so we
         // can choose when to add separating blank lines.
@@ -250,7 +322,8 @@ impl ChatCLI {
         // cancel: we leave file edits in place but pop the history.
         // (turn_start was captured before the user message was pushed.)
 
-        for step in 0..MAX_AGENT_STEPS {
+        let max_agent_steps = self.agent_step_cap();
+        for step in 0..max_agent_steps {
             // Show a spinner while we wait for the model's first token.
             // Label differs by step so the user can tell "first response"
             // from "reacting to tool output".
@@ -706,13 +779,23 @@ impl ChatCLI {
             // Diagnostic if we hit the cap mid-loop. The body of the loop
             // executed the tools for this step; if `step + 1 == MAX`, the
             // next call_stream is what we're skipping, so warn here.
-            if step + 1 == MAX_AGENT_STEPS {
-                eprintln!(
-                    "{} agent loop hit step cap ({}); stopping. Ask me to continue \
-                     if you want me to keep going.",
-                    "Warn:".bright_yellow(),
-                    MAX_AGENT_STEPS
+            if step + 1 == max_agent_steps {
+                let message = format!(
+                    "agent loop hit step cap ({max_agent_steps}) with pending tool calls; \
+                     stopping before a final assistant reply"
                 );
+                eprintln!("{} {}", "Warn:".bright_yellow(), message);
+                if self.subprocess_subagent_mode && json_enabled {
+                    let window = crate::llm::context_window_for_model(self.executor.get_model());
+                    for event in subprocess_step_cap_events(
+                        &format!("subagent {message}"),
+                        max_agent_steps,
+                        &turn_stats,
+                        window,
+                    ) {
+                        Self::emit_json_event(event);
+                    }
+                }
             }
         }
 
@@ -824,7 +907,10 @@ impl ChatCLI {
     /// the model's JSON, drives [`consensus::run`], folds subagent
     /// stats into `session_stats`, and returns a text report for the
     /// model to consume on the next turn.
-    async fn execute_consensus_tool_call(&mut self, call: &ToolCall) -> anyhow::Result<String> {
+    pub(super) async fn execute_consensus_tool_call(
+        &mut self,
+        call: &ToolCall,
+    ) -> anyhow::Result<String> {
         let args = &call.function.arguments;
         let goal = args
             .get("goal")
@@ -873,6 +959,7 @@ impl ChatCLI {
             .get("max_steps")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
+            .map(crate::consensus::normalize_max_steps_per_subagent)
             .unwrap_or(crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS);
         let concurrency = args
             .get("concurrency")
@@ -883,6 +970,14 @@ impl ChatCLI {
             .get("use_tools")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let isolate = args
+            .get("isolate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let isolated_time_cap_secs = args
+            .get("isolated_time_cap_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let req = crate::consensus::ConsensusRequest {
             goal: goal.clone(),
@@ -891,13 +986,20 @@ impl ChatCLI {
             max_steps_per_subagent: max_steps,
             concurrency,
             use_tools,
+            isolate,
+            isolated_time_cap_secs,
         };
+        if let Some(reason) = self.isolated_tool_consensus_policy_error(&req) {
+            anyhow::bail!(reason);
+        }
 
         self.emit_status(format!(
             "  {} consensus over {} models{}: {}",
             "↳".bright_magenta(),
             models.len(),
-            if use_tools {
+            if isolate {
+                " (tools, isolated parallel)"
+            } else if use_tools {
                 " (tools, sequential)"
             } else {
                 ""
@@ -946,5 +1048,33 @@ impl ChatCLI {
         report.push_str("\n--- winning output ---\n");
         report.push_str(&result.winner_output);
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subprocess_step_cap_events_include_final_error_done_and_steps() {
+        let stats = ChatStats {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            elapsed_ms: 5,
+        };
+
+        let events = subprocess_step_cap_events("subagent hit cap", 2, &stats, Some(100));
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "final");
+        assert_eq!(events[0]["value"], "subagent hit cap");
+        assert_eq!(events[0]["steps_used"], 2);
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["message"], "subagent hit cap");
+        assert_eq!(events[1]["steps_used"], 2);
+        assert_eq!(events[2]["type"], "done");
+        assert_eq!(events[2]["stats"]["prompt_tokens"], 3);
+        assert_eq!(events[2]["stats"]["completion_tokens"], 4);
+        assert_eq!(events[2]["steps_used"], 2);
     }
 }
