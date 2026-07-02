@@ -10,7 +10,7 @@ documentation = "https://github.com/peterchoi1014/cubi#readme"
 readme = "README.md"
 keywords = ["ai", "cli", "ollama", "llm", "mcp"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.88"
 exclude = [
     ".copilot/*",
     ".github/*",

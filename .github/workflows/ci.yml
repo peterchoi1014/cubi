@@ -20,8 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85, with rustfmt)
-        uses: dtolnay/rust-toolchain@1.85
+      - name: Install Rust toolchain (1.88, with rustfmt)
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt
 
@@ -34,8 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85, with clippy)
-        uses: dtolnay/rust-toolchain@1.85
+      - name: Install Rust toolchain (1.88, with clippy)
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy
 
@@ -64,8 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85)
-        uses: dtolnay/rust-toolchain@1.85
+      - name: Install Rust toolchain (1.88)
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
