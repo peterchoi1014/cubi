@@ -96,6 +96,21 @@ impl ChatCLI {
                 format!("{} ", "You:".bright_green().bold())
             };
 
+            // Optional between-turn status line. Suppressed in headless,
+            // JSON, and quiet modes and when stdout is not a TTY, so the
+            // headless/JSON output paths stay byte-identical. Scrolls like
+            // normal output (pinning is a later phase).
+            {
+                use std::io::IsTerminal;
+                if !self.headless_mode
+                    && !self.json_enabled
+                    && !self.quiet_mode
+                    && std::io::stdout().is_terminal()
+                {
+                    println!("{}", self.render_status_line());
+                }
+            }
+
             match rl.readline(&prompt) {
                 Ok(line) => {
                     // Multi-line fold: if this line is a `"""` fence opener
