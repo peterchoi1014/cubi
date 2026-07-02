@@ -19,6 +19,9 @@ use crate::file_rollback::FileJournal;
 use crate::permissions::Permissions;
 use crate::repomap::{RepoMap, RepoMapOptions};
 
+const READ_FILE_DEFAULT_MAX_LINES: usize = 400;
+const READ_FILE_DEFAULT_MAX_BYTES: usize = 50 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinTool {
     pub name: String,
@@ -262,7 +265,7 @@ impl BuiltinToolRegistry {
     fn read_file_tool() -> BuiltinTool {
         BuiltinTool {
             name: "read_file".to_string(),
-            description: "Read the contents of a file from the filesystem.".to_string(),
+            description: "Read the contents of a file from the filesystem. Use start_line/end_line for targeted reads of large files; unbounded large-file reads are truncated.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -272,11 +275,13 @@ impl BuiltinToolRegistry {
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "Starting line number (1-indexed, optional)"
+                        "minimum": 1,
+                        "description": "Starting line number (1-indexed, optional). If omitted with end_line, reads from line 1."
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "Ending line number (inclusive, optional)"
+                        "minimum": 1,
+                        "description": "Ending line number (1-indexed, inclusive, optional). If omitted with start_line, reads through end of file."
                     }
                 },
                 "required": ["path"]
@@ -606,17 +611,22 @@ impl BuiltinToolRegistry {
 
         let content = fs::read_to_string(path).context(format!("Failed to read file: {}", path))?;
 
-        let start_line = args["start_line"].as_u64().map(|n| n as usize);
-        let end_line = args["end_line"].as_u64().map(|n| n as usize);
+        let start_line = match parse_read_file_line_arg(&args, "start_line") {
+            Ok(line) => line,
+            Err(error) => return Ok(ToolResult::error(error.to_string())),
+        };
+        let end_line = match parse_read_file_line_arg(&args, "end_line") {
+            Ok(line) => line,
+            Err(error) => return Ok(ToolResult::error(error.to_string())),
+        };
 
-        let result = if let (Some(start), Some(end)) = (start_line, end_line) {
-            let lines: Vec<&str> = content.lines().collect();
-            let start_idx = start.saturating_sub(1);
-            let end_idx = end.min(lines.len());
-
-            lines[start_idx..end_idx].join("\n")
+        let result = if start_line.is_some() || end_line.is_some() {
+            match read_file_line_range(&content, start_line, end_line) {
+                Ok(range) => range,
+                Err(message) => return Ok(ToolResult::error(message)),
+            }
         } else {
-            content
+            read_file_with_default_cap(&content)
         };
 
         Ok(ToolResult::success(result))
@@ -2930,6 +2940,114 @@ fn notebook_save(nb: &serde_json::Value, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_read_file_line_arg(args: &serde_json::Value, name: &str) -> Result<Option<usize>> {
+    let Some(value) = args.get(name).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let line = value
+        .as_u64()
+        .with_context(|| format!("`{name}` must be a positive integer"))?;
+    if line == 0 {
+        anyhow::bail!("`{name}` must be 1 or greater");
+    }
+    usize::try_from(line)
+        .with_context(|| format!("`{name}` is too large"))
+        .map(Some)
+}
+
+fn read_file_line_range(
+    content: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> std::result::Result<String, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let start = start_line.unwrap_or(1);
+
+    if total_lines == 0 {
+        return if start == 1 && end_line.unwrap_or(1) == 1 {
+            Ok(String::new())
+        } else {
+            Err("Requested line range is outside an empty file.".to_string())
+        };
+    }
+
+    let end = end_line.unwrap_or(total_lines);
+    if start > total_lines {
+        return Err(format!(
+            "Invalid line range: start_line ({start}) is beyond end of file ({total_lines} lines)."
+        ));
+    }
+    if start > end {
+        return Err(format!(
+            "Invalid line range: start_line ({start}) must be less than or equal to end_line ({end})."
+        ));
+    }
+
+    let start_idx = start - 1;
+    let end_idx = end.min(total_lines);
+    Ok(lines[start_idx..end_idx].join("\n"))
+}
+
+fn read_file_with_default_cap(content: &str) -> String {
+    let total_bytes = content.len();
+    let total_lines = content.lines().count();
+
+    if total_bytes <= READ_FILE_DEFAULT_MAX_BYTES && total_lines <= READ_FILE_DEFAULT_MAX_LINES {
+        return content.to_string();
+    }
+
+    let mut head = String::new();
+    let mut shown_lines = 0usize;
+    let mut truncated_mid_line = false;
+
+    for line in content.lines().take(READ_FILE_DEFAULT_MAX_LINES) {
+        let separator_bytes = usize::from(shown_lines > 0);
+        let needed_bytes = separator_bytes + line.len();
+        if head.len() + needed_bytes <= READ_FILE_DEFAULT_MAX_BYTES {
+            if separator_bytes == 1 {
+                head.push('\n');
+            }
+            head.push_str(line);
+            shown_lines += 1;
+            continue;
+        }
+
+        let remaining = READ_FILE_DEFAULT_MAX_BYTES.saturating_sub(head.len());
+        if remaining > separator_bytes {
+            if separator_bytes == 1 {
+                head.push('\n');
+            }
+            let prefix = utf8_prefix(line, remaining - separator_bytes);
+            head.push_str(prefix);
+            shown_lines += usize::from(!prefix.is_empty());
+            truncated_mid_line = true;
+        }
+        break;
+    }
+
+    let mut result = head;
+    result.push_str(&format!(
+        "\n\n[read_file output truncated: showing the first {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {READ_FILE_DEFAULT_MAX_LINES} lines or {READ_FILE_DEFAULT_MAX_BYTES} bytes). Re-run read_file with start_line/end_line for the specific range you need; use grep to find relevant line numbers first.]",
+        result.len()
+    ));
+    if truncated_mid_line {
+        result.push_str(" The last shown line was cut at the byte limit.");
+    }
+    result
+}
+
+fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Cap on the response body we'll buffer from a web tool. Keeps a single
 /// rogue URL from blowing the model's context window or the process's RAM.
 const MAX_WEB_BYTES: usize = 64 * 1024;
@@ -3199,6 +3317,20 @@ mod tests {
         p
     }
 
+    fn unique_project_tmp(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-work")
+            .join(format!("cubi-tool-{label}-{nanos}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     fn registry_with_trust(dir: &Path, plan_on: bool) -> BuiltinToolRegistry {
         let mut perms = Permissions::default();
         perms.trust_dir(dir).unwrap();
@@ -3206,6 +3338,119 @@ mod tests {
             Arc::new(Mutex::new(perms)),
             Arc::new(AtomicBool::new(plan_on)),
         )
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_full_small_file_without_range() {
+        let dir = unique_project_tmp("read-small");
+        let path = dir.join("small.txt");
+        let content = "one\ntwo\nthree\n";
+        fs::write(&path, content).unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute("read_file", json!({ "path": path.to_str().unwrap() }))
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert_eq!(result.content[0].text, content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_supports_inclusive_and_open_ended_ranges() {
+        let dir = unique_project_tmp("read-range");
+        let path = dir.join("range.txt");
+        fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let middle = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "start_line": 2, "end_line": 3 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(middle.content[0].text, "two\nthree");
+
+        let from_start = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "end_line": 2 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(from_start.content[0].text, "one\ntwo");
+
+        let through_end = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "start_line": 3 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(through_end.content[0].text, "three\nfour");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_invalid_ranges_return_errors_instead_of_panicking() {
+        let dir = unique_project_tmp("read-invalid-range");
+        let path = dir.join("range.txt");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let reversed = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "start_line": 3, "end_line": 2 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(reversed.is_error, Some(true));
+        assert!(reversed.content[0].text.contains("start_line (3)"));
+
+        let past_end = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "start_line": 99 }),
+            )
+            .await
+            .expect("call ok");
+        assert_eq!(past_end.is_error, Some(true));
+        assert!(past_end.content[0].text.contains("beyond end of file"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_truncates_unbounded_large_files_with_range_guidance() {
+        let dir = unique_project_tmp("read-truncate");
+        let path = dir.join("large.txt");
+        let mut content = String::new();
+        for i in 1..=(READ_FILE_DEFAULT_MAX_LINES + 5) {
+            content.push_str(&format!("line {i}\n"));
+        }
+        fs::write(&path, content).unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute("read_file", json!({ "path": path.to_str().unwrap() }))
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        let text = &result.content[0].text;
+        assert!(text.contains("line 1"));
+        assert!(text.contains(&format!("line {READ_FILE_DEFAULT_MAX_LINES}")));
+        assert!(!text.contains(&format!("line {}", READ_FILE_DEFAULT_MAX_LINES + 1)));
+        assert!(text.contains("read_file output truncated"));
+        assert!(text.contains("start_line/end_line"));
+        assert!(text.contains("grep"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Registry whose trust store also covers the current working

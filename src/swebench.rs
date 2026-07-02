@@ -395,7 +395,10 @@ pub fn build_prompt(problem_statement: &str) -> String {
          file(s) that actually implement the behavior described in the \
          issue. Paths are relative to the current directory.\n\
          2. READ the target file before editing so your `edit_file` \
-         `old_text` matches the real source exactly.\n\
+         `old_text` matches the real source exactly. For large files, use \
+         `grep` to find relevant line numbers first, then call `read_file` \
+         with `start_line`/`end_line` for a focused range instead of reading \
+         the whole file.\n\
          3. EDIT the source to resolve the issue. Make the smallest change \
          that fixes it. If an edit fails because `old_text` didn't match, \
          re-read the file and try again with the exact text.\n\
@@ -1154,6 +1157,9 @@ SKIPPED [1] tests/test_foo.py:12: needs network
         // The explore-first workflow is the key anti-path-guessing directive.
         assert!(p.to_lowercase().contains("explore"));
         assert!(p.contains("repo_map"));
+        assert!(p.contains("start_line"));
+        assert!(p.contains("end_line"));
+        assert!(p.contains("grep"));
     }
 
     #[test]
