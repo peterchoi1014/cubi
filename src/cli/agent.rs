@@ -879,6 +879,10 @@ impl ChatCLI {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(0);
+        let use_tools = args
+            .get("use_tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let req = crate::consensus::ConsensusRequest {
             goal: goal.clone(),
@@ -886,12 +890,18 @@ impl ChatCLI {
             strategy,
             max_steps_per_subagent: max_steps,
             concurrency,
+            use_tools,
         };
 
         self.emit_status(format!(
-            "  {} consensus over {} models: {}",
+            "  {} consensus over {} models{}: {}",
             "↳".bright_magenta(),
             models.len(),
+            if use_tools {
+                " (tools, sequential)"
+            } else {
+                ""
+            },
             goal.chars().take(120).collect::<String>().bright_white()
         ));
 
@@ -899,7 +909,12 @@ impl ChatCLI {
             json_enabled: self.json_enabled && self.headless_mode,
             event_sink: self.event_sink.clone(),
         };
-        let result = crate::consensus::run(req, &self.executor, &sink).await?;
+        let result = if use_tools {
+            crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
+                .await?
+        } else {
+            crate::consensus::run(req, &self.executor, &sink).await?
+        };
         self.session_stats.add(&result.aggregate_stats());
         self.emit_status(format!(
             "  {} consensus winner: {} — {}",

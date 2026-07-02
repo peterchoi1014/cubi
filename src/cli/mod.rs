@@ -5020,7 +5020,7 @@ impl ChatCLI {
         );
     }
 
-    /// `/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>`
+    /// `/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>`
     ///
     /// Drives a multi-model consensus run and prints a per-model
     /// summary table plus the winning output. Subagent token usage is
@@ -5034,7 +5034,7 @@ impl ChatCLI {
                     "{} {}\n  usage: {}",
                     "Error:".bright_red(),
                     e,
-                    "/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>"
+                    "/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>"
                         .bright_cyan()
                 );
                 return;
@@ -5046,7 +5046,14 @@ impl ChatCLI {
             event_sink: self.event_sink.clone(),
         };
 
-        match crate::consensus::run(req, &self.executor, &sink).await {
+        let use_tools = req.use_tools;
+        let result = if use_tools {
+            crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
+                .await
+        } else {
+            crate::consensus::run(req, &self.executor, &sink).await
+        };
+        match result {
             Ok(result) => {
                 self.session_stats.add(&result.aggregate_stats());
                 self.print_consensus_result(&result);
@@ -5510,13 +5517,15 @@ impl ChatCLI {
     }
 }
 
-/// Parses the args of `/consensus <strategy> <model1,model2,...> [judge:<model>] <goal>`.
+/// Parses the args of
+/// `/consensus <strategy> <model1,model2,...> [tools|--tools] [judge:<model>] <goal>`.
 ///
 /// Grammar (whitespace-delimited):
 ///   1. `<strategy>` — one of `vote`, `best-of-n`, `judge`.
 ///   2. `<models>`  — comma-separated, no internal whitespace.
-///   3. Optional `judge:<model>` token (required when strategy != vote).
-///   4. Everything that remains is the `<goal>` text (verbatim).
+///   3. Optional `tools`/`--tools` token to enable sequential tool mode.
+///   4. Optional `judge:<model>` token (required when strategy != vote).
+///   5. Everything that remains is the `<goal>` text (verbatim).
 fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -5537,20 +5546,31 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
         ));
     }
 
-    // Optional `judge:<model>` token. Empty/whitespace judge models
-    // would otherwise flow through to backend calls as an empty string,
-    // so reject them at the parse layer.
+    // Optional prefix tokens before the goal. Empty/whitespace judge
+    // models would otherwise flow through to backend calls as an empty
+    // string, so reject them at the parse layer.
     let mut judge_model: Option<String> = None;
+    let mut use_tools = false;
     let mut next = iter.next();
-    if let Some(tok) = next {
+    while let Some(tok) = next {
+        if tok == "tools" || tok == "--tools" {
+            use_tools = true;
+            next = iter.next();
+            continue;
+        }
         if let Some(rest) = tok.strip_prefix("judge:") {
             let trimmed = rest.trim();
             if trimmed.is_empty() {
                 return Err("judge:<model> requires a non-empty model name".to_string());
             }
+            if judge_model.is_some() {
+                return Err("duplicate judge:<model> token".to_string());
+            }
             judge_model = Some(trimmed.to_string());
             next = iter.next();
+            continue;
         }
+        break;
     }
     // Reassemble the remaining tokens as the goal — preserving the
     // single-space separator between tokens (we don't have the original
@@ -5593,6 +5613,7 @@ fn parse_consensus_args(raw: &str) -> Result<crate::consensus::ConsensusRequest,
         strategy,
         max_steps_per_subagent: crate::consensus::CONSENSUS_DEFAULT_MAX_STEPS,
         concurrency: 0,
+        use_tools,
     })
 }
 
@@ -6680,6 +6701,26 @@ mod tests {
         // judge token contains no whitespace (whitespace separates tokens
         // upstream, so this just exercises the strip_prefix path).
         let req = parse_consensus_args("judge m1,m2 judge:m3 do thing").unwrap();
+        match req.strategy {
+            crate::consensus::ConsensusStrategy::Judge { judge_model } => {
+                assert_eq!(judge_model, "m3");
+            }
+            other => panic!("expected Judge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_consensus_accepts_tools_flag() {
+        let req = parse_consensus_args("vote m1,m2 --tools do thing").unwrap();
+        assert!(req.use_tools);
+        assert_eq!(req.goal, "do thing");
+    }
+
+    #[test]
+    fn parse_consensus_accepts_tools_keyword_before_judge() {
+        let req = parse_consensus_args("judge m1,m2 tools judge:m3 do thing").unwrap();
+        assert!(req.use_tools);
+        assert_eq!(req.goal, "do thing");
         match req.strategy {
             crate::consensus::ConsensusStrategy::Judge { judge_model } => {
                 assert_eq!(judge_model, "m3");
