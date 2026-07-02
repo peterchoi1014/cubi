@@ -56,6 +56,14 @@ knobs let interactive users disable the same affordances individually:
   calls. Also honored by `NO_COLOR` and `CUBI_NO_COLOR`.
 - `CUBI_EDITOR=…` — pin the editor `/edit` opens (otherwise falls back
   through `$VISUAL`, `$EDITOR`, and the platform default).
+- `CUBI_NUM_CTX=…` — raise the Ollama runtime context cap (`num_ctx`).
+  cubi derives `num_ctx` from the model's known window, clamped to a safe
+  default; a positive override raises that ceiling (still bounded by the
+  model's real window).
+- `CUBI_READ_FILE_MAX_LINES=…` / `CUBI_READ_FILE_MAX_BYTES=…` — tune the
+  cap applied to unbounded `read_file` calls (defaults 400 lines / 50 KiB).
+  Raise for large-context models; lower for small-context ones. Ranged
+  reads (`start_line`/`end_line`) are never capped.
 
 Examples:
 

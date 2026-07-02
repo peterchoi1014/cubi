@@ -22,6 +22,25 @@ use crate::repomap::{RepoMap, RepoMapOptions};
 const READ_FILE_DEFAULT_MAX_LINES: usize = 400;
 const READ_FILE_DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
+/// Resolve the unbounded-read output caps, allowing per-environment tuning
+/// via `CUBI_READ_FILE_MAX_LINES` / `CUBI_READ_FILE_MAX_BYTES`. A positive
+/// integer override replaces the corresponding default; anything missing,
+/// zero, or unparseable falls back to the default. Larger-context models
+/// can raise these; small-context models can lower them.
+fn read_file_caps() -> (usize, usize) {
+    let resolve = |var: &str, default: usize| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(default)
+    };
+    (
+        resolve("CUBI_READ_FILE_MAX_LINES", READ_FILE_DEFAULT_MAX_LINES),
+        resolve("CUBI_READ_FILE_MAX_BYTES", READ_FILE_DEFAULT_MAX_BYTES),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinTool {
     pub name: String,
@@ -626,7 +645,8 @@ impl BuiltinToolRegistry {
                 Err(message) => return Ok(ToolResult::error(message)),
             }
         } else {
-            read_file_with_default_cap(&content)
+            let (max_lines, max_bytes) = read_file_caps();
+            read_file_with_cap(&content, max_lines, max_bytes)
         };
 
         Ok(ToolResult::success(result))
@@ -2989,11 +3009,11 @@ fn read_file_line_range(
     Ok(lines[start_idx..end_idx].join("\n"))
 }
 
-fn read_file_with_default_cap(content: &str) -> String {
+fn read_file_with_cap(content: &str, max_lines: usize, max_bytes: usize) -> String {
     let total_bytes = content.len();
     let total_lines = content.lines().count();
 
-    if total_bytes <= READ_FILE_DEFAULT_MAX_BYTES && total_lines <= READ_FILE_DEFAULT_MAX_LINES {
+    if total_bytes <= max_bytes && total_lines <= max_lines {
         return content.to_string();
     }
 
@@ -3001,10 +3021,10 @@ fn read_file_with_default_cap(content: &str) -> String {
     let mut shown_lines = 0usize;
     let mut truncated_mid_line = false;
 
-    for line in content.lines().take(READ_FILE_DEFAULT_MAX_LINES) {
+    for line in content.lines().take(max_lines) {
         let separator_bytes = usize::from(shown_lines > 0);
         let needed_bytes = separator_bytes + line.len();
-        if head.len() + needed_bytes <= READ_FILE_DEFAULT_MAX_BYTES {
+        if head.len() + needed_bytes <= max_bytes {
             if separator_bytes == 1 {
                 head.push('\n');
             }
@@ -3013,7 +3033,7 @@ fn read_file_with_default_cap(content: &str) -> String {
             continue;
         }
 
-        let remaining = READ_FILE_DEFAULT_MAX_BYTES.saturating_sub(head.len());
+        let remaining = max_bytes.saturating_sub(head.len());
         if remaining > separator_bytes {
             if separator_bytes == 1 {
                 head.push('\n');
@@ -3028,7 +3048,7 @@ fn read_file_with_default_cap(content: &str) -> String {
 
     let mut result = head;
     result.push_str(&format!(
-        "\n\n[read_file output truncated: showing the first {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {READ_FILE_DEFAULT_MAX_LINES} lines or {READ_FILE_DEFAULT_MAX_BYTES} bytes). Re-run read_file with start_line/end_line for the specific range you need; use grep to find relevant line numbers first.]",
+        "\n\n[read_file output truncated: showing the first {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {max_lines} lines or {max_bytes} bytes). Re-run read_file with start_line/end_line for the specific range you need; use grep to find relevant line numbers first.]",
         result.len()
     ));
     if truncated_mid_line {
@@ -3451,6 +3471,26 @@ mod tests {
         assert!(text.contains("grep"));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_with_cap_respects_explicit_limits() {
+        // Small file within caps → returned whole.
+        let small = "a\nb\nc";
+        assert_eq!(read_file_with_cap(small, 400, 50 * 1024), small);
+
+        // Line cap: keep the first N lines and append a truncation notice.
+        let many: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        let capped = read_file_with_cap(&many, 5, 50 * 1024);
+        assert!(capped.contains("line 5"));
+        assert!(!capped.contains("line 6\n"));
+        assert!(capped.contains("read_file output truncated"));
+        assert!(capped.contains("limit: 5 lines"));
+
+        // Byte cap can truncate mid-line and says so.
+        let byte_capped = read_file_with_cap("abcdefghij", 400, 4);
+        assert!(byte_capped.contains("read_file output truncated"));
+        assert!(byte_capped.contains("cut at the byte limit"));
     }
 
     /// Registry whose trust store also covers the current working
