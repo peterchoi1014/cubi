@@ -56,6 +56,7 @@ mod multiline;
 mod render;
 mod repl;
 mod spinner;
+mod status;
 
 #[cfg(test)]
 use render::welcome_banner_rows;
@@ -4807,20 +4808,60 @@ impl ChatCLI {
         } else {
             "live"
         };
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
+        // Model / ctx / path / usage / cost come from the shared formatter;
+        // the plan/msgs/todos/memdir extras are preserved as a prefix so
+        // nothing this command previously showed regresses.
         println!(
-            "{} [{}] [{}] {} msgs | todos {}/{} | memdir {} | model {}",
+            "{} [{}] {} msgs | todos {}/{} | memdir {} | {}",
             "statusline:".bright_yellow().bold(),
             plan.bright_cyan(),
-            cwd.bright_cyan(),
             self.history.len(),
             self.todos.pending(),
             self.todos.len(),
             self.memdir.len(),
-            self.executor.get_model().bright_cyan(),
+            self.render_status_line(),
         );
+    }
+
+    /// Terminal width for the status line: the `COLUMNS` env var when it is a
+    /// TTY, otherwise 100 (also the fallback when `COLUMNS` is unset/too small
+    /// so piped/snapshot output stays deterministic).
+    fn status_line_width() -> usize {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            return 100;
+        }
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|w| *w >= 20)
+            .unwrap_or(100)
+    }
+
+    /// Builds the live status snapshot and renders it through the shared
+    /// single-line formatter (see `src/cli/status.rs`).
+    fn render_status_line(&self) -> String {
+        let width = Self::status_line_width();
+        let color = crate::style::should_color();
+        self.status_snapshot().render(width, color)
+    }
+
+    /// Immutable snapshot of the fields the status line can display, built
+    /// from live `ChatCLI` state. Rendering lives in `status::StatusState`.
+    fn status_snapshot(&self) -> crate::cli::status::StatusState {
+        crate::cli::status::StatusState {
+            model: self.executor.get_model().to_string(),
+            context_used: Some(crate::llm::estimate_conversation_tokens(&self.history)),
+            context_window: crate::llm::context_window_for_model(self.executor.get_model()),
+            cwd: std::env::current_dir().unwrap_or_default(),
+            prompt_tokens: self.session_stats.prompt_tokens,
+            completion_tokens: self.session_stats.completion_tokens,
+            cost: crate::pricing::format_cost(
+                crate::pricing::lookup(self.executor.get_model()),
+                self.session_stats.prompt_tokens,
+                self.session_stats.completion_tokens,
+            ),
+        }
     }
 
     fn show_keybindings(&self) {
