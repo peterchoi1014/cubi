@@ -21,6 +21,27 @@
 //! consensus runs subagents sequentially through the standard subagent
 //! loop so the live `McpManager` is never shared concurrently.
 //!
+//! ## Why tool mode is sequential (do not "optimize" into parallelism)
+//!
+//! It is tempting to parallelize tool-enabled subagents (as the LLM-only
+//! path does) by wrapping the single `McpManager` in an async mutex and
+//! locking only around each tool call. **Do not do this.** A per-call
+//! mutex serializes individual tool calls but does NOT isolate a
+//! subagent's multi-step edit sequence: N subagents share ONE process
+//! working tree, so their `edit_file`/`write_file`/`bash` effects
+//! interleave (A reads a file, B rewrites it, A edits a stale view, B
+//! runs tests against A's half-applied change …). That is a logical
+//! filesystem race the mutex cannot prevent. Real parallelism would
+//! require per-subagent workspace isolation, which the process-global
+//! current directory makes impossible in-process — it needs a subprocess
+//! (or worktree) per subagent, like the `bench`/`swebench` harnesses.
+//! That is scoped as future work; here, sequential is the correct design.
+//!
+//! Note that tool mode is therefore **side-effecting**: every subagent's
+//! tool actions (including losing candidates') persist in the working
+//! tree. Consensus selects one *text* answer; it is not isolated
+//! best-of-N execution.
+//!
 //! ## Anti-recursion
 //!
 //! `consensus_run` is stripped from every subagent's tool list (both
@@ -184,7 +205,7 @@ pub fn consensus_run_spec() -> ToolSpec {
                     "use_tools": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Opt in to tool-enabled subagents. Defaults to false; when true, subagents run sequentially with the live tool manager."
+                        "description": "Opt in to tool-enabled subagents. Defaults to false. When true, subagents run SEQUENTIALLY and their tool actions are side-effecting: every subagent (including losing candidates) mutates the shared working tree. Consensus still selects one text answer; it is not isolated best-of-N execution."
                     }
                 },
                 "required": ["goal", "models"]
@@ -383,6 +404,14 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
     indexed.into_iter().map(|(_, o)| o).collect()
 }
 
+/// Run tool-enabled consensus subagents **sequentially**.
+///
+/// This loop is intentionally sequential and must stay that way: see the
+/// module-level "Why tool mode is sequential" note. A plain `for` over the
+/// models (rather than the LLM-only path's `FuturesUnordered`) guarantees
+/// one subagent's tool actions fully complete before the next begins, so
+/// their edits to the shared working tree cannot interleave. `concurrency`
+/// is deliberately not consulted here.
 async fn run_tool_subagents(
     req: &ConsensusRequest,
     executor: &AIExecutor,
