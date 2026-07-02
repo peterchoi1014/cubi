@@ -23,12 +23,21 @@ pub struct TranscriptLine {
     pub kind: LineKind,
 }
 
-/// The provenance of a transcript line, used later by the widgets layer to
-/// pick a style. Rendering treats unknown kinds as plain text.
+/// The provenance of a transcript line, used by the widgets layer to pick a
+/// style. Rendering treats unknown kinds as plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
-    /// A finalized assistant reply.
+    /// A bold role header introducing a user turn (rendered e.g. green `You`).
+    UserHeader,
+    /// A bold role header introducing an assistant turn (rendered e.g. cyan
+    /// `Cubi`).
+    AssistantHeader,
+    /// A finalized user message body (prose).
+    User,
+    /// A finalized assistant reply (prose).
     Assistant,
+    /// A blank spacer row used to separate consecutive turns.
+    Blank,
     /// A status / info line.
     Status,
     /// The post-turn usage footer.
@@ -87,6 +96,11 @@ pub struct AppState {
     thinking: bool,
     /// The label shown while thinking (e.g. "thinking…").
     thinking_label: String,
+    /// Whether a `Cubi` role header has already been pushed for the current
+    /// assistant turn. Set when the header is emitted and reset when a new user
+    /// turn begins, so streaming, buffered, and multi-step replies all share a
+    /// single header per turn.
+    assistant_header_shown: bool,
 }
 
 impl AppState {
@@ -102,6 +116,7 @@ impl AppState {
             status: placeholder_status(),
             thinking: false,
             thinking_label: String::new(),
+            assistant_header_shown: false,
         }
     }
 
@@ -147,11 +162,13 @@ impl AppState {
     pub fn apply(&mut self, ev: RenderEvent) {
         match ev {
             RenderEvent::AssistantToken(tok) => {
+                self.ensure_assistant_header();
                 self.active_reply.push_str(&tok);
             }
             RenderEvent::AssistantFinal(content) => {
                 // A buffered (non-streaming) reply supersedes any partial
                 // streamed text for this turn.
+                self.ensure_assistant_header();
                 self.active_reply.clear();
                 self.push_line(content, LineKind::Assistant);
             }
@@ -162,6 +179,7 @@ impl AppState {
                 self.push_line(format_footer(&stats, window), LineKind::Footer);
             }
             RenderEvent::BeginThinking { label, .. } => {
+                self.ensure_assistant_header();
                 self.thinking = true;
                 self.thinking_label = label;
                 // Start a fresh active reply for the upcoming step.
@@ -190,6 +208,42 @@ impl AppState {
 
     fn push_line(&mut self, text: String, kind: LineKind) {
         self.transcript.push(TranscriptLine { text, kind });
+    }
+
+    /// Push a blank spacer row unless the transcript is empty or already ends
+    /// in one — this is how consecutive turns get a visual separator.
+    fn ensure_blank_separator(&mut self) {
+        match self.transcript.last() {
+            Some(last) if last.kind != LineKind::Blank => {
+                self.push_line(String::new(), LineKind::Blank);
+            }
+            None => {} // nothing to separate from yet
+            _ => {}    // already blank
+        }
+    }
+
+    /// Emit a single `Cubi` role header for the current assistant turn (with a
+    /// leading blank separator), if one has not been emitted already. Idempotent
+    /// across the tokens/thinking/final events of one turn and across multi-step
+    /// turns, so the header never duplicates.
+    fn ensure_assistant_header(&mut self) {
+        if !self.assistant_header_shown {
+            self.ensure_blank_separator();
+            self.push_line("Cubi".to_string(), LineKind::AssistantHeader);
+            self.assistant_header_shown = true;
+        }
+    }
+
+    /// Begin a user turn: a `You` role header followed by the message body as
+    /// prose (with a leading blank separator between turns). Resets the
+    /// assistant-header latch so the upcoming reply gets its own `Cubi` header.
+    /// Used by both the live submit path and resumed-history seeding so the two
+    /// look identical.
+    pub fn push_user_turn(&mut self, text: &str) {
+        self.ensure_blank_separator();
+        self.push_line("You".to_string(), LineKind::UserHeader);
+        self.push_line(text.to_string(), LineKind::User);
+        self.assistant_header_shown = false;
     }
 
     /// Apply a local editing action to the composer. Cursor arithmetic is
@@ -322,7 +376,11 @@ mod tests {
         s.apply(RenderEvent::AssistantToken("Hel".into()));
         s.apply(RenderEvent::AssistantToken("lo".into()));
         assert_eq!(s.active_reply(), "Hello");
-        assert!(s.transcript().is_empty());
+        // The first token emits a single `Cubi` header (no leading blank when
+        // the transcript is empty), and no more.
+        assert_eq!(s.transcript().len(), 1);
+        assert_eq!(s.transcript()[0].kind, LineKind::AssistantHeader);
+        assert_eq!(s.transcript()[0].text, "Cubi");
     }
 
     #[test]
@@ -339,9 +397,12 @@ mod tests {
         s.apply(RenderEvent::EndThinking);
         assert!(!s.thinking());
         assert!(s.active_reply().is_empty());
-        assert_eq!(s.transcript().len(), 1);
-        assert_eq!(s.transcript()[0].text, "hi there");
-        assert_eq!(s.transcript()[0].kind, LineKind::Assistant);
+        // A `Cubi` header (pushed on BeginThinking) followed by the finalized
+        // reply body.
+        assert_eq!(s.transcript().len(), 2);
+        assert_eq!(s.transcript()[0].kind, LineKind::AssistantHeader);
+        assert_eq!(s.transcript()[1].text, "hi there");
+        assert_eq!(s.transcript()[1].kind, LineKind::Assistant);
     }
 
     #[test]
@@ -361,8 +422,64 @@ mod tests {
         s.apply(RenderEvent::AssistantToken("partial".into()));
         s.apply(RenderEvent::AssistantFinal("buffered reply".into()));
         assert!(s.active_reply().is_empty());
-        assert_eq!(s.transcript().len(), 1);
-        assert_eq!(s.transcript()[0].text, "buffered reply");
+        // Header (from the first token) + the buffered body; the header is not
+        // duplicated by the final event.
+        assert_eq!(s.transcript().len(), 2);
+        assert_eq!(s.transcript()[0].kind, LineKind::AssistantHeader);
+        assert_eq!(s.transcript()[1].kind, LineKind::Assistant);
+        assert_eq!(s.transcript()[1].text, "buffered reply");
+    }
+
+    #[test]
+    fn push_user_turn_emits_header_prose_and_resets_latch() {
+        let mut s = AppState::new();
+        s.push_user_turn("what is rust?");
+        // First turn on an empty transcript: no leading blank separator.
+        assert_eq!(s.transcript().len(), 2);
+        assert_eq!(s.transcript()[0].kind, LineKind::UserHeader);
+        assert_eq!(s.transcript()[0].text, "You");
+        assert_eq!(s.transcript()[1].kind, LineKind::User);
+        assert_eq!(s.transcript()[1].text, "what is rust?");
+    }
+
+    #[test]
+    fn full_turn_has_single_headers_and_blank_separators() {
+        let mut s = AppState::new();
+        s.push_user_turn("hello");
+        // Multi-step assistant turn: two thinking steps must share ONE header.
+        s.apply(RenderEvent::BeginThinking {
+            label: "thinking…".into(),
+            continuation: false,
+        });
+        s.apply(RenderEvent::AssistantToken("step one".into()));
+        s.apply(RenderEvent::EndThinking);
+        s.apply(RenderEvent::BeginThinking {
+            label: "more…".into(),
+            continuation: true,
+        });
+        s.apply(RenderEvent::AssistantToken("step two".into()));
+        s.apply(RenderEvent::EndThinking);
+
+        let kinds: Vec<LineKind> = s.transcript().iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::UserHeader,
+                LineKind::User,
+                LineKind::Blank,
+                LineKind::AssistantHeader,
+                LineKind::Assistant,
+                LineKind::Assistant,
+            ]
+        );
+        // Exactly one assistant header despite two steps.
+        assert_eq!(
+            s.transcript()
+                .iter()
+                .filter(|l| l.kind == LineKind::AssistantHeader)
+                .count(),
+            1
+        );
     }
 
     #[test]
