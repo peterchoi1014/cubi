@@ -3047,6 +3047,14 @@ impl ChatCLI {
     /// Lazily allocates a new session on first call. Failures are
     /// logged as warnings but never abort the chat — the user always
     /// has the in-memory copy and can `/save` manually.
+    /// Run a `!`-shell command and CAPTURE its combined stdout+stderr for
+    /// display inside the TUI transcript (where inherited stdio can't be shown
+    /// — the alt screen would hide it). Returns `(ok, output, elapsed_ms)`.
+    /// Output is capped so a runaway command can't flood the channel/transcript.
+    pub(crate) async fn run_shell_command_captured(&self, command: &str) -> (bool, String, u64) {
+        shell_capture(command).await
+    }
+
     /// Execute a `!`-prefixed shell command from an interactive session
     /// (REPL or TUI). The command runs through the OS shell (`sh -c` on Unix,
     /// `cmd /C` on Windows) with inherited stdio, so it sees the real terminal
@@ -6505,6 +6513,48 @@ fn shell_program() -> (&'static str, &'static str) {
     }
 }
 
+/// Run `command` through the OS shell and CAPTURE its combined stdout+stderr,
+/// returning `(ok, output, elapsed_ms)`. Output is capped so a runaway command
+/// can't flood the caller. Used by the TUI to show shell output in-transcript.
+async fn shell_capture(command: &str) -> (bool, String, u64) {
+    let command = command.trim();
+    if command.is_empty() {
+        return (
+            false,
+            "usage: !<shell command>  (e.g. !ls -la)".to_string(),
+            0,
+        );
+    }
+    let (program, flag) = shell_program();
+    let started = std::time::Instant::now();
+    let result = tokio::process::Command::new(program)
+        .arg(flag)
+        .arg(command)
+        .output()
+        .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(out) => {
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.trim().is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&stderr);
+            }
+            let capped: String = text.chars().take(8000).collect();
+            (out.status.success(), capped, elapsed_ms)
+        }
+        Err(e) => (
+            false,
+            format!("failed to run shell command: {e}"),
+            elapsed_ms,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6523,6 +6573,30 @@ mod tests {
         } else {
             assert_eq!((program, flag), ("sh", "-c"));
         }
+    }
+
+    #[tokio::test]
+    async fn shell_capture_returns_command_output() {
+        let (ok, output, _ms) = shell_capture("echo hello_from_shell").await;
+        assert!(ok, "echo should succeed");
+        assert!(
+            output.contains("hello_from_shell"),
+            "captured output should contain the echoed text, got {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_capture_reports_failure_status() {
+        let (ok, _output, _ms) = shell_capture("exit 3").await;
+        assert!(!ok, "a non-zero exit must report failure");
+    }
+
+    #[tokio::test]
+    async fn shell_capture_empty_command_is_usage() {
+        let (ok, output, ms) = shell_capture("   ").await;
+        assert!(!ok);
+        assert_eq!(ms, 0);
+        assert!(output.contains("usage"));
     }
 
     fn assistant(s: &str) -> Message {
