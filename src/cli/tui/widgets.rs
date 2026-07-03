@@ -7,9 +7,10 @@
 //! function of `(frame, state)`, testable with a `TestBackend`.
 
 use super::app::{AppState, LineKind};
+use super::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
@@ -37,6 +38,7 @@ const MAX_COMPOSER_ROWS: u16 = 6;
 ///      four corners.
 pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+    let theme = state.theme();
 
     let composer_rows = composer_height(state.composer());
     let chunks =
@@ -52,13 +54,13 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
             LineKind::UserHeader => lines.push(Line::styled(
                 entry.text.clone(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.role_user)
                     .add_modifier(Modifier::BOLD),
             )),
             LineKind::AssistantHeader => lines.push(Line::styled(
                 entry.text.clone(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.role_assistant)
                     .add_modifier(Modifier::BOLD),
             )),
             // A blank separator row between turns.
@@ -66,14 +68,14 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
             // Prose (user + assistant bodies) flows through the render_prose
             // seam the leader later rewires to the markdown renderer.
             LineKind::User | LineKind::Assistant => {
-                lines.extend(render_prose(&entry.text, transcript_area.width));
+                lines.extend(render_prose(&entry.text, transcript_area.width, &theme));
             }
             // Status / footer keep their own styling.
             LineKind::Status => {
                 for row in entry.text.split('\n') {
                     lines.push(Line::styled(
                         row.to_string(),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(theme.status),
                     ));
                 }
             }
@@ -81,7 +83,9 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
                 for row in entry.text.split('\n') {
                     lines.push(Line::styled(
                         row.to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(theme.usage_dim)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
             }
@@ -90,27 +94,33 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
             LineKind::ToolHeader => lines.push(Line::styled(
                 entry.text.clone(),
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(theme.tool_header)
                     .add_modifier(Modifier::BOLD),
             )),
             LineKind::ToolOutput => {
                 for row in entry.text.split('\n') {
                     lines.push(Line::styled(
                         format!("│ {row}"),
-                        Style::default().add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(theme.tool_output_dim)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
             }
             // Diff-shaped tool output: color rows via the shared diff renderer
             // instead of the plain `│ ` framing.
             LineKind::ToolDiff => {
-                lines.extend(super::diff::render_diff(&entry.text, transcript_area.width));
+                lines.extend(super::diff::render_diff(
+                    &entry.text,
+                    transcript_area.width,
+                    &theme,
+                ));
             }
             LineKind::ToolStatus => {
                 let color = if entry.text.starts_with('✗') {
-                    Color::Red
+                    theme.tool_err
                 } else {
-                    Color::Green
+                    theme.tool_ok
                 };
                 lines.push(Line::styled(entry.text.clone(), Style::default().fg(color)));
             }
@@ -120,7 +130,11 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     // under the `Cubi` header pushed when the turn began. Routed through the
     // same prose seam so live streaming matches finalized replies.
     if !state.active_reply().is_empty() {
-        lines.extend(render_prose(state.active_reply(), transcript_area.width));
+        lines.extend(render_prose(
+            state.active_reply(),
+            transcript_area.width,
+            &theme,
+        ));
     }
     // Word-wrap long lines to the transcript width instead of truncating them.
     // `trim: false` preserves leading indentation (e.g. code blocks).
@@ -159,14 +173,28 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     } else {
         "ready".to_string()
     };
-    let bottom_right = format!("{progress} · {}", status.usage_display());
+    // The bottom-right corner pairs the thinking/progress indicator (its own
+    // themeable `spinner` color) with the dim usage metadata. Both share the
+    // dim modifier so the corner keeps its subdued look.
+    let usage = format!(" · {}", status.usage_display());
 
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let dim = Style::default()
+        .fg(theme.usage_dim)
+        .add_modifier(Modifier::DIM);
+    let spinner_style = Style::default()
+        .fg(theme.spinner)
+        .add_modifier(Modifier::DIM);
     let composer_block = Block::bordered()
         .title_top(Line::from(Span::styled(top_left, dim)).left_aligned())
         .title_top(Line::from(Span::styled(top_right, dim)).right_aligned())
         .title_bottom(Line::from(Span::styled(bottom_left, dim)).left_aligned())
-        .title_bottom(Line::from(Span::styled(bottom_right, dim)).right_aligned());
+        .title_bottom(
+            Line::from(vec![
+                Span::styled(progress, spinner_style),
+                Span::styled(usage, dim),
+            ])
+            .right_aligned(),
+        );
     let inner = composer_block.inner(composer_area);
     let composer = Paragraph::new(compose_lines(state.composer())).block(composer_block);
     frame.render_widget(composer, composer_area);
@@ -204,8 +232,8 @@ fn compose_lines(composer: &str) -> Vec<Line<'static>> {
 /// renderer, so headings, bold/italic, inline code, lists, and fenced code
 /// blocks are legible in the transcript. `Paragraph::wrap` still wraps the
 /// returned rows to the viewport width.
-fn render_prose(text: &str, width: u16) -> Vec<Line<'static>> {
-    super::markdown::render(text, width)
+fn render_prose(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    super::markdown::render(text, width, theme)
 }
 
 /// Compute the (column, row) caret position within the composer text for a
@@ -444,7 +472,7 @@ mod tests {
 
     #[test]
     fn render_prose_splits_lines_plainly() {
-        let rows = render_prose("first\nsecond", 40);
+        let rows = render_prose("first\nsecond", 40, &Theme::default());
         assert_eq!(rows.len(), 2);
         // Plain default-fg content (no styling applied in the Milestone-A body).
         let joined: String = rows
@@ -537,5 +565,75 @@ mod tests {
                 "scroll_down did not return to the bottom"
             );
         }
+    }
+
+    /// Collect every cell's foreground color across the whole buffer.
+    fn all_fgs(buf: &ratatui::buffer::Buffer) -> Vec<ratatui::style::Color> {
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].fg)
+            .collect()
+    }
+
+    #[test]
+    fn same_content_renders_different_colors_across_themes() {
+        // Build identical content, then render it under the light vs dark
+        // palette. At least one cell's foreground must differ, proving the TUI
+        // now sources its colors from the theme instead of hardcoded constants.
+        fn render_with(theme: Theme) -> Vec<ratatui::style::Color> {
+            let mut state = AppState::new();
+            state.set_theme(theme);
+            state.push_user_turn("what is rust?");
+            state.apply(RenderEvent::AssistantFinal("a `systems` language".into()));
+            let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+            terminal.draw(|f| draw(f, &state)).unwrap();
+            all_fgs(terminal.backend().buffer())
+        }
+
+        let light = render_with(Theme::from_name("light"));
+        let dark = render_with(Theme::from_name("dark"));
+        assert_ne!(
+            light, dark,
+            "identical content must render different colors under light vs dark themes"
+        );
+    }
+
+    #[test]
+    fn role_headers_use_theme_colors() {
+        // The `You` / `Cubi` headers must carry the theme's role colors, not a
+        // hardcoded constant.
+        let mut state = AppState::new();
+        let theme = Theme::from_name("dark");
+        state.set_theme(theme);
+        state.push_user_turn("hi");
+        state.apply(RenderEvent::AssistantFinal("hello".into()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Find the row carrying each header and check its first glyph's fg.
+        let user_fg = header_fg(buf, "You");
+        let cubi_fg = header_fg(buf, "Cubi");
+        assert_eq!(
+            user_fg,
+            Some(theme.role_user),
+            "user header uses theme color"
+        );
+        assert_eq!(
+            cubi_fg,
+            Some(theme.role_assistant),
+            "assistant header uses theme color"
+        );
+    }
+
+    /// Foreground of the first cell on the row whose text contains `needle`.
+    fn header_fg(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<ratatui::style::Color> {
+        for y in 0..buf.area.height {
+            let row = row_to_string(buf, y);
+            if let Some(col) = row.find(needle) {
+                return Some(buf[(col as u16, y)].fg);
+            }
+        }
+        None
     }
 }

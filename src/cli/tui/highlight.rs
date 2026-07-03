@@ -32,8 +32,10 @@
 //! unterminated string or comment simply colors to the end of the line (or, for
 //! block comments / triple strings, until a later closing delimiter).
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+
+use super::theme::Theme;
 
 /// Cross-line tokenizer state carried between input rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,32 +68,31 @@ struct Lang {
 /// Highlight a fenced code block. Returns one styled row per input line (NO
 /// left border — the caller adds it). `lang` is the fence info string (e.g.
 /// `"rust"`, `"python"`, `"ts"`); unknown/empty maps to a generic highlighter.
-pub(crate) fn highlight(code: &str, lang: &str) -> Vec<Line<'static>> {
+pub(crate) fn highlight(code: &str, lang: &str, theme: &Theme) -> Vec<Line<'static>> {
     let cfg = lang_config(lang);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cross = Cross::Normal;
     for line in code.lines() {
-        let (row, next) = highlight_line(line, &cfg, cross);
+        let (row, next) = highlight_line(line, &cfg, cross, theme);
         out.push(row);
         cross = next;
     }
     out
 }
 
-// ---- styles (hardcoded for now; a later slice will theme these) ------------
+// ---- styles (sourced from the active theme) --------------------------------
 
-fn keyword_style() -> Style {
-    Style::default().fg(Color::Magenta)
+fn keyword_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.syntax_keyword)
 }
-fn string_style() -> Style {
-    Style::default().fg(Color::Green)
+fn string_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.syntax_string)
 }
-fn comment_style() -> Style {
-    // "dim" comment color == ANSI bright black.
-    Style::default().fg(Color::DarkGray)
+fn comment_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.syntax_comment)
 }
-fn number_style() -> Style {
-    Style::default().fg(Color::Yellow)
+fn number_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.syntax_number)
 }
 fn base_style() -> Style {
     Style::default()
@@ -173,7 +174,12 @@ fn lang_config(lang: &str) -> Lang {
 
 /// Tokenize a single line given the entering [`Cross`] state. Returns the
 /// styled row and the state to carry into the next line.
-fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, Cross) {
+fn highlight_line(
+    line: &str,
+    lang: &Lang,
+    mut cross: Cross,
+    theme: &Theme,
+) -> (Line<'static>, Cross) {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut b = RowBuilder::new();
@@ -185,12 +191,12 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
             let close = lang.block_comment.map(|(_, c)| c).unwrap_or("*/");
             match scan_for_seq(&chars, i, close) {
                 Some(end) => {
-                    push_range(&mut b, &chars, i, end, comment_style());
+                    push_range(&mut b, &chars, i, end, comment_style(theme));
                     i = end;
                     cross = Cross::Normal;
                 }
                 None => {
-                    push_range(&mut b, &chars, i, n, comment_style());
+                    push_range(&mut b, &chars, i, n, comment_style(theme));
                     i = n;
                 }
             }
@@ -201,12 +207,12 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         if let Cross::TripleString(q) = cross {
             match scan_for_triple(&chars, i, q) {
                 Some(end) => {
-                    push_range(&mut b, &chars, i, end, string_style());
+                    push_range(&mut b, &chars, i, end, string_style(theme));
                     i = end;
                     cross = Cross::Normal;
                 }
                 None => {
-                    push_range(&mut b, &chars, i, n, string_style());
+                    push_range(&mut b, &chars, i, n, string_style(theme));
                     i = n;
                 }
             }
@@ -218,7 +224,7 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         // Line comment (scans to end of line).
         if let Some(prefix) = lang.line_comments.iter().find(|p| matches_at(&chars, i, p)) {
             let _ = prefix;
-            push_range(&mut b, &chars, i, n, comment_style());
+            push_range(&mut b, &chars, i, n, comment_style(theme));
             i = n;
             continue;
         }
@@ -229,11 +235,11 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         {
             match scan_for_seq(&chars, i + open.chars().count(), close) {
                 Some(end) => {
-                    push_range(&mut b, &chars, i, end, comment_style());
+                    push_range(&mut b, &chars, i, end, comment_style(theme));
                     i = end;
                 }
                 None => {
-                    push_range(&mut b, &chars, i, n, comment_style());
+                    push_range(&mut b, &chars, i, n, comment_style(theme));
                     i = n;
                     cross = Cross::BlockComment;
                 }
@@ -245,11 +251,11 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         if lang.triple_strings && lang.string_quotes.contains(&c) && matches_triple(&chars, i, c) {
             match scan_for_triple(&chars, i + 3, c) {
                 Some(end) => {
-                    push_range(&mut b, &chars, i, end, string_style());
+                    push_range(&mut b, &chars, i, end, string_style(theme));
                     i = end;
                 }
                 None => {
-                    push_range(&mut b, &chars, i, n, string_style());
+                    push_range(&mut b, &chars, i, n, string_style(theme));
                     i = n;
                     cross = Cross::TripleString(c);
                 }
@@ -261,7 +267,7 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         // `'x'` / `'\n'` is a literal; a bare `'a` (lifetime) stays default.
         if lang.char_quote && c == '\'' {
             if let Some(end) = scan_char_literal(&chars, i) {
-                push_range(&mut b, &chars, i, end, string_style());
+                push_range(&mut b, &chars, i, end, string_style(theme));
                 i = end;
             } else {
                 b.push(c, base_style());
@@ -273,7 +279,7 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
         // Full string literal (double/single/backtick per language).
         if lang.string_quotes.contains(&c) {
             let end = scan_string(&chars, i, c);
-            push_range(&mut b, &chars, i, end, string_style());
+            push_range(&mut b, &chars, i, end, string_style(theme));
             i = end;
             continue;
         }
@@ -285,7 +291,7 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
             {
                 j += 1;
             }
-            push_range(&mut b, &chars, i, j, number_style());
+            push_range(&mut b, &chars, i, j, number_style(theme));
             i = j;
             continue;
         }
@@ -298,7 +304,7 @@ fn highlight_line(line: &str, lang: &Lang, mut cross: Cross) -> (Line<'static>, 
             }
             let word: String = chars[i..j].iter().collect();
             let style = if lang.keywords.contains(&word.as_str()) {
-                keyword_style()
+                keyword_style(theme)
             } else {
                 base_style()
             };
@@ -587,6 +593,11 @@ const GO_KEYWORDS: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// Highlight with the default (auto) theme — the common case in tests.
+    fn hl(code: &str, lang: &str) -> Vec<Line<'static>> {
+        highlight(code, lang, &Theme::default())
+    }
+
     /// Concatenated plain text of every span in a line.
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -609,37 +620,37 @@ mod tests {
 
     #[test]
     fn rust_colors_keyword_string_and_comment() {
-        let rows = highlight("fn main() { let s = \"hi\"; } // done", "rust");
+        let rows = hl("fn main() { let s = \"hi\"; } // done", "rust");
         assert_eq!(rows.len(), 1);
         let line = &rows[0];
         assert_eq!(
             style_of(line, "fn").and_then(|s| s.fg),
-            Some(Color::Magenta),
+            Some(Theme::AUTO.syntax_keyword),
             "`fn` keyword is magenta"
         );
         assert_eq!(
             style_of(line, "let").and_then(|s| s.fg),
-            Some(Color::Magenta),
+            Some(Theme::AUTO.syntax_keyword),
             "`let` keyword is magenta"
         );
         assert_eq!(
             style_of(line, "\"hi\"").and_then(|s| s.fg),
-            Some(Color::Green),
+            Some(Theme::AUTO.syntax_string),
             "string literal is green"
         );
         assert_eq!(
             style_of(line, "// done").and_then(|s| s.fg),
-            Some(Color::DarkGray),
+            Some(Theme::AUTO.syntax_comment),
             "line comment is dim"
         );
     }
 
     #[test]
     fn rust_colors_number() {
-        let rows = highlight("let x = 42;", "rust");
+        let rows = hl("let x = 42;", "rust");
         assert_eq!(
             style_of(&rows[0], "42").and_then(|s| s.fg),
-            Some(Color::Yellow),
+            Some(Theme::AUTO.syntax_number),
             "number literal is yellow"
         );
     }
@@ -647,37 +658,38 @@ mod tests {
     #[test]
     fn rust_lifetime_is_not_a_string() {
         // `'a` is a lifetime, not a char literal — it must stay default.
-        let rows = highlight("fn f<'a>(x: &'a str) {}", "rust");
+        let rows = hl("fn f<'a>(x: &'a str) {}", "rust");
         assert!(
             !rows[0]
                 .spans
                 .iter()
-                .any(|s| s.content.as_ref().contains('\'') && s.style.fg == Some(Color::Green)),
+                .any(|s| s.content.as_ref().contains('\'')
+                    && s.style.fg == Some(Theme::AUTO.syntax_string)),
             "lifetime must not be colored as a string"
         );
     }
 
     #[test]
     fn rust_char_literal_is_string() {
-        let rows = highlight("let c = 'x';", "rust");
+        let rows = hl("let c = 'x';", "rust");
         assert_eq!(
             style_of(&rows[0], "'x'").and_then(|s| s.fg),
-            Some(Color::Green),
+            Some(Theme::AUTO.syntax_string),
             "char literal is green"
         );
     }
 
     #[test]
     fn python_colors_def_and_comment() {
-        let rows = highlight("def f():  # hello", "python");
+        let rows = hl("def f():  # hello", "python");
         assert_eq!(
             style_of(&rows[0], "def").and_then(|s| s.fg),
-            Some(Color::Magenta),
+            Some(Theme::AUTO.syntax_keyword),
             "`def` keyword is magenta"
         );
         assert_eq!(
             style_of(&rows[0], "# hello").and_then(|s| s.fg),
-            Some(Color::DarkGray),
+            Some(Theme::AUTO.syntax_comment),
             "`#` comment is dim"
         );
     }
@@ -685,19 +697,19 @@ mod tests {
     #[test]
     fn block_comment_spans_multiple_lines() {
         let src = "let a = 1; /* start\nstill comment\nend */ let b = 2;";
-        let rows = highlight(src, "rust");
+        let rows = hl(src, "rust");
         assert_eq!(rows.len(), 3);
         // Middle line is entirely comment-colored.
         assert_eq!(
             rows[1].spans.first().and_then(|s| s.style.fg),
-            Some(Color::DarkGray),
+            Some(Theme::AUTO.syntax_comment),
             "middle of a block comment is dim"
         );
         assert_eq!(line_text(&rows[1]), "still comment");
         // The `let b` after the close is highlighted normally again.
         assert_eq!(
             style_of(&rows[2], "let").and_then(|s| s.fg),
-            Some(Color::Magenta),
+            Some(Theme::AUTO.syntax_keyword),
             "code resumes after `*/`"
         );
     }
@@ -705,16 +717,16 @@ mod tests {
     #[test]
     fn python_triple_string_spans_multiple_lines() {
         let src = "x = \"\"\"line one\nline two\"\"\"\ny = 1";
-        let rows = highlight(src, "python");
+        let rows = hl(src, "python");
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[1].spans.first().and_then(|s| s.style.fg),
-            Some(Color::Green),
+            Some(Theme::AUTO.syntax_string),
             "inside a triple-quoted string stays green"
         );
         assert_eq!(
             style_of(&rows[2], "1").and_then(|s| s.fg),
-            Some(Color::Yellow),
+            Some(Theme::AUTO.syntax_number),
             "code resumes after the closing triple quote"
         );
     }
@@ -722,20 +734,20 @@ mod tests {
     #[test]
     fn unknown_language_uses_generic_path() {
         // Generic: strings, numbers, and `#` / `//` comments only; no keywords.
-        let rows = highlight("value = \"str\" 12 # note", "cobol");
+        let rows = hl("value = \"str\" 12 # note", "cobol");
         assert_eq!(
             style_of(&rows[0], "\"str\"").and_then(|s| s.fg),
-            Some(Color::Green),
+            Some(Theme::AUTO.syntax_string),
             "generic colors strings"
         );
         assert_eq!(
             style_of(&rows[0], "12").and_then(|s| s.fg),
-            Some(Color::Yellow),
+            Some(Theme::AUTO.syntax_number),
             "generic colors numbers"
         );
         assert_eq!(
             style_of(&rows[0], "# note").and_then(|s| s.fg),
-            Some(Color::DarkGray),
+            Some(Theme::AUTO.syntax_comment),
             "generic colors `#` comments"
         );
         assert!(
@@ -747,7 +759,7 @@ mod tests {
     #[test]
     fn multibyte_content_does_not_panic() {
         let src = "let s = \"héllo → 世界\"; // café ☕\n# 日本語";
-        let rows = highlight(src, "rust");
+        let rows = hl(src, "rust");
         assert_eq!(rows.len(), 2);
         // Round-trips content without splitting multibyte chars.
         assert!(line_text(&rows[0]).contains("héllo → 世界"));
@@ -756,18 +768,18 @@ mod tests {
 
     #[test]
     fn empty_and_odd_input_do_not_panic() {
-        assert!(highlight("", "rust").is_empty());
+        assert!(hl("", "rust").is_empty());
         // Unterminated string / block comment just colors to end.
-        let rows = highlight("\"unterminated\nlet x = 1;", "rust");
+        let rows = hl("\"unterminated\nlet x = 1;", "rust");
         assert_eq!(rows.len(), 2);
-        let _ = highlight("'", "rust");
-        let _ = highlight("/*", "rust");
-        let _ = highlight("\"\"\"", "python");
+        let _ = hl("'", "rust");
+        let _ = hl("/*", "rust");
+        let _ = hl("\"\"\"", "python");
     }
 
     #[test]
     fn json_has_no_comments_but_colors_keywords() {
-        let rows = highlight("{\"ok\": true, \"n\": 3} // not-a-comment", "json");
+        let rows = hl("{\"ok\": true, \"n\": 3} // not-a-comment", "json");
         // In JSON, `//` is not a comment, so `not-a-comment` stays default.
         assert!(
             style_of(&rows[0], "// not-a-comment")
@@ -777,7 +789,7 @@ mod tests {
         );
         assert_eq!(
             style_of(&rows[0], "true").and_then(|s| s.fg),
-            Some(Color::Magenta),
+            Some(Theme::AUTO.syntax_keyword),
             "json `true` keyword is colored"
         );
         assert!(any_colored(&rows), "json still colors strings/numbers");
