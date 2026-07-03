@@ -808,6 +808,17 @@ impl ChatCLI {
                     r
                 };
                 let Some(result_text) = result_text else {
+                    // Close the framed tool block opened by `tool_started`
+                    // above with a failure status (no-op for LineSink/NullSink,
+                    // so non-TUI output stays byte-identical). Without this the
+                    // TUI transcript keeps a dangling `⚙` header that never
+                    // gets a ✓/✗ status row when a tool is cancelled/times out.
+                    self.ui.tool_finished(
+                        &call.function.name,
+                        false,
+                        "cancelled (Ctrl-C)",
+                        tool_started_at.elapsed().as_millis() as u64,
+                    );
                     if let Some((tracer, id, started)) = trace_ctx {
                         tracer.log_complete(
                             &call.function.name,

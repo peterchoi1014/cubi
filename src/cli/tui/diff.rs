@@ -18,20 +18,14 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// True when `text` looks like a unified diff: it either contains an
-/// `@@ … @@` hunk header, or has several body lines beginning with `+`/`-`
-/// that are not the `+++`/`---` file-header markers.
+/// True when `text` looks like a unified diff. A real unified diff always
+/// carries an `@@ … @@` hunk header, so we require one here. This deliberately
+/// does NOT treat a run of `+`/`-` body lines as a diff: ordinary bullet-list
+/// tool output (`- item one\n- item two`) would otherwise be misclassified and
+/// rendered entirely red. Model-authored diffs in ```diff fences don't rely on
+/// this heuristic — the fence language already selects diff rendering.
 pub(crate) fn looks_like_diff(text: &str) -> bool {
-    let mut change_lines = 0usize;
-    for line in text.lines() {
-        if is_hunk_header(line) {
-            return true;
-        }
-        if is_addition(line) || is_deletion(line) {
-            change_lines += 1;
-        }
-    }
-    change_lines >= 2
+    text.lines().any(is_hunk_header)
 }
 
 /// Render a unified diff into colored rows. Pure/deterministic; owned
@@ -187,5 +181,10 @@ mod tests {
         ));
         // A lone leading '-' bullet is not enough to look like a diff.
         assert!(!looks_like_diff("- a single bullet point"));
+        // A two-bullet list has two `-` lines but no hunk header, so it must
+        // NOT be classified as a diff (otherwise it renders entirely red).
+        assert!(!looks_like_diff("- a\n- b"));
+        // `+`/`-` change lines without a hunk header are still not a diff.
+        assert!(!looks_like_diff("- item one\n- item two\n+ item three"));
     }
 }
