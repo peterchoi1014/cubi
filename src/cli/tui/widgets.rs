@@ -88,6 +88,11 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
                     ));
                 }
             }
+            // Diff-shaped tool output: color rows via the shared diff renderer
+            // instead of the plain `│ ` framing.
+            LineKind::ToolDiff => {
+                lines.extend(super::diff::render_diff(&entry.text, transcript_area.width));
+            }
             LineKind::ToolStatus => {
                 let color = if entry.text.starts_with('✗') {
                     Color::Red

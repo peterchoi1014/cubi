@@ -51,6 +51,10 @@ pub enum LineKind {
     /// A single indented output row inside a tool-call block (dim, `│ ` prefix
     /// added by the widgets layer).
     ToolOutput,
+    /// A tool-output row belonging to a block whose output is a unified diff.
+    /// The widgets layer colors these via [`super::diff`] instead of the plain
+    /// `│ ` framing used for [`LineKind::ToolOutput`].
+    ToolDiff,
     /// The trailing status row of a tool-call block. Its leading glyph is `✓`
     /// (success) or `✗` (error), which the widgets layer inspects to pick a
     /// green/red style.
@@ -237,8 +241,15 @@ impl AppState {
         }
         let rows: Vec<&str> = trimmed.split('\n').collect();
         let shown = rows.len().min(MAX_TOOL_OUTPUT_ROWS);
+        // Patch-shaped output is colored as a diff; everything else keeps the
+        // plain `│ `-bordered framing (unchanged Slice-1 behavior).
+        let kind = if super::diff::looks_like_diff(trimmed) {
+            LineKind::ToolDiff
+        } else {
+            LineKind::ToolOutput
+        };
         for row in &rows[..shown] {
-            self.push_line((*row).to_string(), LineKind::ToolOutput);
+            self.push_line((*row).to_string(), kind);
         }
         if rows.len() > shown {
             let more = rows.len() - shown;
@@ -644,6 +655,48 @@ mod tests {
         // 12 shown rows + 1 "… N more lines" note.
         assert_eq!(output_rows.len(), 13);
         assert_eq!(output_rows.last().unwrap().text, "… 8 more lines");
+    }
+
+    #[test]
+    fn diff_shaped_tool_output_is_marked_as_tool_diff() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted {
+            name: "apply".into(),
+        });
+        s.apply(RenderEvent::ToolFinished {
+            name: "apply".into(),
+            ok: true,
+            output: "@@ -1 +1 @@\n-old\n+new".into(),
+            elapsed_ms: 10,
+        });
+        let kinds: Vec<LineKind> = s.transcript().iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::ToolHeader,
+                LineKind::ToolDiff,
+                LineKind::ToolDiff,
+                LineKind::ToolDiff,
+                LineKind::ToolStatus,
+            ],
+            "unified-diff tool output must be tagged ToolDiff, not ToolOutput"
+        );
+    }
+
+    #[test]
+    fn non_diff_tool_output_stays_plain_tool_output() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "plain line one\nplain line two".into(),
+            elapsed_ms: 10,
+        });
+        assert!(
+            s.transcript().iter().all(|l| l.kind != LineKind::ToolDiff),
+            "prose tool output must not be colored as a diff"
+        );
     }
 
     #[test]

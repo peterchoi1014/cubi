@@ -21,6 +21,7 @@
 //!     `tokio::signal::ctrl_c()` never fires under the TUI).
 
 mod app;
+mod diff;
 mod event;
 mod markdown;
 mod sink;
