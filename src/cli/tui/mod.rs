@@ -512,11 +512,23 @@ impl ChatCLI {
             return self.run_suspended_command(input, control_tx, guard).await;
         }
 
-        // Shell escape: `!<cmd>` runs a shell command on the real terminal via
-        // the same suspend/resume cycle (its output must not paint the alt
-        // screen). Never quits the session.
-        if input.starts_with('!') {
-            return self.run_suspended_command(input, control_tx, guard).await;
+        // Shell escape: `!<cmd>` runs a shell command and shows its output as a
+        // framed block in the transcript. We CAPTURE the output (rather than
+        // suspend to the real terminal like slash commands) because a quick
+        // command's output would otherwise flash on the normal screen and be
+        // hidden the instant we re-enter the alt screen. Reuses the tool-block
+        // rendering (header + framed output + ✓/✗ + duration, incl. diff
+        // coloring). Never quits the session.
+        if let Some(shell_cmd) = input.strip_prefix('!') {
+            let shell_cmd = shell_cmd.trim();
+            if shell_cmd.is_empty() {
+                self.ui.status("usage: !<shell command>  (e.g. !ls -la)");
+                return true;
+            }
+            self.ui.tool_started(shell_cmd);
+            let (ok, output, elapsed_ms) = self.run_shell_command_captured(shell_cmd).await;
+            self.ui.tool_finished(shell_cmd, ok, &output, elapsed_ms);
+            return true;
         }
 
         // The user's line is echoed into the transcript as a `You` role block
@@ -546,10 +558,11 @@ impl ChatCLI {
     /// the user's screen; (3) run the command; (4) restore the sink; (5) on
     /// quit, stop here (do not re-enter); otherwise re-enter the TUI and signal
     /// the render task to resume (rebuild its stream + full repaint).
-    /// Run a `/`-command or a `!`-shell-command on the *real* terminal by
-    /// suspending the TUI (park the render task, leave the alt screen, swap in
-    /// a line sink), running it, then re-entering and repainting. Returns
-    /// `false` when the command asked to quit.
+    /// Run a `/`-command on the *real* terminal by suspending the TUI (park the
+    /// render task, leave the alt screen, swap in a line sink), running it, then
+    /// re-entering and repainting. Returns `false` when the command asked to
+    /// quit. (Shell `!` commands are handled separately in `tui_submit` by
+    /// capturing their output into the transcript.)
     async fn run_suspended_command(
         &mut self,
         input: &str,
@@ -591,13 +604,9 @@ impl ChatCLI {
         let tui_sink = std::mem::replace(&mut self.ui, line_sink);
         self.tui_active = false;
 
-        // (3) Dispatch on the real terminal. `!<cmd>` runs a shell command;
-        // otherwise dispatch exactly as the REPL: user-defined commands first,
-        // then the built-in handler; honor the handler's quit (`Ok(false)`).
-        let keep_running = if let Some(shell_cmd) = input.strip_prefix('!') {
-            self.run_shell_command(shell_cmd);
-            true
-        } else if self.try_user_command(input) {
+        // (3) Dispatch exactly as the REPL: user-defined commands first, then
+        // the built-in handler; honor the handler's quit (`Ok(false)`) return.
+        let keep_running = if self.try_user_command(input) {
             true
         } else {
             match self.handle_command(input).await {
