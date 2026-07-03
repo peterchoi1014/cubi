@@ -40,7 +40,9 @@ cubi \- a pocket-sized AI for your shell
 .BR bash | zsh | fish
 .SH DESCRIPTION
 .B cubi
-starts an interactive local-AI chat REPL with native tool calling, session checkpoints, plugins, and MCP support. In headless mode it runs one prompt and writes model output to standard output so it can be used in shell pipelines.
+starts an interactive local-AI chat session with native tool calling, session checkpoints, plugins, and MCP support. By default the interactive session opens a full-screen terminal UI (TUI); pass
+.B --classic
+for the classic line-based REPL. In headless mode it runs one prompt and writes model output to standard output so it can be used in shell pipelines.
 .SH OPTIONS
 .TP
 .BR -p , " --prompt " \fIprompt\fR
@@ -58,6 +60,17 @@ and is disabled automatically for non-TTY output.
 .TP
 .B --show-stats-footer
 Print a token and timing footer after each reply.
+.TP
+.B --classic
+Use the classic line-based readline REPL instead of the default full-screen terminal UI. Interactive sessions only; also honored via the
+.B CUBI_CLASSIC
+environment variable. The TUI is skipped automatically for non-TTY, piped, headless,
+.BR -p ,
+and
+.B --json
+runs.
+.RB ( --tui " / " CUBI_TUI
+are now the default and a no-op.)
 .TP
 .BI --system " file"
 Prepend the contents of

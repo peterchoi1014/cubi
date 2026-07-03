@@ -605,6 +605,9 @@ async fn main() -> Result<()> {
             "--tui" => {
                 cli_flags.tui = true;
             }
+            "--classic" => {
+                cli_flags.classic = true;
+            }
             "--quiet" => {
                 cli_flags.quiet = true;
                 cli_flags.no_banner = true;
@@ -1060,6 +1063,13 @@ async fn main() -> Result<()> {
     {
         cli_flags.tui = true;
     }
+    if !cli_flags.classic
+        && std::env::var("CUBI_CLASSIC")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    {
+        cli_flags.classic = true;
+    }
     if cli_flags.quiet {
         // Suppress the global "thinking…" / tool-call spinner via the
         // existing env knob so we don't have to thread a flag through
@@ -1299,6 +1309,15 @@ async fn main() -> Result<()> {
         cli_flags.markdown = false;
     }
 
+    // The full-screen TUI is the default for interactive sessions. It applies
+    // only when the session is genuinely interactive: not headless / one-shot
+    // (`-p`) and not JSON output. `--classic` (or `CUBI_CLASSIC`) opts back
+    // into the classic readline REPL and takes precedence over `--tui` /
+    // `CUBI_TUI` (which are now a redundant explicit opt-in). `run_tui` itself
+    // still falls back to `run()` when stdout is not a TTY, so no TTY check is
+    // needed here — headless / one-shot / JSON already route away from the TUI.
+    let use_tui = !cli_flags.classic && !headless && !cli_flags.json;
+
     // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
     // to their new CUBI_* names and rename ~/.ai-chat-cli/ → ~/.cubi/
     // exactly once. Both no-op if there's nothing to migrate.
@@ -1367,9 +1386,11 @@ async fn main() -> Result<()> {
     let cpu_workers = 6;
 
     // Seed the TUI transcript with the normal startup output that the
-    // alternate screen would otherwise wipe. Capture is a no-op for every
-    // non-TUI path (default behavior is byte-identical).
-    if cli_flags.tui && !headless {
+    // alternate screen would otherwise wipe. Fires whenever the TUI will
+    // actually run; if `run_tui` later falls back to `run()` on a non-TTY the
+    // captured lines are simply discarded (harmless). No-op for classic /
+    // headless paths (default behavior is byte-identical there).
+    if use_tui {
         out::capture_start();
     }
 
@@ -1575,10 +1596,6 @@ async fn main() -> Result<()> {
     }
 
     let json_output = cli_flags.json;
-    // Capture the TUI request before `cli_flags` is moved into the CLI. The
-    // TUI is only honored for interactive sessions (no one-shot prompt) and
-    // never in headless / JSON contexts.
-    let tui_requested = cli_flags.tui;
 
     // Create and run CLI
     let mut cli = ChatCLI::new_with_flags(
@@ -1665,11 +1682,12 @@ async fn main() -> Result<()> {
     }
     let run_result = if let Some(prompt) = one_shot_prompt {
         cli.run_one_shot(&prompt).await
-    } else if tui_requested && !headless {
-        // Opt-in full-screen TUI for interactive sessions only. `run_tui`
+    } else if use_tui {
+        // Full-screen TUI is the default for interactive sessions. `run_tui`
         // itself falls back to `run()` when stdout is not a TTY.
         cli.run_tui().await
     } else {
+        // Classic readline REPL (`--classic` / `CUBI_CLASSIC`).
         cli.run().await
     };
 
@@ -2298,7 +2316,12 @@ fn print_help() {
                                         switch. Implies --no-banner. Does not\n  \
                                         affect assistant output, slash command\n  \
                                         output, errors, --events or JSON\n  \
-                                        events. Also honors CUBI_QUIET=1.\n\n\
+                                        events. Also honors CUBI_QUIET=1.\n  \
+         --classic                      Use the classic line-based readline\n  \
+                                        REPL instead of the default full-screen\n  \
+                                        TUI (interactive sessions only). Also\n  \
+                                        honors CUBI_CLASSIC=1. (--tui / CUBI_TUI\n  \
+                                        are now the default and a no-op.)\n\n\
          Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \

@@ -225,10 +225,15 @@ pub struct CliFlags {
     pub subprocess_subagent_mode: bool,
     pub max_agent_steps_override: Option<usize>,
     pub max_agent_time_cap_override: Option<Duration>,
-    /// Opt-in full-screen terminal UI (`--tui` / `CUBI_TUI=1`). Only honored
-    /// for interactive sessions on a TTY; headless / one-shot / JSON never
-    /// enter the TUI.
+    /// Opt-in full-screen terminal UI (`--tui` / `CUBI_TUI=1`). The TUI is now
+    /// the default for interactive sessions, so this flag is a now-redundant
+    /// explicit opt-in kept for back-compat. Only honored for interactive
+    /// sessions on a TTY; headless / one-shot / JSON never enter the TUI.
     pub tui: bool,
+    /// Opt out of the default full-screen TUI (`--classic` / `CUBI_CLASSIC=1`)
+    /// and use the classic line-based readline REPL instead. Takes precedence
+    /// over `--tui` / `CUBI_TUI` when both are set.
+    pub classic: bool,
 }
 
 impl Default for CliFlags {
@@ -250,6 +255,7 @@ impl Default for CliFlags {
             max_agent_steps_override: None,
             max_agent_time_cap_override: None,
             tui: false,
+            classic: false,
         }
     }
 }
