@@ -11,7 +11,20 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+
+/// Standard braille spinner frames for the thinking indicator.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Format the animated thinking indicator shown in the composer's bottom-right
+/// progress slot, e.g. `⠸ working… 4.2s`. Pure and deterministic: the render
+/// task feeds it the current spinner `frame` and `elapsed_ms` so tests can
+/// assert on fixed inputs without touching the wall clock.
+pub(super) fn format_thinking(frame: usize, elapsed_ms: u64, label: &str) -> String {
+    let glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+    let secs = elapsed_ms as f64 / 1000.0;
+    format!("{glyph} {label} {secs:.1}s")
+}
 
 /// Maximum rows the composer *text* region may occupy before it stops growing
 /// (borders are added on top of this).
@@ -72,6 +85,35 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
                     ));
                 }
             }
+            // Framed tool-call block: bold-blue header, dim `│ `-indented
+            // output rows, and a green ✓ / red ✗ status row.
+            LineKind::ToolHeader => lines.push(Line::styled(
+                entry.text.clone(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            LineKind::ToolOutput => {
+                for row in entry.text.split('\n') {
+                    lines.push(Line::styled(
+                        format!("│ {row}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
+            // Diff-shaped tool output: color rows via the shared diff renderer
+            // instead of the plain `│ ` framing.
+            LineKind::ToolDiff => {
+                lines.extend(super::diff::render_diff(&entry.text, transcript_area.width));
+            }
+            LineKind::ToolStatus => {
+                let color = if entry.text.starts_with('✗') {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
+                lines.push(Line::styled(entry.text.clone(), Style::default().fg(color)));
+            }
         }
     }
     // The in-progress streamed reply, shown below the finalized scrollback and
@@ -94,13 +136,26 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     let transcript = transcript.scroll((top, 0));
     frame.render_widget(transcript, transcript_area);
 
+    // Only show a scrollbar when the content overflows the viewport, so short
+    // transcripts don't get a stray track. Content length and position reuse
+    // the same values the scroll math above computed (`total_rows` / `top`).
+    if max_offset > 0 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        let mut scrollbar_state = ScrollbarState::new(total_rows as usize).position(top as usize);
+        frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
+    }
+
     // --- Composer (bordered, info at the four corners) --------------------
     let status = state.status();
     let top_left = status.path_display();
     let top_right = status.session_details.clone();
     let bottom_left = status.model_ctx_display();
     let progress = if state.thinking() && !state.thinking_label().is_empty() {
-        state.thinking_label().to_string()
+        format_thinking(
+            state.spinner_frame(),
+            state.thinking_elapsed_ms(),
+            state.thinking_label(),
+        )
     } else {
         "ready".to_string()
     };
@@ -186,6 +241,74 @@ mod tests {
 
     fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
         (0..buf.area.height).any(|y| row_to_string(buf, y).contains(needle))
+    }
+
+    /// Concatenate the symbols of the rightmost buffer column into a `String`.
+    fn right_column(buf: &ratatui::buffer::Buffer) -> String {
+        let x = buf.area.width.saturating_sub(1);
+        (0..buf.area.height).map(|y| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn format_thinking_renders_glyph_label_and_elapsed() {
+        // Fixed inputs → deterministic output (no wall clock). Frame 3 selects
+        // the fourth braille glyph; 4200ms formats as one decimal second.
+        assert_eq!(format_thinking(3, 4200, "working…"), "⠸ working… 4.2s");
+        // Frame index wraps modulo the frame set.
+        assert_eq!(format_thinking(0, 0, "thinking…"), "⠋ thinking… 0.0s");
+        assert_eq!(
+            format_thinking(SPINNER_FRAMES.len(), 0, "x"),
+            format_thinking(0, 0, "x")
+        );
+    }
+
+    #[test]
+    fn draw_shows_scrollbar_only_when_content_overflows() {
+        // Overflowing transcript: many short lines in a tiny viewport. The
+        // scrollbar's thumb (block::FULL) must appear on the right edge.
+        let mut state = AppState::new();
+        for i in 0..40 {
+            state.apply(RenderEvent::Status(format!("line-{i:02}")));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let overflow_right = right_column(terminal.backend().buffer());
+        assert!(
+            overflow_right.contains('█'),
+            "expected a scrollbar thumb on the right edge, got {overflow_right:?}"
+        );
+
+        // Short transcript that fits: no scrollbar track/thumb/arrows drawn.
+        let mut state = AppState::new();
+        state.apply(RenderEvent::Status("only one line".into()));
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let short_right = right_column(terminal.backend().buffer());
+        assert!(
+            !short_right.contains('█')
+                && !short_right.contains('║')
+                && !short_right.contains('▲')
+                && !short_right.contains('▼'),
+            "no scrollbar should be drawn for short content, got {short_right:?}"
+        );
+    }
+
+    #[test]
+    fn draw_shows_animated_thinking_indicator() {
+        let mut state = AppState::new();
+        state.apply(RenderEvent::BeginThinking {
+            label: "working…".into(),
+            continuation: false,
+        });
+        // The render task would set these before drawing.
+        state.set_thinking_anim(3, 4200);
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buf, "⠸ working… 4.2s"),
+            "animated thinking indicator missing from composer corner"
+        );
     }
 
     #[test]
@@ -276,6 +399,47 @@ mod tests {
         assert!(buffer_contains(buf, "streaming"));
         // The first streamed token surfaces a `Cubi` role header above it.
         assert!(buffer_contains(buf, "Cubi"));
+    }
+
+    #[test]
+    fn draw_renders_a_framed_tool_block() {
+        let mut state = AppState::new();
+        state.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        state.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "hello output".into(),
+            elapsed_ms: 1234,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Header, indented output row, and the ✓ status with elapsed time.
+        assert!(buffer_contains(buf, "⚙ fs"), "missing tool header");
+        assert!(
+            buffer_contains(buf, "│ hello output"),
+            "missing indented output"
+        );
+        assert!(buffer_contains(buf, "✓ fs (1.2s)"), "missing ok status row");
+    }
+
+    #[test]
+    fn draw_renders_error_tool_status() {
+        let mut state = AppState::new();
+        state.apply(RenderEvent::ToolStarted { name: "run".into() });
+        state.apply(RenderEvent::ToolFinished {
+            name: "run".into(),
+            ok: false,
+            output: String::new(),
+            elapsed_ms: 42,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buf, "✗ run (42ms)"),
+            "missing error status row"
+        );
     }
 
     #[test]

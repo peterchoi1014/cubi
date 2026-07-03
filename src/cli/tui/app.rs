@@ -11,6 +11,10 @@ use crate::cli::status::StatusState;
 use crate::cli::ui_sink::RenderEvent;
 use std::path::PathBuf;
 
+/// Maximum tool-output rows shown inside a framed tool block before the rest
+/// are collapsed into a dim `… N more lines` note.
+const MAX_TOOL_OUTPUT_ROWS: usize = 12;
+
 /// A single finalized line/block in the scrollback transcript.
 ///
 /// Kept as a thin newtype over `String` (rather than a bare `Vec<String>`
@@ -42,6 +46,19 @@ pub enum LineKind {
     Status,
     /// The post-turn usage footer.
     Footer,
+    /// The header row opening a framed tool-call block (`⚙ <name>`).
+    ToolHeader,
+    /// A single indented output row inside a tool-call block (dim, `│ ` prefix
+    /// added by the widgets layer).
+    ToolOutput,
+    /// A tool-output row belonging to a block whose output is a unified diff.
+    /// The widgets layer colors these via [`super::diff`] instead of the plain
+    /// `│ ` framing used for [`LineKind::ToolOutput`].
+    ToolDiff,
+    /// The trailing status row of a tool-call block. Its leading glyph is `✓`
+    /// (success) or `✗` (error), which the widgets layer inspects to pick a
+    /// green/red style.
+    ToolStatus,
 }
 
 /// A local editing action against the composer, translated from a key event
@@ -96,6 +113,12 @@ pub struct AppState {
     thinking: bool,
     /// The label shown while thinking (e.g. "thinking…").
     thinking_label: String,
+    /// Spinner frame index for the thinking indicator, advanced by the render
+    /// task on each redraw tick. Purely presentational.
+    spinner_frame: usize,
+    /// Milliseconds elapsed since thinking began, set by the render task (which
+    /// owns the clock) before each draw. `0` when not thinking.
+    thinking_elapsed_ms: u64,
     /// Whether a `Cubi` role header has already been pushed for the current
     /// assistant turn. Set when the header is emitted and reset when a new user
     /// turn begins, so streaming, buffered, and multi-step replies all share a
@@ -116,6 +139,8 @@ impl AppState {
             status: placeholder_status(),
             thinking: false,
             thinking_label: String::new(),
+            spinner_frame: 0,
+            thinking_elapsed_ms: 0,
             assistant_header_shown: false,
         }
     }
@@ -155,6 +180,24 @@ impl AppState {
         &self.thinking_label
     }
 
+    /// Current spinner frame index for the thinking indicator.
+    pub fn spinner_frame(&self) -> usize {
+        self.spinner_frame
+    }
+
+    /// Milliseconds elapsed since thinking began (`0` when not thinking).
+    pub fn thinking_elapsed_ms(&self) -> u64 {
+        self.thinking_elapsed_ms
+    }
+
+    /// Set the presentational thinking-animation state. Called by the render
+    /// task (which owns the clock and redraw tick) before each draw so the
+    /// widgets layer stays a pure function of `AppState`.
+    pub fn set_thinking_anim(&mut self, frame: usize, elapsed_ms: u64) {
+        self.spinner_frame = frame;
+        self.thinking_elapsed_ms = elapsed_ms;
+    }
+
     // --- Mutators ---------------------------------------------------------
 
     /// Fold one [`RenderEvent`] from the agent loop into the view model.
@@ -192,8 +235,51 @@ impl AppState {
             RenderEvent::StatusSnapshot(status) => {
                 self.status = status;
             }
-            // Forward-looking seams — no view-model effect yet.
-            RenderEvent::ToolStarted { .. } | RenderEvent::ToolFinished { .. } => {}
+            RenderEvent::ToolStarted { name } => {
+                // Open a framed tool block below any prior content. Does NOT
+                // touch the assistant-header latch, so the tool block appears
+                // between assistant steps without triggering a second `Cubi`
+                // header for the turn.
+                self.ensure_blank_separator();
+                self.push_line(format!("⚙ {name}"), LineKind::ToolHeader);
+            }
+            RenderEvent::ToolFinished {
+                name,
+                ok,
+                output,
+                elapsed_ms,
+            } => {
+                self.push_tool_output(&output);
+                let glyph = if ok { '✓' } else { '✗' };
+                let status = format!("{glyph} {name} ({})", format_elapsed(elapsed_ms));
+                self.push_line(status, LineKind::ToolStatus);
+            }
+        }
+    }
+
+    /// Push the (already capped) tool output as indented rows, truncating to
+    /// [`MAX_TOOL_OUTPUT_ROWS`] lines with a dim `… N more lines` note. Empty
+    /// output produces no rows.
+    fn push_tool_output(&mut self, output: &str) {
+        let trimmed = output.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return;
+        }
+        let rows: Vec<&str> = trimmed.split('\n').collect();
+        let shown = rows.len().min(MAX_TOOL_OUTPUT_ROWS);
+        // Patch-shaped output is colored as a diff; everything else keeps the
+        // plain `│ `-bordered framing (unchanged Slice-1 behavior).
+        let kind = if super::diff::looks_like_diff(trimmed) {
+            LineKind::ToolDiff
+        } else {
+            LineKind::ToolOutput
+        };
+        for row in &rows[..shown] {
+            self.push_line((*row).to_string(), kind);
+        }
+        if rows.len() > shown {
+            let more = rows.len() - shown;
+            self.push_line(format!("… {more} more lines"), LineKind::ToolOutput);
         }
     }
 
@@ -336,6 +422,16 @@ fn format_footer(stats: &crate::ollama::ChatStats, window: Option<usize>) -> Str
         s.push_str(&format!(" · ctx {w}"));
     }
     s
+}
+
+/// Format a tool's elapsed time for its status row: seconds with one decimal
+/// at or above one second (e.g. `1.2s`), otherwise milliseconds (e.g. `840ms`).
+fn format_elapsed(elapsed_ms: u64) -> String {
+    if elapsed_ms >= 1000 {
+        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+    } else {
+        format!("{elapsed_ms}ms")
+    }
 }
 
 /// A neutral placeholder status snapshot for a freshly-created [`AppState`].
@@ -512,12 +608,163 @@ mod tests {
     }
 
     #[test]
-    fn tool_events_are_noops() {
+    fn tool_started_pushes_a_framed_header() {
         let mut s = AppState::new();
         s.apply(RenderEvent::ToolStarted { name: "fs".into() });
-        s.apply(RenderEvent::ToolFinished { name: "fs".into() });
-        assert!(s.transcript().is_empty());
-        assert!(s.active_reply().is_empty());
+        // A blank separator (none, transcript empty) then the header row.
+        assert_eq!(s.transcript().len(), 1);
+        assert_eq!(s.transcript()[0].kind, LineKind::ToolHeader);
+        assert_eq!(s.transcript()[0].text, "⚙ fs");
+    }
+
+    #[test]
+    fn tool_finished_pushes_output_and_ok_status() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "line one\nline two".into(),
+            elapsed_ms: 1234,
+        });
+        let kinds: Vec<LineKind> = s.transcript().iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::ToolHeader,
+                LineKind::ToolOutput,
+                LineKind::ToolOutput,
+                LineKind::ToolStatus,
+            ]
+        );
+        let status = s.transcript().last().unwrap();
+        assert_eq!(status.kind, LineKind::ToolStatus);
+        assert_eq!(status.text, "✓ fs (1.2s)");
+    }
+
+    #[test]
+    fn tool_finished_error_uses_cross_glyph_and_ms() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted { name: "run".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "run".into(),
+            ok: false,
+            output: String::new(),
+            elapsed_ms: 840,
+        });
+        // Empty output → header + status only.
+        assert_eq!(s.transcript().len(), 2);
+        let status = s.transcript().last().unwrap();
+        assert_eq!(status.kind, LineKind::ToolStatus);
+        assert_eq!(status.text, "✗ run (840ms)");
+    }
+
+    #[test]
+    fn tool_output_truncates_to_twelve_rows_with_more_note() {
+        let mut s = AppState::new();
+        let output = (0..20)
+            .map(|i| format!("row-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.apply(RenderEvent::ToolStarted { name: "big".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "big".into(),
+            ok: true,
+            output,
+            elapsed_ms: 10,
+        });
+        let output_rows: Vec<&TranscriptLine> = s
+            .transcript()
+            .iter()
+            .filter(|l| l.kind == LineKind::ToolOutput)
+            .collect();
+        // 12 shown rows + 1 "… N more lines" note.
+        assert_eq!(output_rows.len(), 13);
+        assert_eq!(output_rows.last().unwrap().text, "… 8 more lines");
+    }
+
+    #[test]
+    fn diff_shaped_tool_output_is_marked_as_tool_diff() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted {
+            name: "apply".into(),
+        });
+        s.apply(RenderEvent::ToolFinished {
+            name: "apply".into(),
+            ok: true,
+            output: "@@ -1 +1 @@\n-old\n+new".into(),
+            elapsed_ms: 10,
+        });
+        let kinds: Vec<LineKind> = s.transcript().iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::ToolHeader,
+                LineKind::ToolDiff,
+                LineKind::ToolDiff,
+                LineKind::ToolDiff,
+                LineKind::ToolStatus,
+            ],
+            "unified-diff tool output must be tagged ToolDiff, not ToolOutput"
+        );
+    }
+
+    #[test]
+    fn non_diff_tool_output_stays_plain_tool_output() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "plain line one\nplain line two".into(),
+            elapsed_ms: 10,
+        });
+        assert!(
+            s.transcript().iter().all(|l| l.kind != LineKind::ToolDiff),
+            "prose tool output must not be colored as a diff"
+        );
+    }
+
+    #[test]
+    fn tool_block_does_not_add_a_second_assistant_header() {
+        // A tool block appears between assistant steps; the `Cubi` header
+        // latch must remain intact so only one header is emitted per turn.
+        let mut s = AppState::new();
+        s.push_user_turn("do it");
+        s.apply(RenderEvent::BeginThinking {
+            label: "thinking…".into(),
+            continuation: false,
+        });
+        s.apply(RenderEvent::AssistantToken("calling a tool".into()));
+        s.apply(RenderEvent::EndThinking);
+        s.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        s.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "ok".into(),
+            elapsed_ms: 5,
+        });
+        s.apply(RenderEvent::BeginThinking {
+            label: "more…".into(),
+            continuation: true,
+        });
+        s.apply(RenderEvent::AssistantToken("all done".into()));
+        s.apply(RenderEvent::EndThinking);
+        assert_eq!(
+            s.transcript()
+                .iter()
+                .filter(|l| l.kind == LineKind::AssistantHeader)
+                .count(),
+            1,
+            "exactly one Cubi header despite a tool block between steps"
+        );
+    }
+
+    #[test]
+    fn format_elapsed_formats_seconds_and_millis() {
+        assert_eq!(format_elapsed(999), "999ms");
+        assert_eq!(format_elapsed(1000), "1.0s");
+        assert_eq!(format_elapsed(1234), "1.2s");
     }
 
     #[test]

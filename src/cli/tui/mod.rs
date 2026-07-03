@@ -21,6 +21,7 @@
 //!     `tokio::signal::ctrl_c()` never fires under the TUI).
 
 mod app;
+mod diff;
 mod event;
 mod markdown;
 mod sink;
@@ -37,6 +38,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use app::UserAction;
@@ -65,8 +67,20 @@ where
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
 {
     let mut tick = tokio::time::interval(TICK);
+    // Thinking-indicator timing is owned here: the render task owns the clock
+    // and the redraw tick. `thinking_since` starts on the first frame where the
+    // state is thinking and clears when it stops; `spinner_frame` advances once
+    // per tick. `redraw` feeds the elapsed/frame into the (pure) widgets layer.
+    let mut thinking_since: Option<Instant> = None;
+    let mut spinner_frame: usize = 0;
     // Paint the initial frame (status row + empty composer) immediately.
-    terminal.draw(|f| widgets::draw(f, &state))?;
+    redraw(
+        &mut terminal,
+        &mut state,
+        &mut thinking_since,
+        &mut spinner_frame,
+        false,
+    )?;
 
     loop {
         tokio::select! {
@@ -75,7 +89,7 @@ where
                 match maybe_ev {
                     Some(ev) => {
                         state.apply(ev);
-                        terminal.draw(|f| widgets::draw(f, &state))?;
+                        redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                     }
                     // Sender dropped (main restored its sink on shutdown).
                     None => break,
@@ -94,7 +108,7 @@ where
                         match event::map_key(key) {
                             event::Action::Edit(e) => {
                                 state.edit(e);
-                                terminal.draw(|f| widgets::draw(f, &state))?;
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Submit => {
                                 let line = state.take_composer();
@@ -107,7 +121,7 @@ where
                                     // Best-effort: if main is gone we exit next loop.
                                     let _ = action_tx.send(UserAction::SubmitLine(line));
                                 }
-                                terminal.draw(|f| widgets::draw(f, &state))?;
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Cancel => {
                                 cancel.store(true, Ordering::SeqCst);
@@ -118,30 +132,64 @@ where
                             }
                             event::Action::ScrollUp => {
                                 state.scroll_up(3);
-                                terminal.draw(|f| widgets::draw(f, &state))?;
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::ScrollDown => {
                                 state.scroll_down(3);
-                                terminal.draw(|f| widgets::draw(f, &state))?;
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::None => {}
                         }
                     }
                     // Resize / focus / paste etc: repaint against current size.
                     Some(Ok(_)) => {
-                        terminal.draw(|f| widgets::draw(f, &state))?;
+                        redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                     }
                     Some(Err(_)) => {}
                     // Event stream ended (stdin closed).
                     None => break,
                 }
             }
-            // Periodic repaint so the thinking indicator animates.
+            // Periodic repaint so the thinking indicator animates. The tick is
+            // the only site that advances the spinner frame.
             _ = tick.tick() => {
-                terminal.draw(|f| widgets::draw(f, &state))?;
+                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, true)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Sync the thinking-indicator animation state and repaint.
+///
+/// The render task owns the clock: on the first thinking frame this stamps
+/// `thinking_since`, and clears it once thinking stops. `advance` is `true`
+/// only on the redraw tick, so the spinner glyph steps at a steady rate while
+/// event-driven redraws keep the *elapsed* readout fresh without skipping
+/// frames. The computed `(frame, elapsed_ms)` are pushed onto `state` so
+/// [`widgets::draw`] stays a pure function of `AppState`.
+fn redraw<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &mut AppState,
+    thinking_since: &mut Option<Instant>,
+    spinner_frame: &mut usize,
+    advance: bool,
+) -> Result<(), B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    if state.thinking() {
+        let since = thinking_since.get_or_insert_with(Instant::now);
+        if advance {
+            *spinner_frame = spinner_frame.wrapping_add(1);
+        }
+        let elapsed_ms = since.elapsed().as_millis() as u64;
+        state.set_thinking_anim(*spinner_frame, elapsed_ms);
+    } else {
+        *thinking_since = None;
+        state.set_thinking_anim(0, 0);
+    }
+    terminal.draw(|f| widgets::draw(f, state))?;
     Ok(())
 }
 

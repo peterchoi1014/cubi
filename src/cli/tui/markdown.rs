@@ -21,6 +21,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::diff;
+
 /// Render `text` (which may contain markdown) into wrapped-ready rows for a
 /// transcript `width` columns wide. Pure: no I/O, deterministic.
 pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
@@ -44,6 +46,29 @@ pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
                 info
             };
             out.push(Line::from(Span::styled(format!("{label} ▏"), border_style)));
+
+            // Diff/patch fences color their body instead of the plain framing:
+            // collect the block body, then hand it to `diff::render_diff`.
+            let is_diff = {
+                let lang = label.split_whitespace().next().unwrap_or("");
+                lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch")
+            };
+            if is_diff {
+                let mut body = String::new();
+                while let Some(next) = lines.peek() {
+                    if fence_close(next) {
+                        let _ = lines.next();
+                        break;
+                    }
+                    let code_line = lines.next().unwrap();
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(code_line);
+                }
+                out.extend(diff::render_diff(&body, width));
+                continue;
+            }
 
             // Body: each line gets a dim `│ ` border + plain code text, up to
             // the matching closing fence (which is consumed but not emitted).
@@ -347,6 +372,43 @@ mod tests {
     fn numbered_list_preserves_number() {
         let rows = render("3. third", 80);
         assert_eq!(line_text(&rows[0]), "3. third");
+    }
+
+    #[test]
+    fn diff_fence_colors_add_and_remove_rows() {
+        let input = "```diff\n@@ -1 +1 @@\n-old line\n+new line\n```";
+        let rows = render(input, 80);
+        // Row 0 is still the dim `diff ▏` label.
+        assert!(
+            line_text(&rows[0]).starts_with("diff"),
+            "label row starts with language: {:?}",
+            line_text(&rows[0])
+        );
+        assert!(line_text(&rows[0]).contains('▏'));
+        // Body rows are diff-colored, NOT plain `│ `-bordered.
+        let add = rows
+            .iter()
+            .find(|r| line_text(r) == "+new line")
+            .expect("addition row present and unbordered");
+        assert_eq!(
+            add.spans.first().and_then(|s| s.style.fg),
+            Some(Color::Green),
+            "addition row is green"
+        );
+        let del = rows
+            .iter()
+            .find(|r| line_text(r) == "-old line")
+            .expect("deletion row present and unbordered");
+        assert_eq!(
+            del.spans.first().and_then(|s| s.style.fg),
+            Some(Color::Red),
+            "deletion row is red"
+        );
+        // No plain `│ ` framing was applied to the diff body.
+        assert!(
+            !rows.iter().any(|r| line_text(r).starts_with("│ ")),
+            "diff body must not use the plain code border"
+        );
     }
 
     #[test]

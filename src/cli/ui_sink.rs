@@ -23,12 +23,13 @@ use std::sync::atomic::Ordering;
 /// these instead of the imperative trait methods. The [`UiSink`] trait's
 /// methods map 1:1 onto these variants.
 ///
-/// The `ToolStarted` / `ToolFinished` variants are a documented seam for a
-/// future phase that routes the tool spinner through the sink; today the tool
-/// spinner is driven directly in the agent loop (see the note in
-/// `agent.rs`'s tool-dispatch region) because it is stderr-only, delayed, and
-/// timing-sensitive, and routing it now would add regression risk for no
-/// user-visible gain.
+/// The `ToolStarted` / `ToolFinished` variants carry per-tool feedback to a
+/// renderer. In `--tui` mode the [`TuiSink`](super::tui::sink::TuiSink)
+/// forwards them so the render task can draw a framed tool block (header,
+/// output, ✓/✗ status). The behavior-preserving [`LineSink`] ignores them
+/// (its trait defaults are no-ops), so the default (non-TUI) output paths are
+/// unaffected — tool feedback there is still the `⚙ tool:` status line and the
+/// dim result preview printed directly in the agent loop.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RenderEvent {
@@ -51,10 +52,18 @@ pub enum RenderEvent {
     BeginThinking { label: String, continuation: bool },
     /// The model-thinking spinner retired.
     EndThinking,
-    /// Forward-looking seam: a tool began executing. Not emitted in Phase 1.
+    /// A tool began executing. In `--tui` mode this opens a framed tool block
+    /// (a `⚙ <name>` header) in the transcript.
     ToolStarted { name: String },
-    /// Forward-looking seam: a tool finished executing. Not emitted in Phase 1.
-    ToolFinished { name: String },
+    /// A tool finished executing. In `--tui` mode this appends the (capped)
+    /// tool `output` beneath the header and a trailing `✓`/`✗` status row with
+    /// the elapsed time. `ok` is `false` when the tool reported an error.
+    ToolFinished {
+        name: String,
+        ok: bool,
+        output: String,
+        elapsed_ms: u64,
+    },
 }
 
 /// Output-mode flags the sink needs to reproduce current behavior. These can
@@ -109,6 +118,18 @@ pub trait UiSink {
 
     /// Re-sync the output-mode flags from the owning `ChatCLI`.
     fn reconfigure(&mut self, flags: SinkFlags);
+
+    /// A tool began executing. Default no-op: the behavior-preserving
+    /// [`LineSink`] conveys tool activity through `status` lines printed in the
+    /// agent loop, so the default (non-TUI) output stays byte-identical. Only
+    /// the TUI sink overrides this to open a framed tool block.
+    fn tool_started(&mut self, _name: &str) {}
+
+    /// A tool finished executing. Default no-op (see [`tool_started`](Self::tool_started)).
+    /// The TUI sink overrides this to append the tool output and a ✓/✗ status
+    /// row. `ok` is `false` when the tool reported an error; `output` is the
+    /// (already capped) result text and `elapsed_ms` its wall-clock duration.
+    fn tool_finished(&mut self, _name: &str, _ok: bool, _output: &str, _elapsed_ms: u64) {}
 }
 
 /// The default, behavior-preserving sink: writes exactly what Cubi wrote

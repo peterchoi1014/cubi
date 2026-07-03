@@ -676,12 +676,18 @@ impl ChatCLI {
                     json_enabled,
                     crate::json_events::tool_call(&call.function.name, &call.function.arguments),
                 );
-                self.emit_status(format!(
-                    "{} {} {}",
-                    "⚙".bright_blue(),
-                    "tool:".bright_blue(),
-                    call.function.name.bright_cyan()
-                ));
+                // In TUI mode the framed tool block (opened by
+                // `tool_started` below) conveys the tool name, so skip the
+                // plain `⚙ tool:` status line to avoid a duplicate. Non-TUI
+                // keeps it exactly.
+                if !self.tui_active {
+                    self.emit_status(format!(
+                        "{} {} {}",
+                        "⚙".bright_blue(),
+                        "tool:".bright_blue(),
+                        call.function.name.bright_cyan()
+                    ));
+                }
 
                 // `--explain-tools` (or CUBI_EXPLAIN_TOOLS=1): surface the
                 // rationale for invoking this tool. In headless+JSON mode
@@ -756,6 +762,11 @@ impl ChatCLI {
                 });
 
                 let mut hit_time_cap = false;
+                // Open a framed tool block in the TUI (no-op for LineSink, so
+                // non-TUI output is byte-identical) and start the wall-clock
+                // used for the trailing ✓/✗ status row's elapsed time.
+                self.ui.tool_started(&call.function.name);
+                let tool_started_at = std::time::Instant::now();
                 let result_text = {
                     // Tool spinner: gives users a visible heartbeat
                     // (with elapsed seconds) while a slow tool runs.
@@ -797,6 +808,17 @@ impl ChatCLI {
                     r
                 };
                 let Some(result_text) = result_text else {
+                    // Close the framed tool block opened by `tool_started`
+                    // above with a failure status (no-op for LineSink/NullSink,
+                    // so non-TUI output stays byte-identical). Without this the
+                    // TUI transcript keeps a dangling `⚙` header that never
+                    // gets a ✓/✗ status row when a tool is cancelled/times out.
+                    self.ui.tool_finished(
+                        &call.function.name,
+                        false,
+                        "cancelled (Ctrl-C)",
+                        tool_started_at.elapsed().as_millis() as u64,
+                    );
                     if let Some((tracer, id, started)) = trace_ctx {
                         tracer.log_complete(
                             &call.function.name,
@@ -909,18 +931,34 @@ impl ChatCLI {
                 }
 
                 // Print a short preview so the user can see what came back
-                // without us dumping a 10 KB log into the terminal.
-                let preview: String = result_text.chars().take(400).collect();
-                let ellipsis = if result_text.len() > preview.len() {
-                    " …"
-                } else {
-                    ""
-                };
-                self.emit_status(format!(
-                    "  {}{}",
-                    preview.bright_black(),
-                    ellipsis.bright_black()
-                ));
+                // without us dumping a 10 KB log into the terminal. In TUI
+                // mode the framed tool block renders the (capped) output and
+                // ✓/✗ status instead, so skip this dim preview line there.
+                if !self.tui_active {
+                    let preview: String = result_text.chars().take(400).collect();
+                    let ellipsis = if result_text.len() > preview.len() {
+                        " …"
+                    } else {
+                        ""
+                    };
+                    self.emit_status(format!(
+                        "  {}{}",
+                        preview.bright_black(),
+                        ellipsis.bright_black()
+                    ));
+                }
+                // Close the framed tool block in the TUI (no-op for LineSink).
+                // `ok` mirrors the error detection used above; the output is
+                // capped so a huge tool result doesn't bloat the event/channel.
+                let tool_ok = !result_text.starts_with("[tool error]")
+                    && !result_text.starts_with("[tool denied]");
+                let tool_output: String = result_text.chars().take(2000).collect();
+                self.ui.tool_finished(
+                    &call.function.name,
+                    tool_ok,
+                    &tool_output,
+                    tool_started_at.elapsed().as_millis() as u64,
+                );
                 Self::emit_json_event_if(
                     json_enabled,
                     crate::json_events::tool_result(&call.function.name, &result_text),
