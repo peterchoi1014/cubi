@@ -6,3 +6,6 @@
 
 # Internal-only planning doc, not for public distribution.
 /ROADMAP.md
+
+# Marathon orchestration state (local only)
+.marathon/
