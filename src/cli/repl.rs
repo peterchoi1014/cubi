@@ -190,6 +190,14 @@ impl ChatCLI {
                         continue;
                     }
 
+                    // Shell escape: `!<cmd>` runs a shell command on the
+                    // terminal (like `!` in a shell / `:!` in vim).
+                    if let Some(shell_cmd) = input.strip_prefix('!') {
+                        rl.add_history_entry(input)?;
+                        self.run_shell_command(shell_cmd);
+                        continue;
+                    }
+
                     // Handle commands
                     if input.starts_with('/') {
                         // Check user-defined commands first.
