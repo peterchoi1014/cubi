@@ -99,6 +99,21 @@ impl UiSink for TuiSink {
     fn reconfigure(&mut self, flags: SinkFlags) {
         self.flags = flags;
     }
+
+    fn tool_started(&mut self, name: &str) {
+        self.send(RenderEvent::ToolStarted {
+            name: name.to_string(),
+        });
+    }
+
+    fn tool_finished(&mut self, name: &str, ok: bool, output: &str, elapsed_ms: u64) {
+        self.send(RenderEvent::ToolFinished {
+            name: name.to_string(),
+            ok,
+            output: output.to_string(),
+            elapsed_ms,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +223,31 @@ mod tests {
         assert!(sink.flags.headless);
         assert!(sink.flags.json);
         assert!(sink.flags.markdown);
+    }
+
+    #[test]
+    fn tool_started_and_finished_send_events() {
+        let (mut sink, mut rx) = channel();
+        sink.tool_started("fs");
+        match rx.try_recv() {
+            Ok(RenderEvent::ToolStarted { name }) => assert_eq!(name, "fs"),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        sink.tool_finished("fs", false, "boom", 1234);
+        match rx.try_recv() {
+            Ok(RenderEvent::ToolFinished {
+                name,
+                ok,
+                output,
+                elapsed_ms,
+            }) => {
+                assert_eq!(name, "fs");
+                assert!(!ok);
+                assert_eq!(output, "boom");
+                assert_eq!(elapsed_ms, 1234);
+            }
+            other => panic!("expected ToolFinished, got {other:?}"),
+        }
     }
 
     #[test]

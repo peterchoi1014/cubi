@@ -72,6 +72,30 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
                     ));
                 }
             }
+            // Framed tool-call block: bold-blue header, dim `│ `-indented
+            // output rows, and a green ✓ / red ✗ status row.
+            LineKind::ToolHeader => lines.push(Line::styled(
+                entry.text.clone(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            LineKind::ToolOutput => {
+                for row in entry.text.split('\n') {
+                    lines.push(Line::styled(
+                        format!("│ {row}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
+            LineKind::ToolStatus => {
+                let color = if entry.text.starts_with('✗') {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
+                lines.push(Line::styled(entry.text.clone(), Style::default().fg(color)));
+            }
         }
     }
     // The in-progress streamed reply, shown below the finalized scrollback and
@@ -276,6 +300,47 @@ mod tests {
         assert!(buffer_contains(buf, "streaming"));
         // The first streamed token surfaces a `Cubi` role header above it.
         assert!(buffer_contains(buf, "Cubi"));
+    }
+
+    #[test]
+    fn draw_renders_a_framed_tool_block() {
+        let mut state = AppState::new();
+        state.apply(RenderEvent::ToolStarted { name: "fs".into() });
+        state.apply(RenderEvent::ToolFinished {
+            name: "fs".into(),
+            ok: true,
+            output: "hello output".into(),
+            elapsed_ms: 1234,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Header, indented output row, and the ✓ status with elapsed time.
+        assert!(buffer_contains(buf, "⚙ fs"), "missing tool header");
+        assert!(
+            buffer_contains(buf, "│ hello output"),
+            "missing indented output"
+        );
+        assert!(buffer_contains(buf, "✓ fs (1.2s)"), "missing ok status row");
+    }
+
+    #[test]
+    fn draw_renders_error_tool_status() {
+        let mut state = AppState::new();
+        state.apply(RenderEvent::ToolStarted { name: "run".into() });
+        state.apply(RenderEvent::ToolFinished {
+            name: "run".into(),
+            ok: false,
+            output: String::new(),
+            elapsed_ms: 42,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buf, "✗ run (42ms)"),
+            "missing error status row"
+        );
     }
 
     #[test]
