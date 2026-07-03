@@ -113,6 +113,12 @@ pub struct AppState {
     thinking: bool,
     /// The label shown while thinking (e.g. "thinking…").
     thinking_label: String,
+    /// Spinner frame index for the thinking indicator, advanced by the render
+    /// task on each redraw tick. Purely presentational.
+    spinner_frame: usize,
+    /// Milliseconds elapsed since thinking began, set by the render task (which
+    /// owns the clock) before each draw. `0` when not thinking.
+    thinking_elapsed_ms: u64,
     /// Whether a `Cubi` role header has already been pushed for the current
     /// assistant turn. Set when the header is emitted and reset when a new user
     /// turn begins, so streaming, buffered, and multi-step replies all share a
@@ -133,6 +139,8 @@ impl AppState {
             status: placeholder_status(),
             thinking: false,
             thinking_label: String::new(),
+            spinner_frame: 0,
+            thinking_elapsed_ms: 0,
             assistant_header_shown: false,
         }
     }
@@ -170,6 +178,24 @@ impl AppState {
 
     pub fn thinking_label(&self) -> &str {
         &self.thinking_label
+    }
+
+    /// Current spinner frame index for the thinking indicator.
+    pub fn spinner_frame(&self) -> usize {
+        self.spinner_frame
+    }
+
+    /// Milliseconds elapsed since thinking began (`0` when not thinking).
+    pub fn thinking_elapsed_ms(&self) -> u64 {
+        self.thinking_elapsed_ms
+    }
+
+    /// Set the presentational thinking-animation state. Called by the render
+    /// task (which owns the clock and redraw tick) before each draw so the
+    /// widgets layer stays a pure function of `AppState`.
+    pub fn set_thinking_anim(&mut self, frame: usize, elapsed_ms: u64) {
+        self.spinner_frame = frame;
+        self.thinking_elapsed_ms = elapsed_ms;
     }
 
     // --- Mutators ---------------------------------------------------------
