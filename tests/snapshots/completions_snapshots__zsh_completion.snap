@@ -1,6 +1,5 @@
 ---
 source: tests/completions_snapshots.rs
-assertion_line: 36
 expression: "completion_script(\"zsh\")"
 ---
 #compdef cubi
@@ -28,6 +27,11 @@ _cubi() {
         '--markdown:enable markdown rendering'
         '--no-markdown:disable markdown rendering'
         '--show-stats-footer:print token and timing stats'
+        '--system:prepend a system prompt file'
+        '--json:emit machine-readable output where supported'
+        '--classic:use the classic line-based REPL'
+        '--tui:use the full-screen TUI (now the default)'
+        '--quiet:suppress banner, tips, and footers'
         'completions:print a shell completion script'
         'plugins:manage plugin bundles'
     )
