@@ -83,6 +83,35 @@ impl TerminalGuard {
     pub(super) fn restore(&self) {
         run_once(&self.done, real_restore);
     }
+
+    /// Momentarily leave the TUI (leave the alternate screen + disable raw
+    /// mode) so a slash-command handler can run on the *real* terminal exactly
+    /// as it does in the standard REPL. Routed through the shared `done` gate
+    /// via [`run_once`] so a concurrent `Drop`/panic-hook restore stays a
+    /// no-op. Paired with [`re_enter`](Self::re_enter), which resets the gate
+    /// so the eventual final restore still fires.
+    pub(super) fn suspend(&self) {
+        run_once(&self.done, real_restore);
+    }
+
+    /// Re-enter the TUI after a suspended command: re-enable raw mode, re-enter
+    /// the alternate screen, and re-request alternate-scroll. Crucially this
+    /// RESETS the shared `done` flag to `false` so a later `Drop`/panic-hook
+    /// restore (or a subsequent `suspend`) still fires — preserving the
+    /// single-guard / single-flag invariant across any number of commands.
+    pub(super) fn re_enter(&self) -> io::Result<()> {
+        enable_raw_mode()?;
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
+        let mut out = stdout();
+        let _ = out.write_all(ENABLE_ALT_SCROLL.as_bytes());
+        let _ = out.flush();
+        // Arm the gate again so restore fires on the real exit / next suspend.
+        self.done.store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl Drop for TerminalGuard {
