@@ -218,7 +218,13 @@ where
                                     // NOT echoed: they run suspended on the real
                                     // terminal, so echoing them would pollute the
                                     // redrawn transcript with a stray `You` block.
-                                    if !trimmed.starts_with('/') {
+                                    // Echo non-command input as a `You` role
+                                    // block into the transcript. Slash and
+                                    // `!`-shell commands are NOT echoed: they
+                                    // run suspended on the real terminal, so
+                                    // echoing would pollute the redrawn
+                                    // transcript with a stray `You` block.
+                                    if !trimmed.starts_with('/') && !trimmed.starts_with('!') {
                                         state.push_user_turn(trimmed);
                                     }
                                     // Best-effort: if main is gone we exit next loop.
@@ -503,7 +509,14 @@ impl ChatCLI {
             }
             // Every other slash command: suspend the TUI, run it on the real
             // terminal, resume. Returns `false` if the command asked to quit.
-            return self.run_slash_command(input, control_tx, guard).await;
+            return self.run_suspended_command(input, control_tx, guard).await;
+        }
+
+        // Shell escape: `!<cmd>` runs a shell command on the real terminal via
+        // the same suspend/resume cycle (its output must not paint the alt
+        // screen). Never quits the session.
+        if input.starts_with('!') {
+            return self.run_suspended_command(input, control_tx, guard).await;
         }
 
         // The user's line is echoed into the transcript as a `You` role block
@@ -533,7 +546,11 @@ impl ChatCLI {
     /// the user's screen; (3) run the command; (4) restore the sink; (5) on
     /// quit, stop here (do not re-enter); otherwise re-enter the TUI and signal
     /// the render task to resume (rebuild its stream + full repaint).
-    async fn run_slash_command(
+    /// Run a `/`-command or a `!`-shell-command on the *real* terminal by
+    /// suspending the TUI (park the render task, leave the alt screen, swap in
+    /// a line sink), running it, then re-entering and repainting. Returns
+    /// `false` when the command asked to quit.
+    async fn run_suspended_command(
         &mut self,
         input: &str,
         control_tx: &UnboundedSender<RenderControl>,
@@ -574,9 +591,13 @@ impl ChatCLI {
         let tui_sink = std::mem::replace(&mut self.ui, line_sink);
         self.tui_active = false;
 
-        // (3) Dispatch exactly as the REPL: user-defined commands first, then
-        // the built-in handler; honor the handler's quit (`Ok(false)`) return.
-        let keep_running = if self.try_user_command(input) {
+        // (3) Dispatch on the real terminal. `!<cmd>` runs a shell command;
+        // otherwise dispatch exactly as the REPL: user-defined commands first,
+        // then the built-in handler; honor the handler's quit (`Ok(false)`).
+        let keep_running = if let Some(shell_cmd) = input.strip_prefix('!') {
+            self.run_shell_command(shell_cmd);
+            true
+        } else if self.try_user_command(input) {
             true
         } else {
             match self.handle_command(input).await {

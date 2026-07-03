@@ -111,7 +111,8 @@ hi, i'm Cubi — a pocket-sized AI
 /help · /quit to exit · Tab completes slash commands · Ctrl-R searches history
 ```
 
-Type `/help` to list every slash command. `Ctrl+C` interrupts; `/quit` exits.
+Type `/help` to list every slash command. Run a shell command by prefixing it
+with `!` (e.g. `!ls -la`). `Ctrl+C` interrupts; `/quit` exits.
 
 For full installation, model selection, and non-Ollama backend setup, see
 **[INSTALL.md](INSTALL.md)**.
@@ -128,6 +129,7 @@ input box and a live status line, and includes:
 - an animated "thinking…" indicator while the model works
 - a scrollbar that appears only when the transcript overflows
 - theme support via `/theme` (all slash commands work inside the TUI)
+- shell escape: prefix input with `!` to run a shell command (e.g. `!git status`)
 
 Navigation uses the terminal's **native selection and scrolling**: the mouse
 wheel, `PageUp`/`PageDown`, and the arrow keys scroll the transcript, while

@@ -3047,6 +3047,49 @@ impl ChatCLI {
     /// Lazily allocates a new session on first call. Failures are
     /// logged as warnings but never abort the chat — the user always
     /// has the in-memory copy and can `/save` manually.
+    /// Execute a `!`-prefixed shell command from an interactive session
+    /// (REPL or TUI). The command runs through the OS shell (`sh -c` on Unix,
+    /// `cmd /C` on Windows) with inherited stdio, so it sees the real terminal
+    /// — output streams directly and interactive tools (pagers, editors) work.
+    /// This is a user-initiated escape hatch, like `!` in a shell or `:!` in
+    /// vim; it is only reachable from interactive input, never headless.
+    pub(crate) fn run_shell_command(&self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            eprintln!(
+                "{} usage: {} (e.g. {})",
+                "cubi:".bright_yellow(),
+                "!<shell command>".bright_cyan(),
+                "!ls -la".bright_cyan()
+            );
+            return;
+        }
+        let (program, flag) = shell_program();
+        match std::process::Command::new(program)
+            .arg(flag)
+            .arg(command)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => match status.code() {
+                Some(code) => eprintln!(
+                    "{} shell command exited with status {}",
+                    "cubi:".bright_yellow(),
+                    code
+                ),
+                None => eprintln!(
+                    "{} shell command terminated by signal",
+                    "cubi:".bright_yellow()
+                ),
+            },
+            Err(e) => eprintln!(
+                "{} failed to run shell command: {}",
+                "Error:".bright_red(),
+                e
+            ),
+        }
+    }
+
     /// Build the on-exit "resume this chat" hint shown by both the standard
     /// REPL and the TUI. Three cases: an on-disk checkpoint for THIS chat →
     /// point at `--resume <id>`; else other checkpoints exist in this cwd →
@@ -6452,6 +6495,16 @@ fn url_encode(input: &str) -> String {
     out
 }
 
+/// The OS shell used to run `!`-prefixed commands: `cmd /C` on Windows,
+/// `sh -c` elsewhere.
+fn shell_program() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6460,6 +6513,16 @@ mod tests {
 
     fn user(s: &str) -> Message {
         Message::text("user", s)
+    }
+
+    #[test]
+    fn shell_program_selects_platform_shell() {
+        let (program, flag) = shell_program();
+        if cfg!(windows) {
+            assert_eq!((program, flag), ("cmd", "/C"));
+        } else {
+            assert_eq!((program, flag), ("sh", "-c"));
+        }
     }
 
     fn assistant(s: &str) -> Message {
