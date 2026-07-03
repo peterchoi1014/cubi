@@ -23,6 +23,7 @@
 mod app;
 mod diff;
 mod event;
+mod highlight;
 mod markdown;
 mod sink;
 mod term;

@@ -12,7 +12,8 @@
 //!   * Inline code (`` `x` ``) rendered in a distinct style.
 //!   * Bullet (`- ` / `* ` / `+ `) and numbered (`1. ` / `1) `) lists.
 //!   * Fenced code blocks — a dim `lang ▏` label row followed by each code
-//!     line prefixed with a dim `│ ` left border (no syntax highlighting yet).
+//!     line prefixed with a dim `│ ` left border. Non-diff blocks are
+//!     syntax-highlighted per language via [`super::highlight`].
 //!   * Plain paragraphs pass through as default-foreground rows.
 //!
 //! Wrapping is left to ratatui's `Paragraph::wrap` downstream; this renderer
@@ -22,6 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::diff;
+use super::highlight;
 
 /// Render `text` (which may contain markdown) into wrapped-ready rows for a
 /// transcript `width` columns wide. Pure: no I/O, deterministic.
@@ -70,18 +72,29 @@ pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
                 continue;
             }
 
-            // Body: each line gets a dim `│ ` border + plain code text, up to
-            // the matching closing fence (which is consumed but not emitted).
+            // Body: collect the block, syntax-highlight it by language, then
+            // prepend the dim `│ ` left border to each returned row. The
+            // matching closing fence is consumed but not emitted.
+            let lang = label.split_whitespace().next().unwrap_or("");
+            let mut body = String::new();
+            let mut first = true;
             while let Some(next) = lines.peek() {
                 if fence_close(next) {
                     let _ = lines.next();
                     break;
                 }
                 let code_line = lines.next().unwrap();
-                out.push(Line::from(vec![
-                    Span::styled("│ ".to_string(), border_style),
-                    Span::styled(code_line.to_string(), base),
-                ]));
+                if !first {
+                    body.push('\n');
+                }
+                first = false;
+                body.push_str(code_line);
+            }
+            for row in highlight::highlight(&body, lang) {
+                let mut spans: Vec<Span<'static>> =
+                    vec![Span::styled("│ ".to_string(), border_style)];
+                spans.extend(row.spans);
+                out.push(Line::from(spans));
             }
             continue;
         }
@@ -408,6 +421,37 @@ mod tests {
         assert!(
             !rows.iter().any(|r| line_text(r).starts_with("│ ")),
             "diff body must not use the plain code border"
+        );
+    }
+
+    #[test]
+    fn rust_fence_is_highlighted_with_border() {
+        let input = "```rust\nfn x() {}\n```";
+        let rows = render(input, 80);
+        // Row 0 is still the dim `rust ▏` label.
+        assert!(line_text(&rows[0]).starts_with("rust"));
+        // The code row keeps its dim `│ ` left border...
+        assert_eq!(rows.len(), 2, "label + one code row");
+        assert!(
+            line_text(&rows[1]).starts_with("│ "),
+            "highlighted code row keeps the left border: {:?}",
+            line_text(&rows[1])
+        );
+        assert!(line_text(&rows[1]).contains("fn x() {}"));
+        // ...and is now colored (not all-default): `fn` is a magenta keyword.
+        let fn_span = rows[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "fn")
+            .expect("`fn` keyword span present");
+        assert_eq!(
+            fn_span.style.fg,
+            Some(Color::Magenta),
+            "keyword is highlighted inside the fenced block"
+        );
+        assert!(
+            rows[1].spans.iter().any(|s| s.style.fg.is_some()),
+            "at least one span carries a highlight color"
         );
     }
 
