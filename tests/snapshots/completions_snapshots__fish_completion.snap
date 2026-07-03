@@ -1,6 +1,5 @@
 ---
 source: tests/completions_snapshots.rs
-assertion_line: 41
 expression: "completion_script(\"fish\")"
 ---
 # cubi fish completions
@@ -24,6 +23,9 @@ complete -c cubi -l no-markdown -d 'Disable markdown rendering'
 complete -c cubi -l show-stats-footer -d 'Print token and timing stats'
 complete -c cubi -l system -r -d 'Prepend a system prompt file'
 complete -c cubi -l json -d 'Emit machine-readable output where supported'
+complete -c cubi -l classic -d 'Use the classic line-based REPL'
+complete -c cubi -l tui -d 'Use the full-screen TUI (now the default)'
+complete -c cubi -l quiet -d 'Suppress banner, tips, and footers'
 complete -c cubi -n '__fish_use_subcommand' -a completions -d 'Print a shell completion script'
 complete -c cubi -n '__fish_use_subcommand' -a plugins -d 'Manage plugin bundles'
 complete -c cubi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'

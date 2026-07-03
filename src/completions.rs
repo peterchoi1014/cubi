@@ -23,7 +23,7 @@ _cubi() {
     fi
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --list-sessions --delete-session --prune-sessions --older-than --dry-run --stream --no-stream --markdown --no-markdown --show-stats-footer --system --json completions plugins" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--version -V -v version --help -h help --resume -r resume --list-sessions --delete-session --prune-sessions --older-than --dry-run --stream --no-stream --markdown --no-markdown --show-stats-footer --system --json --classic --tui --quiet completions plugins" -- "$cur") )
     fi
 }
 complete -F _cubi cubi
@@ -54,6 +54,11 @@ _cubi() {
         '--markdown:enable markdown rendering'
         '--no-markdown:disable markdown rendering'
         '--show-stats-footer:print token and timing stats'
+        '--system:prepend a system prompt file'
+        '--json:emit machine-readable output where supported'
+        '--classic:use the classic line-based REPL'
+        '--tui:use the full-screen TUI (now the default)'
+        '--quiet:suppress banner, tips, and footers'
         'completions:print a shell completion script'
         'plugins:manage plugin bundles'
     )
@@ -99,6 +104,9 @@ complete -c cubi -l no-markdown -d 'Disable markdown rendering'
 complete -c cubi -l show-stats-footer -d 'Print token and timing stats'
 complete -c cubi -l system -r -d 'Prepend a system prompt file'
 complete -c cubi -l json -d 'Emit machine-readable output where supported'
+complete -c cubi -l classic -d 'Use the classic line-based REPL'
+complete -c cubi -l tui -d 'Use the full-screen TUI (now the default)'
+complete -c cubi -l quiet -d 'Suppress banner, tips, and footers'
 complete -c cubi -n '__fish_use_subcommand' -a completions -d 'Print a shell completion script'
 complete -c cubi -n '__fish_use_subcommand' -a plugins -d 'Manage plugin bundles'
 complete -c cubi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
