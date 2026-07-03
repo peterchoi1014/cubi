@@ -49,25 +49,60 @@ use sink::TuiSink;
 /// Redraw tick — ~12fps, enough to animate a spinner without burning CPU.
 const TICK: Duration = Duration::from_millis(80);
 
+/// Control messages from the main task to the render task, on a channel
+/// *separate* from [`RenderEvent`] so a suspend request is never queued behind
+/// pending render output. Used to momentarily leave the TUI so a slash-command
+/// handler can run on the real terminal.
+///
+/// The handshake is two-phase. On `Suspend` the render task drops its
+/// [`EventStream`] (crossterm's stream eagerly consumes stdin via a background
+/// reader, so it must be *dropped* — not merely un-polled — or it steals the
+/// command's confirmation keystrokes), acks via `ack` that it has parked and
+/// released the terminal, then blocks on `resume`. Only after the ack does the
+/// main task touch the real terminal; only after the main task re-enters the
+/// TUI does it fire `resume`, at which point the render task rebuilds its
+/// event source, clears (full repaint) and resumes its select loop. While
+/// parked the render task touches neither stdin nor stdout.
+enum RenderControl {
+    Suspend {
+        /// render → main: sent once the task has parked and released the
+        /// terminal, so the main task may safely drive the real terminal.
+        ack: tokio::sync::oneshot::Sender<()>,
+        /// main → render: fires once the command has finished and the terminal
+        /// has been re-entered, telling the task to rebuild its `EventStream`,
+        /// force a full repaint, and resume.
+        resume: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
 /// The dedicated render task. Sole owner of the `Terminal`, the [`AppState`],
 /// and the crossterm [`EventStream`]. Runs until the user quits (Ctrl-D) or
 /// either channel end closes.
 ///
-/// The crossterm event source is injected as `events` so this loop is unit-
-/// testable with a synthetic stream (a real `EventStream` panics without a
-/// terminal reader). Production callers pass `EventStream::new()`.
-async fn render_task<B, S>(
+/// The crossterm event source is injected as a *factory* `make_events` so this
+/// loop is unit-testable with a synthetic stream (a real `EventStream` panics
+/// without a terminal reader). Production callers pass `EventStream::new`.
+/// A factory (rather than a single stream) is required because a slash-command
+/// suspend must DROP the current stream and build a fresh one on resume.
+async fn render_task<B, S, F>(
     mut terminal: ratatui::Terminal<B>,
     mut state: AppState,
     mut render_rx: UnboundedReceiver<RenderEvent>,
     action_tx: UnboundedSender<UserAction>,
     cancel: Arc<AtomicBool>,
-    mut events: S,
+    mut control_rx: UnboundedReceiver<RenderControl>,
+    mut make_events: F,
 ) -> Result<(), B::Error>
 where
     B: ratatui::backend::Backend,
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+    F: FnMut() -> S,
 {
+    // `events` is an `Option` so a suspend can genuinely drop the stream
+    // (releasing crossterm's background stdin reader) and rebuild it on resume.
+    // It is `Some` whenever the select loop runs; while parked the task is
+    // blocked inside the `Suspend` branch, not re-entering the loop.
+    let mut events: Option<S> = Some(make_events());
     let mut tick = tokio::time::interval(TICK);
     // Thinking-indicator timing is owned here: the render task owns the clock
     // and the redraw tick. `thinking_since` starts on the first frame where the
@@ -86,6 +121,59 @@ where
 
     loop {
         tokio::select! {
+            // Control channel (main → render): suspend/resume around a
+            // slash-command that runs on the real terminal.
+            maybe_ctrl = control_rx.recv() => {
+                match maybe_ctrl {
+                    Some(RenderControl::Suspend { ack, resume }) => {
+                        // Park in place. Drop the EventStream so crossterm's
+                        // background stdin reader releases the terminal (else it
+                        // steals the command's confirmation keystrokes), ack
+                        // that we've parked, then block until the main task has
+                        // run the command and re-entered the TUI.
+                        drop(events.take());
+                        let _ = ack.send(());
+                        // While parked we touch neither stdin nor stdout. If the
+                        // resume sender is DROPPED instead of fired, the command
+                        // asked to quit and the main task did NOT re-enter the
+                        // TUI (terminal is on the normal screen); exit WITHOUT
+                        // repainting so we never scribble a stray frame onto it.
+                        if resume.await.is_err() {
+                            break;
+                        }
+                        // Rebuild the event source now that the command has
+                        // released stdin.
+                        events = Some(make_events());
+                        // The interval accrued "missed" ticks while parked;
+                        // reset it so resume doesn't fire a burst of redraws
+                        // (default `MissedTickBehavior::Burst`) all at once.
+                        tick.reset();
+                        // Force a full repaint: the command scribbled the
+                        // normal screen and we re-entered a fresh (blank) alt
+                        // screen, so ratatui's diff cache is stale. We must NOT
+                        // use `Terminal::clear` here: it first issues an ESC[6n
+                        // cursor-position query and *blocks reading the reply
+                        // from stdin* (2s timeout). That read races the freshly
+                        // rebuilt `EventStream` reader — and some terminals
+                        // (and PTYs) never answer — so it intermittently errors
+                        // with "cursor position could not be read"; propagated
+                        // via `?` it would kill the render task, ending the
+                        // whole TUI after a single command. `Terminal::resize`
+                        // resets the back buffer and clears via `ClearType::All`
+                        // with NO stdin round-trip, forcing the next `draw` to
+                        // repaint every cell. A transient repaint hiccup on
+                        // resume must likewise never kill the loop, so both
+                        // steps are best-effort (no `?`); the periodic tick
+                        // redraw will recover on the next frame.
+                        force_full_repaint(&mut terminal);
+                        let _ = redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false);
+                    }
+                    // Main dropped the control sender: it is shutting down (it
+                    // aborts + drops this task), so stop selecting on a closed
+                    // channel and let the loop exit.
+                    None => break,
+                }
+            }
             // Agent-loop output → fold into the view model and repaint.
             maybe_ev = render_rx.recv() => {
                 match maybe_ev {
@@ -97,8 +185,15 @@ where
                     None => break,
                 }
             }
-            // Local key input → edit / submit / cancel / quit.
-            maybe_key = events.next() => {
+            // Local key input → edit / submit / cancel / quit. `events` is an
+            // `Option`; while parked (None) this branch parks forever so the
+            // select loop is driven only by control/render/tick.
+            maybe_key = async {
+                match events.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending::<Option<std::io::Result<Event>>>().await,
+                }
+            } => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) => {
                         // Ignore key *release* / *repeat* synthetic events
@@ -114,12 +209,18 @@ where
                             }
                             event::Action::Submit => {
                                 let line = state.take_composer();
-                                if !line.trim().is_empty() {
-                                    // Echo the submitted line as a `You` role
-                                    // block directly into the transcript (the
-                                    // render task owns `state`), so the live
-                                    // turn matches resumed history.
-                                    state.push_user_turn(line.trim());
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    // Echo non-slash input as a `You` role block
+                                    // directly into the transcript (the render
+                                    // task owns `state`), so the live turn
+                                    // matches resumed history. Slash commands are
+                                    // NOT echoed: they run suspended on the real
+                                    // terminal, so echoing them would pollute the
+                                    // redrawn transcript with a stray `You` block.
+                                    if !trimmed.starts_with('/') {
+                                        state.push_user_turn(trimmed);
+                                    }
                                     // Best-effort: if main is gone we exit next loop.
                                     let _ = action_tx.send(UserAction::SubmitLine(line));
                                 }
@@ -160,6 +261,27 @@ where
         }
     }
     Ok(())
+}
+
+/// Force the next [`redraw`] to repaint every cell, without any stdin round-trip.
+///
+/// After a suspend/resume cycle the terminal has been left and re-entered, so
+/// the real screen is blank but ratatui's diff cache still believes the last
+/// TUI frame is present — a plain `draw` would diff against that stale buffer
+/// and paint nothing. [`Terminal::clear`] would fix the cache but issues an
+/// `ESC[6n` cursor-position query and blocks reading the reply from stdin,
+/// which races the rebuilt `EventStream` reader and hangs/errors on terminals
+/// (and PTYs) that don't answer. [`Terminal::resize`] to the current size
+/// achieves the same back-buffer reset + full clear (`ClearType::All`) with no
+/// stdin read. Best-effort: a failure here is swallowed so a transient hiccup
+/// on resume can never kill the render task; the next frame recovers.
+fn force_full_repaint<B>(terminal: &mut ratatui::Terminal<B>)
+where
+    B: ratatui::backend::Backend,
+{
+    if let Ok(size) = terminal.size() {
+        let _ = terminal.resize(size.into());
+    }
 }
 
 /// Sync the thinking-indicator animation state and repaint.
@@ -268,6 +390,10 @@ impl ChatCLI {
         // Wire the channels + the shared cancel flag.
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        // Control channel (main → render) for the slash-command suspend/resume
+        // handshake, kept separate from `render_tx` so a suspend is never
+        // queued behind pending render output.
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::clone(&self.cancel);
         cancel.store(false, Ordering::SeqCst);
         // A second handle on the render channel so the main task can push a
@@ -301,7 +427,8 @@ impl ChatCLI {
             render_rx,
             action_tx,
             Arc::clone(&cancel),
-            EventStream::new(),
+            control_rx,
+            EventStream::new,
         ));
 
         // Swap the sink for the whole session and mark the TUI active so tool
@@ -312,7 +439,7 @@ impl ChatCLI {
         // Idle main loop: wait for the user's submitted line. Any non-submit
         // outcome (explicit Quit, or the render channel closing) ends the loop.
         while let Some(UserAction::SubmitLine(line)) = action_rx.recv().await {
-            if !self.tui_submit(&line).await {
+            if !self.tui_submit(&line, &control_tx, &guard).await {
                 break;
             }
             // Refresh the status row after each turn (tokens/cost move).
@@ -348,33 +475,35 @@ impl ChatCLI {
 
     /// Handle one submitted line from the TUI, replicating the REPL's
     /// submission path (`@file` expansion, history push, journal bucket, agent
-    /// turn). Returns `false` when the session should quit. All user-visible
-    /// output flows through `self.ui` (never raw stdout) so it lands in the
-    /// transcript, not on the alt screen. Slash commands are gated to quit-only
-    /// in this preview (see the `input.starts_with('/')` branch) because the
-    /// REPL command handlers print via raw stdout.
-    async fn tui_submit(&mut self, input: &str) -> bool {
+    /// turn). Returns `false` when the session should quit.
+    ///
+    /// Non-slash input flows through `self.ui` (the [`TuiSink`], never raw
+    /// stdout) so it lands in the transcript. Slash commands cannot: the REPL
+    /// handlers print via raw `println!`, which would scribble on the alt
+    /// screen. So every non-quit slash command is run via [`run_slash_command`]
+    /// (`ChatCLI::run_slash_command`), which momentarily suspends the TUI and
+    /// runs the command on the real terminal exactly as the REPL does.
+    async fn tui_submit(
+        &mut self,
+        input: &str,
+        control_tx: &UnboundedSender<RenderControl>,
+        guard: &term::TerminalGuard,
+    ) -> bool {
         let input = input.trim();
         if input.is_empty() {
             return true;
         }
 
         if input.starts_with('/') {
-            // PROTOTYPE LIMITATION: `handle_command`/`try_user_command` print
-            // via raw `println!` by design (correct for the normal REPL), but
-            // that scribbles directly on the alternate screen here. Until that
-            // output is routed through the sink, the only slash command honored
-            // in `--tui` is quit. `commands::parse` gives us the same quit
-            // recognition as the REPL (`/quit`, `/exit`, and unambiguous
-            // prefixes like `/q`). Every other slash command is acknowledged
-            // via a status line so nothing reaches raw stdout.
+            // Fast exit: `/quit` / `/exit` never need a suspend cycle — return
+            // false and let `run_tui` run the normal shutdown path. This is the
+            // same quit recognition the REPL uses (`commands::parse`).
             if matches!(commands::parse(input), Some((Cmd::Quit, _))) {
-                return false; // clean TUI exit — same false/Quit path as run_tui
+                return false;
             }
-            self.ui.status(
-                "slash commands are not yet available in --tui preview (use /quit to exit)",
-            );
-            return true;
+            // Every other slash command: suspend the TUI, run it on the real
+            // terminal, resume. Returns `false` if the command asked to quit.
+            return self.run_slash_command(input, control_tx, guard).await;
         }
 
         // The user's line is echoed into the transcript as a `You` role block
@@ -388,6 +517,97 @@ impl ChatCLI {
         if let Err(e) = self.agent_turn(turn_start).await {
             self.ui.status(&format!("Error: {e}"));
         }
+        true
+    }
+
+    /// Run one slash command on the *real* terminal via the suspend/resume
+    /// handshake, exactly mirroring the REPL's dispatch order
+    /// (`try_user_command` first, then `handle_command`). Returns `false` when
+    /// the command asked to quit (so `run_tui` breaks its idle loop and runs
+    /// the normal shutdown path — leaving the terminal restored).
+    ///
+    /// Sequence: (1) ask the render task to park and wait for its ack (which
+    /// guarantees it has dropped its `EventStream` and released the terminal);
+    /// (2) leave the alt screen + raw mode and swap `self.ui` from the
+    /// [`TuiSink`] to a real-terminal [`LineSink`] so command output prints to
+    /// the user's screen; (3) run the command; (4) restore the sink; (5) on
+    /// quit, stop here (do not re-enter); otherwise re-enter the TUI and signal
+    /// the render task to resume (rebuild its stream + full repaint).
+    async fn run_slash_command(
+        &mut self,
+        input: &str,
+        control_tx: &UnboundedSender<RenderControl>,
+        guard: &term::TerminalGuard,
+    ) -> bool {
+        use crate::cli::ui_sink::{LineSink, SinkFlags, UiSink};
+        use tokio::sync::oneshot;
+
+        // (1) Ask the render task to park; wait until it has released the
+        // terminal before we touch it.
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        if control_tx
+            .send(RenderControl::Suspend {
+                ack: ack_tx,
+                resume: resume_rx,
+            })
+            .is_err()
+        {
+            // Render task is gone; nothing to drive. Keep the session alive.
+            return true;
+        }
+        // If the ack channel closes without a value the render task has died;
+        // don't touch the terminal, just keep the session alive.
+        if ack_rx.await.is_err() {
+            return true;
+        }
+
+        // (2) Leave the TUI and swap in a real-terminal sink. Reconstruct the
+        // same `LineSink` profile the REPL uses in interactive mode:
+        // headless=false, json=false, markdown per session config.
+        guard.suspend();
+        let line_sink: Box<dyn UiSink + Send> = Box::new(LineSink::new(SinkFlags {
+            headless: false,
+            json: false,
+            markdown: self.markdown_enabled,
+        }));
+        let tui_sink = std::mem::replace(&mut self.ui, line_sink);
+        self.tui_active = false;
+
+        // (3) Dispatch exactly as the REPL: user-defined commands first, then
+        // the built-in handler; honor the handler's quit (`Ok(false)`) return.
+        let keep_running = if self.try_user_command(input) {
+            true
+        } else {
+            match self.handle_command(input).await {
+                Ok(cont) => cont,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    true
+                }
+            }
+        };
+
+        // (4) Restore the original TuiSink regardless of outcome.
+        self.ui = tui_sink;
+        self.tui_active = true;
+
+        if !keep_running {
+            // (5a) Quit: leave the terminal on the normal screen and let the
+            // idle loop break; `run_tui`'s shutdown reaps the (still-parked)
+            // render task and finalizes. Do NOT re-enter the TUI.
+            return false;
+        }
+
+        // (5b) Re-enter the TUI, then release the render task to rebuild its
+        // event stream and force a full repaint. Ordering matters: enter the
+        // alt screen BEFORE the render task draws, or it would paint the normal
+        // screen.
+        if let Err(e) = guard.re_enter() {
+            eprintln!("cubi: failed to re-enter the TUI: {e}");
+            return false;
+        }
+        let _ = resume_tx.send(());
         true
     }
 }
@@ -458,6 +678,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
 
         let mut state = AppState::new();
@@ -469,7 +690,8 @@ mod render_loop_tests {
             render_rx,
             action_tx.clone(),
             Arc::clone(&cancel),
-            futures_util::stream::pending::<std::io::Result<Event>>(),
+            control_rx,
+            futures_util::stream::pending::<std::io::Result<Event>>,
         ));
 
         // Feed a couple of events the task must fold + redraw without error.
@@ -515,6 +737,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
         let state = AppState::new();
 
@@ -524,10 +747,224 @@ mod render_loop_tests {
             render_rx,
             action_tx,
             cancel,
-            futures_util::stream::pending::<std::io::Result<Event>>(),
+            control_rx,
+            futures_util::stream::pending::<std::io::Result<Event>>,
         ));
         drop(render_tx);
         let joined = handle.await.expect("join");
         assert!(joined.is_ok());
+    }
+
+    /// A `Suspend` control message must PARK the render task: it drops its
+    /// event stream, acks that it has released the terminal, and then stops
+    /// running its select loop (so it no longer drains `render_rx`) until it is
+    /// resumed. On resume it rebuilds the event stream (a fresh
+    /// `EventStream::new()` in production) and forces a full repaint, then
+    /// resumes draining events. We prove the rebuild via a factory that counts
+    /// its invocations, and prove the resumed loop is live by closing
+    /// `render_rx` and observing a clean exit.
+    #[tokio::test]
+    async fn suspend_parks_then_resume_rebuilds_and_repaints() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::oneshot;
+
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = AppState::new();
+        state.apply(RenderEvent::StatusSnapshot(sample_status()));
+
+        // The factory counts stream (re)creations: 1 at startup, +1 per resume.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_factory = Arc::clone(&builds);
+        let handle = tokio::spawn(render_task(
+            terminal,
+            state,
+            render_rx,
+            action_tx,
+            Arc::clone(&cancel),
+            control_rx,
+            move || {
+                builds_factory.fetch_add(1, Ordering::SeqCst);
+                futures_util::stream::pending::<std::io::Result<Event>>()
+            },
+        ));
+
+        // Ask the task to park and wait for its ack. Awaiting the ack forces the
+        // task to run up to the point where it has dropped its event stream and
+        // released the terminal — the precondition for touching the terminal.
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RenderControl::Suspend {
+                ack: ack_tx,
+                resume: resume_rx,
+            })
+            .unwrap();
+        ack_rx.await.expect("render task should ack the park");
+        // Only the startup stream has been built so far; the parked task has NOT
+        // rebuilt one (that happens on resume).
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        // While parked the task is blocked awaiting resume, NOT selecting, so it
+        // cannot drain `render_rx`. Queue an event and yield repeatedly: a
+        // correctly parked task rebuilds nothing.
+        render_tx
+            .send(RenderEvent::Status("queued while parked".into()))
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "task must stay parked (no rebuild) until resumed"
+        );
+
+        // Resume: the task rebuilds its stream (proving the full-repaint path
+        // ran) and resumes its select loop. Closing the render channel then
+        // drives it to a clean exit, proving events flow again.
+        resume_tx.send(()).unwrap();
+        drop(render_tx);
+        let joined = handle.await.expect("join");
+        assert!(
+            joined.is_ok(),
+            "render task should exit cleanly after resume"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "resume must rebuild the EventStream and force a full repaint"
+        );
+    }
+
+    /// A [`Backend`](ratatui::backend::Backend) that always fails the
+    /// cursor-position query and delegates everything else to a `TestBackend`.
+    /// This reproduces the crossterm `cursor::position()` failure the resume
+    /// path used to hit: [`Terminal::clear`](ratatui::Terminal::clear) issues an
+    /// `ESC[6n` cursor-position query and blocks reading the reply, which on a
+    /// PTY (or when racing the rebuilt event reader) fails with "cursor position
+    /// could not be read". The old resume code did `terminal.clear()?`, so that
+    /// failure `?`-propagated out of `render_task`, killing the whole TUI after
+    /// a single slash command. The fix repaints via
+    /// [`Terminal::resize`](ratatui::Terminal::resize), which never queries the
+    /// cursor — so a task on this backend must SURVIVE a suspend/resume cycle.
+    struct CursorQueryFailsBackend {
+        inner: ratatui::backend::TestBackend,
+    }
+
+    impl ratatui::backend::Backend for CursorQueryFailsBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).unwrap();
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor().unwrap();
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor().unwrap();
+            Ok(())
+        }
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            // The exact failure mode: a blocking DSR read that never resolves.
+            Err(std::io::Error::other(
+                "The cursor position could not be read within a normal duration",
+            ))
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position).unwrap();
+            Ok(())
+        }
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().unwrap();
+            Ok(())
+        }
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type).unwrap();
+            Ok(())
+        }
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            Ok(self.inner.size().unwrap())
+        }
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            Ok(self.inner.window_size().unwrap())
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().unwrap();
+            Ok(())
+        }
+    }
+
+    /// Regression guard for the "TUI exits after one slash command" bug: on
+    /// resume the render task must NOT die if the terminal's cursor-position
+    /// query fails. We suspend → resume with a backend whose cursor query always
+    /// errors, then prove the loop is still live by folding a post-resume event
+    /// and observing a clean exit only when the render channel is closed.
+    #[tokio::test]
+    async fn resume_survives_cursor_position_query_failure() {
+        use tokio::sync::oneshot;
+
+        let backend = CursorQueryFailsBackend {
+            inner: ratatui::backend::TestBackend::new(40, 8),
+        };
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = AppState::new();
+        state.apply(RenderEvent::StatusSnapshot(sample_status()));
+
+        let handle = tokio::spawn(render_task(
+            terminal,
+            state,
+            render_rx,
+            action_tx,
+            Arc::clone(&cancel),
+            control_rx,
+            futures_util::stream::pending::<std::io::Result<Event>>,
+        ));
+
+        // Suspend → resume around a (simulated) slash command.
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RenderControl::Suspend {
+                ack: ack_tx,
+                resume: resume_rx,
+            })
+            .unwrap();
+        ack_rx.await.expect("render task should ack the park");
+        resume_tx.send(()).unwrap();
+
+        // If the resume repaint queried the cursor (the old `clear` path) the
+        // task would already be dead. Prove it is still draining events.
+        render_tx
+            .send(RenderEvent::Status("after resume".into()))
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        drop(render_tx);
+        let joined = handle.await.expect("join");
+        assert!(
+            joined.is_ok(),
+            "render task must survive resume even when the cursor-position query fails"
+        );
     }
 }
