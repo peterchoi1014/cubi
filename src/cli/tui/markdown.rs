@@ -12,27 +12,40 @@
 //!   * Inline code (`` `x` ``) rendered in a distinct style.
 //!   * Bullet (`- ` / `* ` / `+ `) and numbered (`1. ` / `1) `) lists.
 //!   * Fenced code blocks — a dim `lang ▏` label row followed by each code
-//!     line prefixed with a dim `│ ` left border (no syntax highlighting yet).
+//!     line prefixed with a dim `│ ` left border. Non-diff blocks are
+//!     syntax-highlighted per language via [`super::highlight`].
 //!   * Plain paragraphs pass through as default-foreground rows.
 //!
 //! Wrapping is left to ratatui's `Paragraph::wrap` downstream; this renderer
 //! never hard-truncates. `width` is accepted for future wrapping decisions.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::diff;
+use super::highlight;
+use super::theme::Theme;
 
 /// Render `text` (which may contain markdown) into wrapped-ready rows for a
 /// transcript `width` columns wide. Pure: no I/O, deterministic.
-pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
+pub(crate) fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     // `width` is reserved for future wrapping heuristics; ratatui's
     // `Paragraph::wrap` still performs the final soft-wrap on our rows.
     let _ = width;
 
     let base = Style::default();
-    let code_style = Style::default().fg(Color::Cyan);
-    let border_style = Style::default().add_modifier(Modifier::DIM);
+    let code_style = Style::default().fg(theme.inline_code);
+    let heading_style = Style::default()
+        .fg(theme.heading)
+        .add_modifier(Modifier::BOLD);
+    // The dim `lang ▏` label row and the dim `│ ` left border are distinct
+    // semantic slots even though both default to a dim, reset foreground.
+    let label_style = Style::default()
+        .fg(theme.code_label)
+        .add_modifier(Modifier::DIM);
+    let border_style = Style::default()
+        .fg(theme.code_border)
+        .add_modifier(Modifier::DIM);
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut lines = text.lines().peekable();
@@ -45,7 +58,7 @@ pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
             } else {
                 info
             };
-            out.push(Line::from(Span::styled(format!("{label} ▏"), border_style)));
+            out.push(Line::from(Span::styled(format!("{label} ▏"), label_style)));
 
             // Diff/patch fences color their body instead of the plain framing:
             // collect the block body, then hand it to `diff::render_diff`.
@@ -66,27 +79,38 @@ pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
                     }
                     body.push_str(code_line);
                 }
-                out.extend(diff::render_diff(&body, width));
+                out.extend(diff::render_diff(&body, width, theme));
                 continue;
             }
 
-            // Body: each line gets a dim `│ ` border + plain code text, up to
-            // the matching closing fence (which is consumed but not emitted).
+            // Body: collect the block, syntax-highlight it by language, then
+            // prepend the dim `│ ` left border to each returned row. The
+            // matching closing fence is consumed but not emitted.
+            let lang = label.split_whitespace().next().unwrap_or("");
+            let mut body = String::new();
+            let mut first = true;
             while let Some(next) = lines.peek() {
                 if fence_close(next) {
                     let _ = lines.next();
                     break;
                 }
                 let code_line = lines.next().unwrap();
-                out.push(Line::from(vec![
-                    Span::styled("│ ".to_string(), border_style),
-                    Span::styled(code_line.to_string(), base),
-                ]));
+                if !first {
+                    body.push('\n');
+                }
+                first = false;
+                body.push_str(code_line);
+            }
+            for row in highlight::highlight(&body, lang, theme) {
+                let mut spans: Vec<Span<'static>> =
+                    vec![Span::styled("│ ".to_string(), border_style)];
+                spans.extend(row.spans);
+                out.push(Line::from(spans));
             }
             continue;
         }
 
-        out.push(render_line(line, base, code_style));
+        out.push(render_line(line, base, code_style, heading_style));
     }
 
     out
@@ -94,7 +118,7 @@ pub(crate) fn render(text: &str, width: u16) -> Vec<Line<'static>> {
 
 /// Render a single non-fence line into a styled [`Line`], detecting headings
 /// and list items before falling back to inline-parsed prose.
-fn render_line(line: &str, base: Style, code_style: Style) -> Line<'static> {
+fn render_line(line: &str, base: Style, code_style: Style, heading_style: Style) -> Line<'static> {
     let trimmed = line.trim_start();
 
     // ATX headings: 1..=6 leading '#', then a space-separated title.
@@ -102,7 +126,6 @@ fn render_line(line: &str, base: Style, code_style: Style) -> Line<'static> {
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) {
             let rest = trimmed[hashes..].trim_start();
-            let heading_style = base.add_modifier(Modifier::BOLD);
             return Line::from(parse_inline(rest, heading_style, code_style));
         }
     }
@@ -262,6 +285,11 @@ fn fence_close(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Render with the default (auto) theme, the common case in these tests.
+    fn render_auto(text: &str, width: u16) -> Vec<Line<'static>> {
+        render(text, width, &Theme::default())
+    }
+
     /// Concatenated plain text of every span in a line.
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -274,7 +302,7 @@ mod tests {
 
     #[test]
     fn heading_is_bold_without_hashes() {
-        let rows = render("## Hello World", 80);
+        let rows = render_auto("## Hello World", 80);
         assert_eq!(rows.len(), 1);
         assert_eq!(line_text(&rows[0]), "Hello World");
         assert!(
@@ -290,7 +318,7 @@ mod tests {
 
     #[test]
     fn inline_code_gets_code_style() {
-        let rows = render("use the `foo()` call", 80);
+        let rows = render_auto("use the `foo()` call", 80);
         assert_eq!(rows.len(), 1);
         let code_span = rows[0]
             .spans
@@ -299,14 +327,14 @@ mod tests {
             .expect("inline code span present");
         assert_eq!(
             code_span.style.fg,
-            Some(Color::Cyan),
+            Some(Theme::default().inline_code),
             "inline code carries the distinct code style"
         );
     }
 
     #[test]
     fn bold_span_present() {
-        let rows = render("this is **strong** text", 80);
+        let rows = render_auto("this is **strong** text", 80);
         let strong = rows[0]
             .spans
             .iter()
@@ -317,7 +345,7 @@ mod tests {
 
     #[test]
     fn italic_span_present() {
-        let rows = render("this is _soft_ text", 80);
+        let rows = render_auto("this is _soft_ text", 80);
         let soft = rows[0]
             .spans
             .iter()
@@ -329,7 +357,7 @@ mod tests {
     #[test]
     fn fenced_block_has_label_and_bordered_rows() {
         let input = "```rust\nfn x() {}\nlet y = 1;\n```";
-        let rows = render(input, 80);
+        let rows = render_auto(input, 80);
         // Row 0: dim language label ending in the label marker.
         assert!(
             line_text(&rows[0]).starts_with("rust"),
@@ -358,7 +386,7 @@ mod tests {
 
     #[test]
     fn bullet_list_renders_bullet() {
-        let rows = render("- first item", 80);
+        let rows = render_auto("- first item", 80);
         assert_eq!(rows.len(), 1);
         assert!(
             line_text(&rows[0]).starts_with("• "),
@@ -370,14 +398,15 @@ mod tests {
 
     #[test]
     fn numbered_list_preserves_number() {
-        let rows = render("3. third", 80);
+        let rows = render_auto("3. third", 80);
         assert_eq!(line_text(&rows[0]), "3. third");
     }
 
     #[test]
     fn diff_fence_colors_add_and_remove_rows() {
+        let theme = Theme::default();
         let input = "```diff\n@@ -1 +1 @@\n-old line\n+new line\n```";
-        let rows = render(input, 80);
+        let rows = render(input, 80, &theme);
         // Row 0 is still the dim `diff ▏` label.
         assert!(
             line_text(&rows[0]).starts_with("diff"),
@@ -392,8 +421,8 @@ mod tests {
             .expect("addition row present and unbordered");
         assert_eq!(
             add.spans.first().and_then(|s| s.style.fg),
-            Some(Color::Green),
-            "addition row is green"
+            Some(theme.diff_add),
+            "addition row uses the theme add color"
         );
         let del = rows
             .iter()
@@ -401,8 +430,8 @@ mod tests {
             .expect("deletion row present and unbordered");
         assert_eq!(
             del.spans.first().and_then(|s| s.style.fg),
-            Some(Color::Red),
-            "deletion row is red"
+            Some(theme.diff_del),
+            "deletion row uses the theme del color"
         );
         // No plain `│ ` framing was applied to the diff body.
         assert!(
@@ -412,8 +441,40 @@ mod tests {
     }
 
     #[test]
+    fn rust_fence_is_highlighted_with_border() {
+        let theme = Theme::default();
+        let input = "```rust\nfn x() {}\n```";
+        let rows = render(input, 80, &theme);
+        // Row 0 is still the dim `rust ▏` label.
+        assert!(line_text(&rows[0]).starts_with("rust"));
+        // The code row keeps its dim `│ ` left border...
+        assert_eq!(rows.len(), 2, "label + one code row");
+        assert!(
+            line_text(&rows[1]).starts_with("│ "),
+            "highlighted code row keeps the left border: {:?}",
+            line_text(&rows[1])
+        );
+        assert!(line_text(&rows[1]).contains("fn x() {}"));
+        // ...and is now colored (not all-default): `fn` is a keyword.
+        let fn_span = rows[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "fn")
+            .expect("`fn` keyword span present");
+        assert_eq!(
+            fn_span.style.fg,
+            Some(theme.syntax_keyword),
+            "keyword is highlighted inside the fenced block"
+        );
+        assert!(
+            rows[1].spans.iter().any(|s| s.style.fg.is_some()),
+            "at least one span carries a highlight color"
+        );
+    }
+
+    #[test]
     fn plain_paragraph_passthrough() {
-        let rows = render("just some plain text", 80);
+        let rows = render_auto("just some plain text", 80);
         assert_eq!(rows.len(), 1);
         assert_eq!(line_text(&rows[0]), "just some plain text");
     }

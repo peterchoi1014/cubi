@@ -23,9 +23,11 @@
 mod app;
 mod diff;
 mod event;
+mod highlight;
 mod markdown;
 mod sink;
 mod term;
+mod theme;
 mod widgets;
 
 use crate::cli::ChatCLI;
@@ -278,6 +280,9 @@ impl ChatCLI {
         // welcome content (mascot + tagline + help-line + banner). Plain text
         // (color=false) — the transcript renders its own styled spans.
         let mut state = AppState::new();
+        state.set_theme(theme::Theme::from_name(
+            self.app_config.theme.as_deref().unwrap_or("auto"),
+        ));
         for line in &self.startup_transcript {
             state.apply(RenderEvent::Status(line.clone()));
         }

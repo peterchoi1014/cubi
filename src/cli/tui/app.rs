@@ -11,6 +11,8 @@ use crate::cli::status::StatusState;
 use crate::cli::ui_sink::RenderEvent;
 use std::path::PathBuf;
 
+use super::theme::Theme;
+
 /// Maximum tool-output rows shown inside a framed tool block before the rest
 /// are collapsed into a dim `… N more lines` note.
 const MAX_TOOL_OUTPUT_ROWS: usize = 12;
@@ -124,6 +126,10 @@ pub struct AppState {
     /// turn begins, so streaming, buffered, and multi-step replies all share a
     /// single header per turn.
     assistant_header_shown: bool,
+    /// The active color palette. Sourced from the persisted `/theme` choice in
+    /// `run_tui`; defaults to `auto` (today's appearance) so a state built in
+    /// tests renders exactly as before.
+    theme: Theme,
 }
 
 impl AppState {
@@ -142,6 +148,7 @@ impl AppState {
             spinner_frame: 0,
             thinking_elapsed_ms: 0,
             assistant_header_shown: false,
+            theme: Theme::default(),
         }
     }
 
@@ -196,6 +203,17 @@ impl AppState {
     pub fn set_thinking_anim(&mut self, frame: usize, elapsed_ms: u64) {
         self.spinner_frame = frame;
         self.thinking_elapsed_ms = elapsed_ms;
+    }
+
+    /// The active color palette used by the widgets layer.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Set the active color palette. Called once by `run_tui` after resolving
+    /// the persisted `/theme` choice.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     // --- Mutators ---------------------------------------------------------
