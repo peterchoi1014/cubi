@@ -8,6 +8,13 @@ A pocket-sized AI for your shell. Cubi is a Rust-based command-line AI chat
 application with local model inference through Ollama (or any OpenAI-compatible
 local server), a streaming native-tool-calling agent loop, and MCP support.
 
+> **What's new:** interactive `cubi` now launches a full-screen terminal UI by
+> default — markdown, syntax-highlighted code, colored diffs, framed tool calls,
+> an animated thinking indicator, a scrollbar, `/theme` support, and slash
+> commands, with native mouse/keyboard scrolling and selection. Pass
+> `--classic` (or set `CUBI_CLASSIC=1`) for the classic line-based REPL. See
+> the "Interactive UI (TUI)" section below.
+
 <div align="center">
 
 ![Rust](https://img.shields.io/badge/rust-1.88-orange.svg)
@@ -18,6 +25,11 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 
 ## ✨ Features
 
+- 🖥️ **Full-screen interactive UI** — interactive `cubi` opens a TUI by default
+  (bottom-pinned input, live status line, markdown + syntax-highlighted code,
+  colored diffs, framed tool calls, an animated thinking indicator, scrollbar,
+  and `/theme` support). Slash commands work inside it; pass `--classic` for the
+  old line-based REPL
 - 🤖 **Local AI** — runs fully offline against Ollama, llama-server, LM Studio,
   or any OpenAI-compatible local backend
 - ⚡ **Streaming agent loop** — tokens stream live; the model calls built-in or
@@ -104,11 +116,36 @@ Type `/help` to list every slash command. `Ctrl+C` interrupts; `/quit` exits.
 For full installation, model selection, and non-Ollama backend setup, see
 **[INSTALL.md](INSTALL.md)**.
 
+## 🖥️ Interactive UI (TUI)
+
+Running `cubi` with no prompt now opens a **full-screen terminal UI by default**.
+It renders your conversation in a scrollable transcript with a bottom-pinned
+input box and a live status line, and includes:
+
+- markdown formatting and syntax-highlighted code blocks
+- colored, unified diffs for file edits
+- framed tool-call blocks with their (capped) output
+- an animated "thinking…" indicator while the model works
+- a scrollbar that appears only when the transcript overflows
+- theme support via `/theme` (all slash commands work inside the TUI)
+
+Navigation uses the terminal's **native selection and scrolling**: the mouse
+wheel, `PageUp`/`PageDown`, and the arrow keys scroll the transcript, while
+click-drag text selection and copy keep working (the mouse is never captured).
+On exit — and when you resume a saved session — Cubi prints a copyable resume
+hint with the session id.
+
+Prefer the classic line-based readline REPL? Pass `--classic` (or set
+`CUBI_CLASSIC=1`). The TUI is also skipped automatically for non-TTY, piped,
+headless, `-p`, and `--json` runs, so scripts and pipelines are unaffected.
+(`--tui` / `CUBI_TUI` remain accepted but are now the default and a no-op.)
+
 ## 📖 Usage
 
-Inside the REPL, type `/help` to list every slash command, or `/help <cmd>` for
-per-command detail. The full command surface is the single source of truth in
-[`src/commands.rs`](src/commands.rs).
+Interactive `cubi` opens the full-screen TUI (see above); use `--classic` for
+the line-based REPL. Inside either mode, type `/help` to list every slash
+command, or `/help <cmd>` for per-command detail. The full command surface is
+the single source of truth in [`src/commands.rs`](src/commands.rs).
 
 A few common ones to get started:
 
