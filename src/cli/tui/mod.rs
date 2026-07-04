@@ -654,6 +654,13 @@ impl ChatCLI {
                         self.render_captured_command("/mcp", &output);
                         return true;
                     }
+                    Cmd::McpTools => {
+                        // Read-only tool listing — render it in-transcript like
+                        // `/mcp` rather than suspending to the real terminal.
+                        let output = self.mcp_tools_output();
+                        self.render_captured_command("/mcp-tools", &output);
+                        return true;
+                    }
                     _ => {}
                 }
             }
