@@ -209,6 +209,22 @@ where
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Submit => {
+                                // With the picker open, Enter executes the
+                                // highlighted command immediately (no prompt):
+                                // clear the partial token, route the full
+                                // command through the same submit path as a
+                                // typed line, and close the picker.
+                                if let Some(cmd) =
+                                    state.picker_selected_command().map(str::to_string)
+                                {
+                                    let _ = state.take_composer();
+                                    state.push_history(&cmd);
+                                    // Slash commands are not echoed (they run
+                                    // suspended on the real terminal).
+                                    let _ = action_tx.send(UserAction::SubmitLine(cmd));
+                                    redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                                    continue;
+                                }
                                 let line = state.take_composer();
                                 state.push_history(&line);
                                 let trimmed = line.trim();
@@ -250,24 +266,45 @@ where
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Complete => {
-                                state.complete();
+                                // Tab accepts the highlighted picker candidate
+                                // when the picker is open; otherwise it runs the
+                                // usual slash/`@file` token completion.
+                                if state.picker_open() {
+                                    state.picker_accept();
+                                } else {
+                                    state.complete();
+                                }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::HistoryPrev => {
-                                // Recall an older entry, or scroll up if there
-                                // is nothing to recall.
-                                if !state.history_prev() {
+                                // Up moves the picker selection when open;
+                                // otherwise recall an older entry, or scroll up
+                                // if there is nothing to recall.
+                                if state.picker_open() {
+                                    state.picker_prev();
+                                } else if !state.history_prev() {
                                     state.scroll_up(3);
                                 }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::HistoryNext => {
-                                // Step to a newer entry, or scroll down when not
-                                // navigating history.
-                                if !state.history_next() {
+                                // Down moves the picker selection when open;
+                                // otherwise step to a newer entry, or scroll
+                                // down when not navigating history.
+                                if state.picker_open() {
+                                    state.picker_next();
+                                } else if !state.history_next() {
                                     state.scroll_down(3);
                                 }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                            }
+                            event::Action::DismissPicker => {
+                                // Esc closes the picker (staying closed until the
+                                // next edit); a no-op when it is not open.
+                                if state.picker_open() {
+                                    state.picker_dismiss();
+                                    redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                                }
                             }
                             event::Action::None => {}
                         }
@@ -470,6 +507,27 @@ impl ChatCLI {
             if let Ok(contents) = std::fs::read_to_string(&path) {
                 state.seed_input_history(contents.lines().map(str::to_string));
             }
+        }
+        // Seed the slash-command picker catalog: built-in command names plus
+        // every enabled agent as `/<name>`. Built-ins win any name collision,
+        // so an agent whose name duplicates a built-in is skipped. This is a
+        // startup snapshot; agents enabled/disabled mid-session are not
+        // reflected until the next launch (acceptable for v1).
+        {
+            let mut catalog: Vec<String> =
+                crate::commands::command_names().map(String::from).collect();
+            let builtins: std::collections::HashSet<String> =
+                catalog.iter().map(|c| c.to_ascii_lowercase()).collect();
+            for agent in crate::agents::load_agents() {
+                if crate::agents::is_disabled(&agent.name) {
+                    continue;
+                }
+                let cmd = format!("/{}", agent.name);
+                if !builtins.contains(&cmd.to_ascii_lowercase()) {
+                    catalog.push(cmd);
+                }
+            }
+            state.set_command_catalog(catalog);
         }
         state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
 

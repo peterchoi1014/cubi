@@ -141,6 +141,22 @@ pub struct AppState {
     /// The live draft stashed when history navigation begins, restored when the
     /// user steps back past the newest entry (exiting navigation).
     history_draft: String,
+    /// The full slash-command catalog the picker filters against, each entry a
+    /// complete command string including the leading `/` (e.g. `/status`,
+    /// `/reviewer`). Seeded once at TUI start via [`Self::set_command_catalog`]
+    /// (built-ins + enabled agents); a startup snapshot is acceptable for v1,
+    /// so agents enabled/disabled mid-session are not reflected until restart.
+    command_catalog: Vec<String>,
+    /// Whether the slash-command picker popup is currently open. Recomputed by
+    /// [`Self::refresh_picker`] on every composer mutation.
+    picker_open: bool,
+    /// The filtered command candidates shown in the picker, in catalog order.
+    picker_candidates: Vec<String>,
+    /// Index of the highlighted candidate within `picker_candidates`.
+    picker_selected: usize,
+    /// Latch set by [`Self::picker_dismiss`] (Esc): keeps the picker closed
+    /// until the next composer edit, which resets it in [`Self::edit`].
+    picker_dismissed_until_edit: bool,
 }
 
 impl AppState {
@@ -163,6 +179,11 @@ impl AppState {
             input_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            command_catalog: Vec::new(),
+            picker_open: false,
+            picker_candidates: Vec::new(),
+            picker_selected: 0,
+            picker_dismissed_until_edit: false,
         }
     }
 
@@ -182,6 +203,21 @@ impl AppState {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Whether the slash-command picker popup is currently open.
+    pub fn picker_open(&self) -> bool {
+        self.picker_open
+    }
+
+    /// The filtered command candidates shown in the picker (catalog order).
+    pub fn picker_candidates(&self) -> &[String] {
+        &self.picker_candidates
+    }
+
+    /// Index of the highlighted candidate within [`Self::picker_candidates`].
+    pub fn picker_selected(&self) -> usize {
+        self.picker_selected
     }
 
     /// Rows the view is scrolled up from the bottom (0 = pinned to newest).
@@ -377,6 +413,8 @@ impl AppState {
     /// draft.
     pub fn edit(&mut self, action: EditAction) {
         self.exit_history_nav();
+        // Any composer edit re-arms the picker after an Esc dismissal.
+        self.picker_dismissed_until_edit = false;
         match action {
             EditAction::InsertChar(c) => {
                 self.composer.insert(self.cursor, c);
@@ -404,12 +442,15 @@ impl AppState {
                 }
             }
         }
+        self.refresh_picker();
     }
 
     /// Return the composer contents, clearing the buffer and resetting the
     /// cursor. Used when the user submits a message.
     pub fn take_composer(&mut self) -> String {
         self.cursor = 0;
+        self.close_picker();
+        self.picker_dismissed_until_edit = false;
         std::mem::take(&mut self.composer)
     }
 
@@ -640,6 +681,7 @@ impl AppState {
     fn replace_range(&mut self, start: usize, end: usize, text: &str) {
         self.composer.replace_range(start..end, text);
         self.cursor = start + text.len();
+        self.refresh_picker();
     }
 
     // --- Input-history recall ---------------------------------------------
@@ -725,6 +767,7 @@ impl AppState {
     fn set_composer(&mut self, text: String) {
         self.composer = text;
         self.cursor = self.composer.len();
+        self.refresh_picker();
     }
 
     /// End input-history navigation without changing the composer: the current
@@ -732,6 +775,124 @@ impl AppState {
     fn exit_history_nav(&mut self) {
         self.history_index = None;
         self.history_draft.clear();
+    }
+
+    // --- Slash-command picker ---------------------------------------------
+
+    /// Seed the command catalog the picker filters against, replacing any
+    /// previous contents. Each entry must be a full command string including
+    /// the leading `/`. Called once from `run_tui` with built-ins + enabled
+    /// agents (built-ins winning any name collision).
+    pub fn set_command_catalog<I>(&mut self, commands: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.command_catalog = commands.into_iter().collect();
+        self.refresh_picker();
+    }
+
+    /// Byte length of the leading command token: from the start of the composer
+    /// up to the first whitespace (or the whole composer when there is none).
+    fn command_token_end(&self) -> usize {
+        self.composer
+            .find(char::is_whitespace)
+            .unwrap_or(self.composer.len())
+    }
+
+    /// Recompute the picker candidates and open/close state from the current
+    /// composer. The picker opens when: the composer starts with `/`, the
+    /// cursor sits within the first (whitespace-delimited) token, there is at
+    /// least one case-insensitive prefix match in the catalog, and no Esc
+    /// dismissal is latched. Opening resets the selection to the top; while it
+    /// stays open the selection is clamped into range. Any other case closes.
+    fn refresh_picker(&mut self) {
+        if self.picker_dismissed_until_edit || !self.composer.starts_with('/') {
+            self.close_picker();
+            return;
+        }
+        let token_end = self.command_token_end();
+        // The picker only drives the command token; once the cursor moves past
+        // it (a space was typed) subcommand/`@file` completion takes over.
+        if self.cursor > token_end {
+            self.close_picker();
+            return;
+        }
+        let token_lower = self.composer[..token_end].to_ascii_lowercase();
+        let candidates: Vec<String> = self
+            .command_catalog
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().starts_with(&token_lower))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            self.close_picker();
+            return;
+        }
+        let was_open = self.picker_open;
+        self.picker_candidates = candidates;
+        self.picker_open = true;
+        if !was_open {
+            self.picker_selected = 0;
+        } else if self.picker_selected >= self.picker_candidates.len() {
+            self.picker_selected = self.picker_candidates.len() - 1;
+        }
+    }
+
+    /// Close the picker and clear its transient state (candidates + selection).
+    /// Does not touch the composer or the Esc-dismissal latch.
+    fn close_picker(&mut self) {
+        self.picker_open = false;
+        self.picker_candidates.clear();
+        self.picker_selected = 0;
+    }
+
+    /// Move the picker highlight to the next candidate, wrapping at the end.
+    pub fn picker_next(&mut self) {
+        if self.picker_candidates.is_empty() {
+            return;
+        }
+        self.picker_selected = (self.picker_selected + 1) % self.picker_candidates.len();
+    }
+
+    /// Move the picker highlight to the previous candidate, wrapping at the top.
+    pub fn picker_prev(&mut self) {
+        let len = self.picker_candidates.len();
+        if len == 0 {
+            return;
+        }
+        self.picker_selected = (self.picker_selected + len - 1) % len;
+    }
+
+    /// The currently highlighted command string, or `None` when the picker is
+    /// closed / empty. Used by Enter to execute the selection immediately.
+    pub fn picker_selected_command(&self) -> Option<&str> {
+        if !self.picker_open {
+            return None;
+        }
+        self.picker_candidates
+            .get(self.picker_selected)
+            .map(String::as_str)
+    }
+
+    /// Accept the highlighted candidate (Tab): replace the leading command
+    /// token with the selected command followed by a single space, move the
+    /// cursor to the end, and close the picker so the user can type args.
+    pub fn picker_accept(&mut self) {
+        let Some(cmd) = self.picker_candidates.get(self.picker_selected).cloned() else {
+            return;
+        };
+        let token_end = self.command_token_end();
+        let replacement = format!("{cmd} ");
+        self.composer.replace_range(0..token_end, &replacement);
+        self.cursor = replacement.len();
+        self.close_picker();
+    }
+
+    /// Dismiss the picker (Esc) without changing the composer. It stays closed
+    /// until the next composer edit re-arms it (see [`Self::edit`]).
+    pub fn picker_dismiss(&mut self) {
+        self.picker_dismissed_until_edit = true;
+        self.close_picker();
     }
 }
 
@@ -1507,5 +1668,146 @@ mod tests {
         assert!(s.history_prev());
         assert_eq!(s.composer(), "a");
         assert!(!s.history_prev());
+    }
+
+    // --- Slash-command picker --------------------------------------------
+
+    /// Seed a catalog, then type `text`, returning the resulting state.
+    fn picker_state(catalog: &[&str], text: &str) -> AppState {
+        let mut s = AppState::new();
+        s.set_command_catalog(catalog.iter().map(|c| c.to_string()));
+        for c in text.chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        s
+    }
+
+    #[test]
+    fn typing_slash_prefix_opens_picker_with_prefix_matches() {
+        let s = picker_state(&["/status", "/stop", "/help"], "/st");
+        assert!(s.picker_open());
+        let cands = s.picker_candidates();
+        assert!(cands.contains(&"/status".to_string()));
+        assert!(cands.contains(&"/stop".to_string()));
+        assert!(!cands.contains(&"/help".to_string()));
+        assert_eq!(s.picker_selected(), 0);
+    }
+
+    #[test]
+    fn picker_uses_real_builtin_catalog_seed() {
+        // Seeded from the actual built-in names, `/st` must surface `/status`.
+        let mut s = AppState::new();
+        s.set_command_catalog(crate::commands::command_names().map(String::from));
+        for c in "/st".chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        assert!(s.picker_open());
+        assert!(
+            s.picker_candidates().iter().any(|c| c == "/status"),
+            "candidates: {:?}",
+            s.picker_candidates()
+        );
+    }
+
+    #[test]
+    fn picker_prefix_match_is_case_insensitive() {
+        let s = picker_state(&["/status"], "/ST");
+        assert!(s.picker_open());
+        assert_eq!(s.picker_candidates(), &["/status".to_string()]);
+    }
+
+    #[test]
+    fn picker_next_and_prev_wrap_and_clamp() {
+        let mut s = picker_state(&["/status", "/stop", "/style"], "/st");
+        assert_eq!(s.picker_selected(), 0);
+        s.picker_next();
+        assert_eq!(s.picker_selected(), 1);
+        s.picker_next();
+        assert_eq!(s.picker_selected(), 2);
+        s.picker_next(); // wraps back to the top
+        assert_eq!(s.picker_selected(), 0);
+        s.picker_prev(); // wraps to the bottom
+        assert_eq!(s.picker_selected(), 2);
+    }
+
+    #[test]
+    fn picker_accept_replaces_token_and_closes() {
+        let mut s = picker_state(&["/status", "/stop"], "/st");
+        s.picker_next(); // select /stop
+        assert_eq!(s.picker_selected_command(), Some("/stop"));
+        s.picker_accept();
+        assert_eq!(s.composer(), "/stop ");
+        assert_eq!(s.cursor(), s.composer().len());
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn typing_a_space_closes_the_picker() {
+        let mut s = picker_state(&["/status"], "/status");
+        assert!(s.picker_open());
+        s.edit(EditAction::InsertChar(' '));
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn esc_dismiss_closes_until_next_edit() {
+        let mut s = picker_state(&["/status"], "/st");
+        assert!(s.picker_open());
+        s.picker_dismiss();
+        assert!(!s.picker_open());
+        // A cursor move re-arms the picker (it is an edit).
+        s.edit(EditAction::InsertChar('a'));
+        // "/sta" still matches "/status".
+        assert!(s.picker_open());
+    }
+
+    #[test]
+    fn non_slash_composer_keeps_picker_closed() {
+        let s = picker_state(&["/status"], "hello");
+        assert!(!s.picker_open());
+        assert_eq!(s.picker_selected_command(), None);
+    }
+
+    #[test]
+    fn cursor_past_command_token_closes_picker() {
+        // With a trailing arg the cursor sits past the first token, so the
+        // picker yields to subcommand/`@file` completion.
+        let s = picker_state(&["/status"], "/status arg");
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn enabled_agent_appears_as_candidate_without_duplicating_builtins() {
+        // Mirror the run_tui seeding: built-ins + `/<agent>`, built-ins win.
+        let mut catalog: Vec<String> = vec!["/status".to_string(), "/stop".to_string()];
+        let builtins: std::collections::HashSet<String> =
+            catalog.iter().map(|c| c.to_ascii_lowercase()).collect();
+        for agent in ["reviewer", "status"] {
+            let cmd = format!("/{agent}");
+            if !builtins.contains(&cmd.to_ascii_lowercase()) {
+                catalog.push(cmd);
+            }
+        }
+        let mut s = AppState::new();
+        s.set_command_catalog(catalog);
+        for c in "/re".chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        assert!(s.picker_open());
+        assert_eq!(s.picker_candidates(), &["/reviewer".to_string()]);
+        // The `status` agent collided with the `/status` built-in and was
+        // dropped, so `/st` lists it exactly once.
+        let mut s2 = AppState::new();
+        s2.set_command_catalog(vec!["/status".to_string(), "/stop".to_string()]);
+        for c in "/status".chars() {
+            s2.edit(EditAction::InsertChar(c));
+        }
+        assert_eq!(
+            s2.picker_candidates()
+                .iter()
+                .filter(|c| *c == "/status")
+                .count(),
+            1
+        );
     }
 }

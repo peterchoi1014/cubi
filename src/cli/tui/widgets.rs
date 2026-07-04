@@ -31,6 +31,10 @@ pub(super) fn format_thinking(frame: usize, elapsed_ms: u64, label: &str) -> Str
 /// (borders are added on top of this).
 const MAX_COMPOSER_ROWS: u16 = 6;
 
+/// Maximum command candidates the picker popup lists at once. Extra candidates
+/// are hidden behind a "… N more" affordance.
+const MAX_PICKER_ROWS: usize = 8;
+
 /// Render `state` into `frame`. Regions, top to bottom:
 ///   1. scrollable, word-wrapped transcript (`Constraint::Min(1)`),
 ///   2. a fully-bordered composer pinned at the bottom
@@ -41,10 +45,19 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     let theme = state.theme();
 
     let composer_rows = composer_height(state.composer());
-    let chunks =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(composer_rows)]).split(area);
+    let picker_rows = picker_height(state);
+    // Reserve a middle region for the picker popup when it is open. When
+    // closed `picker_rows == 0`, so the zero-height region renders nothing and
+    // the layout is byte-for-byte the previous transcript/composer split.
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(picker_rows),
+        Constraint::Length(composer_rows),
+    ])
+    .split(area);
     let transcript_area = chunks[0];
-    let composer_area = chunks[1];
+    let picker_area = chunks[1];
+    let composer_area = chunks[2];
 
     // --- Transcript -------------------------------------------------------
     let mut lines: Vec<Line> = Vec::new();
@@ -159,6 +172,11 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
         frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
     }
 
+    // --- Slash-command picker popup ---------------------------------------
+    if picker_rows > 0 {
+        draw_picker(frame, picker_area, state, &theme);
+    }
+
     // --- Composer (bordered, info at the four corners) --------------------
     let status = state.status();
     let top_left = status.path_display();
@@ -215,6 +233,59 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
 fn composer_height(composer: &str) -> u16 {
     let logical = composer.split('\n').count().max(1) as u16;
     logical.min(MAX_COMPOSER_ROWS).saturating_add(2)
+}
+
+/// Rows the picker popup occupies, or `0` when it is closed. One row per shown
+/// candidate (capped at [`MAX_PICKER_ROWS`]), plus one row for the "… N more"
+/// overflow affordance when there are extra candidates, plus two border rows.
+fn picker_height(state: &AppState) -> u16 {
+    if !state.picker_open() {
+        return 0;
+    }
+    let total = state.picker_candidates().len();
+    let shown = total.min(MAX_PICKER_ROWS);
+    let overflow = usize::from(total > MAX_PICKER_ROWS);
+    (shown + overflow) as u16 + 2
+}
+
+/// Render the slash-command picker popup: a bordered list of candidates with
+/// the selected row reverse-highlighted. When more than [`MAX_PICKER_ROWS`]
+/// candidates match, a scrolling window keeps the selection visible and a
+/// dim "… N more" row signals the overflow.
+fn draw_picker(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState, theme: &Theme) {
+    let candidates = state.picker_candidates();
+    let selected = state.picker_selected();
+    let total = candidates.len();
+    let shown = total.min(MAX_PICKER_ROWS);
+    // Scroll the window so the selection is always visible.
+    let start = if selected >= shown {
+        selected + 1 - shown
+    } else {
+        0
+    };
+
+    let dim = Style::default()
+        .fg(theme.usage_dim)
+        .add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, cmd) in candidates.iter().enumerate().skip(start).take(shown) {
+        let style = if i == selected {
+            Style::default()
+                .fg(theme.role_assistant)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!(" {cmd}"), style));
+    }
+    if total > shown {
+        lines.push(Line::styled(format!(" … {} more", total - shown), dim));
+    }
+
+    let block =
+        Block::bordered().title_top(Line::from(Span::styled(" commands ", dim)).left_aligned());
+    let picker = Paragraph::new(lines).block(block);
+    frame.render_widget(picker, area);
 }
 
 /// Split the composer text into styled lines for the paragraph.
@@ -635,5 +706,51 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn picker_height_is_zero_when_closed_and_reserves_rows_when_open() {
+        // Closed: no reserved rows, and the layout matches the plain split.
+        let closed = AppState::new();
+        assert_eq!(picker_height(&closed), 0);
+
+        // Open with two candidates: 2 rows + 2 borders = 4.
+        let mut open = AppState::new();
+        open.set_command_catalog(["/status", "/stop"].iter().map(|c| c.to_string()));
+        for c in "/st".chars() {
+            open.edit(super::super::app::EditAction::InsertChar(c));
+        }
+        assert!(open.picker_open());
+        assert_eq!(picker_height(&open), 4);
+    }
+
+    #[test]
+    fn picker_height_caps_and_adds_overflow_row() {
+        let mut state = AppState::new();
+        let cmds: Vec<String> = (0..20).map(|i| format!("/status{i:02}")).collect();
+        state.set_command_catalog(cmds);
+        for c in "/status".chars() {
+            state.edit(super::super::app::EditAction::InsertChar(c));
+        }
+        assert!(state.picker_open());
+        // 20 matches → capped at MAX_PICKER_ROWS shown + 1 overflow + 2 borders.
+        assert_eq!(picker_height(&state), MAX_PICKER_ROWS as u16 + 1 + 2);
+    }
+
+    #[test]
+    fn draw_renders_picker_candidate_above_composer() {
+        let mut state = AppState::new();
+        state.set_command_catalog(["/status", "/stop"].iter().map(|c| c.to_string()));
+        for c in "/st".chars() {
+            state.edit(super::super::app::EditAction::InsertChar(c));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buf, "/status"),
+            "picker should list /status"
+        );
+        assert!(buffer_contains(buf, "commands"), "picker has a title");
     }
 }
