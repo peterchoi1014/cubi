@@ -649,10 +649,10 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/agents",
-        usage: "/agents [list|show <name>|create <name>|edit <name>|delete <name>]",
-        help: "Manage custom agent definitions (~/.cubi/agents)",
+        usage: "/agents [list|enable <name>|disable <name>]",
+        help: "List custom agents and enable/disable them (~/.cubi/agents)",
         cmd: Cmd::Agents,
-        subcommands: &["list", "show", "create", "edit", "delete"],
+        subcommands: &["list", "enable", "disable"],
     },
     SlashCommandSpec {
         name: "/tasks",
@@ -1276,10 +1276,7 @@ mod tests {
             subcommands(Cmd::Skills),
             &["list", "run", "enable", "disable"]
         );
-        assert_eq!(
-            subcommands(Cmd::Agents),
-            &["list", "show", "create", "edit", "delete"]
-        );
+        assert_eq!(subcommands(Cmd::Agents), &["list", "enable", "disable"]);
         assert_eq!(
             subcommands(Cmd::Mcp),
             &["list", "enable", "disable", "add", "remove", "reload"]
@@ -1318,8 +1315,8 @@ mod tests {
         assert!(skills.usage.contains("enable <name>"));
         assert!(skills.usage.contains("disable <name>"));
         let agents = find_command("/agents").expect("registered");
-        assert!(agents.usage.contains("show <name>"));
-        assert!(agents.usage.contains("delete <name>"));
+        assert!(agents.usage.contains("enable <name>"));
+        assert!(agents.usage.contains("disable <name>"));
         let mcp = find_command("/mcp").expect("registered");
         assert!(mcp.usage.contains("reload"));
         assert!(mcp.usage.contains("enable <name>"));

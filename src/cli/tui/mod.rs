@@ -30,12 +30,13 @@ mod term;
 mod theme;
 mod widgets;
 
+use crate::cli::AgentCommand;
 use crate::cli::ChatCLI;
 use crate::cli::ui_sink::RenderEvent;
 use crate::commands::{self, Cmd};
 use anyhow::{Context, Result};
 use app::AppState;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,6 +209,22 @@ where
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Submit => {
+                                // With the picker open, Enter executes the
+                                // highlighted command immediately (no prompt):
+                                // clear the partial token, route the full
+                                // command through the same submit path as a
+                                // typed line, and close the picker.
+                                if let Some(cmd) =
+                                    state.picker_selected_command().map(str::to_string)
+                                {
+                                    let _ = state.take_composer();
+                                    state.push_history(&cmd);
+                                    // Slash commands are not echoed (they run
+                                    // suspended on the real terminal).
+                                    let _ = action_tx.send(UserAction::SubmitLine(cmd));
+                                    redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                                    continue;
+                                }
                                 let line = state.take_composer();
                                 state.push_history(&line);
                                 let trimmed = line.trim();
@@ -249,28 +266,65 @@ where
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::Complete => {
-                                state.complete();
+                                // Tab accepts the highlighted picker candidate
+                                // when the picker is open; otherwise it runs the
+                                // usual slash/`@file` token completion.
+                                if state.picker_open() {
+                                    state.picker_accept();
+                                } else {
+                                    state.complete();
+                                }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::HistoryPrev => {
-                                // Recall an older entry, or scroll up if there
-                                // is nothing to recall.
-                                if !state.history_prev() {
+                                // Up moves the picker selection when open;
+                                // otherwise recall an older entry, or scroll up
+                                // if there is nothing to recall.
+                                if state.picker_open() {
+                                    state.picker_prev();
+                                } else if !state.history_prev() {
                                     state.scroll_up(3);
                                 }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::HistoryNext => {
-                                // Step to a newer entry, or scroll down when not
-                                // navigating history.
-                                if !state.history_next() {
+                                // Down moves the picker selection when open;
+                                // otherwise step to a newer entry, or scroll
+                                // down when not navigating history.
+                                if state.picker_open() {
+                                    state.picker_next();
+                                } else if !state.history_next() {
                                     state.scroll_down(3);
                                 }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
+                            event::Action::DismissPicker => {
+                                // Esc closes the picker (staying closed until the
+                                // next edit); a no-op when it is not open.
+                                if state.picker_open() {
+                                    state.picker_dismiss();
+                                    redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                                }
+                            }
                             event::Action::None => {}
                         }
                     }
+                    // Mouse wheel → scroll the transcript. With mouse capture
+                    // enabled the wheel arrives here (not as Up/Down keys), so
+                    // keyboard arrows can keep driving history recall. Mirror
+                    // the `Action::ScrollUp`/`ScrollDown` handlers; ignore all
+                    // other mouse kinds (clicks/drags) so they don't interfere.
+                    Some(Ok(Event::Mouse(m))) => match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            state.scroll_up(3);
+                            redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            state.scroll_down(3);
+                            redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                        }
+                        _ => {}
+                    },
                     // Resize / focus / paste etc: repaint against current size.
                     Some(Ok(_)) => {
                         redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
@@ -454,6 +508,27 @@ impl ChatCLI {
                 state.seed_input_history(contents.lines().map(str::to_string));
             }
         }
+        // Seed the slash-command picker catalog: built-in command names plus
+        // every enabled agent as `/<name>`. Built-ins win any name collision,
+        // so an agent whose name duplicates a built-in is skipped. This is a
+        // startup snapshot; agents enabled/disabled mid-session are not
+        // reflected until the next launch (acceptable for v1).
+        {
+            let mut catalog: Vec<String> =
+                crate::commands::command_names().map(String::from).collect();
+            let builtins: std::collections::HashSet<String> =
+                catalog.iter().map(|c| c.to_ascii_lowercase()).collect();
+            for agent in crate::agents::load_agents() {
+                if crate::agents::is_disabled(&agent.name) {
+                    continue;
+                }
+                let cmd = format!("/{}", agent.name);
+                if !builtins.contains(&cmd.to_ascii_lowercase()) {
+                    catalog.push(cmd);
+                }
+            }
+            state.set_command_catalog(catalog);
+        }
         state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
 
         let render_handle = tokio::spawn(render_task(
@@ -561,20 +636,12 @@ impl ChatCLI {
                         return true;
                     }
                     Cmd::Agents => {
-                        // `/agents edit <name>` needs an interactive editor,
-                        // which can't render inside the alt screen — so
-                        // `agents_manage` returns `None` there and we fall
-                        // through to the suspend/resume path. Every other
-                        // subcommand yields text we capture in-transcript.
-                        match self.agents_manage(cmd_args) {
-                            Some(output) => {
-                                self.render_captured_command("/agents", &output);
-                                return true;
-                            }
-                            None => {
-                                return self.run_suspended_command(input, control_tx, guard).await;
-                            }
-                        }
+                        // All `/agents` subcommands (list/enable/disable) now
+                        // yield text we capture in-transcript — there is no
+                        // editor/suspend path anymore.
+                        let output = self.agents_manage(cmd_args);
+                        self.render_captured_command("/agents", &output);
+                        return true;
                     }
                     Cmd::Mcp => {
                         // Run the management dispatch (list/enable/disable/add/
@@ -588,6 +655,22 @@ impl ChatCLI {
                     }
                     _ => {}
                 }
+            }
+            // Dynamic `/<name>` agent command: run it as a LIVE turn streamed
+            // through the TuiSink (exactly like a submitted user message), NOT a
+            // suspended real-terminal command. `resolve_agent_command` enforces
+            // precedence (built-ins and user/plugin commands win).
+            match self.resolve_agent_command(input) {
+                AgentCommand::Run(agent, agent_args) => {
+                    self.run_agent_command(&agent, &agent_args).await;
+                    return true;
+                }
+                AgentCommand::Disabled(name) => {
+                    let msg = ChatCLI::agent_disabled_message(&name);
+                    self.render_captured_command(&format!("/{name}"), &msg);
+                    return true;
+                }
+                AgentCommand::NotAgent => {}
             }
             // Every other slash command: suspend the TUI, run it on the real
             // terminal, resume. Returns `false` if the command asked to quit.

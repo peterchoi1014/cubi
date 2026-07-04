@@ -32,6 +32,9 @@ pub(super) enum Action {
     /// Down arrow: step to a newer input-history entry, or (when not
     /// navigating) fall back to scrolling the transcript down.
     HistoryNext,
+    /// Escape: dismiss the slash-command picker popup if it is open. A no-op
+    /// otherwise. The render loop resolves the picker state.
+    DismissPicker,
     /// No actionable interpretation (unhandled key).
     None,
 }
@@ -62,6 +65,7 @@ pub(super) fn map_key(ev: KeyEvent) -> Action {
         KeyCode::Down => Action::HistoryNext,
         KeyCode::PageUp => Action::ScrollUp,
         KeyCode::PageDown => Action::ScrollDown,
+        KeyCode::Esc => Action::DismissPicker,
         _ => Action::None,
     }
 }
@@ -129,7 +133,12 @@ mod tests {
             map_key(key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             Action::None
         );
-        assert_eq!(map_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(map_key(key(KeyCode::Insert)), Action::None);
+    }
+
+    #[test]
+    fn esc_dismisses_picker() {
+        assert_eq!(map_key(key(KeyCode::Esc)), Action::DismissPicker);
     }
 
     #[test]

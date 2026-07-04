@@ -60,6 +60,19 @@ mod status;
 mod tui;
 mod ui_sink;
 
+/// Outcome of resolving a `/<name>` line as a dynamic agent command. A `/<name>`
+/// is only an agent command when it is not a built-in (or unique prefix) and not
+/// a user/plugin markdown command; see [`ChatCLI::resolve_agent_command`].
+enum AgentCommand {
+    /// Not an agent command — the caller should fall through to normal handling
+    /// (built-in dispatch / the unknown-command hint).
+    NotAgent,
+    /// The named agent exists but is disabled. Carries the (lowercased) name.
+    Disabled(String),
+    /// An enabled agent to run, with the trailing args (may be empty).
+    Run(Box<crate::agents::AgentDef>, String),
+}
+
 #[cfg(test)]
 use render::welcome_banner_rows;
 #[cfg(test)]
@@ -4840,6 +4853,7 @@ impl ChatCLI {
     /// into the returned text so a caller can render it in-band.
     fn agents_output(&self) -> String {
         use std::fmt::Write as _;
+        let disabled = crate::agents::load_disabled();
         let mut out = String::new();
         let _ = writeln!(out, "\n{}", "Agents:".bright_yellow().bold());
         let agents = crate::agents::load_agents();
@@ -4851,20 +4865,25 @@ impl ChatCLI {
             );
             let _ = writeln!(
                 out,
-                "  {} Create one with /agents create <name>",
+                "  {} Add a Markdown file to ~/.cubi/agents, then run it with /<name>",
                 "ℹ".bright_blue()
             );
         } else {
             for agent in &agents {
+                let status = if disabled.contains(&agent.name) {
+                    "disabled".bright_red().to_string()
+                } else {
+                    "enabled".bright_green().to_string()
+                };
                 let model = match &agent.model {
                     Some(m) => format!(" {}", format!("(model: {m})").bright_black()),
                     None => String::new(),
                 };
                 let _ = writeln!(
                     out,
-                    "  {} {} - {}{}",
-                    "•".bright_cyan(),
+                    "  {} [{}] - {}{}",
                     agent.name.bright_cyan(),
+                    status,
                     agent.description.bright_white(),
                     model
                 );
@@ -4874,18 +4893,13 @@ impl ChatCLI {
         out
     }
 
-    /// Dispatch `/agents` management subcommands and return the text to render.
-    ///
-    /// Returns `Some(text)` for every case that produces textual output
-    /// (`list`/`show`/`create`/`delete`, unknown subcommands, and errors).
-    ///
-    /// Returns `None` ONLY for `edit <name>` when the named agent exists — this
-    /// is the "needs the interactive editor" signal. The classic REPL opens the
-    /// editor inline; the TUI falls through to its suspend/resume path so the
-    /// editor runs on the real terminal. When the agent to edit does NOT exist
-    /// we still return `Some(error)` (never `None`), so the caller never opens
-    /// an editor on a missing file.
-    fn agents_manage(&self, args: &str) -> Option<String> {
+    /// Dispatch `/agents` management subcommands (`list`, `enable`, `disable`)
+    /// and return the text to render. Mirrors [`Self::skills_manage`] so the
+    /// classic REPL (which prints it) and the TUI (which frames it in the
+    /// transcript) share one source of truth. There is no CRUD / editor path
+    /// anymore — agents are defined by dropping Markdown files into
+    /// `~/.cubi/agents` and run with `/<name>`.
+    fn agents_manage(&mut self, args: &str) -> String {
         use std::fmt::Write as _;
         let trimmed = args.trim();
         let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -4893,180 +4907,181 @@ impl ChatCLI {
         let rest = parts.next().unwrap_or("").trim();
 
         if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
-            return Some(self.agents_output());
+            return self.agents_output();
         }
 
-        let action = sub.to_ascii_lowercase();
         let mut out = String::new();
-        match action.as_str() {
-            "show" => {
-                if rest.is_empty() {
-                    let _ = writeln!(out, "{} Usage: /agents show <name>", "Error:".bright_red());
-                    return Some(out);
-                }
-                match crate::agents::load_one(rest) {
-                    Some(agent) => {
-                        let _ = writeln!(out, "\n{}", "Agent:".bright_yellow().bold());
-                        let _ = writeln!(
-                            out,
-                            "  {} {}",
-                            "name:".bright_black(),
-                            agent.name.bright_cyan()
-                        );
-                        let _ = writeln!(
-                            out,
-                            "  {} {}",
-                            "description:".bright_black(),
-                            agent.description.bright_white()
-                        );
-                        if let Some(model) = &agent.model {
-                            let _ = writeln!(
-                                out,
-                                "  {} {}",
-                                "model:".bright_black(),
-                                model.bright_white()
-                            );
-                        }
-                        let _ =
-                            writeln!(out, "  {} {}", "path:".bright_black(), agent.path.display());
-                        let _ = writeln!(out, "\n{}\n{}", "prompt:".bright_black(), agent.prompt);
-                    }
-                    None => {
-                        let _ = writeln!(
-                            out,
-                            "{} Unknown agent '{}' — see /agents list",
-                            "Error:".bright_red(),
-                            rest
-                        );
-                    }
-                }
-                Some(out)
-            }
-            "create" => {
-                if rest.is_empty() {
-                    let _ = writeln!(
-                        out,
-                        "{} Usage: /agents create <name>",
-                        "Error:".bright_red()
-                    );
-                    return Some(out);
-                }
-                match crate::agents::create(rest, None, None, None) {
-                    Ok(path) => {
-                        let _ = writeln!(
-                            out,
-                            "{} Created agent {} at {}",
-                            "✓".bright_green(),
-                            rest.to_ascii_lowercase().bright_cyan(),
-                            path.display()
-                        );
-                        let _ = writeln!(
-                            out,
-                            "  {} Edit it with /agents edit {}",
-                            "ℹ".bright_blue(),
-                            rest.to_ascii_lowercase()
-                        );
-                    }
-                    Err(e) => {
-                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
-                    }
-                }
-                Some(out)
-            }
-            "delete" => {
-                if rest.is_empty() {
-                    let _ = writeln!(
-                        out,
-                        "{} Usage: /agents delete <name>",
-                        "Error:".bright_red()
-                    );
-                    return Some(out);
-                }
-                match crate::agents::delete(rest) {
-                    Ok(true) => {
-                        let _ = writeln!(
-                            out,
-                            "{} Deleted agent {}",
-                            "✓".bright_green(),
-                            rest.to_ascii_lowercase().bright_cyan()
-                        );
-                    }
-                    Ok(false) => {
-                        let _ = writeln!(
-                            out,
-                            "{} Unknown agent '{}' — see /agents list",
-                            "Error:".bright_red(),
-                            rest
-                        );
-                    }
-                    Err(e) => {
-                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
-                    }
-                }
-                Some(out)
-            }
-            "edit" => {
-                if rest.is_empty() {
-                    let _ = writeln!(out, "{} Usage: /agents edit <name>", "Error:".bright_red());
-                    return Some(out);
-                }
-                // Only signal the interactive-editor path (None) when the agent
-                // actually exists; otherwise return a helpful error.
-                if crate::agents::load_one(rest).is_some() {
-                    None
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "{} Unknown agent '{}' — create it first with /agents create {}",
-                        "Error:".bright_red(),
-                        rest,
-                        rest.to_ascii_lowercase()
-                    );
-                    Some(out)
-                }
-            }
-            _ => {
+        let action = sub.to_ascii_lowercase();
+        if action != "enable" && action != "disable" {
+            let _ = writeln!(
+                out,
+                "{} Usage: /agents [list|enable <name>|disable <name>]",
+                "Info:".bright_yellow()
+            );
+            return out;
+        }
+
+        let name = rest.to_ascii_lowercase();
+        if name.is_empty() {
+            let _ = writeln!(
+                out,
+                "{} Usage: /agents {} <name>",
+                "Error:".bright_red(),
+                action
+            );
+            return out;
+        }
+        if !crate::agents::load_agents().iter().any(|a| a.name == name) {
+            let _ = writeln!(out, "{} Unknown agent '{}'", "Error:".bright_red(), rest);
+            return out;
+        }
+
+        let result = if action == "enable" {
+            crate::agents::enable(&name).map(|changed| (changed, "enabled"))
+        } else {
+            crate::agents::disable(&name).map(|changed| (changed, "disabled"))
+        };
+        match result {
+            Ok((true, verb)) => {
                 let _ = writeln!(
                     out,
-                    "{} Usage: /agents [list|show <name>|create <name>|edit <name>|delete <name>]",
-                    "Info:".bright_yellow()
+                    "{} Agent /{} {}",
+                    "\u{2713}".bright_green(),
+                    name.bright_cyan(),
+                    verb
                 );
-                Some(out)
             }
+            Ok((false, verb)) => {
+                let _ = writeln!(
+                    out,
+                    "{} Agent /{} was already {}",
+                    "\u{2139}".bright_blue(),
+                    name.bright_cyan(),
+                    verb
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+            }
+        }
+        out
+    }
+
+    fn show_agents(&mut self, args: &str) {
+        print!("{}", self.agents_manage(args));
+    }
+
+    /// Read-only check: does `input` match a user-defined or plugin markdown
+    /// command? Mirrors the matching in [`Self::try_user_command`] without any
+    /// side effects (no history injection, no printing). Used by the
+    /// agent-command resolver to honor precedence: user/plugin commands win over
+    /// a `/<name>` agent of the same name.
+    fn is_user_or_plugin_command(&self, input: &str) -> bool {
+        let input = input.trim();
+        let head = match input.find(char::is_whitespace) {
+            Some(i) => &input[..i],
+            None => input,
+        };
+        let cmd_name = head.strip_prefix('/').unwrap_or(head).to_lowercase();
+        if self.user_commands.iter().any(|c| c.name == cmd_name) {
+            return true;
+        }
+        plugins::resolve(&self.plugins, head).is_some()
+    }
+
+    /// Resolve a `/<name>` line into an [`AgentCommand`]. Precedence (checked in
+    /// order): a built-in command or unique prefix (`commands::parse` is `Some`)
+    /// is never an agent; a user/plugin markdown command is never an agent; only
+    /// then is `<name>` matched against the defined agents. A matching agent that
+    /// is disabled yields [`AgentCommand::Disabled`]; an enabled one yields
+    /// [`AgentCommand::Run`]. Anything else is [`AgentCommand::NotAgent`], so the
+    /// caller can fall through to the existing unknown-command handling.
+    fn resolve_agent_command(&self, input: &str) -> AgentCommand {
+        // Built-in (or unambiguous prefix) commands always win.
+        if commands::parse(input).is_some() {
+            return AgentCommand::NotAgent;
+        }
+        // User/plugin markdown commands win over agents of the same name.
+        if self.is_user_or_plugin_command(input) {
+            return AgentCommand::NotAgent;
+        }
+        let input = input.trim();
+        let (head, args) = match input.find(char::is_whitespace) {
+            Some(i) => (&input[..i], input[i..].trim()),
+            None => (input, ""),
+        };
+        let name = head.strip_prefix('/').unwrap_or(head).to_ascii_lowercase();
+        if name.is_empty() {
+            return AgentCommand::NotAgent;
+        }
+        match crate::agents::load_one(&name) {
+            Some(agent) if crate::agents::is_disabled(&agent.name) => {
+                AgentCommand::Disabled(agent.name)
+            }
+            Some(agent) => AgentCommand::Run(Box::new(agent), args.to_string()),
+            None => AgentCommand::NotAgent,
         }
     }
 
-    fn show_agents(&self, args: &str) {
-        match self.agents_manage(args) {
-            Some(text) => print!("{text}"),
-            None => {
-                // `edit <name>` on an existing agent: open the resolved file in
-                // the user's editor. This is the classic REPL, so running the
-                // editor inline on the real terminal is fine.
-                let name = args
-                    .trim()
-                    .split_once(char::is_whitespace)
-                    .map(|(_, tail)| tail.trim())
-                    .unwrap_or("");
-                let Some(path) = crate::agents::agent_path(name) else {
-                    eprintln!("{} invalid agent name '{}'", "Error:".bright_red(), name);
-                    return;
-                };
-                let editor = edit_cmd::resolve_editor();
-                match edit_cmd::spawn_editor_blocking(&editor, &path) {
-                    Ok(()) => println!(
-                        "{} Edited agent {}",
-                        "✓".bright_green(),
-                        name.to_ascii_lowercase().bright_cyan()
-                    ),
-                    Err(e) => eprintln!(
-                        "{} could not run editor ({}): {}",
-                        "Error:".bright_red(),
-                        editor,
-                        e
-                    ),
+    /// The disabled-agent notice, shared by the classic REPL and the TUI.
+    fn agent_disabled_message(name: &str) -> String {
+        format!("agent '{name}' is disabled — enable it with /agents enable {name}")
+    }
+
+    /// Run one dynamic `/<name>` agent turn: inject the agent's `prompt` as a
+    /// single-turn system message (with any trailing `args` as the user task),
+    /// honor the agent's `model:` override (best-effort, restored afterwards),
+    /// then drive one [`Self::agent_turn`]. Mirrors `/skills run`: the injected
+    /// system message is consumed for this turn only, and history is NOT cleared.
+    ///
+    /// Streams through whatever `self.ui` is currently installed, so the classic
+    /// REPL prints to the terminal and the TUI streams a live assistant block.
+    async fn run_agent_command(&mut self, agent: &crate::agents::AgentDef, args: &str) {
+        self.history.push(Message::text(
+            "system",
+            format!(
+                "{} Agent /{} (from {}):\n\n{}",
+                SINGLE_TURN_SYSTEM_TAG,
+                agent.name,
+                agent.path.display(),
+                agent.prompt
+            ),
+        ));
+        let args = args.trim();
+        if !args.is_empty() {
+            self.history.push(Message::text("user", args));
+        }
+
+        // Honor the agent's model override for the duration of this turn.
+        let prev_model = self.executor.get_model().to_string();
+        let mut switched = false;
+        if let Some(model) = &agent.model {
+            if !model.is_empty() && *model != prev_model {
+                match self.executor.switch_model(model.clone()).await {
+                    Ok(()) => switched = true,
+                    Err(e) => {
+                        self.ui.status(&format!(
+                            "could not switch to model '{model}' for agent /{}: {e} — staying on {prev_model}",
+                            agent.name
+                        ));
+                    }
                 }
             }
+        }
+
+        self.ui.status(&format!("Running agent /{}", agent.name));
+        self.journal.start_turn();
+        // Like /skills run, the "user message" is the injected system prompt, so
+        // snapshot the current history length as the turn boundary.
+        let turn_start = self.history.len();
+        if let Err(e) = self.agent_turn(turn_start).await {
+            self.ui.status(&format!("Error: {e}"));
+        }
+
+        // Restore the previous model (best-effort). switch_model only validates
+        // and sets the model; it does not clear history.
+        if switched {
+            let _ = self.executor.switch_model(prev_model).await;
         }
     }
 
@@ -7831,6 +7846,182 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn agent_command_resolution_respects_precedence() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut cli = new_test_cli();
+
+            // An agent whose name collides with a built-in (`/status`) must
+            // never shadow the built-in: the built-in command wins.
+            crate::agents::create("status", None, None, Some("shadow prompt\n"))
+                .expect("create status agent");
+            assert!(
+                matches!(cli.resolve_agent_command("/status"), AgentCommand::NotAgent),
+                "a built-in command name must not resolve as an agent"
+            );
+
+            // An enabled agent resolves to Run, carrying its trailing args.
+            crate::agents::create("reviewer", Some("Reviewer"), None, Some("review it\n"))
+                .expect("create reviewer");
+            match cli.resolve_agent_command("/reviewer summarize this") {
+                AgentCommand::Run(agent, args) => {
+                    assert_eq!(agent.name, "reviewer");
+                    assert_eq!(args, "summarize this");
+                }
+                other => panic!("expected Run, got {}", agent_kind(&other)),
+            }
+
+            // A user/plugin markdown command of the same name wins over the
+            // agent (precedence): register a fake user command `reviewer`.
+            cli.user_commands.push(crate::file_mentions::UserCommand {
+                name: "reviewer".to_string(),
+                body: "user cmd body".to_string(),
+                path: std::path::PathBuf::from("/tmp/reviewer.md"),
+            });
+            assert!(
+                matches!(
+                    cli.resolve_agent_command("/reviewer"),
+                    AgentCommand::NotAgent
+                ),
+                "a user/plugin command must win over an agent of the same name"
+            );
+            cli.user_commands.clear();
+
+            // A disabled agent reports Disabled (and is treated as handled).
+            crate::agents::disable("reviewer").expect("disable reviewer");
+            match cli.resolve_agent_command("/reviewer") {
+                AgentCommand::Disabled(name) => assert_eq!(name, "reviewer"),
+                other => panic!("expected Disabled, got {}", agent_kind(&other)),
+            }
+
+            // An unknown `/<name>` is not an agent — falls through to the
+            // normal unknown-command handling.
+            assert!(matches!(
+                cli.resolve_agent_command("/nonesuch"),
+                AgentCommand::NotAgent
+            ));
+        });
+    }
+
+    /// Small helper so the panic messages above name the variant we got.
+    fn agent_kind(a: &AgentCommand) -> &'static str {
+        match a {
+            AgentCommand::NotAgent => "NotAgent",
+            AgentCommand::Disabled(_) => "Disabled",
+            AgentCommand::Run(_, _) => "Run",
+        }
+    }
+
+    #[test]
+    fn agents_manage_list_shows_enable_disable_status() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut cli = new_test_cli();
+            crate::agents::create("alpha", Some("First"), Some("qwen3:8b"), Some("a\n"))
+                .expect("create alpha");
+            crate::agents::create("beta", Some("Second"), None, Some("b\n")).expect("create beta");
+            crate::agents::disable("beta").expect("disable beta");
+
+            let listing = strip_ansi(&cli.agents_manage("list"));
+            assert!(
+                listing.contains("alpha"),
+                "listing missing alpha: {listing}"
+            );
+            assert!(listing.contains("beta"), "listing missing beta: {listing}");
+            assert!(
+                listing.contains("[enabled]"),
+                "listing should mark alpha enabled: {listing}"
+            );
+            assert!(
+                listing.contains("[disabled]"),
+                "listing should mark beta disabled: {listing}"
+            );
+            assert!(
+                listing.contains("(model: qwen3:8b)"),
+                "listing should show the model annotation: {listing}"
+            );
+
+            // enable/disable subcommands mutate the store and report.
+            let out = strip_ansi(&cli.agents_manage("enable beta"));
+            assert!(out.contains("enabled"), "enable output: {out}");
+            assert!(!crate::agents::is_disabled("beta"));
+
+            let out = strip_ansi(&cli.agents_manage("disable alpha"));
+            assert!(out.contains("disabled"), "disable output: {out}");
+            assert!(crate::agents::is_disabled("alpha"));
+
+            // Unknown agent → clear error, no mutation.
+            let out = strip_ansi(&cli.agents_manage("disable ghost"));
+            assert!(out.contains("Unknown agent"), "unknown output: {out}");
+        });
+    }
+
+    #[test]
+    fn run_agent_command_restores_model_after_turn() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            // A Fake backend answers every turn with "hi" and reports
+            // `["qwen3:4b"]` as its model list. `switch_model` accepts any
+            // prefix of a listed model, so "qwen3" (prev) and "qwen3:4b" (agent
+            // override) are both valid — exercising a real switch AND restore.
+            let executor =
+                AIExecutor::with_backend(crate::llm::LlmBackend::Fake, "qwen3".to_string());
+            let mut cli = ChatCLI::new(
+                executor,
+                None,
+                Arc::new(Mutex::new(Permissions::default())),
+                Arc::new(AtomicBool::new(false)),
+                FileJournal::default(),
+            );
+
+            let agent = crate::agents::AgentDef {
+                name: "runner".to_string(),
+                description: "runs".to_string(),
+                model: Some("qwen3:4b".to_string()),
+                prompt: "you are runner".to_string(),
+                path: std::path::PathBuf::from("/tmp/runner.md"),
+            };
+
+            assert_eq!(cli.executor.get_model(), "qwen3");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(cli.run_agent_command(&agent, "do the task"));
+
+            // The model was switched for the turn but restored afterwards.
+            assert_eq!(
+                cli.executor.get_model(),
+                "qwen3",
+                "the previous model must be restored after an agent turn"
+            );
+            // The agent prompt is injected as a single-turn system message and
+            // consumed by the turn (SINGLE_TURN_SYSTEM_TAG messages are stripped
+            // after the model responds), so it must NOT linger in history.
+            assert!(
+                !cli.history
+                    .iter()
+                    .any(|m| m.role == "system" && m.content.starts_with(SINGLE_TURN_SYSTEM_TAG)),
+                "the single-turn agent system prompt must be consumed after the turn"
+            );
+            // The trailing args became a user message (kept in history) and the
+            // fake backend's assistant reply ("hi") streamed into history.
+            assert!(
+                cli.history
+                    .iter()
+                    .any(|m| m.role == "user" && m.content == "do the task"),
+                "trailing args should be injected as the user task"
+            );
+            assert!(
+                cli.history
+                    .iter()
+                    .any(|m| m.role == "assistant" && m.content.contains("hi")),
+                "the agent turn should have produced an assistant reply"
+            );
+        });
     }
 
     #[test]
