@@ -2662,22 +2662,40 @@ impl ChatCLI {
         );
     }
 
+    /// Renders the `/skills list` output (the read-only listing) as a String
+    /// so both the classic REPL (which prints it) and the TUI (which renders it
+    /// as a framed transcript block) share one byte-identical source. Mirrors
+    /// the historical `println!` layout exactly, including the leading/trailing
+    /// blank lines. The `run <name>` path is NOT captured here — it executes an
+    /// agent turn and stays on the normal dispatch path.
+    fn skills_output(&self, _args: &str) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "Skills:".bright_yellow().bold());
+        if self.skills.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {} No skills found in ~/.cubi/skills",
+                "ℹ".bright_blue()
+            );
+        } else {
+            for skill in &self.skills {
+                let _ = writeln!(
+                    out,
+                    "  {} - {}",
+                    skill.name.bright_cyan(),
+                    skill.description.bright_white()
+                );
+            }
+        }
+        let _ = writeln!(out);
+        out
+    }
+
     async fn handle_skills(&mut self, args: &str) {
         let trimmed = args.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
-            println!("\n{}", "Skills:".bright_yellow().bold());
-            if self.skills.is_empty() {
-                println!("  {} No skills found in ~/.cubi/skills", "ℹ".bright_blue());
-            } else {
-                for skill in &self.skills {
-                    println!(
-                        "  {} - {}",
-                        skill.name.bright_cyan(),
-                        skill.description.bright_white()
-                    );
-                }
-            }
-            println!();
+            print!("{}", self.skills_output(args));
             return;
         }
 
@@ -4720,20 +4738,31 @@ impl ChatCLI {
 
     /// `/agents` — list active background agent sessions (from the session
     /// store). Each session is a candidate "agent" worker.
-    fn show_agents(&self) {
-        println!("\n{}", "Agents / sessions:".bright_yellow().bold());
+    /// Renders the `/agents` listing as a String so the classic REPL and the
+    /// TUI share one byte-identical source. Mirrors the historical `println!`
+    /// layout exactly (leading/trailing blank lines included). The rare
+    /// `store.list()` error, historically an `eprintln!` to stderr, is folded
+    /// into the returned text so a caller can render it in-band.
+    fn agents_output(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "Agents / sessions:".bright_yellow().bold());
         let Some(store) = self.session_store.as_ref() else {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {} Sessions disabled (no home dir resolved).",
                 "ℹ".bright_blue()
             );
-            return;
+            return out;
         };
         match store.list() {
-            Ok(list) if list.is_empty() => println!("  {} No sessions yet.", "ℹ".bright_blue()),
+            Ok(list) if list.is_empty() => {
+                let _ = writeln!(out, "  {} No sessions yet.", "ℹ".bright_blue());
+            }
             Ok(list) => {
                 for s in list {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "  {} {} ({} msgs)",
                         "•".bright_cyan(),
                         s.id.bright_cyan(),
@@ -4741,9 +4770,16 @@ impl ChatCLI {
                     );
                 }
             }
-            Err(e) => eprintln!("  {} {}", "✗".bright_red(), e),
+            Err(e) => {
+                let _ = writeln!(out, "  {} {}", "✗".bright_red(), e);
+            }
         }
-        println!();
+        let _ = writeln!(out);
+        out
+    }
+
+    fn show_agents(&self) {
+        print!("{}", self.agents_output());
     }
 
     /// `/teleport <path>` — change cwd to a trusted directory.
@@ -5211,22 +5247,39 @@ impl ChatCLI {
         }
     }
 
-    fn show_mcp_status(&self) {
-        println!("\n{}", "MCP status:".bright_yellow().bold());
+    /// Renders the `/mcp` status as a String so the classic REPL and the TUI
+    /// share one byte-identical source. Mirrors the historical `println!`
+    /// layout exactly (leading/trailing blank lines included).
+    fn mcp_output(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "MCP status:".bright_yellow().bold());
         match &self.mcp_manager {
             Some(m) => {
                 let tools = m.list_tools();
-                println!("  {} {} tool(s) available", "•".bright_cyan(), tools.len());
+                let _ = writeln!(
+                    out,
+                    "  {} {} tool(s) available",
+                    "•".bright_cyan(),
+                    tools.len()
+                );
                 for t in tools.iter().take(20) {
-                    println!("    - {}", t.name.bright_cyan());
+                    let _ = writeln!(out, "    - {}", t.name.bright_cyan());
                 }
                 if tools.len() > 20 {
-                    println!("    … {} more (see /mcp-tools)", tools.len() - 20);
+                    let _ = writeln!(out, "    … {} more (see /mcp-tools)", tools.len() - 20);
                 }
             }
-            None => println!("  {} No MCP manager loaded.", "ℹ".bright_blue()),
+            None => {
+                let _ = writeln!(out, "  {} No MCP manager loaded.", "ℹ".bright_blue());
+            }
         }
-        println!();
+        let _ = writeln!(out);
+        out
+    }
+
+    fn show_mcp_status(&self) {
+        print!("{}", self.mcp_output());
     }
 
     fn show_plugins(&self) {

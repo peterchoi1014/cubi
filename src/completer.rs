@@ -207,6 +207,21 @@ fn arg_suggestions(
     // Resolve the head to a canonical command name so prefix-typed
     // commands (`/sav<Tab>`) still get arg completion.
     let canonical = canonical_command(head);
+    // Managed commands (those carrying a subcommand vocabulary in the
+    // registry) suggest their subcommands at the first argument position.
+    if *arg_pos == 0 {
+        if let Some((cmd, _)) = commands::parse(head) {
+            let subs = commands::subcommands(cmd);
+            if !subs.is_empty() {
+                let pool = subs.iter().map(|s| s.to_string());
+                return if word.is_empty() {
+                    pool.collect()
+                } else {
+                    pool.filter(|s| s.starts_with(word)).collect()
+                };
+            }
+        }
+    }
     let pool: Vec<String> = match canonical.as_deref() {
         Some("/resume") | Some("/load") | Some("/save") if *arg_pos == 0 => helper.sessions(),
         Some("/plugin") if *arg_pos == 0 => vec!["list".to_string()],
@@ -321,6 +336,64 @@ mod tests {
     fn plugin_second_position_returns_no_suggestions() {
         // arg_pos == 1 → no canned suggestions for `/plugin`.
         let out = complete("/plugin list ", 13);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn mcp_first_arg_suggests_subcommands() {
+        let out = complete("/mcp ", 5);
+        assert_eq!(
+            out,
+            vec![
+                "list".to_string(),
+                "enable".to_string(),
+                "disable".to_string(),
+                "add".to_string(),
+                "remove".to_string(),
+                "reload".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_first_arg_filters_by_word_prefix() {
+        let out = complete("/mcp e", 6);
+        assert_eq!(out, vec!["enable".to_string()]);
+        let out = complete("/mcp r", 6);
+        assert_eq!(out, vec!["remove".to_string(), "reload".to_string()]);
+    }
+
+    #[test]
+    fn skills_first_arg_suggests_subcommands() {
+        let out = complete("/skills ", 8);
+        assert_eq!(
+            out,
+            vec![
+                "list".to_string(),
+                "run".to_string(),
+                "enable".to_string(),
+                "disable".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_first_arg_suggests_subcommands() {
+        let out = complete("/agents d", 9);
+        assert_eq!(out, vec!["delete".to_string()]);
+    }
+
+    #[test]
+    fn managed_command_second_position_returns_no_suggestions() {
+        // arg_pos == 1 → subcommand suggestions do not fire.
+        let out = complete("/mcp enable ", 12);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unmanaged_command_has_no_subcommand_suggestions() {
+        // `/status` carries no subcommand vocabulary.
+        let out = complete("/status ", 8);
         assert!(out.is_empty());
     }
 

@@ -159,6 +159,11 @@ pub struct SlashCommandSpec {
     pub help: &'static str,
     /// Tag matched by `ChatCLI::handle_command`.
     pub cmd: Cmd,
+    /// The command's subcommand vocabulary, in display order. The FIRST
+    /// entry is the default subcommand (used when the user types the bare
+    /// command). Empty for commands that take no subcommands. This is the
+    /// single source of truth consumed by subcommand autocompletion.
+    pub subcommands: &'static [&'static str],
 }
 
 /// Single source of truth for the slash-command surface. Order here is the
@@ -170,384 +175,448 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/help",
         help: "Show this help message",
         cmd: Cmd::Help,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/status",
         usage: "/status",
         help: "Show session status",
         cmd: Cmd::Status,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/stats",
         usage: "/stats",
         help: "Show session statistics",
         cmd: Cmd::Stats,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/usage",
         usage: "/usage [footer on|off]",
         help: "Per-turn token usage + cost table",
         cmd: Cmd::Usage,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/plan",
         usage: "/plan",
         help: "Toggle plan mode (read-only)",
         cmd: Cmd::Plan,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/init",
         usage: "/init",
         help: "Create starter CUBI.md",
         cmd: Cmd::Init,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memory",
         usage: "/memory",
         help: "Show project memory (CUBI.md)",
         cmd: Cmd::Memory,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memory-reload",
         usage: "/memory-reload",
         help: "Re-read CUBI.md from disk",
         cmd: Cmd::MemoryReload,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/todos",
         usage: "/todos",
         help: "List todos",
         cmd: Cmd::Todos,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/todo-add",
         usage: "/todo-add <text>",
         help: "Add a todo",
         cmd: Cmd::TodoAdd,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/todo-done",
         usage: "/todo-done <n>",
         help: "Mark todo n as done",
         cmd: Cmd::TodoDone,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/todo-rm",
         usage: "/todo-rm <n>",
         help: "Remove todo n",
         cmd: Cmd::TodoRm,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/todo-clear",
         usage: "/todo-clear",
         help: "Clear all todos",
         cmd: Cmd::TodoClear,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/ask",
         usage: "/ask <q>",
         help: "Record a clarifying question (single-turn)",
         cmd: Cmd::Ask,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/clear",
         usage: "/clear",
         help: "Clear conversation history",
         cmd: Cmd::Clear,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/history",
         usage: "/history [next|prev|<N>]",
         help: "Page conversation history; /history N trims",
         cmd: Cmd::History,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/export",
         usage: "/export [-f] <f.md>",
         help: "Export conversation as Markdown",
         cmd: Cmd::Export,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/save",
         usage: "/save [-f] <f.json>",
         help: "Save conversation (-f overwrites)",
         cmd: Cmd::Save,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/load",
         usage: "/load <f.json>",
         help: "Load conversation",
         cmd: Cmd::Load,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/batch",
         usage: "/batch <f>",
         help: "Process batch file",
         cmd: Cmd::Batch,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/sessions",
         usage: "/sessions",
         help: "List auto-saved sessions for this project",
         cmd: Cmd::Sessions,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/resume",
         usage: "/resume [id]",
         help: "Resume the latest (or named) auto-saved session",
         cmd: Cmd::Resume,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/fork",
         usage: "/fork",
         help: "Branch the current session at the last completed turn and continue in the fork",
         cmd: Cmd::Fork,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/repomap",
         usage: "/repomap [scope]",
         help: "Print a compact outline of the project's files and top-level symbols",
         cmd: Cmd::Repomap,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/trust",
         usage: "/trust [revoke]",
         help: "Trust this project (or pass `revoke` to undo)",
         cmd: Cmd::Trust,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/diff",
         usage: "/diff [path]",
         help: "Show `git diff` for the working tree",
         cmd: Cmd::Diff,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/commit",
         usage: "/commit [-a] <msg>",
         help: "Run git commit (-a stages tracked files first)",
         cmd: Cmd::Commit,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/commit-push-pr",
         usage: "/commit-push-pr [-a] <msg>",
         help: "Commit, push, and print a GitHub PR URL",
         cmd: Cmd::CommitPushPr,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/undo",
         usage: "/undo [hard]",
         help: "Undo the latest commit (or hard reset HEAD~1)",
         cmd: Cmd::Undo,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/review",
         usage: "/review",
         help: "Ask the model to review the current `git diff`",
         cmd: Cmd::Review,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/worktree",
         usage: "/worktree [list|add <path> [branch]|remove <path>]",
         help: "Manage git worktrees (add auto-trusts the new path)",
         cmd: Cmd::Worktree,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/branch",
         usage: "/branch [list|create <name>|switch <name>]",
         help: "List, create, or switch git branches",
         cmd: Cmd::Branch,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/tag",
         usage: "/tag [list|<name>|create <name> [-m <msg>]]",
         help: "List or create git tags",
         cmd: Cmd::Tag,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/files",
         usage: "/files",
         help: "List files tracked by git in this project",
         cmd: Cmd::Files,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/add-dir",
         usage: "/add-dir <path>",
         help: "Trust an additional directory for write/exec tools",
         cmd: Cmd::AddDir,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memdir",
         usage: "/memdir",
         help: "List cross-session persistent memories",
         cmd: Cmd::Memdir,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memdir-add",
         usage: "/memdir-add <text>",
         help: "Add a persistent memory",
         cmd: Cmd::MemdirAdd,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memdir-rm",
         usage: "/memdir-rm <n>",
         help: "Remove memory by index",
         cmd: Cmd::MemdirRm,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/memdir-clear",
         usage: "/memdir-clear",
         help: "Clear all persistent memories",
         cmd: Cmd::MemdirClear,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/rewind",
         usage: "/rewind [n]",
         help: "Remove the last n exchanges (default 1)",
         cmd: Cmd::Rewind,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/compact",
         usage: "/compact [preview]",
         help: "Summarize old turns (preview = dry-run, no mutation)",
         cmd: Cmd::Compact,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/pin",
         usage: "/pin <text>",
         help: "Pin text as a persistent system note that survives /compact",
         cmd: Cmd::Pin,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/pins",
         usage: "/pins",
         help: "List pinned items with 1-based indices",
         cmd: Cmd::Pins,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/unpin",
         usage: "/unpin <idx>",
         help: "Remove the pinned item at the given 1-based index",
         cmd: Cmd::Unpin,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/skills",
-        usage: "/skills [list|run <name>]",
+        usage: "/skills [list|run <name>|enable <name>|disable <name>]",
         help: "List or run reusable Markdown skills",
         cmd: Cmd::Skills,
+        subcommands: &["list", "run", "enable", "disable"],
     },
     SlashCommandSpec {
         name: "/hooks",
         usage: "/hooks [list | add <event> <cmd> | rm <n>]",
         help: "List, add, or remove lifecycle hooks",
         cmd: Cmd::Hooks,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-tools",
         usage: "/mcp-tools",
         help: "List available MCP tools",
         cmd: Cmd::McpTools,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-call",
         usage: "/mcp-call <t> <a>",
         help: "Call MCP tool",
         cmd: Cmd::McpCall,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-reload",
         usage: "/mcp-reload",
         help: "Reload MCP configuration",
         cmd: Cmd::McpReload,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-resources",
         usage: "/mcp-resources [server]",
         help: "List MCP resources",
         cmd: Cmd::McpResources,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-read",
         usage: "/mcp-read <uri>",
         help: "Read an MCP resource by URI",
         cmd: Cmd::McpRead,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-search",
         usage: "/mcp-search [<query>]",
         help: "Search the embedded MCP registry",
         cmd: Cmd::McpSearch,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-install",
         usage: "/mcp-install <name> [--force] [--env K=V]...",
         help: "Install an MCP server from the registry",
         cmd: Cmd::McpInstall,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-uninstall",
         usage: "/mcp-uninstall <name>",
         help: "Remove an MCP server from ~/.cubi/mcp.json",
         cmd: Cmd::McpUninstall,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/model",
         usage: "/model [name]",
         help: "Show or switch the active model",
         cmd: Cmd::Model,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/version",
         usage: "/version",
         help: "Show version",
         cmd: Cmd::Version,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/doctor",
         usage: "/doctor",
         help: "Sanity-check the runtime (Ollama, model, config dir, git)",
         cmd: Cmd::Doctor,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/env",
         usage: "/env",
         help: "Show resolved runtime environment",
         cmd: Cmd::Env,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/config",
         usage: "/config",
         help: "Show contents of ~/.cubi/config.json",
         cmd: Cmd::Config,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/permissions",
         usage: "/permissions",
         help: "List trusted directories and gated built-in tools",
         cmd: Cmd::Permissions,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/tool-allow",
         usage: "/tool-allow <name>",
         help: "Allow a specific tool in this trust store",
         cmd: Cmd::ToolAllow,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/tool-deny",
         usage: "/tool-deny <name>",
         help: "Deny a specific tool in this trust store",
         cmd: Cmd::ToolDeny,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/bug",
         usage: "/bug [summary]",
         help: "Print a pre-filled GitHub bug URL with runtime info",
         cmd: Cmd::Bug,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/issue",
         usage: "/issue [title]",
         help: "Print a pre-filled GitHub feature request URL",
         cmd: Cmd::Issue,
+        subcommands: &[],
     },
     // -- New in 0.2.0 --
     SlashCommandSpec {
@@ -555,282 +624,329 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
         usage: "/init-verifiers",
         help: "Detect project verifier commands (build/test/lint) and print/save them",
         cmd: Cmd::InitVerifiers,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/pr_comments",
         usage: "/pr_comments [pr#]",
         help: "Show PR review comments via `gh pr view --comments`",
         cmd: Cmd::PrComments,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/security-review",
         usage: "/security-review",
         help: "Ask the model to security-review the current `git diff`",
         cmd: Cmd::SecurityReview,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/autofix-pr",
         usage: "/autofix-pr [pr#]",
         help: "Fetch PR review comments and ask the model to propose fixes",
         cmd: Cmd::AutofixPr,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/agents",
-        usage: "/agents",
+        usage: "/agents [list|show <id>|create|edit <id>|delete <id>]",
         help: "List background/sub-agent sessions",
         cmd: Cmd::Agents,
+        subcommands: &["list", "show", "create", "edit", "delete"],
     },
     SlashCommandSpec {
         name: "/tasks",
         usage: "/tasks",
         help: "Alias for /todos (per-project task list)",
         cmd: Cmd::Tasks,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/teleport",
         usage: "/teleport <path>",
         help: "Change cwd to a trusted directory (use /trust to approve first)",
         cmd: Cmd::Teleport,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/passes",
         usage: "/passes [n]",
         help: "Show or set the agent-loop max passes (1..=12)",
         cmd: Cmd::Passes,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/effort",
         usage: "/effort [low|medium|high]",
         help: "Show or set agent effort (maps to agent-loop pass budget)",
         cmd: Cmd::Effort,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/theme",
         usage: "/theme [auto|light|dark]",
         help: "Show or set the colored-output theme",
         cmd: Cmd::Theme,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/color",
         usage: "/color [on|off]",
         help: "Toggle colored output for this session",
         cmd: Cmd::Color,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/output-style",
         usage: "/output-style [concise|markdown|explanatory]",
         help: "Show or set the assistant output style",
         cmd: Cmd::OutputStyle,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/statusline",
         usage: "/statusline",
         help: "Show the contents of the status line",
         cmd: Cmd::Statusline,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/keybindings",
         usage: "/keybindings",
         help: "Show the active rustyline keybindings",
         cmd: Cmd::Keybindings,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/vim",
         usage: "/vim [on|off]",
         help: "Toggle vim-style readline editing",
         cmd: Cmd::Vim,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/login",
         usage: "/login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
         help: "Store an OAuth token for a provider (persisted in ~/.cubi/oauth.json)",
         cmd: Cmd::Login,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/logout",
         usage: "/logout [provider]",
         help: "Forget a provider API key for this process and remove its persisted OAuth token",
         cmd: Cmd::Logout,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/oauth-refresh",
         usage: "/oauth-refresh [provider]",
         help: "Load stored OAuth tokens into this process and show token status",
         cmd: Cmd::OauthRefresh,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/privacy-settings",
         usage: "/privacy-settings [telemetry on|off]",
         help: "Show or set local privacy preferences",
         cmd: Cmd::PrivacySettings,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp",
-        usage: "/mcp",
+        usage: "/mcp [list|enable <name>|disable <name>|add|remove <name>|reload]",
         help: "Show overall MCP status (servers, tools, resources)",
         cmd: Cmd::Mcp,
+        subcommands: &["list", "enable", "disable", "add", "remove", "reload"],
     },
     SlashCommandSpec {
         name: "/plugin",
         usage: "/plugin [list]",
         help: "List plugins discovered in ~/.cubi/plugins/",
         cmd: Cmd::Plugin,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/reload-plugins",
         usage: "/reload-plugins",
         help: "Rescan the plugins directory",
         cmd: Cmd::ReloadPlugins,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/cost",
         usage: "/cost",
         help: "Show estimated session cost (always $0 for local Ollama)",
         cmd: Cmd::Cost,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/perf-issue",
         usage: "/perf-issue [summary]",
         help: "Print a pre-filled GitHub perf-issue URL with runtime info",
         cmd: Cmd::PerfIssue,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/heapdump",
         usage: "/heapdump",
         help: "Print process resident-set / heap info if available",
         cmd: Cmd::Heapdump,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/debug-tool-call",
         usage: "/debug-tool-call [on|off]",
         help: "Toggle verbose tool-call debug logging",
         cmd: Cmd::DebugToolCall,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/upgrade",
         usage: "/upgrade",
         help: "Print upgrade instructions for cubi",
         cmd: Cmd::Upgrade,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/install",
         usage: "/install",
         help: "Print install instructions for cubi + Ollama",
         cmd: Cmd::Install,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/install-github-app",
         usage: "/install-github-app",
         help: "Show the GitHub-app install URL (placeholder)",
         cmd: Cmd::InstallGithubApp,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/install-slack-app",
         usage: "/install-slack-app",
         help: "Show the Slack-app install URL (placeholder)",
         cmd: Cmd::InstallSlackApp,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/sandbox-toggle",
         usage: "/sandbox-toggle",
         help: "Toggle strict-sandbox mode (alias for /plan)",
         cmd: Cmd::SandboxToggle,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/reset-limits",
         usage: "/reset-limits",
         help: "Clear the in-process rate-limit / retry backoff counters",
         cmd: Cmd::ResetLimits,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/share",
         usage: "/share <file.md>",
         help: "Export this conversation as a shareable Markdown file",
         cmd: Cmd::Share,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/copy",
         usage: "/copy",
         help: "Copy the last assistant message to the system clipboard",
         cmd: Cmd::Copy,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/feedback",
         usage: "/feedback [text]",
         help: "Print the feedback URL (pre-fills text if provided)",
         cmd: Cmd::Feedback,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/release-notes",
         usage: "/release-notes",
         help: "Print release notes for the current version",
         cmd: Cmd::ReleaseNotes,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/stickers",
         usage: "/stickers",
         help: "Print a friendly ASCII sticker sheet",
         cmd: Cmd::Stickers,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/settings-sync",
         usage: "/settings-sync [init <remote>|push [msg]|pull|status]",
         help: "Sync ~/.cubi/ via git (cross-machine config + memdir + skills)",
         cmd: Cmd::SettingsSync,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/policy",
         usage: "/policy",
         help: "Show the active admin-managed policy overlay (read-only)",
         cmd: Cmd::Policy,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/tip",
         usage: "/tip",
         help: "Show a quick tip about using cubi",
         cmd: Cmd::Tip,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/mcp-prompts",
         usage: "/mcp-prompts [server[:prompt]]",
         help: "List MCP prompts (or fetch a specific one)",
         cmd: Cmd::McpPrompts,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/stream",
         usage: "/stream [on|off]",
         help: "Toggle live token streaming (default: on)",
         cmd: Cmd::Stream,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/markdown",
         usage: "/markdown [on|off]",
         help: "Toggle markdown rendering (applies when streaming is off)",
         cmd: Cmd::Markdown,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/stats-footer",
         usage: "/stats-footer [on|off]",
         help: "Toggle per-turn usage footer (default: off)",
         cmd: Cmd::StatsFooter,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/edit",
         usage: "/edit [seed text]",
         help: "Open $EDITOR to compose the next prompt",
         cmd: Cmd::Edit,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/quit",
         usage: "/quit",
         help: "Exit the chat",
         cmd: Cmd::Quit,
+        subcommands: &[],
     },
     SlashCommandSpec {
         name: "/consensus",
         usage: "/consensus <strategy> <model1,model2,...> [tools|--tools] [isolate|--isolate] [concurrency:<n>|c:<n>] [--max-steps <n>] [--isolated-time-cap-secs <seconds>] [judge:<model>] <goal>",
         help: "Run N-model consensus; --isolate uses tool worktrees (trusted clean cwd, /plan off), c:<n> capped at 2",
         cmd: Cmd::Consensus,
+        subcommands: &[],
     },
 ];
 
@@ -924,6 +1040,24 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// `/help <name>` is unambiguous.
 pub fn find_command(name: &str) -> Option<&'static SlashCommandSpec> {
     COMMANDS.iter().find(|s| s.name == name)
+}
+
+/// Returns the subcommand vocabulary for `cmd` (in display order, first entry
+/// is the default). Empty for commands that take no subcommands or that are
+/// not present in the registry.
+pub fn subcommands(cmd: Cmd) -> &'static [&'static str] {
+    COMMANDS
+        .iter()
+        .find(|s| s.cmd == cmd)
+        .map(|s| s.subcommands)
+        .unwrap_or(&[])
+}
+
+/// Returns the default (first) subcommand for `cmd`, or `None` when the
+/// command has no subcommand vocabulary.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn default_subcommand(cmd: Cmd) -> Option<&'static str> {
+    subcommands(cmd).first().copied()
 }
 
 /// Parses an input line that starts with `/` into a `(Cmd, args)` pair.
@@ -1134,5 +1268,60 @@ mod tests {
         assert!(spec.usage.contains("--isolated-time-cap-secs"));
         assert!(spec.help.contains("tool worktrees"));
         assert!(spec.help.contains("c:<n> capped at 2"));
+    }
+
+    #[test]
+    fn subcommands_expose_managed_vocab() {
+        assert_eq!(
+            subcommands(Cmd::Skills),
+            &["list", "run", "enable", "disable"]
+        );
+        assert_eq!(
+            subcommands(Cmd::Agents),
+            &["list", "show", "create", "edit", "delete"]
+        );
+        assert_eq!(
+            subcommands(Cmd::Mcp),
+            &["list", "enable", "disable", "add", "remove", "reload"]
+        );
+    }
+
+    #[test]
+    fn default_subcommand_is_first_entry() {
+        assert_eq!(default_subcommand(Cmd::Skills), Some("list"));
+        assert_eq!(default_subcommand(Cmd::Agents), Some("list"));
+        assert_eq!(default_subcommand(Cmd::Mcp), Some("list"));
+    }
+
+    #[test]
+    fn commands_without_subcommands_are_empty() {
+        assert!(subcommands(Cmd::Help).is_empty());
+        assert_eq!(default_subcommand(Cmd::Help), None);
+        // A representative sampling of unmanaged commands.
+        assert!(subcommands(Cmd::Quit).is_empty());
+        assert!(subcommands(Cmd::Status).is_empty());
+    }
+
+    #[test]
+    fn only_the_three_managed_commands_carry_a_vocab() {
+        let with_vocab: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|s| !s.subcommands.is_empty())
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(with_vocab, vec!["/skills", "/agents", "/mcp"]);
+    }
+
+    #[test]
+    fn managed_usage_strings_reflect_new_vocab() {
+        let skills = find_command("/skills").expect("registered");
+        assert!(skills.usage.contains("enable <name>"));
+        assert!(skills.usage.contains("disable <name>"));
+        let agents = find_command("/agents").expect("registered");
+        assert!(agents.usage.contains("show <id>"));
+        assert!(agents.usage.contains("delete <id>"));
+        let mcp = find_command("/mcp").expect("registered");
+        assert!(mcp.usage.contains("reload"));
+        assert!(mcp.usage.contains("enable <name>"));
     }
 }

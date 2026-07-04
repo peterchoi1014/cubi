@@ -438,6 +438,12 @@ impl AppState {
                 self.complete_slash(word_end);
                 return;
             }
+            // Past the command name: for the managed commands (those with a
+            // subcommand vocabulary) complete the first argument word against
+            // that vocabulary.
+            if self.complete_subcommand(word_end) {
+                return;
+            }
         }
         // `@file` mention: the token containing the cursor starts with '@'.
         let (start, end) = self.token_bounds();
@@ -501,6 +507,79 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Complete the first argument word (the *subcommand*) for a managed
+    /// command whose head spans `0..word_end`. Returns `true` when it handled
+    /// the completion (so the caller stops), `false` to fall through to `@file`
+    /// completion.
+    ///
+    /// Behaviour: an empty partial (e.g. `/skills `) inserts the DEFAULT
+    /// subcommand; a unique prefix match is replaced and given a trailing
+    /// space; multiple matches extend to their longest common prefix.
+    ///
+    /// Only fires when the cursor sits within the first argument word; a third
+    /// token or later is left untouched. UTF-8 / byte safe throughout.
+    fn complete_subcommand(&mut self, word_end: usize) -> bool {
+        // Resolve the head to a command with a subcommand vocabulary. Prefix
+        // heads (`/mc`) resolve via the parser too.
+        let head = &self.composer[..word_end];
+        let Some((cmd, _)) = crate::commands::parse(head) else {
+            return false;
+        };
+        let subs = crate::commands::subcommands(cmd);
+        if subs.is_empty() {
+            return false;
+        }
+
+        // Byte bounds of the first argument word (skipping the whitespace that
+        // separates it from the command name).
+        let rest = &self.composer[word_end..];
+        let ws_len = rest.len() - rest.trim_start().len();
+        let sub_start = word_end + ws_len;
+        let after = &self.composer[sub_start..];
+        let sub_end = after
+            .find(char::is_whitespace)
+            .map(|i| sub_start + i)
+            .unwrap_or(self.composer.len());
+
+        // Only complete when the cursor is within the first argument word.
+        if self.cursor < sub_start || self.cursor > sub_end {
+            return false;
+        }
+
+        let word = self.composer[sub_start..sub_end].to_string();
+        if word.is_empty() {
+            // Bare command + space: insert the default (first) subcommand.
+            let default = subs[0];
+            self.replace_range(sub_start, sub_end, &format!("{default} "));
+            return true;
+        }
+
+        let matches: Vec<&&str> = subs.iter().filter(|s| s.starts_with(&word)).collect();
+        match matches.as_slice() {
+            [] => {}
+            [only] => {
+                let followed_by_space = self.composer[sub_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace);
+                let replacement = if followed_by_space {
+                    (**only).to_string()
+                } else {
+                    format!("{only} ")
+                };
+                self.replace_range(sub_start, sub_end, &replacement);
+            }
+            many => {
+                let names: Vec<&str> = many.iter().map(|s| **s).collect();
+                let common = common_prefix(&names);
+                if common.len() > word.len() {
+                    self.replace_range(sub_start, sub_end, &common);
+                }
+            }
+        }
+        true
     }
 
     /// Complete the `@file` token spanning `start..end` against the filesystem.
@@ -1203,6 +1282,60 @@ mod tests {
         let mut s = typed(&format!("@{base}/sub"));
         s.complete();
         assert_eq!(s.composer(), format!("@{base}/subdir/"));
+    }
+
+    #[test]
+    fn complete_subcommand_unique_prefix_appends_space() {
+        // `/mcp e` uniquely matches `enable`.
+        let mut s = typed("/mcp e");
+        s.complete();
+        assert_eq!(s.composer(), "/mcp enable ");
+        assert_eq!(s.cursor(), s.composer().len());
+    }
+
+    #[test]
+    fn complete_subcommand_empty_partial_inserts_default() {
+        // `/skills ` (trailing space, empty subcommand) inserts the default.
+        let mut s = typed("/skills ");
+        s.complete();
+        assert_eq!(s.composer(), "/skills list ");
+        assert_eq!(s.cursor(), s.composer().len());
+    }
+
+    #[test]
+    fn complete_subcommand_ambiguous_extends_common_prefix() {
+        // `/mcp r` matches both `remove` and `reload` → extend to `re`, no
+        // trailing space and no arbitrary pick.
+        let mut s = typed("/mcp r");
+        s.complete();
+        assert_eq!(s.composer(), "/mcp re");
+        assert!(!s.composer().ends_with(' '));
+    }
+
+    #[test]
+    fn complete_subcommand_unmanaged_command_is_unaffected() {
+        // `/help` carries no subcommand vocabulary; a trailing-space Tab must
+        // not synthesize a subcommand (and the `@file` path is a no-op here).
+        let mut s = typed("/help ");
+        s.complete();
+        assert_eq!(s.composer(), "/help ");
+    }
+
+    #[test]
+    fn complete_subcommand_no_match_is_noop() {
+        // `/mcp zz` matches no subcommand → composer unchanged.
+        let mut s = typed("/mcp zz");
+        s.complete();
+        assert_eq!(s.composer(), "/mcp zz");
+    }
+
+    #[test]
+    fn complete_subcommand_does_not_touch_second_argument() {
+        // Cursor in the SECOND arg word (`foo`) → subcommand completion does
+        // not fire, leaving the line untouched.
+        let mut s = typed("/mcp enable foo");
+        s.complete();
+        assert_eq!(s.composer(), "/mcp enable foo");
     }
 
     // --- Input-history recall ---------------------------------------------
