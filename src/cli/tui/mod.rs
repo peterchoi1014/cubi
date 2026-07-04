@@ -35,7 +35,7 @@ use crate::cli::ui_sink::RenderEvent;
 use crate::commands::{self, Cmd};
 use anyhow::{Context, Result};
 use app::AppState;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -271,6 +271,22 @@ where
                             event::Action::None => {}
                         }
                     }
+                    // Mouse wheel → scroll the transcript. With mouse capture
+                    // enabled the wheel arrives here (not as Up/Down keys), so
+                    // keyboard arrows can keep driving history recall. Mirror
+                    // the `Action::ScrollUp`/`ScrollDown` handlers; ignore all
+                    // other mouse kinds (clicks/drags) so they don't interfere.
+                    Some(Ok(Event::Mouse(m))) => match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            state.scroll_up(3);
+                            redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            state.scroll_down(3);
+                            redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                        }
+                        _ => {}
+                    },
                     // Resize / focus / paste etc: repaint against current size.
                     Some(Ok(_)) => {
                         redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;

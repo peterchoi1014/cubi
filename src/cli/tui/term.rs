@@ -9,6 +9,7 @@
 //! clean screen) and the subsequent unwinding `Drop` becomes a no-op.
 
 use crossterm::cursor::Show;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,13 +18,16 @@ use std::io::{self, Stdout, Write, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// DECSET 1007 (xterm "Alternate Scroll"): while the alternate screen is
-/// active, the terminal translates mouse-wheel motion into arrow-key presses
-/// instead of sending mouse events. This lets the wheel scroll the transcript
-/// (we map Up/Down to scroll) WITHOUT capturing the mouse, so the terminal's
-/// native click-drag text selection and copy keep working.
-const ENABLE_ALT_SCROLL: &str = "\x1b[?1007h";
-const DISABLE_ALT_SCROLL: &str = "\x1b[?1007l";
+// Mouse capture (crossterm `EnableMouseCapture`/`DisableMouseCapture`, i.e. the
+// xterm DECSET modes ?1000/?1002/?1003 + SGR ?1006) is enabled while the
+// alternate screen is active so the mouse WHEEL is delivered as distinct
+// `Event::Mouse(MouseEventKind::ScrollUp/ScrollDown)` events. The event loop
+// maps those to transcript scrolling, while the keyboard arrow keys stay as
+// `KeyCode::Up/Down` and keep driving input-history recall. We deliberately do
+// NOT enable alternate-scroll (?1007): with mouse capture on it is redundant
+// and would translate the wheel into arrow keys again, re-triggering the
+// history-recall bug. The tradeoff is that native click-drag text selection
+// now requires holding Shift/Option.
 
 /// Run `restore` at most once, guarded by `done`. Returns `true` iff this call
 /// actually executed the closure (i.e. it had not run before). Kept generic
@@ -42,8 +46,9 @@ pub(super) fn run_once(done: &AtomicBool, restore: impl FnOnce()) -> bool {
 fn real_restore() {
     let _ = disable_raw_mode();
     let mut out = stdout();
-    let _ = out.write_all(DISABLE_ALT_SCROLL.as_bytes());
-    let _ = execute!(out, LeaveAlternateScreen, Show);
+    // Disable mouse capture BEFORE leaving the alternate screen so the user's
+    // normal terminal is never left in mouse-capture mode.
+    let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, Show);
 }
 
 /// Owns the "we entered raw mode + alt screen" state for the lifetime of a
@@ -61,12 +66,12 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(e);
         }
-        // Request alternate-scroll mode so the wheel scrolls via arrow keys
-        // without capturing the mouse (preserving native selection/copy).
-        // Best-effort: terminals that don't support it simply ignore it.
-        let mut out = stdout();
-        let _ = out.write_all(ENABLE_ALT_SCROLL.as_bytes());
-        let _ = out.flush();
+        // Enable mouse capture so the wheel arrives as `Event::Mouse` scroll
+        // events (mapped to transcript scrolling) while keyboard arrows keep
+        // driving history recall. Best-effort: terminals that don't support it
+        // simply ignore the request.
+        let _ = execute!(stdout(), EnableMouseCapture);
+        let _ = stdout().flush();
         Ok(Self {
             done: Arc::new(AtomicBool::new(false)),
         })
@@ -95,19 +100,19 @@ impl TerminalGuard {
     }
 
     /// Re-enter the TUI after a suspended command: re-enable raw mode, re-enter
-    /// the alternate screen, and re-request alternate-scroll. Crucially this
-    /// RESETS the shared `done` flag to `false` so a later `Drop`/panic-hook
-    /// restore (or a subsequent `suspend`) still fires — preserving the
-    /// single-guard / single-flag invariant across any number of commands.
+    /// the alternate screen, and re-enable mouse capture. Crucially this RESETS
+    /// the shared `done` flag to `false` so a later `Drop`/panic-hook restore
+    /// (or a subsequent `suspend`) still fires — preserving the single-guard /
+    /// single-flag invariant across any number of commands.
     pub(super) fn re_enter(&self) -> io::Result<()> {
         enable_raw_mode()?;
         if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(e);
         }
-        let mut out = stdout();
-        let _ = out.write_all(ENABLE_ALT_SCROLL.as_bytes());
-        let _ = out.flush();
+        // Re-arm mouse capture so the wheel keeps scrolling after resume.
+        let _ = execute!(stdout(), EnableMouseCapture);
+        let _ = stdout().flush();
         // Arm the gate again so restore fires on the real exit / next suspend.
         self.done.store(false, Ordering::SeqCst);
         Ok(())

@@ -79,7 +79,7 @@ pub fn status_line(headless: bool, msg: impl Display) {
 /// `s`, returning a plain-text copy. Non-CSI escapes and all other bytes pass
 /// through unchanged. Used so captured startup lines seed the TUI transcript
 /// as plain text (the transcript renders its own styled spans).
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

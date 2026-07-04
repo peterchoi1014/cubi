@@ -293,7 +293,14 @@ impl AppState {
     /// [`MAX_TOOL_OUTPUT_ROWS`] lines with a dim `… N more lines` note. Empty
     /// output produces no rows.
     fn push_tool_output(&mut self, output: &str) {
-        let trimmed = output.trim_end_matches('\n');
+        // Captured command output (`/skills`, `/mcp`, `/agents`, `!`-shell) is
+        // built with the `colored` crate and carries ANSI escape sequences.
+        // ratatui does not interpret ANSI, so it would render the raw escape
+        // bytes as literal garbage. Strip them FIRST, then run diff-detection
+        // and row-splitting on the visible text so both are based on what the
+        // user actually sees. The transcript renders its own styled spans.
+        let cleaned = crate::out::strip_ansi(output);
+        let trimmed = cleaned.trim_end_matches('\n');
         if trimmed.is_empty() {
             return;
         }
@@ -1061,6 +1068,64 @@ mod tests {
                 LineKind::ToolStatus,
             ],
             "unified-diff tool output must be tagged ToolDiff, not ToolOutput"
+        );
+    }
+
+    #[test]
+    fn tool_output_strips_ansi_escape_sequences() {
+        // Captured `/skills` output carries `colored`-crate ANSI escapes;
+        // ratatui can't interpret them, so they must be stripped before the
+        // rows land in the transcript.
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted {
+            name: "skills".into(),
+        });
+        s.apply(RenderEvent::ToolFinished {
+            name: "skills".into(),
+            ok: true,
+            output: "\x1b[1m\x1b[93mSkills:\x1b[0m".into(),
+            elapsed_ms: 10,
+        });
+        let output_line = s
+            .transcript()
+            .iter()
+            .find(|l| l.kind == LineKind::ToolOutput)
+            .expect("expected a ToolOutput row");
+        assert_eq!(output_line.text, "Skills:");
+        assert!(
+            !output_line.text.contains('\x1b'),
+            "no ANSI escape bytes must survive into the transcript"
+        );
+    }
+
+    #[test]
+    fn diff_with_ansi_still_detected_as_tool_diff_after_stripping() {
+        // A diff wrapped in ANSI color codes must still be recognized as a diff
+        // once the escapes are stripped, and each cleaned row tagged ToolDiff.
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ToolStarted {
+            name: "apply".into(),
+        });
+        s.apply(RenderEvent::ToolFinished {
+            name: "apply".into(),
+            ok: true,
+            output: "\x1b[36m@@ -1 +1 @@\x1b[0m\n\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[0m".into(),
+            elapsed_ms: 10,
+        });
+        let diff_rows: Vec<&TranscriptLine> = s
+            .transcript()
+            .iter()
+            .filter(|l| l.kind == LineKind::ToolDiff)
+            .collect();
+        assert_eq!(
+            diff_rows.len(),
+            3,
+            "all three cleaned diff rows are ToolDiff"
+        );
+        assert_eq!(diff_rows[0].text, "@@ -1 +1 @@");
+        assert!(
+            diff_rows.iter().all(|l| !l.text.contains('\x1b')),
+            "diff rows must be ANSI-free"
         );
     }
 
