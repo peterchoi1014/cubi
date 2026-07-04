@@ -95,6 +95,13 @@ getrandom = "0.2"
 # Parse `bench/tasks/<id>/task.toml` definitions for `cubi bench`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
+# Raw file-descriptor ops (dup/dup2/close/open) for `capture_fds`, which
+# redirects the process stdout/stderr to a tempfile so slash-command output
+# can be folded into the TUI transcript instead of suspending the terminal.
+# Cross-platform: on Windows the CRT fds backing `println!`/`eprintln!` are
+# reached via the same `libc`-exposed `_dup`/`_dup2`/`_open` shims. MIT/Apache.
+libc = "0.2"
+
 # Opt-in full-screen terminal UI (Phase 2). `ratatui` owns layout/rendering;
 # its default backend targets the `crossterm` 0.29.x line, so we pin
 # `crossterm` to a matching `0.29` (deduped to a single version in the tree —
