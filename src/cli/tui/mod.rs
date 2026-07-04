@@ -20,6 +20,7 @@
 //!     `agent_turn`'s extra cancel branch (raw mode disables ISIG, so
 //!     `tokio::signal::ctrl_c()` never fires under the TUI).
 
+mod ansi;
 mod app;
 mod diff;
 mod event;

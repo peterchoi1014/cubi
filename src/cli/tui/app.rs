@@ -331,26 +331,35 @@ impl AppState {
     fn push_tool_output(&mut self, output: &str) {
         // Captured command output (`/skills`, `/mcp`, `/agents`, `!`-shell) is
         // built with the `colored` crate and carries ANSI escape sequences.
-        // ratatui does not interpret ANSI, so it would render the raw escape
-        // bytes as literal garbage. Strip them FIRST, then run diff-detection
-        // and row-splitting on the visible text so both are based on what the
-        // user actually sees. The transcript renders its own styled spans.
-        let cleaned = crate::out::strip_ansi(output);
-        let trimmed = cleaned.trim_end_matches('\n');
-        if trimmed.is_empty() {
+        // The RAW row text (WITH escapes) is stored for `LineKind::ToolOutput`
+        // rows so the transcript renderer can parse SGR into colored spans.
+        // Diff-detection and the empty/trim checks run on an ANSI-STRIPPED copy
+        // so both are based on the visible text the user sees.
+        let stripped = crate::out::strip_ansi(output);
+        let stripped_trimmed = stripped.trim_end_matches('\n');
+        if stripped_trimmed.is_empty() {
             return;
         }
-        let rows: Vec<&str> = trimmed.split('\n').collect();
+        let raw_trimmed = output.trim_end_matches('\n');
+        let rows: Vec<&str> = raw_trimmed.split('\n').collect();
         let shown = rows.len().min(MAX_TOOL_OUTPUT_ROWS);
         // Patch-shaped output is colored as a diff; everything else keeps the
-        // plain `│ `-bordered framing (unchanged Slice-1 behavior).
-        let kind = if super::diff::looks_like_diff(trimmed) {
+        // plain `│ `-bordered framing (now with ANSI-driven span colors).
+        let kind = if super::diff::looks_like_diff(stripped_trimmed) {
             LineKind::ToolDiff
         } else {
             LineKind::ToolOutput
         };
         for row in &rows[..shown] {
-            self.push_line((*row).to_string(), kind);
+            // The diff renderer does not parse ANSI, so diff rows are stored
+            // stripped; plain tool-output rows keep their escapes for the span
+            // parser.
+            let text = if kind == LineKind::ToolDiff {
+                crate::out::strip_ansi(row)
+            } else {
+                (*row).to_string()
+            };
+            self.push_line(text, kind);
         }
         if rows.len() > shown {
             let more = rows.len() - shown;
@@ -818,7 +827,7 @@ impl AppState {
             return;
         }
         let token_lower = self.composer[..token_end].to_ascii_lowercase();
-        let candidates: Vec<String> = self
+        let mut candidates: Vec<String> = self
             .command_catalog
             .iter()
             .filter(|c| c.to_ascii_lowercase().starts_with(&token_lower))
@@ -828,14 +837,18 @@ impl AppState {
             self.close_picker();
             return;
         }
-        let was_open = self.picker_open;
+        // Lift an exactly-typed command to the front so it is the default
+        // selection rather than a longer sibling. Without this, typing `/mcp`
+        // would highlight `/mcp-tools` (earlier in catalog order) and Enter
+        // would run that instead of `/mcp`. Stable otherwise, preserving the
+        // natural catalog order for the remaining prefix matches.
+        candidates.sort_by_key(|c| !c.eq_ignore_ascii_case(&token_lower));
         self.picker_candidates = candidates;
         self.picker_open = true;
-        if !was_open {
-            self.picker_selected = 0;
-        } else if self.picker_selected >= self.picker_candidates.len() {
-            self.picker_selected = self.picker_candidates.len() - 1;
-        }
+        // `refresh_picker` only runs on a composer edit, which changes the
+        // filter, so always reset to the (now best-match) first candidate.
+        // Arrow navigation between edits calls `picker_prev/next`, not this.
+        self.picker_selected = 0;
     }
 
     /// Close the picker and clear its transient state (candidates + selection).
@@ -1233,10 +1246,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_strips_ansi_escape_sequences() {
-        // Captured `/skills` output carries `colored`-crate ANSI escapes;
-        // ratatui can't interpret them, so they must be stripped before the
-        // rows land in the transcript.
+    fn tool_output_retains_ansi_for_coloring() {
+        // Captured `/skills` output carries `colored`-crate ANSI escapes. These
+        // are now KEPT in the stored `ToolOutput` text so the transcript
+        // renderer can parse SGR into colored spans; only the diff-detection /
+        // empty checks run on a stripped copy.
         let mut s = AppState::new();
         s.apply(RenderEvent::ToolStarted {
             name: "skills".into(),
@@ -1252,10 +1266,13 @@ mod tests {
             .iter()
             .find(|l| l.kind == LineKind::ToolOutput)
             .expect("expected a ToolOutput row");
-        assert_eq!(output_line.text, "Skills:");
         assert!(
-            !output_line.text.contains('\x1b'),
-            "no ANSI escape bytes must survive into the transcript"
+            output_line.text.contains('\x1b'),
+            "raw ANSI must be retained so the renderer can color it"
+        );
+        assert!(
+            output_line.text.contains("Skills:"),
+            "visible text must survive alongside the escapes"
         );
     }
 
@@ -1691,6 +1708,25 @@ mod tests {
         assert!(cands.contains(&"/stop".to_string()));
         assert!(!cands.contains(&"/help".to_string()));
         assert_eq!(s.picker_selected(), 0);
+    }
+
+    #[test]
+    fn picker_defaults_to_exact_match_over_longer_sibling() {
+        // Typing a full command must highlight the exact match, not a longer
+        // catalog-earlier sibling (regression: `/mcp` ran `/mcp-tools`).
+        let s = picker_state(&["/mcp-tools", "/mcp-reload", "/mcp"], "/mcp");
+        assert!(s.picker_open());
+        assert_eq!(
+            s.picker_selected_command(),
+            Some("/mcp"),
+            "candidates: {:?}",
+            s.picker_candidates()
+        );
+        // Shorter/exact leads regardless of catalog order.
+        assert_eq!(
+            s.picker_candidates().first().map(String::as_str),
+            Some("/mcp")
+        );
     }
 
     #[test]
