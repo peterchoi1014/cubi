@@ -257,10 +257,8 @@ fn absolutize(p: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::compat::test_env::env_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvRestore {
         cubi_home: Option<std::ffi::OsString>,
@@ -358,7 +356,7 @@ mod tests {
 
     #[test]
     fn cubi_home_env_overrides_platform_home_for_trust_store() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_guard();
         let _restore = EnvRestore::capture();
         let cubi_home = tempfile::tempdir().unwrap();
         let other_home = tempfile::tempdir().unwrap();
