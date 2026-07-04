@@ -152,7 +152,7 @@ impl McpManager {
         crate::out::status_line(quiet_stdout, builtins_msg);
 
         // Connect to configured MCP servers
-        for (name, server_config) in config.mcp_servers {
+        for (name, server_config) in Self::connectable_servers(&config) {
             if let Err(e) =
                 with_mcp_startup_timeout(manager.connect_server(&name, &server_config)).await
             {
@@ -180,6 +180,20 @@ impl McpManager {
         manager.discover_tools().await?;
 
         Ok(manager)
+    }
+
+    /// Servers that should be connected on load: enabled ones only, sorted by
+    /// name for deterministic connect order. Disabled servers are intentionally
+    /// skipped and therefore never counted as connection failures.
+    fn connectable_servers(config: &McpConfig) -> Vec<(String, McpServerConfig)> {
+        let mut servers: Vec<(String, McpServerConfig)> = config
+            .mcp_servers
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled)
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
     }
 
     pub fn get_tools_with_server(&self) -> &HashMap<String, (String, Tool)> {
@@ -694,6 +708,29 @@ mod tests {
         assert!(!is_transport_dead(&err));
         let err = anyhow::anyhow!("invalid arguments: missing field 'command'");
         assert!(!is_transport_dead(&err));
+    }
+
+    #[test]
+    fn connectable_servers_skips_disabled() {
+        use crate::mcp_config::McpServerConfig;
+        let mk = |enabled: bool| McpServerConfig {
+            command: Some("echo".to_string()),
+            args: None,
+            env: None,
+            http_url: None,
+            headers: None,
+            oauth_provider: None,
+            enabled,
+        };
+        let mut servers = HashMap::new();
+        servers.insert("on".to_string(), mk(true));
+        servers.insert("off".to_string(), mk(false));
+        let config = McpConfig {
+            mcp_servers: servers,
+        };
+        let connectable = McpManager::connectable_servers(&config);
+        let names: Vec<&str> = connectable.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["on"], "disabled server must be skipped");
     }
 
     /// Build an empty manager (no clients, no MCP config loaded) so

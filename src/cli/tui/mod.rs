@@ -546,10 +546,17 @@ impl ChatCLI {
                     Cmd::Skills
                         if {
                             let a = cmd_args.trim();
-                            a.is_empty() || a.eq_ignore_ascii_case("list")
+                            let head = a
+                                .split_once(char::is_whitespace)
+                                .map(|(h, _)| h)
+                                .unwrap_or(a);
+                            a.is_empty()
+                                || head.eq_ignore_ascii_case("list")
+                                || head.eq_ignore_ascii_case("enable")
+                                || head.eq_ignore_ascii_case("disable")
                         } =>
                     {
-                        let output = self.skills_output(cmd_args);
+                        let output = self.skills_manage(cmd_args);
                         self.render_captured_command("/skills", &output);
                         return true;
                     }
@@ -559,10 +566,12 @@ impl ChatCLI {
                         return true;
                     }
                     Cmd::Mcp => {
-                        // Keep the statusline denominator fresh, exactly as the
-                        // classic `/mcp` handler does, then render the status.
+                        // Run the management dispatch (list/enable/disable/add/
+                        // remove/reload) and render its text in-transcript, then
+                        // keep the statusline denominator fresh exactly as the
+                        // classic `/mcp` handler does.
+                        let output = self.mcp_manage(cmd_args).await;
                         self.refresh_mcp_counts();
-                        let output = self.mcp_output();
                         self.render_captured_command("/mcp", &output);
                         return true;
                     }

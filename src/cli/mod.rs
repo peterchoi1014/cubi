@@ -1303,7 +1303,8 @@ impl ChatCLI {
             Cmd::OauthRefresh => self.show_oauth_refresh(args),
             Cmd::PrivacySettings => self.handle_privacy_settings(args),
             Cmd::Mcp => {
-                self.show_mcp_status();
+                let output = self.mcp_manage(args).await;
+                print!("{output}");
                 self.refresh_mcp_counts();
             }
             Cmd::Plugin => self.show_plugins(),
@@ -2670,6 +2671,7 @@ impl ChatCLI {
     /// agent turn and stays on the normal dispatch path.
     fn skills_output(&self, _args: &str) -> String {
         use std::fmt::Write as _;
+        let disabled = skills::load_disabled();
         let mut out = String::new();
         let _ = writeln!(out, "\n{}", "Skills:".bright_yellow().bold());
         if self.skills.is_empty() {
@@ -2680,10 +2682,16 @@ impl ChatCLI {
             );
         } else {
             for skill in &self.skills {
+                let status = if disabled.contains(&skill.name) {
+                    "disabled".bright_red().to_string()
+                } else {
+                    "enabled".bright_green().to_string()
+                };
                 let _ = writeln!(
                     out,
-                    "  {} - {}",
+                    "  {} [{}] - {}",
                     skill.name.bright_cyan(),
+                    status,
                     skill.description.bright_white()
                 );
             }
@@ -2692,25 +2700,108 @@ impl ChatCLI {
         out
     }
 
+    /// Dispatch `/skills` management subcommands (`list`, `enable`, `disable`)
+    /// and return the text to render. `run <name>` is intentionally NOT handled
+    /// here — it stays on the agent-turn path in [`Self::handle_skills`]. Used by
+    /// both the classic REPL and the TUI capture path so the two stay in sync.
+    fn skills_manage(&mut self, args: &str) -> String {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+            return self.skills_output(args);
+        }
+
+        let mut out = String::new();
+        let action = sub.to_ascii_lowercase();
+        if action != "enable" && action != "disable" {
+            let _ = writeln!(
+                out,
+                "{} Usage: /skills [list|run <name>|enable <name>|disable <name>]",
+                "Info:".bright_yellow()
+            );
+            return out;
+        }
+
+        let name = rest.to_ascii_lowercase();
+        if name.is_empty() {
+            let _ = writeln!(
+                out,
+                "{} Usage: /skills {} <name>",
+                "Error:".bright_red(),
+                action
+            );
+            return out;
+        }
+        if !self.skills.iter().any(|s| s.name == name) {
+            let _ = writeln!(out, "{} Unknown skill '{}'", "Error:".bright_red(), rest);
+            return out;
+        }
+
+        let result = if action == "enable" {
+            skills::enable(&name).map(|changed| (changed, "enabled"))
+        } else {
+            skills::disable(&name).map(|changed| (changed, "disabled"))
+        };
+        match result {
+            Ok((true, verb)) => {
+                let _ = writeln!(
+                    out,
+                    "{} Skill /{} {}",
+                    "✓".bright_green(),
+                    name.bright_cyan(),
+                    verb
+                );
+            }
+            Ok((false, verb)) => {
+                let _ = writeln!(
+                    out,
+                    "{} Skill /{} was already {}",
+                    "ℹ".bright_blue(),
+                    name.bright_cyan(),
+                    verb
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+            }
+        }
+        out
+    }
+
     async fn handle_skills(&mut self, args: &str) {
         let trimmed = args.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
-            print!("{}", self.skills_output(args));
+        let is_run = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(head, _)| head.eq_ignore_ascii_case("run"))
+            .unwrap_or(false);
+        if !is_run {
+            // list / enable / disable / unknown → textual dispatch.
+            print!("{}", self.skills_manage(args));
             return;
         }
 
-        let Some(name) = trimmed.strip_prefix("run ") else {
-            println!(
-                "{} Usage: /skills [list|run <name>]",
-                "Info:".bright_yellow()
-            );
-            return;
-        };
+        let name = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, tail)| tail)
+            .unwrap_or("");
         let lookup = name.trim().to_ascii_lowercase();
         let Some(skill) = self.skills.iter().find(|s| s.name == lookup).cloned() else {
             eprintln!("{} Unknown skill '{}'", "Error:".bright_red(), name.trim());
             return;
         };
+        if skills::is_disabled(&skill.name) {
+            eprintln!(
+                "{} Skill /{} is disabled — enable it with /skills enable {}",
+                "Error:".bright_red(),
+                skill.name,
+                skill.name
+            );
+            return;
+        }
 
         self.history.push(Message::text(
             "system",
@@ -5274,12 +5365,224 @@ impl ChatCLI {
                 let _ = writeln!(out, "  {} No MCP manager loaded.", "ℹ".bright_blue());
             }
         }
+
+        // Configured servers with enabled/disabled + connected status. The
+        // config is the source of truth for the server set; the manager tells
+        // us which are actually connected vs failed.
+        let _ = writeln!(out, "\n{}", "Servers:".bright_yellow().bold());
+        match crate::mcp_config::McpConfig::load() {
+            Ok(config) if !config.mcp_servers.is_empty() => {
+                let connected = self.connected_server_names();
+                let failed: std::collections::HashSet<String> = self
+                    .mcp_manager
+                    .as_ref()
+                    .map(|m| m.failed_servers().into_iter().map(|(n, _)| n).collect())
+                    .unwrap_or_default();
+                let mut names: Vec<&String> = config.mcp_servers.keys().collect();
+                names.sort();
+                for name in names {
+                    let cfg = &config.mcp_servers[name];
+                    let status = if !cfg.enabled {
+                        "disabled".bright_red().to_string()
+                    } else if connected.contains(name) {
+                        "connected".bright_green().to_string()
+                    } else if failed.contains(name) {
+                        "failed".bright_red().to_string()
+                    } else {
+                        "not loaded".bright_yellow().to_string()
+                    };
+                    let _ = writeln!(out, "  {} [{}]", name.bright_cyan(), status);
+                }
+            }
+            Ok(_) => {
+                let _ = writeln!(out, "  {} No MCP servers configured.", "ℹ".bright_blue());
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  {} Could not read mcp.json: {}", "✗".bright_red(), e);
+            }
+        }
         let _ = writeln!(out);
         out
     }
 
-    fn show_mcp_status(&self) {
-        print!("{}", self.mcp_output());
+    /// External MCP server names (excluding the `builtin` pseudo-server) that
+    /// currently have at least one tool registered, i.e. are connected.
+    fn connected_server_names(&self) -> std::collections::HashSet<String> {
+        let mut servers = std::collections::HashSet::new();
+        if let Some(m) = &self.mcp_manager {
+            for (owner, _tool) in m.get_tools_with_server().values() {
+                if owner != "builtin" {
+                    servers.insert(owner.clone());
+                }
+            }
+        }
+        servers
+    }
+
+    /// Dispatch `/mcp` management subcommands and return the text to render.
+    /// Subcommands that mutate `mcp.json` (`enable`/`disable`/`add`/`remove`)
+    /// save the config and reload the manager so the change takes effect
+    /// immediately; `reload` re-reads the config; `list` (default) just renders
+    /// [`Self::mcp_output`]. Shared by the classic REPL and the TUI so the two
+    /// stay consistent.
+    async fn mcp_manage(&mut self, args: &str) -> String {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.split_whitespace();
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest: Vec<&str> = parts.collect();
+
+        if sub.is_empty() || sub == "list" {
+            return self.mcp_output();
+        }
+
+        let mut out = String::new();
+        match sub.as_str() {
+            "enable" | "disable" => {
+                let Some(name) = rest.first() else {
+                    let _ = writeln!(out, "{} Usage: /mcp {} <name>", "Error:".bright_red(), sub);
+                    return out;
+                };
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                let Some(server) = config.mcp_servers.get_mut(*name) else {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown MCP server '{}'",
+                        "Error:".bright_red(),
+                        name
+                    );
+                    return out;
+                };
+                server.enabled = sub == "enable";
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} MCP server '{}' {}d",
+                    "✓".bright_green(),
+                    name.bright_cyan(),
+                    sub
+                );
+            }
+            "add" => {
+                if rest.len() < 2 {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /mcp add <name> <command|url> [args...]",
+                        "Error:".bright_red()
+                    );
+                    return out;
+                }
+                let name = rest[0].to_string();
+                let target = rest[1];
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                let server = if target.starts_with("http://") || target.starts_with("https://") {
+                    crate::mcp_config::McpServerConfig {
+                        command: None,
+                        args: None,
+                        env: None,
+                        http_url: Some(target.to_string()),
+                        headers: None,
+                        oauth_provider: None,
+                        enabled: true,
+                    }
+                } else {
+                    let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+                    crate::mcp_config::McpServerConfig {
+                        command: Some(target.to_string()),
+                        args: if extra.is_empty() { None } else { Some(extra) },
+                        env: None,
+                        http_url: None,
+                        headers: None,
+                        oauth_provider: None,
+                        enabled: true,
+                    }
+                };
+                config.add_server(name.clone(), server);
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} Added MCP server '{}'",
+                    "✓".bright_green(),
+                    name.bright_cyan()
+                );
+            }
+            "remove" | "rm" => {
+                let Some(name) = rest.first() else {
+                    let _ = writeln!(out, "{} Usage: /mcp remove <name>", "Error:".bright_red());
+                    return out;
+                };
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                if !config.remove_server(name) {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown MCP server '{}'",
+                        "Error:".bright_red(),
+                        name
+                    );
+                    return out;
+                }
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} Removed MCP server '{}'",
+                    "✓".bright_green(),
+                    name.bright_cyan()
+                );
+            }
+            "reload" => {
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(out, "{} MCP configuration reloaded", "✓".bright_green());
+            }
+            other => {
+                let _ = writeln!(
+                    out,
+                    "{} Unknown /mcp subcommand '{}'. Usage: /mcp [list|enable <name>|disable <name>|add <name> <command|url> [args...]|remove <name>|reload]",
+                    "Error:".bright_red(),
+                    other
+                );
+            }
+        }
+        out
+    }
+
+    /// Reload the MCP manager and note any error into `out`, keeping the
+    /// statusline denominator fresh afterward.
+    async fn reload_and_note(&mut self, out: &mut String) {
+        use std::fmt::Write as _;
+        if let Err(e) = self.reload_mcp().await {
+            let _ = writeln!(out, "{} reload failed: {}", "Warning:".bright_yellow(), e);
+        }
+        self.refresh_mcp_counts();
     }
 
     fn show_plugins(&self) {
@@ -7247,6 +7550,75 @@ mod tests {
             std::env::remove_var("CUBI_OAUTH_FILE");
             std::env::remove_var("CUBI_GITHUB_API_KEY");
         }
+    }
+
+    #[test]
+    fn skills_run_refuses_a_disabled_skill() {
+        // These cli env tests share a local `env_lock()`; `with_cubi_home`
+        // mutates HOME/CUBI_HOME under a *different* global lock, so hold both
+        // to serialize against the other env-mutating cli tests.
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            // Build a CLI with one fake skill and disable it.
+            let mut cli = new_test_cli();
+            cli.skills = vec![Skill {
+                name: "demo".to_string(),
+                description: "demo skill".to_string(),
+                body: "do the thing".to_string(),
+                path: std::path::PathBuf::from("/tmp/demo.md"),
+            }];
+            skills::disable("demo").expect("disable demo");
+
+            // `/skills list` reflects the disabled state.
+            let listing = cli.skills_manage("list");
+            assert!(
+                strip_ansi(&listing).contains("disabled"),
+                "list should mark the skill disabled, got: {listing}"
+            );
+
+            // `/skills run demo` must refuse WITHOUT injecting the skill body
+            // into history (the refusal returns before the agent turn).
+            let history_before = cli.history.len();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(cli.handle_skills("run demo"));
+            assert_eq!(
+                cli.history.len(),
+                history_before,
+                "a disabled skill must not push its body into history"
+            );
+            assert!(
+                !cli.history
+                    .iter()
+                    .any(|m| m.content.contains("do the thing")),
+                "disabled skill body must never be injected"
+            );
+
+            // Re-enabling clears the refusal.
+            skills::enable("demo").expect("enable demo");
+            assert!(!skills::is_disabled("demo"));
+        });
+    }
+
+    /// Strip ANSI escape sequences so status assertions are colour-agnostic.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_escape = false;
+        for c in s.chars() {
+            if in_escape {
+                // A CSI SGR sequence terminates at 'm'.
+                if c == 'm' {
+                    in_escape = false;
+                }
+            } else if c == '\u{1b}' {
+                in_escape = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
