@@ -20,10 +20,12 @@
 //! Parsing is done by hand (a couple of `key: value` lines); this module
 //! deliberately introduces **no** YAML dependency.
 //!
-//! NOTE: these are definitions only. Defined agents are not runnable yet — the
-//! `/agents` command manages (CRUD) them.
+//! NOTE: these are definitions only. `/agents` lists them and toggles each on
+//! or off via the disabled-store below; typing `/<name>` runs a matching
+//! enabled agent as a single-turn injected system prompt.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,6 +44,66 @@ pub struct AgentDef {
 /// [`crate::skills::skills_dir`]).
 pub fn agents_dir() -> Option<PathBuf> {
     crate::sessions::cubi_dir().map(|d| d.join("agents"))
+}
+
+/// Path to the JSON file that persists the set of disabled agent names,
+/// `~/.cubi/agents-disabled.json`. Returns `None` when no home directory is
+/// available. Mirrors [`crate::skills::disabled_path`].
+pub fn disabled_path() -> Option<PathBuf> {
+    crate::sessions::cubi_dir().map(|d| d.join("agents-disabled.json"))
+}
+
+/// Load the set of disabled agent names (lowercased, matching [`AgentDef::name`]).
+/// A missing file means nothing is disabled, so callers stay backward
+/// compatible with installs that predate this feature.
+pub fn load_disabled() -> BTreeSet<String> {
+    let Some(path) = disabled_path() else {
+        return BTreeSet::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return BTreeSet::new();
+    };
+    let names: Vec<String> = serde_json::from_str(&content).unwrap_or_default();
+    names.into_iter().map(|n| n.to_ascii_lowercase()).collect()
+}
+
+/// Persist the set of disabled agent names to `~/.cubi/agents-disabled.json`.
+pub fn save_disabled(disabled: &BTreeSet<String>) -> Result<()> {
+    let path = disabled_path().context("Could not find home directory")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let names: Vec<&String> = disabled.iter().collect();
+    let json = serde_json::to_string_pretty(&names)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Returns `true` when the named agent is currently disabled.
+pub fn is_disabled(name: &str) -> bool {
+    load_disabled().contains(&name.to_ascii_lowercase())
+}
+
+/// Mark an agent as disabled. Returns `true` when the state actually changed
+/// (i.e. the agent was previously enabled).
+pub fn disable(name: &str) -> Result<bool> {
+    let mut disabled = load_disabled();
+    let changed = disabled.insert(name.to_ascii_lowercase());
+    if changed {
+        save_disabled(&disabled)?;
+    }
+    Ok(changed)
+}
+
+/// Mark an agent as enabled (remove it from the disabled set). Returns `true`
+/// when the state actually changed (i.e. the agent was previously disabled).
+pub fn enable(name: &str) -> Result<bool> {
+    let mut disabled = load_disabled();
+    let changed = disabled.remove(&name.to_ascii_lowercase());
+    if changed {
+        save_disabled(&disabled)?;
+    }
+    Ok(changed)
 }
 
 /// Returns `true` when `name` is a safe single filename component: non-empty,
@@ -318,6 +380,36 @@ mod tests {
 
             let names: Vec<String> = load_agents().into_iter().map(|a| a.name).collect();
             assert_eq!(names, vec!["alpha".to_string(), "zebra".to_string()]);
+        });
+    }
+
+    #[test]
+    fn disabled_store_round_trips() {
+        crate::compat::test_env::with_cubi_home(|cubi_home, _other_home| {
+            // Missing file = nothing disabled (backward compatible).
+            assert!(load_disabled().is_empty());
+            assert!(!is_disabled("reviewer"));
+
+            // disable() persists and reports a real change (lowercasing the name).
+            assert!(disable("Reviewer").expect("disable"));
+            assert!(is_disabled("reviewer"));
+            assert!(
+                cubi_home
+                    .join(".cubi")
+                    .join("agents-disabled.json")
+                    .exists()
+            );
+            // A fresh load reflects the persisted (lowercased) state.
+            assert!(load_disabled().contains("reviewer"));
+            // Re-disabling is idempotent (no change).
+            assert!(!disable("reviewer").expect("disable idempotent"));
+
+            // enable() persists the removal and reports the change.
+            assert!(enable("REVIEWER").expect("enable"));
+            assert!(!is_disabled("reviewer"));
+            assert!(load_disabled().is_empty());
+            // Re-enabling an already-enabled agent is a no-op.
+            assert!(!enable("reviewer").expect("enable idempotent"));
         });
     }
 

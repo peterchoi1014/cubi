@@ -205,6 +205,25 @@ impl ChatCLI {
                             invalidate_completer_caches_if_mutating(&rl, input);
                             continue;
                         }
+                        // Then dynamic `/<name>` agent commands, before falling
+                        // back to the built-in handler (which owns the
+                        // unknown-command hint). Precedence is enforced inside
+                        // `resolve_agent_command`.
+                        match self.resolve_agent_command(input) {
+                            AgentCommand::Run(agent, agent_args) => {
+                                self.run_agent_command(&agent, &agent_args).await;
+                                continue;
+                            }
+                            AgentCommand::Disabled(name) => {
+                                eprintln!(
+                                    "{} {}",
+                                    "Error:".bright_red(),
+                                    ChatCLI::agent_disabled_message(&name)
+                                );
+                                continue;
+                            }
+                            AgentCommand::NotAgent => {}
+                        }
                         if !self.handle_command(input).await? {
                             break;
                         }

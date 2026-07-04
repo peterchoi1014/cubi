@@ -30,6 +30,7 @@ mod term;
 mod theme;
 mod widgets;
 
+use crate::cli::AgentCommand;
 use crate::cli::ChatCLI;
 use crate::cli::ui_sink::RenderEvent;
 use crate::commands::{self, Cmd};
@@ -577,20 +578,12 @@ impl ChatCLI {
                         return true;
                     }
                     Cmd::Agents => {
-                        // `/agents edit <name>` needs an interactive editor,
-                        // which can't render inside the alt screen — so
-                        // `agents_manage` returns `None` there and we fall
-                        // through to the suspend/resume path. Every other
-                        // subcommand yields text we capture in-transcript.
-                        match self.agents_manage(cmd_args) {
-                            Some(output) => {
-                                self.render_captured_command("/agents", &output);
-                                return true;
-                            }
-                            None => {
-                                return self.run_suspended_command(input, control_tx, guard).await;
-                            }
-                        }
+                        // All `/agents` subcommands (list/enable/disable) now
+                        // yield text we capture in-transcript — there is no
+                        // editor/suspend path anymore.
+                        let output = self.agents_manage(cmd_args);
+                        self.render_captured_command("/agents", &output);
+                        return true;
                     }
                     Cmd::Mcp => {
                         // Run the management dispatch (list/enable/disable/add/
@@ -604,6 +597,22 @@ impl ChatCLI {
                     }
                     _ => {}
                 }
+            }
+            // Dynamic `/<name>` agent command: run it as a LIVE turn streamed
+            // through the TuiSink (exactly like a submitted user message), NOT a
+            // suspended real-terminal command. `resolve_agent_command` enforces
+            // precedence (built-ins and user/plugin commands win).
+            match self.resolve_agent_command(input) {
+                AgentCommand::Run(agent, agent_args) => {
+                    self.run_agent_command(&agent, &agent_args).await;
+                    return true;
+                }
+                AgentCommand::Disabled(name) => {
+                    let msg = ChatCLI::agent_disabled_message(&name);
+                    self.render_captured_command(&format!("/{name}"), &msg);
+                    return true;
+                }
+                AgentCommand::NotAgent => {}
             }
             // Every other slash command: suspend the TUI, run it on the real
             // terminal, resume. Returns `false` if the command asked to quit.

@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn agents_first_arg_suggests_subcommands() {
         let out = complete("/agents d", 9);
-        assert_eq!(out, vec!["delete".to_string()]);
+        assert_eq!(out, vec!["disable".to_string()]);
     }
 
     #[test]
