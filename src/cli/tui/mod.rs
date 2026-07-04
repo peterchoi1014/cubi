@@ -561,9 +561,20 @@ impl ChatCLI {
                         return true;
                     }
                     Cmd::Agents => {
-                        let output = self.agents_output();
-                        self.render_captured_command("/agents", &output);
-                        return true;
+                        // `/agents edit <name>` needs an interactive editor,
+                        // which can't render inside the alt screen — so
+                        // `agents_manage` returns `None` there and we fall
+                        // through to the suspend/resume path. Every other
+                        // subcommand yields text we capture in-transcript.
+                        match self.agents_manage(cmd_args) {
+                            Some(output) => {
+                                self.render_captured_command("/agents", &output);
+                                return true;
+                            }
+                            None => {
+                                return self.run_suspended_command(input, control_tx, guard).await;
+                            }
+                        }
                     }
                     Cmd::Mcp => {
                         // Run the management dispatch (list/enable/disable/add/

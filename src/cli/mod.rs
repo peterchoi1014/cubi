@@ -1288,7 +1288,7 @@ impl ChatCLI {
             Cmd::PrComments => self.run_pr_comments(args),
             Cmd::SecurityReview => self.run_security_review().await,
             Cmd::AutofixPr => self.run_autofix_pr(args).await,
-            Cmd::Agents => self.show_agents(),
+            Cmd::Agents => self.show_agents(args),
             Cmd::Tasks => self.todos.render(),
             Cmd::Teleport => self.run_teleport(args),
             Cmd::Passes | Cmd::Effort => self.handle_effort(cmd, args),
@@ -4837,40 +4837,233 @@ impl ChatCLI {
     fn agents_output(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
-        let _ = writeln!(out, "\n{}", "Agents / sessions:".bright_yellow().bold());
-        let Some(store) = self.session_store.as_ref() else {
+        let _ = writeln!(out, "\n{}", "Agents:".bright_yellow().bold());
+        let agents = crate::agents::load_agents();
+        if agents.is_empty() {
             let _ = writeln!(
                 out,
-                "  {} Sessions disabled (no home dir resolved).",
+                "  {} No agents defined in ~/.cubi/agents",
                 "ℹ".bright_blue()
             );
-            return out;
-        };
-        match store.list() {
-            Ok(list) if list.is_empty() => {
-                let _ = writeln!(out, "  {} No sessions yet.", "ℹ".bright_blue());
-            }
-            Ok(list) => {
-                for s in list {
-                    let _ = writeln!(
-                        out,
-                        "  {} {} ({} msgs)",
-                        "•".bright_cyan(),
-                        s.id.bright_cyan(),
-                        s.message_count
-                    );
-                }
-            }
-            Err(e) => {
-                let _ = writeln!(out, "  {} {}", "✗".bright_red(), e);
+            let _ = writeln!(
+                out,
+                "  {} Create one with /agents create <name>",
+                "ℹ".bright_blue()
+            );
+        } else {
+            for agent in &agents {
+                let model = match &agent.model {
+                    Some(m) => format!(" {}", format!("(model: {m})").bright_black()),
+                    None => String::new(),
+                };
+                let _ = writeln!(
+                    out,
+                    "  {} {} - {}{}",
+                    "•".bright_cyan(),
+                    agent.name.bright_cyan(),
+                    agent.description.bright_white(),
+                    model
+                );
             }
         }
         let _ = writeln!(out);
         out
     }
 
-    fn show_agents(&self) {
-        print!("{}", self.agents_output());
+    /// Dispatch `/agents` management subcommands and return the text to render.
+    ///
+    /// Returns `Some(text)` for every case that produces textual output
+    /// (`list`/`show`/`create`/`delete`, unknown subcommands, and errors).
+    ///
+    /// Returns `None` ONLY for `edit <name>` when the named agent exists — this
+    /// is the "needs the interactive editor" signal. The classic REPL opens the
+    /// editor inline; the TUI falls through to its suspend/resume path so the
+    /// editor runs on the real terminal. When the agent to edit does NOT exist
+    /// we still return `Some(error)` (never `None`), so the caller never opens
+    /// an editor on a missing file.
+    fn agents_manage(&self, args: &str) -> Option<String> {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+            return Some(self.agents_output());
+        }
+
+        let action = sub.to_ascii_lowercase();
+        let mut out = String::new();
+        match action.as_str() {
+            "show" => {
+                if rest.is_empty() {
+                    let _ = writeln!(out, "{} Usage: /agents show <name>", "Error:".bright_red());
+                    return Some(out);
+                }
+                match crate::agents::load_one(rest) {
+                    Some(agent) => {
+                        let _ = writeln!(out, "\n{}", "Agent:".bright_yellow().bold());
+                        let _ = writeln!(
+                            out,
+                            "  {} {}",
+                            "name:".bright_black(),
+                            agent.name.bright_cyan()
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  {} {}",
+                            "description:".bright_black(),
+                            agent.description.bright_white()
+                        );
+                        if let Some(model) = &agent.model {
+                            let _ = writeln!(
+                                out,
+                                "  {} {}",
+                                "model:".bright_black(),
+                                model.bright_white()
+                            );
+                        }
+                        let _ =
+                            writeln!(out, "  {} {}", "path:".bright_black(), agent.path.display());
+                        let _ = writeln!(out, "\n{}\n{}", "prompt:".bright_black(), agent.prompt);
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "{} Unknown agent '{}' — see /agents list",
+                            "Error:".bright_red(),
+                            rest
+                        );
+                    }
+                }
+                Some(out)
+            }
+            "create" => {
+                if rest.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /agents create <name>",
+                        "Error:".bright_red()
+                    );
+                    return Some(out);
+                }
+                match crate::agents::create(rest, None, None, None) {
+                    Ok(path) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Created agent {} at {}",
+                            "✓".bright_green(),
+                            rest.to_ascii_lowercase().bright_cyan(),
+                            path.display()
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  {} Edit it with /agents edit {}",
+                            "ℹ".bright_blue(),
+                            rest.to_ascii_lowercase()
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    }
+                }
+                Some(out)
+            }
+            "delete" => {
+                if rest.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /agents delete <name>",
+                        "Error:".bright_red()
+                    );
+                    return Some(out);
+                }
+                match crate::agents::delete(rest) {
+                    Ok(true) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Deleted agent {}",
+                            "✓".bright_green(),
+                            rest.to_ascii_lowercase().bright_cyan()
+                        );
+                    }
+                    Ok(false) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Unknown agent '{}' — see /agents list",
+                            "Error:".bright_red(),
+                            rest
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    }
+                }
+                Some(out)
+            }
+            "edit" => {
+                if rest.is_empty() {
+                    let _ = writeln!(out, "{} Usage: /agents edit <name>", "Error:".bright_red());
+                    return Some(out);
+                }
+                // Only signal the interactive-editor path (None) when the agent
+                // actually exists; otherwise return a helpful error.
+                if crate::agents::load_one(rest).is_some() {
+                    None
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown agent '{}' — create it first with /agents create {}",
+                        "Error:".bright_red(),
+                        rest,
+                        rest.to_ascii_lowercase()
+                    );
+                    Some(out)
+                }
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "{} Usage: /agents [list|show <name>|create <name>|edit <name>|delete <name>]",
+                    "Info:".bright_yellow()
+                );
+                Some(out)
+            }
+        }
+    }
+
+    fn show_agents(&self, args: &str) {
+        match self.agents_manage(args) {
+            Some(text) => print!("{text}"),
+            None => {
+                // `edit <name>` on an existing agent: open the resolved file in
+                // the user's editor. This is the classic REPL, so running the
+                // editor inline on the real terminal is fine.
+                let name = args
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or("");
+                let Some(path) = crate::agents::agent_path(name) else {
+                    eprintln!("{} invalid agent name '{}'", "Error:".bright_red(), name);
+                    return;
+                };
+                let editor = edit_cmd::resolve_editor();
+                match edit_cmd::spawn_editor_blocking(&editor, &path) {
+                    Ok(()) => println!(
+                        "{} Edited agent {}",
+                        "✓".bright_green(),
+                        name.to_ascii_lowercase().bright_cyan()
+                    ),
+                    Err(e) => eprintln!(
+                        "{} could not run editor ({}): {}",
+                        "Error:".bright_red(),
+                        editor,
+                        e
+                    ),
+                }
+            }
+        }
     }
 
     /// `/teleport <path>` — change cwd to a trusted directory.
