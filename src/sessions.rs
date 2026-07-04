@@ -875,9 +875,7 @@ pub(crate) fn civil_from_unix(secs: u64) -> (i64, u64, u64, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::compat::test_env::env_guard;
 
     fn tmp_store(label: &str) -> SessionStore {
         let nanos = SystemTime::now()
@@ -929,7 +927,7 @@ mod tests {
 
     #[test]
     fn cubi_home_env_overrides_platform_home_for_state_paths() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
@@ -956,7 +954,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn home_dir_prefers_home_over_userprofile_on_non_windows() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
@@ -976,7 +974,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn home_dir_ignores_home_and_prefers_userprofile_on_windows() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
@@ -1106,7 +1104,7 @@ mod tests {
 
     #[test]
     fn rebuild_index_from_disk() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let sessions_root = sessions_root().expect("home directory should exist for tests");
         let bucket = sessions_root.join(format!(
             "bucket-rebuild-{}",
@@ -1138,7 +1136,7 @@ mod tests {
 
     #[test]
     fn save_then_list_uses_sidecar_index() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");
@@ -1173,7 +1171,7 @@ mod tests {
 
     #[test]
     fn resume_prefers_last_used_session_for_cwd() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let old_cubi_home = std::env::var_os(CUBI_HOME_ENV);
         let old_home = std::env::var_os("HOME");
         let old_userprofile = std::env::var_os("USERPROFILE");

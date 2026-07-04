@@ -127,6 +127,17 @@ pub(crate) mod test_env {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serialize every test that mutates process-global environment variables
+    /// (`HOME`, `CUBI_HOME`, `USERPROFILE`, ...). Env vars are process-wide, so
+    /// tests across *all* modules must share this one lock or they race under
+    /// parallel `cargo test`. Poison-tolerant: a panicking test that held the
+    /// lock must not cascade into failures in every other env-touching test.
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct EnvRestore {
         old: Vec<(&'static str, Option<OsString>)>,
     }
@@ -156,7 +167,7 @@ pub(crate) mod test_env {
     }
 
     pub(crate) fn with_cubi_home<T>(f: impl FnOnce(&Path, &Path) -> T) -> T {
-        let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
+        let _lock = env_guard();
         let cubi_home = tempfile::tempdir().expect("cubi home tempdir");
         let other_home = tempfile::tempdir().expect("other home tempdir");
         let _restore = EnvRestore::capture(&[
