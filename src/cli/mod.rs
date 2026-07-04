@@ -1288,7 +1288,7 @@ impl ChatCLI {
             Cmd::PrComments => self.run_pr_comments(args),
             Cmd::SecurityReview => self.run_security_review().await,
             Cmd::AutofixPr => self.run_autofix_pr(args).await,
-            Cmd::Agents => self.show_agents(),
+            Cmd::Agents => self.show_agents(args),
             Cmd::Tasks => self.todos.render(),
             Cmd::Teleport => self.run_teleport(args),
             Cmd::Passes | Cmd::Effort => self.handle_effort(cmd, args),
@@ -1303,7 +1303,8 @@ impl ChatCLI {
             Cmd::OauthRefresh => self.show_oauth_refresh(args),
             Cmd::PrivacySettings => self.handle_privacy_settings(args),
             Cmd::Mcp => {
-                self.show_mcp_status();
+                let output = self.mcp_manage(args).await;
+                print!("{output}");
                 self.refresh_mcp_counts();
             }
             Cmd::Plugin => self.show_plugins(),
@@ -1557,7 +1558,11 @@ impl ChatCLI {
             {
                 Ok(manager) => Some(manager),
                 Err(e) => {
-                    eprintln!("{} {}", "Warning:".bright_yellow(), e);
+                    // Route through status_line so that when reloading under
+                    // the TUI (suppressed capture) this error is folded into
+                    // the transcript instead of corrupting the alt screen.
+                    // reload_mcp is only reached interactively, never headless.
+                    crate::out::status_line(false, format!("{} {}", "Warning:".bright_yellow(), e));
                     None
                 }
             };
@@ -2662,37 +2667,145 @@ impl ChatCLI {
         );
     }
 
+    /// Renders the `/skills list` output (the read-only listing) as a String
+    /// so both the classic REPL (which prints it) and the TUI (which renders it
+    /// as a framed transcript block) share one byte-identical source. Mirrors
+    /// the historical `println!` layout exactly, including the leading/trailing
+    /// blank lines. The `run <name>` path is NOT captured here — it executes an
+    /// agent turn and stays on the normal dispatch path.
+    fn skills_output(&self, _args: &str) -> String {
+        use std::fmt::Write as _;
+        let disabled = skills::load_disabled();
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "Skills:".bright_yellow().bold());
+        if self.skills.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {} No skills found in ~/.cubi/skills",
+                "ℹ".bright_blue()
+            );
+        } else {
+            for skill in &self.skills {
+                let status = if disabled.contains(&skill.name) {
+                    "disabled".bright_red().to_string()
+                } else {
+                    "enabled".bright_green().to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    "  {} [{}] - {}",
+                    skill.name.bright_cyan(),
+                    status,
+                    skill.description.bright_white()
+                );
+            }
+        }
+        let _ = writeln!(out);
+        out
+    }
+
+    /// Dispatch `/skills` management subcommands (`list`, `enable`, `disable`)
+    /// and return the text to render. `run <name>` is intentionally NOT handled
+    /// here — it stays on the agent-turn path in [`Self::handle_skills`]. Used by
+    /// both the classic REPL and the TUI capture path so the two stay in sync.
+    fn skills_manage(&mut self, args: &str) -> String {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+            return self.skills_output(args);
+        }
+
+        let mut out = String::new();
+        let action = sub.to_ascii_lowercase();
+        if action != "enable" && action != "disable" {
+            let _ = writeln!(
+                out,
+                "{} Usage: /skills [list|run <name>|enable <name>|disable <name>]",
+                "Info:".bright_yellow()
+            );
+            return out;
+        }
+
+        let name = rest.to_ascii_lowercase();
+        if name.is_empty() {
+            let _ = writeln!(
+                out,
+                "{} Usage: /skills {} <name>",
+                "Error:".bright_red(),
+                action
+            );
+            return out;
+        }
+        if !self.skills.iter().any(|s| s.name == name) {
+            let _ = writeln!(out, "{} Unknown skill '{}'", "Error:".bright_red(), rest);
+            return out;
+        }
+
+        let result = if action == "enable" {
+            skills::enable(&name).map(|changed| (changed, "enabled"))
+        } else {
+            skills::disable(&name).map(|changed| (changed, "disabled"))
+        };
+        match result {
+            Ok((true, verb)) => {
+                let _ = writeln!(
+                    out,
+                    "{} Skill /{} {}",
+                    "✓".bright_green(),
+                    name.bright_cyan(),
+                    verb
+                );
+            }
+            Ok((false, verb)) => {
+                let _ = writeln!(
+                    out,
+                    "{} Skill /{} was already {}",
+                    "ℹ".bright_blue(),
+                    name.bright_cyan(),
+                    verb
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+            }
+        }
+        out
+    }
+
     async fn handle_skills(&mut self, args: &str) {
         let trimmed = args.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
-            println!("\n{}", "Skills:".bright_yellow().bold());
-            if self.skills.is_empty() {
-                println!("  {} No skills found in ~/.cubi/skills", "ℹ".bright_blue());
-            } else {
-                for skill in &self.skills {
-                    println!(
-                        "  {} - {}",
-                        skill.name.bright_cyan(),
-                        skill.description.bright_white()
-                    );
-                }
-            }
-            println!();
+        let is_run = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(head, _)| head.eq_ignore_ascii_case("run"))
+            .unwrap_or(false);
+        if !is_run {
+            // list / enable / disable / unknown → textual dispatch.
+            print!("{}", self.skills_manage(args));
             return;
         }
 
-        let Some(name) = trimmed.strip_prefix("run ") else {
-            println!(
-                "{} Usage: /skills [list|run <name>]",
-                "Info:".bright_yellow()
-            );
-            return;
-        };
+        let name = trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, tail)| tail)
+            .unwrap_or("");
         let lookup = name.trim().to_ascii_lowercase();
         let Some(skill) = self.skills.iter().find(|s| s.name == lookup).cloned() else {
             eprintln!("{} Unknown skill '{}'", "Error:".bright_red(), name.trim());
             return;
         };
+        if skills::is_disabled(&skill.name) {
+            eprintln!(
+                "{} Skill /{} is disabled — enable it with /skills enable {}",
+                "Error:".bright_red(),
+                skill.name,
+                skill.name
+            );
+            return;
+        }
 
         self.history.push(Message::text(
             "system",
@@ -4720,30 +4833,241 @@ impl ChatCLI {
 
     /// `/agents` — list active background agent sessions (from the session
     /// store). Each session is a candidate "agent" worker.
-    fn show_agents(&self) {
-        println!("\n{}", "Agents / sessions:".bright_yellow().bold());
-        let Some(store) = self.session_store.as_ref() else {
-            println!(
-                "  {} Sessions disabled (no home dir resolved).",
+    /// Renders the `/agents` listing as a String so the classic REPL and the
+    /// TUI share one byte-identical source. Mirrors the historical `println!`
+    /// layout exactly (leading/trailing blank lines included). The rare
+    /// `store.list()` error, historically an `eprintln!` to stderr, is folded
+    /// into the returned text so a caller can render it in-band.
+    fn agents_output(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "Agents:".bright_yellow().bold());
+        let agents = crate::agents::load_agents();
+        if agents.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {} No agents defined in ~/.cubi/agents",
                 "ℹ".bright_blue()
             );
-            return;
-        };
-        match store.list() {
-            Ok(list) if list.is_empty() => println!("  {} No sessions yet.", "ℹ".bright_blue()),
-            Ok(list) => {
-                for s in list {
-                    println!(
-                        "  {} {} ({} msgs)",
-                        "•".bright_cyan(),
-                        s.id.bright_cyan(),
-                        s.message_count
+            let _ = writeln!(
+                out,
+                "  {} Create one with /agents create <name>",
+                "ℹ".bright_blue()
+            );
+        } else {
+            for agent in &agents {
+                let model = match &agent.model {
+                    Some(m) => format!(" {}", format!("(model: {m})").bright_black()),
+                    None => String::new(),
+                };
+                let _ = writeln!(
+                    out,
+                    "  {} {} - {}{}",
+                    "•".bright_cyan(),
+                    agent.name.bright_cyan(),
+                    agent.description.bright_white(),
+                    model
+                );
+            }
+        }
+        let _ = writeln!(out);
+        out
+    }
+
+    /// Dispatch `/agents` management subcommands and return the text to render.
+    ///
+    /// Returns `Some(text)` for every case that produces textual output
+    /// (`list`/`show`/`create`/`delete`, unknown subcommands, and errors).
+    ///
+    /// Returns `None` ONLY for `edit <name>` when the named agent exists — this
+    /// is the "needs the interactive editor" signal. The classic REPL opens the
+    /// editor inline; the TUI falls through to its suspend/resume path so the
+    /// editor runs on the real terminal. When the agent to edit does NOT exist
+    /// we still return `Some(error)` (never `None`), so the caller never opens
+    /// an editor on a missing file.
+    fn agents_manage(&self, args: &str) -> Option<String> {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+            return Some(self.agents_output());
+        }
+
+        let action = sub.to_ascii_lowercase();
+        let mut out = String::new();
+        match action.as_str() {
+            "show" => {
+                if rest.is_empty() {
+                    let _ = writeln!(out, "{} Usage: /agents show <name>", "Error:".bright_red());
+                    return Some(out);
+                }
+                match crate::agents::load_one(rest) {
+                    Some(agent) => {
+                        let _ = writeln!(out, "\n{}", "Agent:".bright_yellow().bold());
+                        let _ = writeln!(
+                            out,
+                            "  {} {}",
+                            "name:".bright_black(),
+                            agent.name.bright_cyan()
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  {} {}",
+                            "description:".bright_black(),
+                            agent.description.bright_white()
+                        );
+                        if let Some(model) = &agent.model {
+                            let _ = writeln!(
+                                out,
+                                "  {} {}",
+                                "model:".bright_black(),
+                                model.bright_white()
+                            );
+                        }
+                        let _ =
+                            writeln!(out, "  {} {}", "path:".bright_black(), agent.path.display());
+                        let _ = writeln!(out, "\n{}\n{}", "prompt:".bright_black(), agent.prompt);
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "{} Unknown agent '{}' — see /agents list",
+                            "Error:".bright_red(),
+                            rest
+                        );
+                    }
+                }
+                Some(out)
+            }
+            "create" => {
+                if rest.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /agents create <name>",
+                        "Error:".bright_red()
                     );
+                    return Some(out);
+                }
+                match crate::agents::create(rest, None, None, None) {
+                    Ok(path) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Created agent {} at {}",
+                            "✓".bright_green(),
+                            rest.to_ascii_lowercase().bright_cyan(),
+                            path.display()
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  {} Edit it with /agents edit {}",
+                            "ℹ".bright_blue(),
+                            rest.to_ascii_lowercase()
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    }
+                }
+                Some(out)
+            }
+            "delete" => {
+                if rest.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /agents delete <name>",
+                        "Error:".bright_red()
+                    );
+                    return Some(out);
+                }
+                match crate::agents::delete(rest) {
+                    Ok(true) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Deleted agent {}",
+                            "✓".bright_green(),
+                            rest.to_ascii_lowercase().bright_cyan()
+                        );
+                    }
+                    Ok(false) => {
+                        let _ = writeln!(
+                            out,
+                            "{} Unknown agent '{}' — see /agents list",
+                            "Error:".bright_red(),
+                            rest
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    }
+                }
+                Some(out)
+            }
+            "edit" => {
+                if rest.is_empty() {
+                    let _ = writeln!(out, "{} Usage: /agents edit <name>", "Error:".bright_red());
+                    return Some(out);
+                }
+                // Only signal the interactive-editor path (None) when the agent
+                // actually exists; otherwise return a helpful error.
+                if crate::agents::load_one(rest).is_some() {
+                    None
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown agent '{}' — create it first with /agents create {}",
+                        "Error:".bright_red(),
+                        rest,
+                        rest.to_ascii_lowercase()
+                    );
+                    Some(out)
                 }
             }
-            Err(e) => eprintln!("  {} {}", "✗".bright_red(), e),
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "{} Usage: /agents [list|show <name>|create <name>|edit <name>|delete <name>]",
+                    "Info:".bright_yellow()
+                );
+                Some(out)
+            }
         }
-        println!();
+    }
+
+    fn show_agents(&self, args: &str) {
+        match self.agents_manage(args) {
+            Some(text) => print!("{text}"),
+            None => {
+                // `edit <name>` on an existing agent: open the resolved file in
+                // the user's editor. This is the classic REPL, so running the
+                // editor inline on the real terminal is fine.
+                let name = args
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or("");
+                let Some(path) = crate::agents::agent_path(name) else {
+                    eprintln!("{} invalid agent name '{}'", "Error:".bright_red(), name);
+                    return;
+                };
+                let editor = edit_cmd::resolve_editor();
+                match edit_cmd::spawn_editor_blocking(&editor, &path) {
+                    Ok(()) => println!(
+                        "{} Edited agent {}",
+                        "✓".bright_green(),
+                        name.to_ascii_lowercase().bright_cyan()
+                    ),
+                    Err(e) => eprintln!(
+                        "{} could not run editor ({}): {}",
+                        "Error:".bright_red(),
+                        editor,
+                        e
+                    ),
+                }
+            }
+        }
     }
 
     /// `/teleport <path>` — change cwd to a trusted directory.
@@ -5211,22 +5535,266 @@ impl ChatCLI {
         }
     }
 
-    fn show_mcp_status(&self) {
-        println!("\n{}", "MCP status:".bright_yellow().bold());
+    /// Renders the `/mcp` status as a String so the classic REPL and the TUI
+    /// share one byte-identical source. Mirrors the historical `println!`
+    /// layout exactly (leading/trailing blank lines included).
+    fn mcp_output(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "\n{}", "MCP status:".bright_yellow().bold());
         match &self.mcp_manager {
             Some(m) => {
                 let tools = m.list_tools();
-                println!("  {} {} tool(s) available", "•".bright_cyan(), tools.len());
+                let _ = writeln!(
+                    out,
+                    "  {} {} tool(s) available",
+                    "•".bright_cyan(),
+                    tools.len()
+                );
                 for t in tools.iter().take(20) {
-                    println!("    - {}", t.name.bright_cyan());
+                    let _ = writeln!(out, "    - {}", t.name.bright_cyan());
                 }
                 if tools.len() > 20 {
-                    println!("    … {} more (see /mcp-tools)", tools.len() - 20);
+                    let _ = writeln!(out, "    … {} more (see /mcp-tools)", tools.len() - 20);
                 }
             }
-            None => println!("  {} No MCP manager loaded.", "ℹ".bright_blue()),
+            None => {
+                let _ = writeln!(out, "  {} No MCP manager loaded.", "ℹ".bright_blue());
+            }
         }
-        println!();
+
+        // Configured servers with enabled/disabled + connected status. The
+        // config is the source of truth for the server set; the manager tells
+        // us which are actually connected vs failed.
+        let _ = writeln!(out, "\n{}", "Servers:".bright_yellow().bold());
+        match crate::mcp_config::McpConfig::load() {
+            Ok(config) if !config.mcp_servers.is_empty() => {
+                let connected = self.connected_server_names();
+                let failed: std::collections::HashSet<String> = self
+                    .mcp_manager
+                    .as_ref()
+                    .map(|m| m.failed_servers().into_iter().map(|(n, _)| n).collect())
+                    .unwrap_or_default();
+                let mut names: Vec<&String> = config.mcp_servers.keys().collect();
+                names.sort();
+                for name in names {
+                    let cfg = &config.mcp_servers[name];
+                    let status = if !cfg.enabled {
+                        "disabled".bright_red().to_string()
+                    } else if connected.contains(name) {
+                        "connected".bright_green().to_string()
+                    } else if failed.contains(name) {
+                        "failed".bright_red().to_string()
+                    } else {
+                        "not loaded".bright_yellow().to_string()
+                    };
+                    let _ = writeln!(out, "  {} [{}]", name.bright_cyan(), status);
+                }
+            }
+            Ok(_) => {
+                let _ = writeln!(out, "  {} No MCP servers configured.", "ℹ".bright_blue());
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  {} Could not read mcp.json: {}", "✗".bright_red(), e);
+            }
+        }
+        let _ = writeln!(out);
+        out
+    }
+
+    /// External MCP server names (excluding the `builtin` pseudo-server) that
+    /// currently have at least one tool registered, i.e. are connected.
+    fn connected_server_names(&self) -> std::collections::HashSet<String> {
+        let mut servers = std::collections::HashSet::new();
+        if let Some(m) = &self.mcp_manager {
+            for (owner, _tool) in m.get_tools_with_server().values() {
+                if owner != "builtin" {
+                    servers.insert(owner.clone());
+                }
+            }
+        }
+        servers
+    }
+
+    /// Dispatch `/mcp` management subcommands and return the text to render.
+    /// Subcommands that mutate `mcp.json` (`enable`/`disable`/`add`/`remove`)
+    /// save the config and reload the manager so the change takes effect
+    /// immediately; `reload` re-reads the config; `list` (default) just renders
+    /// [`Self::mcp_output`]. Shared by the classic REPL and the TUI so the two
+    /// stay consistent.
+    async fn mcp_manage(&mut self, args: &str) -> String {
+        use std::fmt::Write as _;
+        let trimmed = args.trim();
+        let mut parts = trimmed.split_whitespace();
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest: Vec<&str> = parts.collect();
+
+        if sub.is_empty() || sub == "list" {
+            return self.mcp_output();
+        }
+
+        let mut out = String::new();
+        match sub.as_str() {
+            "enable" | "disable" => {
+                let Some(name) = rest.first() else {
+                    let _ = writeln!(out, "{} Usage: /mcp {} <name>", "Error:".bright_red(), sub);
+                    return out;
+                };
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                let Some(server) = config.mcp_servers.get_mut(*name) else {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown MCP server '{}'",
+                        "Error:".bright_red(),
+                        name
+                    );
+                    return out;
+                };
+                server.enabled = sub == "enable";
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} MCP server '{}' {}d",
+                    "✓".bright_green(),
+                    name.bright_cyan(),
+                    sub
+                );
+            }
+            "add" => {
+                if rest.len() < 2 {
+                    let _ = writeln!(
+                        out,
+                        "{} Usage: /mcp add <name> <command|url> [args...]",
+                        "Error:".bright_red()
+                    );
+                    return out;
+                }
+                let name = rest[0].to_string();
+                let target = rest[1];
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                let server = if target.starts_with("http://") || target.starts_with("https://") {
+                    crate::mcp_config::McpServerConfig {
+                        command: None,
+                        args: None,
+                        env: None,
+                        http_url: Some(target.to_string()),
+                        headers: None,
+                        oauth_provider: None,
+                        enabled: true,
+                    }
+                } else {
+                    let extra: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+                    crate::mcp_config::McpServerConfig {
+                        command: Some(target.to_string()),
+                        args: if extra.is_empty() { None } else { Some(extra) },
+                        env: None,
+                        http_url: None,
+                        headers: None,
+                        oauth_provider: None,
+                        enabled: true,
+                    }
+                };
+                config.add_server(name.clone(), server);
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} Added MCP server '{}'",
+                    "✓".bright_green(),
+                    name.bright_cyan()
+                );
+            }
+            "remove" | "rm" => {
+                let Some(name) = rest.first() else {
+                    let _ = writeln!(out, "{} Usage: /mcp remove <name>", "Error:".bright_red());
+                    return out;
+                };
+                let mut config = match crate::mcp_config::McpConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                        return out;
+                    }
+                };
+                if !config.remove_server(name) {
+                    let _ = writeln!(
+                        out,
+                        "{} Unknown MCP server '{}'",
+                        "Error:".bright_red(),
+                        name
+                    );
+                    return out;
+                }
+                if let Err(e) = config.save() {
+                    let _ = writeln!(out, "{} {}", "Error:".bright_red(), e);
+                    return out;
+                }
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(
+                    out,
+                    "{} Removed MCP server '{}'",
+                    "✓".bright_green(),
+                    name.bright_cyan()
+                );
+            }
+            "reload" => {
+                self.reload_and_note(&mut out).await;
+                let _ = writeln!(out, "{} MCP configuration reloaded", "✓".bright_green());
+            }
+            other => {
+                let _ = writeln!(
+                    out,
+                    "{} Unknown /mcp subcommand '{}'. Usage: /mcp [list|enable <name>|disable <name>|add <name> <command|url> [args...]|remove <name>|reload]",
+                    "Error:".bright_red(),
+                    other
+                );
+            }
+        }
+        out
+    }
+
+    /// Reload the MCP manager and note any error into `out`, keeping the
+    /// statusline denominator fresh afterward.
+    async fn reload_and_note(&mut self, out: &mut String) {
+        use std::fmt::Write as _;
+        // Under the TUI, the MCP manager rebuild (McpManager::new) emits
+        // connection chatter via `crate::out::status_line`, which would
+        // otherwise print directly to the raw terminal and corrupt the
+        // ratatui alt screen. Capture it and fold it into the transcript
+        // `out` instead. In the classic REPL (`!tui_active`) we leave the
+        // chatter alone so it prints to the terminal as it always has.
+        if self.tui_active {
+            crate::out::capture_start_suppressed();
+        }
+        let reload_err = self.reload_mcp().await.err();
+        if self.tui_active {
+            for line in crate::out::capture_take() {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+        if let Some(e) = reload_err {
+            let _ = writeln!(out, "{} reload failed: {}", "Warning:".bright_yellow(), e);
+        }
+        self.refresh_mcp_counts();
     }
 
     fn show_plugins(&self) {
@@ -7194,6 +7762,75 @@ mod tests {
             std::env::remove_var("CUBI_OAUTH_FILE");
             std::env::remove_var("CUBI_GITHUB_API_KEY");
         }
+    }
+
+    #[test]
+    fn skills_run_refuses_a_disabled_skill() {
+        // These cli env tests share a local `env_lock()`; `with_cubi_home`
+        // mutates HOME/CUBI_HOME under a *different* global lock, so hold both
+        // to serialize against the other env-mutating cli tests.
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            // Build a CLI with one fake skill and disable it.
+            let mut cli = new_test_cli();
+            cli.skills = vec![Skill {
+                name: "demo".to_string(),
+                description: "demo skill".to_string(),
+                body: "do the thing".to_string(),
+                path: std::path::PathBuf::from("/tmp/demo.md"),
+            }];
+            skills::disable("demo").expect("disable demo");
+
+            // `/skills list` reflects the disabled state.
+            let listing = cli.skills_manage("list");
+            assert!(
+                strip_ansi(&listing).contains("disabled"),
+                "list should mark the skill disabled, got: {listing}"
+            );
+
+            // `/skills run demo` must refuse WITHOUT injecting the skill body
+            // into history (the refusal returns before the agent turn).
+            let history_before = cli.history.len();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(cli.handle_skills("run demo"));
+            assert_eq!(
+                cli.history.len(),
+                history_before,
+                "a disabled skill must not push its body into history"
+            );
+            assert!(
+                !cli.history
+                    .iter()
+                    .any(|m| m.content.contains("do the thing")),
+                "disabled skill body must never be injected"
+            );
+
+            // Re-enabling clears the refusal.
+            skills::enable("demo").expect("enable demo");
+            assert!(!skills::is_disabled("demo"));
+        });
+    }
+
+    /// Strip ANSI escape sequences so status assertions are colour-agnostic.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_escape = false;
+        for c in s.chars() {
+            if in_escape {
+                // A CSI SGR sequence terminates at 'm'.
+                if c == 'm' {
+                    in_escape = false;
+                }
+            } else if c == '\u{1b}' {
+                in_escape = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]

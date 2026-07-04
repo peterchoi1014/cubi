@@ -38,6 +38,21 @@ pub struct McpServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "oauthProvider")]
     pub oauth_provider: Option<String>,
+
+    /// Whether this server should be connected. Absent in older config files,
+    /// which serde treats as `true` so pre-existing `~/.cubi/mcp.json` files
+    /// keep working (every configured server enabled). Skipped when `true` so
+    /// saved files stay clean; only an explicit `false` is written.
+    #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn is_enabled(enabled: &bool) -> bool {
+    *enabled
 }
 
 impl McpServerConfig {
@@ -115,5 +130,56 @@ mod tests {
             assert_eq!(path, cubi_home.join(".cubi").join("mcp.json"));
             assert!(!path.starts_with(other_home));
         });
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_when_absent() {
+        // A server entry with no `enabled` field (as written by older cubi
+        // versions) must deserialize as enabled so existing configs keep
+        // connecting.
+        let json = r#"{
+            "mcpServers": {
+                "legacy": { "command": "echo", "args": ["hi"] }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json).expect("parse legacy config");
+        let server = config.mcp_servers.get("legacy").expect("legacy server");
+        assert!(server.enabled, "absent enabled field must default to true");
+
+        // An explicit false round-trips.
+        let json_disabled = r#"{
+            "mcpServers": {
+                "off": { "command": "echo", "enabled": false }
+            }
+        }"#;
+        let config: McpConfig = serde_json::from_str(json_disabled).expect("parse disabled config");
+        assert!(!config.mcp_servers.get("off").expect("off server").enabled);
+    }
+
+    #[test]
+    fn enabled_true_is_not_serialized() {
+        // skip_serializing_if keeps saved files clean: an enabled server does
+        // not write the field, while a disabled one does.
+        let mut servers = HashMap::new();
+        servers.insert(
+            "on".to_string(),
+            McpServerConfig {
+                command: Some("echo".to_string()),
+                args: None,
+                env: None,
+                http_url: None,
+                headers: None,
+                oauth_provider: None,
+                enabled: true,
+            },
+        );
+        let config = McpConfig {
+            mcp_servers: servers,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            !json.contains("enabled"),
+            "enabled=true should be skipped, got: {json}"
+        );
     }
 }

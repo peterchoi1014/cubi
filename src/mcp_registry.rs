@@ -135,6 +135,7 @@ impl RegistryEntry {
                     http_url: None,
                     headers: None,
                     oauth_provider: None,
+                    enabled: true,
                 }
             }
             Transport::Http {
@@ -156,6 +157,7 @@ impl RegistryEntry {
                     http_url: Some(url.clone()),
                     headers: if hdrs.is_empty() { None } else { Some(hdrs) },
                     oauth_provider: oauth_provider.clone(),
+                    enabled: true,
                 }
             }
         }

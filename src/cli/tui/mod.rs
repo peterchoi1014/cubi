@@ -536,6 +536,59 @@ impl ChatCLI {
             if matches!(commands::parse(input), Some((Cmd::Quit, _))) {
                 return false;
             }
+            // The three "managed" commands render their textual output INSIDE
+            // the transcript as a framed block (like `!` shell output) rather
+            // than suspending the TUI. Only their read-only listing output is
+            // captured; `/skills run <name>` still executes an agent turn and
+            // stays on the suspend/turn path below.
+            if let Some((cmd, cmd_args)) = commands::parse(input) {
+                match cmd {
+                    Cmd::Skills
+                        if {
+                            let a = cmd_args.trim();
+                            let head = a
+                                .split_once(char::is_whitespace)
+                                .map(|(h, _)| h)
+                                .unwrap_or(a);
+                            a.is_empty()
+                                || head.eq_ignore_ascii_case("list")
+                                || head.eq_ignore_ascii_case("enable")
+                                || head.eq_ignore_ascii_case("disable")
+                        } =>
+                    {
+                        let output = self.skills_manage(cmd_args);
+                        self.render_captured_command("/skills", &output);
+                        return true;
+                    }
+                    Cmd::Agents => {
+                        // `/agents edit <name>` needs an interactive editor,
+                        // which can't render inside the alt screen — so
+                        // `agents_manage` returns `None` there and we fall
+                        // through to the suspend/resume path. Every other
+                        // subcommand yields text we capture in-transcript.
+                        match self.agents_manage(cmd_args) {
+                            Some(output) => {
+                                self.render_captured_command("/agents", &output);
+                                return true;
+                            }
+                            None => {
+                                return self.run_suspended_command(input, control_tx, guard).await;
+                            }
+                        }
+                    }
+                    Cmd::Mcp => {
+                        // Run the management dispatch (list/enable/disable/add/
+                        // remove/reload) and render its text in-transcript, then
+                        // keep the statusline denominator fresh exactly as the
+                        // classic `/mcp` handler does.
+                        let output = self.mcp_manage(cmd_args).await;
+                        self.refresh_mcp_counts();
+                        self.render_captured_command("/mcp", &output);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             // Every other slash command: suspend the TUI, run it on the real
             // terminal, resume. Returns `false` if the command asked to quit.
             return self.run_suspended_command(input, control_tx, guard).await;
@@ -572,6 +625,19 @@ impl ChatCLI {
             self.ui.status(&format!("Error: {e}"));
         }
         true
+    }
+
+    /// Render a slash command's captured textual output as a framed block in
+    /// the transcript, reusing the same seam the shell escape (`!cmd`) and the
+    /// agent-loop tool blocks use (`ui.tool_started` + `ui.tool_finished`). The
+    /// `header` (e.g. `/mcp`) becomes the block's `⚙` header line. Leading and
+    /// trailing blank lines from the classic layout are trimmed so the block
+    /// doesn't open or close with an empty framed row. There is no meaningful
+    /// wall-clock duration for a synchronous listing, so `elapsed_ms` is 0.
+    fn render_captured_command(&mut self, header: &str, output: &str) {
+        self.ui.tool_started(header);
+        let body = output.trim_matches('\n');
+        self.ui.tool_finished(header, true, body, 0);
     }
 
     /// Run one slash command on the *real* terminal via the suspend/resume

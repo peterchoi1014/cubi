@@ -1,4 +1,5 @@
 mod agent_loop;
+pub mod agents;
 mod bench;
 #[cfg(feature = "browser")]
 mod browser_tool;

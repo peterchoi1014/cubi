@@ -68,7 +68,10 @@ impl McpManager {
     pub async fn health_check_configured() -> Result<Vec<McpHealth>> {
         let config = McpConfig::load()?;
         let mut handles = Vec::new();
-        for (name, server_config) in config.mcp_servers {
+        // Only probe enabled servers: a user-disabled server is intentionally
+        // not connected, so it must not appear as "failed" in the health list
+        // (mirrors the `connectable_servers` filter).
+        for (name, server_config) in Self::connectable_servers(&config) {
             handles.push(tokio::spawn(async move {
                 let state = match with_mcp_startup_timeout(async {
                     let mut client = Self::connect_client(&server_config).await?;
@@ -152,16 +155,17 @@ impl McpManager {
         crate::out::status_line(quiet_stdout, builtins_msg);
 
         // Connect to configured MCP servers
-        for (name, server_config) in config.mcp_servers {
+        for (name, server_config) in Self::connectable_servers(&config) {
             if let Err(e) =
                 with_mcp_startup_timeout(manager.connect_server(&name, &server_config)).await
             {
-                eprintln!(
+                let warn_msg = format!(
                     "{} Failed to connect to MCP server '{}': {}",
                     "Warning:".bright_yellow(),
                     name,
                     e
                 );
+                crate::out::status_line(quiet_stdout, warn_msg);
                 continue;
             }
             let server_msg = format!(
@@ -169,17 +173,27 @@ impl McpManager {
                 "✓".bright_green(),
                 name.bright_cyan()
             );
-            if quiet_stdout {
-                eprintln!("{server_msg}");
-            } else {
-                println!("{server_msg}");
-            }
+            crate::out::status_line(quiet_stdout, server_msg);
         }
 
         // Discover tools from external servers
         manager.discover_tools().await?;
 
         Ok(manager)
+    }
+
+    /// Servers that should be connected on load: enabled ones only, sorted by
+    /// name for deterministic connect order. Disabled servers are intentionally
+    /// skipped and therefore never counted as connection failures.
+    fn connectable_servers(config: &McpConfig) -> Vec<(String, McpServerConfig)> {
+        let mut servers: Vec<(String, McpServerConfig)> = config
+            .mcp_servers
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled)
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
     }
 
     pub fn get_tools_with_server(&self) -> &HashMap<String, (String, Tool)> {
@@ -694,6 +708,137 @@ mod tests {
         assert!(!is_transport_dead(&err));
         let err = anyhow::anyhow!("invalid arguments: missing field 'command'");
         assert!(!is_transport_dead(&err));
+    }
+
+    #[test]
+    fn connectable_servers_skips_disabled() {
+        use crate::mcp_config::McpServerConfig;
+        let mk = |enabled: bool| McpServerConfig {
+            command: Some("echo".to_string()),
+            args: None,
+            env: None,
+            http_url: None,
+            headers: None,
+            oauth_provider: None,
+            enabled,
+        };
+        let mut servers = HashMap::new();
+        servers.insert("on".to_string(), mk(true));
+        servers.insert("off".to_string(), mk(false));
+        let config = McpConfig {
+            mcp_servers: servers,
+        };
+        let connectable = McpManager::connectable_servers(&config);
+        let names: Vec<&str> = connectable.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["on"], "disabled server must be skipped");
+    }
+
+    /// Bug 2: `health_check_configured` must not probe disabled servers, so a
+    /// user-disabled server never shows up as `Failed` in the statusline
+    /// health list. Uses an isolated CUBI_HOME with a persisted config
+    /// containing one enabled + one disabled server. Both point at a bogus
+    /// binary so the enabled one fails to connect fast (no real network),
+    /// which is fine — the assertion is that the disabled one is absent.
+    #[test]
+    fn health_check_configured_skips_disabled_servers() {
+        use crate::mcp_config::{McpConfig, McpServerConfig};
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mk = |enabled: bool| McpServerConfig {
+                command: Some("/nonexistent-cubi-test-mcp-binary".to_string()),
+                args: None,
+                env: None,
+                http_url: None,
+                headers: None,
+                oauth_provider: None,
+                enabled,
+            };
+            let mut servers = HashMap::new();
+            servers.insert("enabled-srv".to_string(), mk(true));
+            servers.insert("disabled-srv".to_string(), mk(false));
+            McpConfig {
+                mcp_servers: servers,
+            }
+            .save()
+            .expect("save config");
+
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let health = rt
+                .block_on(McpManager::health_check_configured())
+                .expect("health check");
+            let names: Vec<&str> = health.iter().map(|h| h.name.as_str()).collect();
+            assert!(
+                !names.contains(&"disabled-srv"),
+                "disabled server must not be probed or counted, got {names:?}"
+            );
+            assert!(
+                names.contains(&"enabled-srv"),
+                "enabled server should still be probed, got {names:?}"
+            );
+        });
+    }
+
+    /// Bug 1: the MCP connection chatter emitted during manager construction
+    /// must go through `crate::out::status_line`, so it honors the capture
+    /// buffer (and thus can be folded into the TUI transcript instead of
+    /// corrupting the alt screen). Build a manager with a bogus enabled
+    /// server under capture and assert the "Failed to connect" warning was
+    /// recorded rather than written straight to the terminal.
+    #[test]
+    fn connect_chatter_routes_through_status_line_capture() {
+        use crate::mcp_config::{McpConfig, McpServerConfig};
+        // Serialize against other capture-mutating tests (shared global buffer).
+        let _cap = crate::out::CAPTURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut servers = HashMap::new();
+            servers.insert(
+                "bogus-srv".to_string(),
+                McpServerConfig {
+                    command: Some("/nonexistent-cubi-test-mcp-binary".to_string()),
+                    args: None,
+                    env: None,
+                    http_url: None,
+                    headers: None,
+                    oauth_provider: None,
+                    enabled: true,
+                },
+            );
+            McpConfig {
+                mcp_servers: servers,
+            }
+            .save()
+            .expect("save config");
+
+            let permissions = Arc::new(Mutex::new(crate::permissions::Permissions::default()));
+            let plan_mode = Arc::new(AtomicBool::new(false));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+            crate::out::capture_start_suppressed();
+            let manager = rt
+                .block_on(McpManager::new_with_journal_quiet(
+                    permissions,
+                    plan_mode,
+                    FileJournal::default(),
+                    // quiet_stdout is irrelevant here: suppressed capture records
+                    // the line and skips the terminal write regardless.
+                    false,
+                ))
+                .expect("manager builds even when a server fails to connect");
+            drop(manager);
+            let lines = crate::out::capture_take();
+
+            assert!(
+                lines.iter().any(|l| l.contains("Loaded")),
+                "built-in tools line should be captured, got {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Failed to connect to MCP server 'bogus-srv'")),
+                "connection failure must route through status_line capture, got {lines:?}"
+            );
+        });
     }
 
     /// Build an empty manager (no clients, no MCP config loaded) so
