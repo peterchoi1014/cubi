@@ -111,13 +111,17 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             )),
             LineKind::ToolOutput => {
+                // The base (no-ANSI) look is the dim `tool_output_dim` style so
+                // plain output is unchanged; embedded SGR sequences drive per-
+                // span colors via the ANSI parser. The `│ ` frame keeps the dim
+                // style regardless of the row's own coloring.
+                let base = Style::default()
+                    .fg(theme.tool_output_dim)
+                    .add_modifier(Modifier::DIM);
                 for row in entry.text.split('\n') {
-                    lines.push(Line::styled(
-                        format!("│ {row}"),
-                        Style::default()
-                            .fg(theme.tool_output_dim)
-                            .add_modifier(Modifier::DIM),
-                    ));
+                    let mut spans = vec![Span::styled("│ ".to_string(), base)];
+                    spans.extend(super::ansi::ansi_spans(row, base));
+                    lines.push(Line::from(spans));
                 }
             }
             // Diff-shaped tool output: color rows via the shared diff renderer
@@ -644,6 +648,32 @@ mod tests {
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].fg)
             .collect()
+    }
+
+    #[test]
+    fn tool_output_ansi_reaches_the_tui_as_color() {
+        // A ToolOutput row carrying `colored`-crate ANSI (bright-green "green")
+        // must render with a green foreground somewhere on screen — proving the
+        // escapes are parsed into styled spans instead of being stripped to a
+        // single dim style.
+        let mut state = AppState::new();
+        state.set_theme(Theme::from_name("dark"));
+        state.apply(RenderEvent::ToolStarted {
+            name: "skills".into(),
+        });
+        state.apply(RenderEvent::ToolFinished {
+            name: "skills".into(),
+            ok: true,
+            output: "\x1b[92mgreen\x1b[0m".into(),
+            elapsed_ms: 10,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let fgs = all_fgs(terminal.backend().buffer());
+        assert!(
+            fgs.contains(&ratatui::style::Color::LightGreen),
+            "expected a LightGreen cell from the parsed ANSI, got {fgs:?}"
+        );
     }
 
     #[test]

@@ -2689,29 +2689,49 @@ impl ChatCLI {
     fn skills_output(&self, _args: &str) -> String {
         use std::fmt::Write as _;
         let disabled = skills::load_disabled();
+        let dir = "~/.cubi/skills";
         let mut out = String::new();
-        let _ = writeln!(out, "\n{}", "Skills:".bright_yellow().bold());
+        let _ = writeln!(
+            out,
+            "\n{} {}",
+            "Skills".bright_yellow().bold(),
+            format!("· {dir}").bright_black()
+        );
         if self.skills.is_empty() {
             let _ = writeln!(
                 out,
-                "  {} No skills found in ~/.cubi/skills",
-                "ℹ".bright_blue()
+                "  {}",
+                format!("no skills in {dir} — add a Markdown file").bright_black()
             );
-        } else {
-            for skill in &self.skills {
-                let status = if disabled.contains(&skill.name) {
-                    "disabled".bright_red().to_string()
-                } else {
-                    "enabled".bright_green().to_string()
-                };
-                let _ = writeln!(
-                    out,
-                    "  {} [{}] - {}",
-                    skill.name.bright_cyan(),
-                    status,
-                    skill.description.bright_white()
-                );
-            }
+            let _ = writeln!(out);
+            return out;
+        }
+        let name_w = self
+            .skills
+            .iter()
+            .map(|s| s.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(22);
+        for skill in &self.skills {
+            let is_disabled = disabled.contains(&skill.name);
+            let marker = if is_disabled {
+                "○".bright_black()
+            } else {
+                "●".bright_green()
+            };
+            let name_col = pad_col(&skill.name, name_w);
+            let name_disp = if is_disabled {
+                name_col.bright_black()
+            } else {
+                name_col.bright_cyan()
+            };
+            let desc = if is_disabled {
+                "disabled".to_string()
+            } else {
+                truncate_cols(&skill.description, 64)
+            };
+            let _ = writeln!(out, "  {} {}  {}", marker, name_disp, desc.bright_black());
         }
         let _ = writeln!(out);
         out
@@ -4854,40 +4874,61 @@ impl ChatCLI {
     fn agents_output(&self) -> String {
         use std::fmt::Write as _;
         let disabled = crate::agents::load_disabled();
-        let mut out = String::new();
-        let _ = writeln!(out, "\n{}", "Agents:".bright_yellow().bold());
         let agents = crate::agents::load_agents();
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "\n{} {}",
+            "Agents".bright_yellow().bold(),
+            "· run with /<name>".bright_black()
+        );
         if agents.is_empty() {
             let _ = writeln!(
                 out,
-                "  {} No agents defined in ~/.cubi/agents",
-                "ℹ".bright_blue()
+                "  {}",
+                "no agents in ~/.cubi/agents — add a Markdown file, then run it with /<name>"
+                    .bright_black()
             );
+            let _ = writeln!(out);
+            return out;
+        }
+        let name_w = agents
+            .iter()
+            .map(|a| a.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(22);
+        for agent in &agents {
+            let is_disabled = disabled.contains(&agent.name);
+            let marker = if is_disabled {
+                "○".bright_black()
+            } else {
+                "●".bright_green()
+            };
+            let name_col = pad_col(&agent.name, name_w);
+            let name_disp = if is_disabled {
+                name_col.bright_black()
+            } else {
+                name_col.bright_cyan()
+            };
+            let desc = if is_disabled {
+                "disabled".to_string()
+            } else {
+                truncate_cols(&agent.description, 64)
+            };
+            // The model annotation only makes sense for an enabled agent.
+            let model = match &agent.model {
+                Some(m) if !is_disabled => format!(" {}", format!("· {m}").bright_black()),
+                _ => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "  {} Add a Markdown file to ~/.cubi/agents, then run it with /<name>",
-                "ℹ".bright_blue()
+                "  {} {}  {}{}",
+                marker,
+                name_disp,
+                desc.bright_black(),
+                model
             );
-        } else {
-            for agent in &agents {
-                let status = if disabled.contains(&agent.name) {
-                    "disabled".bright_red().to_string()
-                } else {
-                    "enabled".bright_green().to_string()
-                };
-                let model = match &agent.model {
-                    Some(m) => format!(" {}", format!("(model: {m})").bright_black()),
-                    None => String::new(),
-                };
-                let _ = writeln!(
-                    out,
-                    "  {} [{}] - {}{}",
-                    agent.name.bright_cyan(),
-                    status,
-                    agent.description.bright_white(),
-                    model
-                );
-            }
         }
         let _ = writeln!(out);
         out
@@ -5556,34 +5597,38 @@ impl ChatCLI {
     fn mcp_output(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
-        let _ = writeln!(out, "\n{}", "MCP status:".bright_yellow().bold());
-        match &self.mcp_manager {
-            Some(m) => {
-                let tools = m.list_tools();
-                let _ = writeln!(
-                    out,
-                    "  {} {} tool(s) available",
-                    "•".bright_cyan(),
-                    tools.len()
-                );
-                for t in tools.iter().take(20) {
-                    let _ = writeln!(out, "    - {}", t.name.bright_cyan());
+
+        // Tool inventory: total, built-in, and per external server. The manager
+        // tags each tool with its owning server (`builtin` for the built-ins).
+        let mut builtin_count = 0usize;
+        let mut total = 0usize;
+        let mut per_server: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        if let Some(m) = &self.mcp_manager {
+            total = m.list_tools().len();
+            for (owner, _tool) in m.get_tools_with_server().values() {
+                if owner == "builtin" {
+                    builtin_count += 1;
+                } else {
+                    *per_server.entry(owner.clone()).or_insert(0) += 1;
                 }
-                if tools.len() > 20 {
-                    let _ = writeln!(out, "    … {} more (see /mcp-tools)", tools.len() - 20);
-                }
-            }
-            None => {
-                let _ = writeln!(out, "  {} No MCP manager loaded.", "ℹ".bright_blue());
             }
         }
 
-        // Configured servers with enabled/disabled + connected status. The
-        // config is the source of truth for the server set; the manager tells
-        // us which are actually connected vs failed.
-        let _ = writeln!(out, "\n{}", "Servers:".bright_yellow().bold());
         match crate::mcp_config::McpConfig::load() {
             Ok(config) if !config.mcp_servers.is_empty() => {
+                let n = config.mcp_servers.len();
+                let servers_word = if n == 1 { "server" } else { "servers" };
+                let tools_word = if total == 1 { "tool" } else { "tools" };
+                let _ = writeln!(
+                    out,
+                    "\n{} {}",
+                    "MCP".bright_yellow().bold(),
+                    format!(
+                        "· {n} {servers_word} · {total} {tools_word} ({builtin_count} built-in)"
+                    )
+                    .bright_black()
+                );
                 let connected = self.connected_server_names();
                 let failed: std::collections::HashSet<String> = self
                     .mcp_manager
@@ -5592,24 +5637,54 @@ impl ChatCLI {
                     .unwrap_or_default();
                 let mut names: Vec<&String> = config.mcp_servers.keys().collect();
                 names.sort();
+                let name_w = names
+                    .iter()
+                    .map(|n| n.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .min(22);
                 for name in names {
                     let cfg = &config.mcp_servers[name];
-                    let status = if !cfg.enabled {
-                        "disabled".bright_red().to_string()
+                    let (marker, status) = if !cfg.enabled {
+                        ("○".bright_black(), "disabled".bright_black())
                     } else if connected.contains(name) {
-                        "connected".bright_green().to_string()
+                        let count = per_server.get(name).copied().unwrap_or(0);
+                        let tw = if count == 1 { "tool" } else { "tools" };
+                        (
+                            "●".bright_green(),
+                            format!("connected · {count} {tw}").bright_green(),
+                        )
                     } else if failed.contains(name) {
-                        "failed".bright_red().to_string()
+                        ("●".bright_red(), "failed".bright_red())
                     } else {
-                        "not loaded".bright_yellow().to_string()
+                        ("○".yellow(), "not loaded".bright_yellow())
                     };
-                    let _ = writeln!(out, "  {} [{}]", name.bright_cyan(), status);
+                    let _ = writeln!(
+                        out,
+                        "  {} {}  {}",
+                        marker,
+                        pad_col(name, name_w).bright_cyan(),
+                        status
+                    );
                 }
             }
             Ok(_) => {
-                let _ = writeln!(out, "  {} No MCP servers configured.", "ℹ".bright_blue());
+                let tools_word = if builtin_count == 1 { "tool" } else { "tools" };
+                let _ = writeln!(
+                    out,
+                    "\n{} {}",
+                    "MCP".bright_yellow().bold(),
+                    format!("· no servers configured · {builtin_count} built-in {tools_word}")
+                        .bright_black()
+                );
+                let _ = writeln!(
+                    out,
+                    "  {}",
+                    "add one with /mcp add <name> <command|url>".bright_black()
+                );
             }
             Err(e) => {
+                let _ = writeln!(out, "\n{}", "MCP".bright_yellow().bold());
                 let _ = writeln!(out, "  {} Could not read mcp.json: {}", "✗".bright_red(), e);
             }
         }
@@ -6753,6 +6828,33 @@ fn parse_toggle(arg: &str, current: bool) -> Option<bool> {
         "off" | "false" | "0" | "disable" | "disabled" | "no" => Some(false),
         _ => None,
     }
+}
+
+/// Truncate `s` to at most `max` visible chars, replacing the tail with `…`
+/// when it would be cut. Used by the compact `/skills`, `/agents`, and `/mcp`
+/// list layouts to keep descriptions on one row.
+fn truncate_cols(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Truncate `s` to `width` chars (with `…`) then right-pad with spaces to
+/// exactly `width` visible columns, so names align in a fixed column.
+fn pad_col(s: &str, width: usize) -> String {
+    let mut out = truncate_cols(s, width);
+    let len = out.chars().count();
+    if len < width {
+        out.extend(std::iter::repeat_n(' ', width - len));
+    }
+    out
 }
 
 /// Reads `CUBI_HISTORY_PAGE` (clamped to a sane range) to size the
@@ -7931,16 +8033,19 @@ mod tests {
                 "listing missing alpha: {listing}"
             );
             assert!(listing.contains("beta"), "listing missing beta: {listing}");
+            // Concise header carries the `·` separator.
             assert!(
-                listing.contains("[enabled]"),
-                "listing should mark alpha enabled: {listing}"
+                listing.contains('·'),
+                "listing header should use the `·` separator: {listing}"
             );
+            // The disabled agent renders a `disabled` marker; the enabled one
+            // shows its model annotation instead.
             assert!(
-                listing.contains("[disabled]"),
+                listing.contains("disabled"),
                 "listing should mark beta disabled: {listing}"
             );
             assert!(
-                listing.contains("(model: qwen3:8b)"),
+                listing.contains("qwen3:8b"),
                 "listing should show the model annotation: {listing}"
             );
 
@@ -7956,6 +8061,85 @@ mod tests {
             // Unknown agent → clear error, no mutation.
             let out = strip_ansi(&cli.agents_manage("disable ghost"));
             assert!(out.contains("Unknown agent"), "unknown output: {out}");
+        });
+    }
+
+    #[test]
+    fn skills_output_uses_concise_colored_layout() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut cli = new_test_cli();
+            cli.skills = vec![
+                Skill {
+                    name: "ultramarathon".to_string(),
+                    description: "orchestrate, do not implement".to_string(),
+                    body: String::new(),
+                    path: std::path::PathBuf::from("/tmp/u.md"),
+                },
+                Skill {
+                    name: "demo".to_string(),
+                    description: "a demo skill".to_string(),
+                    body: String::new(),
+                    path: std::path::PathBuf::from("/tmp/d.md"),
+                },
+            ];
+            skills::disable("demo").expect("disable demo");
+
+            let listing = strip_ansi(&cli.skills_output("list"));
+            // Compact header with the `·` path separator.
+            assert!(
+                listing.contains("Skills") && listing.contains('·'),
+                "header should be `Skills · …`: {listing}"
+            );
+            // Enabled skills show a filled marker + description; disabled ones a
+            // hollow marker + `disabled`.
+            assert!(listing.contains('●'), "enabled marker missing: {listing}");
+            assert!(listing.contains('○'), "disabled marker missing: {listing}");
+            assert!(
+                listing.contains("orchestrate, do not implement"),
+                "enabled description missing: {listing}"
+            );
+            assert!(
+                listing.contains("disabled"),
+                "disabled skill row should say disabled: {listing}"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_output_list_does_not_dump_tool_names() {
+        // The `/mcp` list view is a summary — it must NOT enumerate the built-in
+        // tool names (that is what `/mcp-tools` is for). Build a manager (which
+        // loads the built-in tools) and confirm none of their names leak into
+        // the list, while the concise summary header is present.
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut cli = new_test_cli();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let manager = rt.block_on(McpManager::new(
+                Arc::new(Mutex::new(Permissions::default())),
+                Arc::new(AtomicBool::new(false)),
+            ));
+            cli.mcp_manager = manager.ok();
+
+            let listing = strip_ansi(&cli.mcp_output());
+            assert!(
+                listing.contains("MCP") && listing.contains('·'),
+                "concise header should be `MCP · …`: {listing}"
+            );
+            assert!(
+                listing.contains("built-in"),
+                "header should summarize built-in tool count: {listing}"
+            );
+            for name in ["read_file", "write_file", "edit_file", "search_glob"] {
+                assert!(
+                    !listing.contains(name),
+                    "list view must not dump built-in tool name `{name}`: {listing}"
+                );
+            }
         });
     }
 
