@@ -629,7 +629,19 @@ impl ChatCLI {
             return false;
         }
 
-        // (5b) Re-enter the TUI, then release the render task to rebuild its
+        // (5) The command printed to the real terminal during the suspend
+        // window; pause until the user presses Enter so quick output isn't
+        // wiped the instant we repaint the alt screen. Raw mode is off here
+        // (see `guard.suspend()`), so a line-buffered stdin read is correct.
+        {
+            use std::io::Write;
+            print!("\n\x1b[2m— press Enter to return to Cubi —\x1b[0m ");
+            let _ = std::io::stdout().flush();
+            let mut ack = String::new();
+            let _ = std::io::stdin().read_line(&mut ack);
+        }
+
+        // (6) Re-enter the TUI, then release the render task to rebuild its
         // event stream and force a full repaint. Ordering matters: enter the
         // alt screen BEFORE the render task draws, or it would paint the normal
         // screen.
