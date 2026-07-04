@@ -22,6 +22,7 @@
 
 mod ansi;
 mod app;
+mod capture;
 mod diff;
 mod event;
 mod highlight;

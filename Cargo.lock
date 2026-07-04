@@ -507,6 +507,7 @@ dependencies = [
  "getrandom 0.2.16",
  "ignore",
  "insta",
+ "libc",
  "predicates",
  "ratatui",
  "reqwest",
