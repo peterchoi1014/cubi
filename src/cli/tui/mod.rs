@@ -681,9 +681,15 @@ impl ChatCLI {
                 }
                 AgentCommand::NotAgent => {}
             }
-            // Every other slash command: suspend the TUI, run it on the real
-            // terminal, resume. Returns `false` if the command asked to quit.
-            return self.run_suspended_command(input, control_tx, guard).await;
+            // Every other slash command: by default CAPTURE its stdout/stderr
+            // and render it as a framed block inside the transcript (no
+            // suspend, no "press Enter" prompt, staying on the alt screen).
+            // Only commands that genuinely need the real terminal (an
+            // interactive child like `$EDITOR`) still take the suspend path.
+            if Self::command_needs_terminal(input) {
+                return self.run_suspended_command(input, control_tx, guard).await;
+            }
+            return self.run_captured_command(input, control_tx).await;
         }
 
         // Shell escape: `!<cmd>` runs a shell command and shows its output as a
@@ -836,6 +842,135 @@ impl ChatCLI {
             eprintln!("cubi: failed to re-enter the TUI: {e}");
             return false;
         }
+        let _ = resume_tx.send(());
+        true
+    }
+
+    /// True only for slash commands that must run on the REAL terminal because
+    /// they hand control to an interactive child program. Currently that is
+    /// just `/edit`, which launches `$EDITOR` via
+    /// [`edit_cmd::spawn_editor_blocking`](crate::cli::edit_cmd). Every other
+    /// command's output is captured and rendered in-transcript, so it must
+    /// return `false` here to take the capture path.
+    fn command_needs_terminal(input: &str) -> bool {
+        matches!(commands::parse(input), Some((Cmd::Edit, _)))
+    }
+
+    /// Run one slash command with its stdout/stderr CAPTURED and rendered as a
+    /// framed block INSIDE the transcript, instead of suspending the TUI to the
+    /// real terminal. This is the default path for every non-interactive
+    /// command (`/status`, `/diff`, `/config`, `/model`, `/history`, …). It
+    /// mirrors [`run_suspended_command`](Self::run_suspended_command)'s dispatch
+    /// order (`try_user_command` first, then `handle_command`) but never leaves
+    /// the alt screen and never prompts "press Enter". Returns `false` when the
+    /// command asked to quit.
+    ///
+    /// Sequence: (1) ask the render task to park and await its ack — the same
+    /// handshake `run_suspended_command` uses, so the render task drops its
+    /// `EventStream` and stops competing for stdin; (2) swap `self.ui` to a
+    /// [`LineSink`] and clear `tui_active` so any writes go to fd 1 (captured),
+    /// WITHOUT leaving the alt screen; (3) install the capture guard, dispatch,
+    /// read the captured bytes, and drop the guard to restore the fds (degrading
+    /// to an uncaptured run if the redirect could not be installed); (4) restore
+    /// the [`TuiSink`]; (5) on quit, stop WITHOUT firing resume (shutdown reaps
+    /// the parked render task); (6) render the captured text into the transcript
+    /// via [`render_captured_command`](Self::render_captured_command) (the same
+    /// seam `/mcp` uses); (7) fire `resume` so the render task rebuilds its
+    /// stream and repaints the new block.
+    async fn run_captured_command(
+        &mut self,
+        input: &str,
+        control_tx: &UnboundedSender<RenderControl>,
+    ) -> bool {
+        use crate::cli::ui_sink::{LineSink, SinkFlags, UiSink};
+        use tokio::sync::oneshot;
+
+        // (1) Park the render task and wait until it has dropped its
+        // `EventStream` (so it neither reads stdin nor writes stdout during our
+        // capture window). Unlike the suspend path we do NOT leave the alt
+        // screen — we stay on it the whole time.
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        if control_tx
+            .send(RenderControl::Suspend {
+                ack: ack_tx,
+                resume: resume_rx,
+            })
+            .is_err()
+        {
+            // Render task is gone; nothing to drive. Keep the session alive.
+            return true;
+        }
+        if ack_rx.await.is_err() {
+            // Render task died between send and ack; keep the session alive.
+            return true;
+        }
+
+        // (2) Swap in a real-terminal `LineSink` (same profile as
+        // `run_suspended_command`) so any `self.ui` writes emit plain text to
+        // fd 1 — which the capture guard redirects into the tempfile. We keep
+        // the alt screen and raw mode as-is; only the render task is parked.
+        let line_sink: Box<dyn UiSink + Send> = Box::new(LineSink::new(SinkFlags {
+            headless: false,
+            json: false,
+            markdown: self.markdown_enabled,
+        }));
+        let tui_sink = std::mem::replace(&mut self.ui, line_sink);
+        self.tui_active = false;
+
+        // (3) Install the capture guard, then dispatch exactly as the REPL:
+        // user-defined commands first, then the built-in handler. The guard is
+        // held across the `.await`; that is sound only because the render task
+        // is parked and nothing else writes fd 1/2 under the TuiSink (the same
+        // invariant `run_suspended_command` relies on). If the redirect could
+        // not be installed, run uncaptured and treat the capture as empty.
+        let maybe_redir = capture::begin();
+        let keep_running = if self.try_user_command(input) {
+            true
+        } else {
+            match self.handle_command(input).await {
+                Ok(cont) => cont,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    true
+                }
+            }
+        };
+        let captured = match maybe_redir {
+            Some(redir) => {
+                let text = redir.read_captured();
+                // Restore fds/color before we resume rendering.
+                drop(redir);
+                text
+            }
+            None => String::new(),
+        };
+
+        // (4) Restore the original TuiSink regardless of outcome.
+        self.ui = tui_sink;
+        self.tui_active = true;
+
+        if !keep_running {
+            // (5) Quit: do NOT fire resume. We never left the alt screen, so
+            // there is nothing to re-enter; `run_tui`'s shutdown reaps the
+            // (still-parked) render task and finalizes.
+            return false;
+        }
+
+        // (6) Render the captured output into the transcript. These
+        // `tool_started`/`tool_finished` RenderEvents buffer in the channel
+        // while the render task is parked and paint once it resumes. Use the
+        // leading `/word` as the block header. If the command produced no
+        // output, still render a minimal line so the block acknowledges it ran.
+        let header = input.split_whitespace().next().unwrap_or(input);
+        if captured.trim().is_empty() {
+            self.render_captured_command(header, "(no output)");
+        } else {
+            self.render_captured_command(header, &captured);
+        }
+
+        // (7) Release the render task to rebuild its `EventStream` and force a
+        // full repaint (showing the freshly rendered transcript block).
         let _ = resume_tx.send(());
         true
     }
@@ -1195,5 +1330,28 @@ mod render_loop_tests {
             joined.is_ok(),
             "render task must survive resume even when the cursor-position query fails"
         );
+    }
+
+    #[test]
+    fn command_needs_terminal_only_for_edit() {
+        // `/edit` launches `$EDITOR` and MUST keep the real-terminal suspend
+        // path; every other command is captured in-transcript.
+        assert!(ChatCLI::command_needs_terminal("/edit"));
+        assert!(ChatCLI::command_needs_terminal("/edit some seed text"));
+        for cmd in [
+            "/status",
+            "/diff",
+            "/sessions",
+            "/history",
+            "/login",
+            "/mcp",
+            "/config",
+            "/model",
+        ] {
+            assert!(
+                !ChatCLI::command_needs_terminal(cmd),
+                "{cmd} must take the capture path, not suspend"
+            );
+        }
     }
 }

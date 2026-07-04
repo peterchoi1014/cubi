@@ -58,7 +58,7 @@ const NULL_DEV: &str = "/dev/null";
 /// the redirect cannot be installed (e.g. the tempfile cannot be created) `f`
 /// still runs, and the returned capture string is empty.
 pub(crate) fn capture_fds<R>(f: impl FnOnce() -> R) -> (R, String) {
-    match Redirect::install() {
+    match Redirect::install(true) {
         Ok(redir) => {
             let r = f();
             let captured = redir.read_captured();
@@ -72,17 +72,40 @@ pub(crate) fn capture_fds<R>(f: impl FnOnce() -> R) -> (R, String) {
     }
 }
 
+/// Begin capturing stdout/stderr for an ASYNC caller. Installs the redirect and
+/// hands back the RAII guard, or `None` if it could not be installed (in which
+/// case the caller should run uncaptured and treat the capture as empty).
+///
+/// Unlike [`capture_fds`], which owns the whole synchronous closure, this lets
+/// the caller keep the guard alive across an `.await`: install with `begin()`,
+/// drive the async dispatch, read the bytes with [`Redirect::read_captured`],
+/// then `drop` the guard to restore the fds. This is only sound while nothing
+/// else writes fd 1/2 during the window (e.g. the TUI render task is parked).
+///
+/// **fd 0 is deliberately left untouched.** The TUI's crossterm event reader
+/// registers process stdin (fd 0) with a *global*, lazily-initialized OS poll
+/// (epoll/kqueue). `dup2`'ing over fd 0 — even transiently — closes that
+/// registration, and restoring the fd afterwards does NOT re-arm it, so the
+/// render task would go permanently deaf to the keyboard after the first
+/// captured command. We therefore only redirect stdout/stderr here; the caller
+/// (the confirm prompts) detects the non-interactive capture window via
+/// `stdout` no longer being a TTY instead of relying on a stdin EOF.
+pub(crate) fn begin() -> Option<Redirect> {
+    Redirect::install(false).ok()
+}
+
 /// RAII guard that owns the redirect. Installing it saves the original fd
 /// 0/1/2 with `dup` and points them at the null device / tempfile; dropping it
 /// flushes, restores the originals with `dup2`, closes every fd it opened, and
 /// restores the previous `colored` override.
-struct Redirect {
+pub(crate) struct Redirect {
     /// `dup`'d copies of the original fd 0, 1, 2 (in that order). `-1` marks a
     /// slot that failed to save (and therefore must not be restored/closed).
     saved: [c_int; 3],
     /// fd into the tempfile that fd 1 / fd 2 are redirected to.
     write_fd: c_int,
-    /// fd into the null device that fd 0 is redirected from.
+    /// fd into the null device that fd 0 is redirected from, or `-1` when stdin
+    /// is left untouched (the async [`begin`] path).
     null_fd: c_int,
     /// Backing tempfile; dropped (and deleted) with the guard.
     tmp: NamedTempFile,
@@ -91,26 +114,42 @@ struct Redirect {
 }
 
 impl Redirect {
-    fn install() -> io::Result<Self> {
+    /// Install the redirect. `redirect_stdin` controls whether fd 0 is pointed
+    /// at the null device: [`capture_fds`] (a fully synchronous window) sets it
+    /// so any read gets EOF, while [`begin`] (the async window driven under the
+    /// TUI) leaves fd 0 alone so crossterm's global stdin poll registration is
+    /// never disturbed. fd 1 / fd 2 are always redirected to the tempfile.
+    fn install(redirect_stdin: bool) -> io::Result<Self> {
         let prev_color = colored::control::SHOULD_COLORIZE.should_colorize();
 
         let tmp = NamedTempFile::new()?;
         let write_fd = open_fd(tmp.path(), libc::O_RDWR | libc::O_CREAT | O_BINARY, 0o600)?;
-        let null_fd = match open_fd(Path::new(NULL_DEV), libc::O_RDWR | O_BINARY, 0) {
-            Ok(fd) => fd,
-            Err(e) => {
-                unsafe { libc::close(write_fd) };
-                return Err(e);
+        let null_fd = if redirect_stdin {
+            match open_fd(Path::new(NULL_DEV), libc::O_RDWR | O_BINARY, 0) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    unsafe { libc::close(write_fd) };
+                    return Err(e);
+                }
             }
+        } else {
+            -1
         };
 
         // Flush any buffered bytes to the *real* terminal before swapping.
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
 
-        // Save the originals. If any save fails, the guard's Drop closes the
-        // fds we opened and restores whatever it can.
-        let saved = unsafe { [libc::dup(0), libc::dup(1), libc::dup(2)] };
+        // Save the originals. fd 0 is only saved (and later restored) when we
+        // actually redirect it. If any required save fails, the guard's Drop
+        // closes the fds we opened and restores whatever it can.
+        let saved = unsafe {
+            [
+                if redirect_stdin { libc::dup(0) } else { -1 },
+                libc::dup(1),
+                libc::dup(2),
+            ]
+        };
         let guard = Redirect {
             saved,
             write_fd,
@@ -118,14 +157,14 @@ impl Redirect {
             tmp,
             prev_color,
         };
-        if saved.iter().any(|&fd| fd < 0) {
+        if saved[1] < 0 || saved[2] < 0 || (redirect_stdin && saved[0] < 0) {
             return Err(io::Error::last_os_error());
         }
 
         // Install the redirect. On any failure the guard's Drop restores the
         // originals from `saved`.
         let ok = unsafe {
-            libc::dup2(null_fd, 0) >= 0
+            (!redirect_stdin || libc::dup2(null_fd, 0) >= 0)
                 && libc::dup2(write_fd, 1) >= 0
                 && libc::dup2(write_fd, 2) >= 0
         };
@@ -143,7 +182,7 @@ impl Redirect {
     /// Flush the std streams and read everything written to the tempfile so
     /// far. Reads through `write_fd` itself (fd 1/2 share its file
     /// description), so no additional handle to the file is opened.
-    fn read_captured(&self) -> String {
+    pub(crate) fn read_captured(&self) -> String {
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
         let bytes = unsafe {
@@ -174,7 +213,9 @@ impl Drop for Redirect {
                 libc::close(self.saved[2]);
             }
             libc::close(self.write_fd);
-            libc::close(self.null_fd);
+            if self.null_fd >= 0 {
+                libc::close(self.null_fd);
+            }
         }
         colored::control::set_override(self.prev_color);
         // `self.tmp` is dropped here, deleting the backing file.
@@ -346,6 +387,34 @@ mod tests {
         assert!(
             out.contains("child-inherited-out"),
             "child stdout (inherited fd) not captured: {out:?}"
+        );
+    }
+
+    #[test]
+    fn begin_captures_stdout_for_async_callers() {
+        let _g = lock();
+        // The async entry point installs the redirect, captures fd 1/2 while
+        // the guard is alive, and restores on drop — mirroring `capture_fds`
+        // but leaving the guard under the caller's control across an `.await`.
+        let redir = begin().expect("begin() should install the redirect");
+        emit_stdout("async-captured-out");
+        emit_stderr("async-captured-err");
+        let captured = redir.read_captured();
+        drop(redir);
+        assert!(
+            captured.contains("async-captured-out"),
+            "begin() must capture stdout: {captured:?}"
+        );
+        assert!(
+            captured.contains("async-captured-err"),
+            "begin() must capture stderr: {captured:?}"
+        );
+        // fds are restored after drop: a following sync capture is clean.
+        let (_, after) = capture_fds(|| emit_stdout("after-begin"));
+        assert!(after.contains("after-begin"), "fds not restored: {after:?}");
+        assert!(
+            !after.contains("async-captured-out"),
+            "begin() capture leaked into a later window: {after:?}"
         );
     }
 

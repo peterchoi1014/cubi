@@ -1773,7 +1773,18 @@ impl ChatCLI {
     fn history_trim_interactive(&mut self, n: usize) {
         let before_len = self.history.len();
         if !self.headless_mode {
-            use std::io::{self, Write};
+            use std::io::{self, IsTerminal, Write};
+            // Under the TUI capture path stdout/stderr are redirected to a file
+            // (not a TTY) and there is no interactive terminal to read a
+            // confirmation from. Abort safely with a clear note rather than
+            // silently doing nothing (a null-device stdin would read as EOF).
+            if !io::stdout().is_terminal() {
+                eprintln!(
+                    "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
+                    "Info:".bright_yellow()
+                );
+                return;
+            }
             print!(
                 "Trim history to the last {} user turn{}? [y/N] ",
                 n,
@@ -1781,9 +1792,21 @@ impl ChatCLI {
             );
             let _ = io::stdout().flush();
             let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_err() {
-                eprintln!("{} Aborted.", "Info:".bright_yellow());
-                return;
+            match io::stdin().read_line(&mut input) {
+                // EOF with no input (e.g. piped/redirected stdin): no
+                // confirmation possible, so abort safely.
+                Ok(0) => {
+                    eprintln!(
+                        "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
+                        "Info:".bright_yellow()
+                    );
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("{} Aborted.", "Info:".bright_yellow());
+                    return;
+                }
+                Ok(_) => {}
             }
             if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
                 println!("{} Aborted.", "ℹ".bright_blue());
@@ -3022,14 +3045,33 @@ impl ChatCLI {
     }
 
     fn confirm_session_delete(&self, id: &str) -> bool {
-        use std::io::{self, Write};
+        use std::io::{self, IsTerminal, Write};
+        // Under the TUI capture path stdout is redirected to a file (not a
+        // TTY): there is no interactive terminal to confirm on, so refuse the
+        // destructive delete safely with a clear note instead of silently
+        // treating a null-device EOF as a decision.
+        if !io::stdout().is_terminal() {
+            eprintln!(
+                "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
+                "Info:".bright_yellow()
+            );
+            return false;
+        }
         print!("Delete session {}? [y/N] ", id.bright_cyan());
         let _ = io::stdout().flush();
         let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .map(|_| matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
-            .unwrap_or(false)
+        match io::stdin().read_line(&mut input) {
+            // EOF with no input (e.g. piped/redirected stdin): abort safely.
+            Ok(0) => {
+                eprintln!(
+                    "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
+                    "Info:".bright_yellow()
+                );
+                false
+            }
+            Ok(_) => matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+            Err(_) => false,
+        }
     }
 
     /// Lists checkpointed sessions for the current project, newest first.
