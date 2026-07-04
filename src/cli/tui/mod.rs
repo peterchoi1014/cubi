@@ -209,6 +209,7 @@ where
                             }
                             event::Action::Submit => {
                                 let line = state.take_composer();
+                                state.push_history(&line);
                                 let trimmed = line.trim();
                                 if !trimmed.is_empty() {
                                     // Echo non-slash input as a `You` role block
@@ -245,6 +246,26 @@ where
                             }
                             event::Action::ScrollDown => {
                                 state.scroll_down(3);
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                            }
+                            event::Action::Complete => {
+                                state.complete();
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                            }
+                            event::Action::HistoryPrev => {
+                                // Recall an older entry, or scroll up if there
+                                // is nothing to recall.
+                                if !state.history_prev() {
+                                    state.scroll_up(3);
+                                }
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                            }
+                            event::Action::HistoryNext => {
+                                // Step to a newer entry, or scroll down when not
+                                // navigating history.
+                                if !state.history_next() {
+                                    state.scroll_down(3);
+                                }
                                 redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                             }
                             event::Action::None => {}
@@ -425,6 +446,14 @@ impl ChatCLI {
         // turns into the transcript so the TUI shows the conversation being
         // continued rather than opening on just the banner.
         seed_history(&mut state, &self.history);
+        // Seed input-history recall from the persisted REPL history file so
+        // Up/Down recall spans sessions. Best-effort: ignore a missing or
+        // unreadable file, and read one entry per line.
+        if let Some(path) = crate::cli::repl::repl_history_path() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                state.seed_input_history(contents.lines().map(str::to_string));
+            }
+        }
         state.apply(RenderEvent::StatusSnapshot(self.status_snapshot()));
 
         let render_handle = tokio::spawn(render_task(

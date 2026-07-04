@@ -23,6 +23,15 @@ pub(super) enum Action {
     ScrollUp,
     /// Scroll the transcript toward newer content.
     ScrollDown,
+    /// Tab-completion of the token at the cursor (slash command or `@file`).
+    Complete,
+    /// Up arrow: recall the previous input-history entry, or (when there is
+    /// nothing to recall) fall back to scrolling the transcript up. The render
+    /// loop resolves recall-vs-scroll because only it holds `&mut AppState`.
+    HistoryPrev,
+    /// Down arrow: step to a newer input-history entry, or (when not
+    /// navigating) fall back to scrolling the transcript down.
+    HistoryNext,
     /// No actionable interpretation (unhandled key).
     None,
 }
@@ -44,11 +53,13 @@ pub(super) fn map_key(ev: KeyEvent) -> Action {
         KeyCode::Backspace => Action::Edit(EditAction::Backspace),
         KeyCode::Left => Action::Edit(EditAction::MoveLeft),
         KeyCode::Right => Action::Edit(EditAction::MoveRight),
-        // Up/Down scroll the transcript. Under alternate-scroll mode the mouse
-        // wheel is delivered as Up/Down key presses, so this also drives
-        // wheel scrolling without capturing the mouse.
-        KeyCode::Up => Action::ScrollUp,
-        KeyCode::Down => Action::ScrollDown,
+        KeyCode::Tab => Action::Complete,
+        // Up/Down first try input-history recall; the render loop falls back to
+        // transcript scrolling when there is nothing to recall. Under
+        // alternate-scroll mode the mouse wheel is delivered as Up/Down key
+        // presses, so this still drives wheel scrolling via that fallback.
+        KeyCode::Up => Action::HistoryPrev,
+        KeyCode::Down => Action::HistoryNext,
         KeyCode::PageUp => Action::ScrollUp,
         KeyCode::PageDown => Action::ScrollDown,
         _ => Action::None,
@@ -122,10 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn arrow_and_page_keys_scroll() {
-        assert_eq!(map_key(key(KeyCode::Up)), Action::ScrollUp);
-        assert_eq!(map_key(key(KeyCode::Down)), Action::ScrollDown);
+    fn arrow_and_page_keys_map_to_history_and_scroll() {
+        assert_eq!(map_key(key(KeyCode::Up)), Action::HistoryPrev);
+        assert_eq!(map_key(key(KeyCode::Down)), Action::HistoryNext);
         assert_eq!(map_key(key(KeyCode::PageUp)), Action::ScrollUp);
         assert_eq!(map_key(key(KeyCode::PageDown)), Action::ScrollDown);
+    }
+
+    #[test]
+    fn tab_maps_to_complete() {
+        assert_eq!(map_key(key(KeyCode::Tab)), Action::Complete);
     }
 }

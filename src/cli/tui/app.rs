@@ -130,6 +130,17 @@ pub struct AppState {
     /// `run_tui`; defaults to `auto` (today's appearance) so a state built in
     /// tests renders exactly as before.
     theme: Theme,
+    /// Past submitted composer lines, oldest first, used for Up/Down recall.
+    /// Seeded from the persisted REPL history at TUI start so recall spans
+    /// sessions. Empties and consecutive duplicates are never pushed.
+    input_history: Vec<String>,
+    /// Current history-navigation cursor. `None` means "not navigating" (the
+    /// composer holds a live draft); `Some(i)` means the composer currently
+    /// mirrors `input_history[i]`.
+    history_index: Option<usize>,
+    /// The live draft stashed when history navigation begins, restored when the
+    /// user steps back past the newest entry (exiting navigation).
+    history_draft: String,
 }
 
 impl AppState {
@@ -149,6 +160,9 @@ impl AppState {
             thinking_elapsed_ms: 0,
             assistant_header_shown: false,
             theme: Theme::default(),
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
@@ -351,8 +365,11 @@ impl AppState {
     }
 
     /// Apply a local editing action to the composer. Cursor arithmetic is
-    /// UTF-8 aware: the cursor is always kept on a char boundary.
+    /// UTF-8 aware: the cursor is always kept on a char boundary. Any edit
+    /// exits input-history navigation: the current buffer becomes a fresh
+    /// draft.
     pub fn edit(&mut self, action: EditAction) {
+        self.exit_history_nav();
         match action {
             EditAction::InsertChar(c) => {
                 self.composer.insert(self.cursor, c);
@@ -401,6 +418,235 @@ impl AppState {
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(n);
     }
+
+    // --- Tab completion ---------------------------------------------------
+
+    /// Complete the token at the cursor in place. Completes a leading slash
+    /// command name when the cursor is within the first word, or an `@file`
+    /// mention as a filesystem path relative to the current directory;
+    /// otherwise a no-op. Panic-free and UTF-8 aware; IO errors yield no
+    /// completion.
+    pub fn complete(&mut self) {
+        // Slash-command name: composer starts with '/' and the cursor sits
+        // within the first (whitespace-delimited) word.
+        if self.composer.starts_with('/') {
+            let word_end = self
+                .composer
+                .find(char::is_whitespace)
+                .unwrap_or(self.composer.len());
+            if self.cursor <= word_end {
+                self.complete_slash(word_end);
+                return;
+            }
+        }
+        // `@file` mention: the token containing the cursor starts with '@'.
+        let (start, end) = self.token_bounds();
+        if self.composer[start..end].starts_with('@') {
+            self.complete_file(start, end);
+        }
+    }
+
+    /// Byte bounds of the whitespace-delimited token containing the cursor.
+    fn token_bounds(&self) -> (usize, usize) {
+        let s = &self.composer;
+        let mut start = self.cursor;
+        while start > 0 {
+            let prev = prev_boundary(s, start);
+            if s[prev..start]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+            {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = self.cursor;
+        while end < s.len() {
+            let next = next_boundary(s, end);
+            if s[end..next].chars().next().is_some_and(char::is_whitespace) {
+                break;
+            }
+            end = next;
+        }
+        (start, end)
+    }
+
+    /// Complete the leading slash command spanning `0..word_end`.
+    fn complete_slash(&mut self, word_end: usize) {
+        let word = self.composer[..word_end].to_string();
+        let matches = crate::commands::prefix_matches(&word);
+        match matches.as_slice() {
+            [] => {}
+            [only] => {
+                // Append a trailing space only when the command is not already
+                // followed by whitespace, so completing mid-line (e.g. the
+                // cursor sitting before the space in "/hel foo") does not insert
+                // a second space.
+                let followed_by_space = self.composer[word_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace);
+                let replacement = if followed_by_space {
+                    only.to_string()
+                } else {
+                    format!("{only} ")
+                };
+                self.replace_range(0, word_end, &replacement);
+            }
+            many => {
+                let common = common_prefix(many);
+                if common.len() > word_end {
+                    self.replace_range(0, word_end, &common);
+                }
+            }
+        }
+    }
+
+    /// Complete the `@file` token spanning `start..end` against the filesystem.
+    fn complete_file(&mut self, start: usize, end: usize) {
+        let token = self.composer[start..end].to_string();
+        let partial = &token[1..]; // strip the leading '@'
+        // Split into an already-typed directory portion (kept verbatim, with
+        // its trailing '/') and the partial file name being completed.
+        let (dir, file_prefix) = match partial.rfind('/') {
+            Some(pos) => (&partial[..=pos], &partial[pos + 1..]),
+            None => ("", partial),
+        };
+        let read_dir_path = if dir.is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            std::path::PathBuf::from(dir)
+        };
+        let Ok(entries) = std::fs::read_dir(&read_dir_path) else {
+            return;
+        };
+        let mut candidates: Vec<(String, bool)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(file_prefix) {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                candidates.push((name, is_dir));
+            }
+        }
+        match candidates.as_slice() {
+            [] => {}
+            [(name, is_dir)] => {
+                let mut replacement = format!("@{dir}{name}");
+                if *is_dir {
+                    replacement.push('/');
+                }
+                self.replace_range(start, end, &replacement);
+            }
+            many => {
+                let names: Vec<&str> = many.iter().map(|(n, _)| n.as_str()).collect();
+                let common = common_prefix(&names);
+                if common.len() > file_prefix.len() {
+                    let replacement = format!("@{dir}{common}");
+                    self.replace_range(start, end, &replacement);
+                }
+            }
+        }
+    }
+
+    /// Replace the composer bytes in `start..end` (both char boundaries) with
+    /// `text`, leaving the cursor at the end of the inserted text.
+    fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        self.composer.replace_range(start..end, text);
+        self.cursor = start + text.len();
+    }
+
+    // --- Input-history recall ---------------------------------------------
+
+    /// Push a submitted line into input history and end any navigation. Empty
+    /// lines and consecutive duplicates are skipped. Called on submit and when
+    /// seeding history from the persisted REPL file.
+    pub fn push_history(&mut self, line: &str) {
+        if !line.trim().is_empty() && self.input_history.last().map(String::as_str) != Some(line) {
+            self.input_history.push(line.to_string());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Seed input history from an iterator of prior lines (e.g. the persisted
+    /// REPL history), applying the same skip rules as [`Self::push_history`].
+    pub fn seed_input_history<I>(&mut self, lines: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for line in lines {
+            self.push_history(&line);
+        }
+    }
+
+    /// Recall the previous (older) input-history entry into the composer.
+    ///
+    /// Returns `true` if it consumed the key by recalling an entry, or `false`
+    /// if the render loop should instead scroll the transcript up — namely when
+    /// there is no history, the composer is multi-line and not yet navigating,
+    /// or navigation is already at the oldest entry.
+    pub fn history_prev(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        match self.history_index {
+            None => {
+                // Only enter navigation from an empty or single-line draft.
+                if self.composer.contains('\n') {
+                    return false;
+                }
+                self.history_draft = std::mem::take(&mut self.composer);
+                let idx = self.input_history.len() - 1;
+                self.history_index = Some(idx);
+                self.set_composer(self.input_history[idx].clone());
+                true
+            }
+            Some(0) => false,
+            Some(i) => {
+                let idx = i - 1;
+                self.history_index = Some(idx);
+                self.set_composer(self.input_history[idx].clone());
+                true
+            }
+        }
+    }
+
+    /// Step to the next (newer) input-history entry, or restore the stashed
+    /// draft and exit navigation when stepping past the newest entry.
+    ///
+    /// Returns `true` if it consumed the key, or `false` (not navigating) if the
+    /// render loop should instead scroll the transcript down.
+    pub fn history_next(&mut self) -> bool {
+        match self.history_index {
+            None => false,
+            Some(i) if i + 1 < self.input_history.len() => {
+                let idx = i + 1;
+                self.history_index = Some(idx);
+                self.set_composer(self.input_history[idx].clone());
+                true
+            }
+            Some(_) => {
+                self.history_index = None;
+                let draft = std::mem::take(&mut self.history_draft);
+                self.set_composer(draft);
+                true
+            }
+        }
+    }
+
+    /// Replace the whole composer with `text` and move the cursor to its end.
+    fn set_composer(&mut self, text: String) {
+        self.composer = text;
+        self.cursor = self.composer.len();
+    }
+
+    /// End input-history navigation without changing the composer: the current
+    /// buffer becomes a fresh draft. Called on any edit.
+    fn exit_history_nav(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
 }
 
 impl Default for AppState {
@@ -427,6 +673,18 @@ fn next_boundary(s: &str, idx: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Longest common string prefix of `items` (assumed non-empty). Trimming with
+/// `pop` keeps the result on a char boundary, so it is safe for multibyte text.
+fn common_prefix<S: AsRef<str>>(items: &[S]) -> String {
+    let mut prefix = items[0].as_ref().to_string();
+    for item in &items[1..] {
+        while !item.as_ref().starts_with(&prefix) {
+            prefix.pop();
+        }
+    }
+    prefix
 }
 
 /// Format a one-line usage footer for the transcript. Deliberately plain (no
@@ -867,5 +1125,189 @@ mod tests {
         s.edit(EditAction::Backspace);
         assert_eq!(s.composer(), "");
         assert_eq!(s.cursor(), 0);
+    }
+
+    // --- Tab completion ---------------------------------------------------
+
+    /// Type each char of `text` into the composer, leaving the cursor at end.
+    fn typed(text: &str) -> AppState {
+        let mut s = AppState::new();
+        for c in text.chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        s
+    }
+
+    #[test]
+    fn complete_unique_slash_prefix_appends_space() {
+        let mut s = typed("/hel");
+        s.complete();
+        assert_eq!(s.composer(), "/help ");
+        assert_eq!(s.cursor(), s.composer().len());
+    }
+
+    #[test]
+    fn complete_extends_common_prefix_for_ambiguous_slash() {
+        // `/re` matches several commands; completion extends to their longest
+        // common prefix without picking one, and does not append a space.
+        let matches = crate::commands::prefix_matches("/re");
+        assert!(
+            matches.len() > 1,
+            "test premise: /re must be ambiguous, got {matches:?}"
+        );
+        let common = common_prefix(&matches);
+        let mut s = typed("/re");
+        s.complete();
+        assert_eq!(s.composer(), common);
+        assert!(common.starts_with("/re"));
+        assert!(!s.composer().ends_with(' '));
+    }
+
+    #[test]
+    fn complete_no_match_is_noop() {
+        let mut s = typed("/zzzznotacommand");
+        s.complete();
+        assert_eq!(s.composer(), "/zzzznotacommand");
+    }
+
+    #[test]
+    fn complete_mid_line_slash_does_not_double_space() {
+        // Cursor sits right after "/hel" (before the existing space); completing
+        // must not insert a second space ahead of the trailing argument.
+        let mut s = typed("/hel foo");
+        for _ in 0..4 {
+            s.edit(EditAction::MoveLeft);
+        }
+        s.complete();
+        assert_eq!(s.composer(), "/help foo");
+    }
+
+    #[test]
+    fn complete_file_mention_against_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        // Use an absolute path in the token so the test does not depend on the
+        // process-global current directory.
+        let base = dir.path().to_string_lossy().into_owned();
+        let mut s = typed(&format!("@{base}/hel"));
+        s.complete();
+        assert_eq!(s.composer(), format!("@{base}/hello.txt"));
+        assert_eq!(s.cursor(), s.composer().len());
+    }
+
+    #[test]
+    fn complete_file_mention_appends_slash_for_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        let mut s = typed(&format!("@{base}/sub"));
+        s.complete();
+        assert_eq!(s.composer(), format!("@{base}/subdir/"));
+    }
+
+    // --- Input-history recall ---------------------------------------------
+
+    #[test]
+    fn history_prev_recalls_newest_first_then_walks_back_to_empty() {
+        let mut s = AppState::new();
+        s.push_history("first");
+        s.push_history("second");
+        // Not navigating yet: Up recalls the newest entry.
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "second");
+        assert_eq!(s.cursor(), s.composer().len());
+        // Up again steps to the older entry.
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "first");
+        // Already at the oldest: Up returns false (loop should scroll).
+        assert!(!s.history_prev());
+        assert_eq!(s.composer(), "first");
+        // Down steps back to the newer entry.
+        assert!(s.history_next());
+        assert_eq!(s.composer(), "second");
+        // Down past the newest restores the (empty) draft and exits nav.
+        assert!(s.history_next());
+        assert_eq!(s.composer(), "");
+        // No longer navigating: Down returns false.
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn history_prev_stashes_and_restores_a_live_draft() {
+        let mut s = AppState::new();
+        s.push_history("recalled");
+        for c in "draft".chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "recalled");
+        // Stepping past the newest restores the stashed draft.
+        assert!(s.history_next());
+        assert_eq!(s.composer(), "draft");
+    }
+
+    #[test]
+    fn editing_resets_history_navigation() {
+        let mut s = AppState::new();
+        s.push_history("alpha");
+        s.push_history("beta");
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "beta");
+        // An edit exits navigation: the buffer is now a fresh draft.
+        s.edit(EditAction::InsertChar('!'));
+        assert_eq!(s.composer(), "beta!");
+        // Down no longer navigates history (returns false → scroll).
+        assert!(!s.history_next());
+        // Up starts a new navigation from the newest entry, stashing "beta!".
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "beta");
+        assert!(s.history_next());
+        assert_eq!(s.composer(), "beta!");
+    }
+
+    #[test]
+    fn history_prev_false_when_history_empty() {
+        let mut s = AppState::new();
+        assert!(!s.history_prev());
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn push_history_skips_empties_and_consecutive_duplicates() {
+        let mut s = AppState::new();
+        s.push_history("x");
+        s.push_history("x"); // consecutive dup skipped
+        s.push_history("   "); // empty (whitespace) skipped
+        s.push_history("y");
+        // Newest-first recall should see exactly y, x.
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "y");
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "x");
+        assert!(!s.history_prev());
+    }
+
+    #[test]
+    fn history_prev_does_not_recall_into_a_multiline_draft() {
+        let mut s = AppState::new();
+        s.push_history("cmd");
+        for c in "line".chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        s.edit(EditAction::Newline);
+        // Multi-line draft: Up must not recall (returns false → scroll).
+        assert!(!s.history_prev());
+        assert_eq!(s.composer(), "line\n");
+    }
+
+    #[test]
+    fn seed_input_history_applies_skip_rules() {
+        let mut s = AppState::new();
+        s.seed_input_history(["a", "a", "", "b"].into_iter().map(str::to_string));
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "b");
+        assert!(s.history_prev());
+        assert_eq!(s.composer(), "a");
+        assert!(!s.history_prev());
     }
 }
