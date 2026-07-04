@@ -1558,7 +1558,11 @@ impl ChatCLI {
             {
                 Ok(manager) => Some(manager),
                 Err(e) => {
-                    eprintln!("{} {}", "Warning:".bright_yellow(), e);
+                    // Route through status_line so that when reloading under
+                    // the TUI (suppressed capture) this error is folded into
+                    // the transcript instead of corrupting the alt screen.
+                    // reload_mcp is only reached interactively, never headless.
+                    crate::out::status_line(false, format!("{} {}", "Warning:".bright_yellow(), e));
                     None
                 }
             };
@@ -5772,7 +5776,22 @@ impl ChatCLI {
     /// statusline denominator fresh afterward.
     async fn reload_and_note(&mut self, out: &mut String) {
         use std::fmt::Write as _;
-        if let Err(e) = self.reload_mcp().await {
+        // Under the TUI, the MCP manager rebuild (McpManager::new) emits
+        // connection chatter via `crate::out::status_line`, which would
+        // otherwise print directly to the raw terminal and corrupt the
+        // ratatui alt screen. Capture it and fold it into the transcript
+        // `out` instead. In the classic REPL (`!tui_active`) we leave the
+        // chatter alone so it prints to the terminal as it always has.
+        if self.tui_active {
+            crate::out::capture_start_suppressed();
+        }
+        let reload_err = self.reload_mcp().await.err();
+        if self.tui_active {
+            for line in crate::out::capture_take() {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+        if let Some(e) = reload_err {
             let _ = writeln!(out, "{} reload failed: {}", "Warning:".bright_yellow(), e);
         }
         self.refresh_mcp_counts();
