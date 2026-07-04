@@ -38,7 +38,20 @@ use libc::c_int;
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::NamedTempFile;
+
+/// True while a capture window is active (fd 1/2 redirected to a tempfile).
+/// Handlers that would otherwise prompt on the real terminal check this to
+/// abort safely: during [`begin`] fd 0 is intentionally left connected, so an
+/// `is_terminal()` probe on stdin/stdout cannot tell this window apart from a
+/// classic session whose stdout is piped.
+static IN_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a stdout/stderr capture window is currently active.
+pub(crate) fn in_capture() -> bool {
+    IN_CAPTURE.load(Ordering::SeqCst)
+}
 
 #[cfg(windows)]
 const O_BINARY: c_int = libc::O_BINARY;
@@ -176,6 +189,13 @@ impl Redirect {
         // TTY. Restored to `prev_color` on Drop.
         colored::control::set_override(true);
 
+        // Mark the capture window active so handlers that would otherwise prompt
+        // on the real terminal (e.g. `[y/N]` confirmations) can detect it and
+        // abort safely — fd 0 is left connected during `begin()`, so an
+        // is-terminal check on stdin/stdout cannot distinguish this window from
+        // a classic session with a piped stdout.
+        IN_CAPTURE.store(true, Ordering::SeqCst);
+
         Ok(guard)
     }
 
@@ -218,6 +238,7 @@ impl Drop for Redirect {
             }
         }
         colored::control::set_override(self.prev_color);
+        IN_CAPTURE.store(false, Ordering::SeqCst);
         // `self.tmp` is dropped here, deleting the backing file.
     }
 }

@@ -22,7 +22,7 @@
 
 mod ansi;
 mod app;
-mod capture;
+pub(crate) mod capture;
 mod diff;
 mod event;
 mod highlight;

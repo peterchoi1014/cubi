@@ -910,7 +910,7 @@ impl ChatCLI {
                         "Error:".bright_red(),
                         args
                     );
-                    return Ok(false);
+                    return Ok(true);
                 };
                 self.stream_enabled = next;
                 println!(
@@ -936,7 +936,7 @@ impl ChatCLI {
                         "Error:".bright_red(),
                         args
                     );
-                    return Ok(false);
+                    return Ok(true);
                 };
                 self.markdown_enabled = next;
                 println!(
@@ -962,7 +962,7 @@ impl ChatCLI {
                         "Error:".bright_red(),
                         args
                     );
-                    return Ok(false);
+                    return Ok(true);
                 };
                 self.stats_footer_enabled = next;
                 println!(
@@ -1773,12 +1773,12 @@ impl ChatCLI {
     fn history_trim_interactive(&mut self, n: usize) {
         let before_len = self.history.len();
         if !self.headless_mode {
-            use std::io::{self, IsTerminal, Write};
+            use std::io::{self, Write};
             // Under the TUI capture path stdout/stderr are redirected to a file
             // (not a TTY) and there is no interactive terminal to read a
             // confirmation from. Abort safely with a clear note rather than
             // silently doing nothing (a null-device stdin would read as EOF).
-            if !io::stdout().is_terminal() {
+            if crate::cli::tui::capture::in_capture() {
                 eprintln!(
                     "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
                     "Info:".bright_yellow()
@@ -3045,12 +3045,12 @@ impl ChatCLI {
     }
 
     fn confirm_session_delete(&self, id: &str) -> bool {
-        use std::io::{self, IsTerminal, Write};
+        use std::io::{self, Write};
         // Under the TUI capture path stdout is redirected to a file (not a
         // TTY): there is no interactive terminal to confirm on, so refuse the
         // destructive delete safely with a clear note instead of silently
         // treating a null-device EOF as a decision.
-        if !io::stdout().is_terminal() {
+        if crate::cli::tui::capture::in_capture() {
             eprintln!(
                 "{} Confirmation isn't available here — run `cubi --classic` to confirm.",
                 "Info:".bright_yellow()
