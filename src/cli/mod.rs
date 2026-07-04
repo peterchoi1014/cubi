@@ -1395,65 +1395,99 @@ impl ChatCLI {
     }
 
     fn show_mcp_tools(&self) {
-        if let Some(mcp) = &self.mcp_manager {
-            let tools = mcp.list_tools();
-            if tools.is_empty() {
-                println!("{}", "No MCP tools available.".yellow());
-                return;
+        print!("{}", self.mcp_tools_output());
+    }
+
+    /// Concise, aligned tool listing shared by the classic REPL (which prints
+    /// it) and the TUI (which captures it into the transcript). One row per
+    /// tool — `● name  description` — grouped built-in then per external
+    /// server, mirroring the `/mcp` / `/skills` / `/agents` list aesthetic.
+    fn mcp_tools_output(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let Some(mcp) = &self.mcp_manager else {
+            let _ = writeln!(
+                out,
+                "\n{} {}",
+                "MCP tools".bright_yellow().bold(),
+                "· none (no manager loaded)".bright_black()
+            );
+            return out;
+        };
+
+        // Group by built-in vs external server.
+        let mut builtin = Vec::new();
+        let mut external = Vec::new();
+        for (server_name, tool) in mcp.get_tools_with_server().values() {
+            if server_name == "builtin" {
+                builtin.push(tool);
+            } else {
+                external.push((server_name, tool));
             }
-
-            println!("\n{}", "Available MCP Tools:".bright_yellow().bold());
-            println!("{}", "=".repeat(60).bright_black());
-
-            // Group by built-in vs external
-            let mut builtin = Vec::new();
-            let mut external = Vec::new();
-
-            for (server_name, tool) in mcp.get_tools_with_server().values() {
-                if server_name == "builtin" {
-                    builtin.push(tool);
-                } else {
-                    external.push((server_name, tool));
-                }
-            }
-
-            if !builtin.is_empty() {
-                println!("\n{}", "Built-in Tools:".bright_blue().bold());
-                for tool in builtin {
-                    println!("\n  {} {}", "●".bright_green(), tool.name.bright_cyan());
-                    println!("    {}", tool.description);
-                }
-            }
-
-            if !external.is_empty() {
-                println!("\n{}", "External MCP Servers:".bright_blue().bold());
-                for (server, tool) in external {
-                    println!(
-                        "\n  {} {} (from {})",
-                        "●".bright_green(),
-                        tool.name.bright_cyan(),
-                        server.bright_magenta()
-                    );
-                    println!("    {}", tool.description);
-                }
-            }
-
-            let failed = mcp.failed_servers();
-            if !failed.is_empty() {
-                println!("\n{}", "Offline MCP Servers:".bright_red().bold());
-                for (name, reason) in failed {
-                    println!(
-                        "  {} {} — {}",
-                        "✗".bright_red(),
-                        name.bright_magenta(),
-                        reason
-                    );
-                }
-            }
-
-            println!("\n{}\n", "=".repeat(60).bright_black());
-            println!("Use {} <tool> <args> to execute", "/mcp-call".bright_cyan());
         }
+        builtin.sort_by(|a, b| a.name.cmp(&b.name));
+        external.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+        let total = builtin.len() + external.len();
+        if total == 0 {
+            let _ = writeln!(
+                out,
+                "\n{} {}",
+                "MCP tools".bright_yellow().bold(),
+                "· none".bright_black()
+            );
+            return out;
+        }
+
+        let name_w = builtin
+            .iter()
+            .map(|t| t.name.chars().count())
+            .chain(external.iter().map(|(_, t)| t.name.chars().count()))
+            .max()
+            .unwrap_or(0)
+            .min(24);
+        let desc = |d: &str| truncate_cols(&d.replace('\n', " "), 60);
+
+        let _ = writeln!(
+            out,
+            "\n{} {}",
+            "MCP tools".bright_yellow().bold(),
+            format!("· {total} · {} built-in", builtin.len()).bright_black()
+        );
+        for tool in builtin {
+            let _ = writeln!(
+                out,
+                "  {} {}  {}",
+                "●".bright_green(),
+                pad_col(&tool.name, name_w).bright_cyan(),
+                desc(&tool.description).bright_black()
+            );
+        }
+        for (server, tool) in external {
+            let _ = writeln!(
+                out,
+                "  {} {}  {} {}",
+                "●".bright_green(),
+                pad_col(&tool.name, name_w).bright_cyan(),
+                desc(&tool.description).bright_black(),
+                format!("· {server}").bright_magenta()
+            );
+        }
+        for (name, reason) in mcp.failed_servers() {
+            let _ = writeln!(
+                out,
+                "  {} {}  {}",
+                "✗".bright_red(),
+                pad_col(&name, name_w).bright_red(),
+                truncate_cols(&reason.replace('\n', " "), 60).bright_black()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  {}",
+            "run one with /mcp-call <tool> <args>".bright_black()
+        );
+        out
     }
 
     async fn call_mcp_tool(&mut self, tool_name: &str, arguments: serde_json::Value) -> Result<()> {
@@ -8140,6 +8174,40 @@ mod tests {
                     "list view must not dump built-in tool name `{name}`: {listing}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn mcp_tools_output_lists_tools_concisely() {
+        // `/mcp-tools` DOES list the built-in tools (unlike `/mcp`), one row per
+        // tool, with a concise header — and renders in the TUI (capture path).
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        crate::compat::test_env::with_cubi_home(|_cubi_home, _other_home| {
+            let mut cli = new_test_cli();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let manager = rt.block_on(McpManager::new(
+                Arc::new(Mutex::new(Permissions::default())),
+                Arc::new(AtomicBool::new(false)),
+            ));
+            cli.mcp_manager = manager.ok();
+
+            let listing = strip_ansi(&cli.mcp_tools_output());
+            assert!(
+                listing.contains("MCP tools") && listing.contains("built-in"),
+                "concise header expected: {listing}"
+            );
+            assert!(
+                listing.contains("read_file"),
+                "tool list should enumerate built-in tools: {listing}"
+            );
+            // Concise: one row per tool (no blank-line-separated 2-line entries).
+            assert!(
+                !listing.contains("\n\n  ●"),
+                "rows should be compact, not blank-separated: {listing}"
+            );
         });
     }
 
