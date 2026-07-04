@@ -818,7 +818,7 @@ impl AppState {
             return;
         }
         let token_lower = self.composer[..token_end].to_ascii_lowercase();
-        let candidates: Vec<String> = self
+        let mut candidates: Vec<String> = self
             .command_catalog
             .iter()
             .filter(|c| c.to_ascii_lowercase().starts_with(&token_lower))
@@ -828,14 +828,18 @@ impl AppState {
             self.close_picker();
             return;
         }
-        let was_open = self.picker_open;
+        // Lift an exactly-typed command to the front so it is the default
+        // selection rather than a longer sibling. Without this, typing `/mcp`
+        // would highlight `/mcp-tools` (earlier in catalog order) and Enter
+        // would run that instead of `/mcp`. Stable otherwise, preserving the
+        // natural catalog order for the remaining prefix matches.
+        candidates.sort_by_key(|c| !c.eq_ignore_ascii_case(&token_lower));
         self.picker_candidates = candidates;
         self.picker_open = true;
-        if !was_open {
-            self.picker_selected = 0;
-        } else if self.picker_selected >= self.picker_candidates.len() {
-            self.picker_selected = self.picker_candidates.len() - 1;
-        }
+        // `refresh_picker` only runs on a composer edit, which changes the
+        // filter, so always reset to the (now best-match) first candidate.
+        // Arrow navigation between edits calls `picker_prev/next`, not this.
+        self.picker_selected = 0;
     }
 
     /// Close the picker and clear its transient state (candidates + selection).
@@ -1691,6 +1695,25 @@ mod tests {
         assert!(cands.contains(&"/stop".to_string()));
         assert!(!cands.contains(&"/help".to_string()));
         assert_eq!(s.picker_selected(), 0);
+    }
+
+    #[test]
+    fn picker_defaults_to_exact_match_over_longer_sibling() {
+        // Typing a full command must highlight the exact match, not a longer
+        // catalog-earlier sibling (regression: `/mcp` ran `/mcp-tools`).
+        let s = picker_state(&["/mcp-tools", "/mcp-reload", "/mcp"], "/mcp");
+        assert!(s.picker_open());
+        assert_eq!(
+            s.picker_selected_command(),
+            Some("/mcp"),
+            "candidates: {:?}",
+            s.picker_candidates()
+        );
+        // Shorter/exact leads regardless of catalog order.
+        assert_eq!(
+            s.picker_candidates().first().map(String::as_str),
+            Some("/mcp")
+        );
     }
 
     #[test]
