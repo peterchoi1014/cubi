@@ -6087,39 +6087,81 @@ impl ChatCLI {
         let req = match parse_consensus_args(args) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
+                self.ui.status(&format!(
                     "{} {}\n  usage: {}",
                     "Error:".bright_red(),
                     e,
                     CONSENSUS_SLASH_USAGE.bright_cyan()
-                );
+                ));
                 return;
             }
         };
         if let Some(reason) = self.isolated_tool_consensus_policy_error(&req) {
-            eprintln!("{} {}", "Error:".bright_red(), reason);
+            self.ui
+                .status(&format!("{} {}", "Error:".bright_red(), reason));
             return;
         }
 
+        // The JSON / structured event path is unchanged — `CliConsensusSink`
+        // still prints nothing to the terminal in interactive mode. All
+        // human-facing output below is routed through `self.ui` so it lands in
+        // the TUI transcript (and stays a plain LineSink write in the REPL).
         let sink = CliConsensusSink {
             json_enabled: self.json_enabled && self.headless_mode,
             event_sink: self.event_sink.clone(),
         };
 
-        let use_tools = req.use_tools;
-        let result = if use_tools {
-            crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
-                .await
-        } else {
-            crate::consensus::run(req, &self.executor, &sink).await
+        // Announce the run so the transcript shows it began. Consensus does not
+        // token-stream by design, so this start line is the only progress the
+        // user sees until the aggregated result lands.
+        let strategy_label = match &req.strategy {
+            crate::consensus::ConsensusStrategy::Vote => "vote",
+            crate::consensus::ConsensusStrategy::BestOfN { .. } => "best-of-n",
+            crate::consensus::ConsensusStrategy::Judge { .. } => "judge",
         };
+        self.ui.status(&format!(
+            "{} Running consensus across {} model(s) [{}]…",
+            "⚙".bright_blue(),
+            req.models.len(),
+            strategy_label.bright_cyan()
+        ));
+
+        // Reset the cooperative TUI cancel flag so a stale Ctrl-C from a prior
+        // turn can't abort this run. No-op for the non-TUI path.
+        self.cancel.store(false, Ordering::SeqCst);
+        let cancel = Arc::clone(&self.cancel);
+
+        let use_tools = req.use_tools;
+        // Race the consensus run against Ctrl-C and the cooperative TUI cancel
+        // flag. Cancelling an in-flight isolate/subprocess run is best-effort:
+        // dropped worktrees / subprocesses may linger on disk — acceptable for
+        // a user abort.
+        let run_fut = async {
+            if use_tools {
+                crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
+                    .await
+            } else {
+                crate::consensus::run(req, &self.executor, &sink).await
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => None,
+            _ = agent::wait_for_cancel(&cancel) => None,
+            r = run_fut => Some(r),
+        };
+
         match result {
-            Ok(result) => {
+            // Cancelled (Ctrl-C or the TUI cancel flag). Not an error.
+            None => {
+                self.ui.status("(cancelled)");
+            }
+            Some(Ok(result)) => {
                 self.session_stats.add(&result.aggregate_stats());
                 self.print_consensus_result(&result);
             }
-            Err(e) => {
-                eprintln!("{} {}", "Error:".bright_red(), e);
+            Some(Err(e)) => {
+                self.ui.status(&format!("{} {}", "Error:".bright_red(), e));
             }
         }
     }
@@ -6161,13 +6203,14 @@ impl ChatCLI {
         }
     }
 
-    fn print_consensus_result(&self, r: &crate::consensus::ConsensusResult) {
-        println!(
-            "\n{} (strategy: {}) over {} models:",
+    fn print_consensus_result(&mut self, r: &crate::consensus::ConsensusResult) {
+        let strategy = self.consensus_strategy_label(r).bright_cyan().to_string();
+        self.ui.status(&format!(
+            "{} (strategy: {}) over {} models:",
             "Consensus".bright_yellow().bold(),
-            self.consensus_strategy_label(r).bright_cyan(),
+            strategy,
             r.subagent_outputs.len()
-        );
+        ));
         let name_width = r
             .subagent_outputs
             .iter()
@@ -6192,23 +6235,25 @@ impl ChatCLI {
                 )
             };
             let secs = sub.elapsed_ms as f64 / 1000.0;
-            println!(
+            self.ui.status(&format!(
                 "  {:<width$} {} {:>5.1}s   {}",
                 sub.model,
                 glyph,
                 secs,
                 detail,
                 width = name_width
-            );
+            ));
         }
-        println!(
-            "\n{} {} — {}",
+        self.ui.status(&format!(
+            "{} {} — {}",
             "Winner:".bright_yellow().bold(),
             r.winner_model.bright_cyan(),
             r.decision_reason.bright_white()
-        );
-        println!("\n--- winning output ---");
-        println!("{}\n", r.winner_output);
+        ));
+        // Present the winning answer as a finalized assistant block so it reads
+        // as a proper transcript entry (matching how the review commands land
+        // the model's reply), rather than a dim status line.
+        self.ui.assistant_final(&r.winner_output);
     }
 
     fn consensus_strategy_label<'a>(&self, r: &'a crate::consensus::ConsensusResult) -> &'a str {

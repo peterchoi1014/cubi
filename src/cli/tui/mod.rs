@@ -872,16 +872,21 @@ impl ChatCLI {
         matches!(commands::parse(input), Some((Cmd::Edit, _)))
     }
 
-    /// True for the slash commands that stream a long single-shot model reply
-    /// (`/review`, `/security-review`, `/autofix-pr`). In the TUI these run
-    /// INLINE with the render task active so their output streams live into the
-    /// transcript and Ctrl-C cancels them, instead of being buffered by the
+    /// True for the slash commands that run a long single-shot / multi-model
+    /// model exchange live in the transcript (`/review`, `/security-review`,
+    /// `/autofix-pr`, `/consensus`). In the TUI these run INLINE with the
+    /// render task active so their output (streamed tokens for the reviews, or
+    /// the aggregated result + progress for consensus) lands in the transcript
+    /// and Ctrl-C cancels them, instead of being buffered by the
     /// capture/suspend paths. Every other command returns `false` and takes the
     /// capture (or suspend) route.
     fn command_streams_inline(input: &str) -> bool {
         matches!(
             commands::parse(input),
-            Some((Cmd::Review | Cmd::SecurityReview | Cmd::AutofixPr, _))
+            Some((
+                Cmd::Review | Cmd::SecurityReview | Cmd::AutofixPr | Cmd::Consensus,
+                _
+            ))
         )
     }
 
@@ -1386,13 +1391,15 @@ mod render_loop_tests {
 
     #[test]
     fn command_streams_inline_only_for_streaming_llm_commands() {
-        // These stream a long model reply live into the transcript and must run
+        // These run a long model exchange live into the transcript and must run
         // with the render task active (no capture/suspend).
         for cmd in [
             "/review",
             "/security-review",
             "/autofix-pr",
             "/autofix-pr 42",
+            "/consensus",
+            "/consensus vote qwen3:8b,qwen3:8b say hi",
         ] {
             assert!(
                 ChatCLI::command_streams_inline(cmd),
