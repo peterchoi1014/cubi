@@ -681,6 +681,22 @@ impl ChatCLI {
                 }
                 AgentCommand::NotAgent => {}
             }
+            // These three "streaming" commands (/review, /security-review,
+            // /autofix-pr) send a long single-shot chat to the model. They must
+            // run with the render task ACTIVE so their output streams live into
+            // the transcript and Ctrl-C cancels them — exactly like the
+            // `/<agent>` and `!`-shell inline paths above. Dispatch INLINE (live
+            // TuiSink, `tui_active` true, no capture/suspend handshake) rather
+            // than parking the render task via `run_captured_command`.
+            if Self::command_streams_inline(input) {
+                match self.handle_command(input).await {
+                    Ok(cont) => return cont,
+                    Err(e) => {
+                        self.ui.status(&format!("Error: {e}"));
+                        return true;
+                    }
+                }
+            }
             // Every other slash command: by default CAPTURE its stdout/stderr
             // and render it as a framed block inside the transcript (no
             // suspend, no "press Enter" prompt, staying on the alt screen).
@@ -854,6 +870,19 @@ impl ChatCLI {
     /// return `false` here to take the capture path.
     fn command_needs_terminal(input: &str) -> bool {
         matches!(commands::parse(input), Some((Cmd::Edit, _)))
+    }
+
+    /// True for the slash commands that stream a long single-shot model reply
+    /// (`/review`, `/security-review`, `/autofix-pr`). In the TUI these run
+    /// INLINE with the render task active so their output streams live into the
+    /// transcript and Ctrl-C cancels them, instead of being buffered by the
+    /// capture/suspend paths. Every other command returns `false` and takes the
+    /// capture (or suspend) route.
+    fn command_streams_inline(input: &str) -> bool {
+        matches!(
+            commands::parse(input),
+            Some((Cmd::Review | Cmd::SecurityReview | Cmd::AutofixPr, _))
+        )
     }
 
     /// Run one slash command with its stdout/stderr CAPTURED and rendered as a
@@ -1351,6 +1380,30 @@ mod render_loop_tests {
             assert!(
                 !ChatCLI::command_needs_terminal(cmd),
                 "{cmd} must take the capture path, not suspend"
+            );
+        }
+    }
+
+    #[test]
+    fn command_streams_inline_only_for_streaming_llm_commands() {
+        // These stream a long model reply live into the transcript and must run
+        // with the render task active (no capture/suspend).
+        for cmd in [
+            "/review",
+            "/security-review",
+            "/autofix-pr",
+            "/autofix-pr 42",
+        ] {
+            assert!(
+                ChatCLI::command_streams_inline(cmd),
+                "{cmd} must run inline so it streams + cancels"
+            );
+        }
+        // Everything else takes the capture/suspend route.
+        for cmd in ["/status", "/diff", "/mcp", "/edit"] {
+            assert!(
+                !ChatCLI::command_streams_inline(cmd),
+                "{cmd} must NOT take the inline streaming path"
             );
         }
     }

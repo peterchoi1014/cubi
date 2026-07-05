@@ -3632,27 +3632,90 @@ impl ChatCLI {
     /// The exchange is transient: it's printed to stdout but not added
     /// to the persistent conversation history, so successive `/review`
     /// calls don't accumulate stale diffs in context.
-    async fn run_review(&self) {
+    /// Stream a single-shot chat through the sink with live output and
+    /// Ctrl-C / cooperative-cancel support, mirroring [`agent_turn`]'s
+    /// streaming path. Tokens flow to `self.ui.assistant_token` as they arrive;
+    /// the streamed block is finalized by `end_thinking` (which the TUI render
+    /// task turns into a committed assistant block). Returns `Some(message)`
+    /// with the assistant reply on success, or `None` when the call was
+    /// cancelled or errored (the error is surfaced through `self.ui.status`).
+    ///
+    /// Works identically in the classic REPL (LineSink → stdout) and the TUI
+    /// (TuiSink → transcript); no mode special-casing.
+    async fn stream_single_shot(&mut self, messages: Vec<Message>) -> Option<Message> {
+        // Reset the cooperative TUI cancel flag so a stale Ctrl-C from a prior
+        // turn can't abort this call. No-op for the non-TUI path.
+        self.cancel.store(false, Ordering::SeqCst);
+        let cancel = Arc::clone(&self.cancel);
+
+        // Spinner while we wait for the first token; matches agent_turn.
+        self.ui.begin_thinking("thinking…", false);
+
+        // Move the sink out of `self` so the token closure can own `&mut` it
+        // while `self.executor` is borrowed by `chat_stream`. Restored right
+        // after the select. These commands are single-shot chats, not
+        // tool-using turns, so no tools are offered (`None`).
+        let mut ui = std::mem::replace(&mut self.ui, Box::new(ui_sink::NullSink));
+        let stream_fut = self.executor.chat_stream(messages, None, |tok| {
+            ui.assistant_token(tok);
+        });
+        let res = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => None,
+            _ = agent::wait_for_cancel(&cancel) => None,
+            r = stream_fut => Some(r),
+        };
+        let got_token = ui.got_token();
+        self.ui = ui;
+
+        // Retire the spinner before emitting anything else.
+        if let Some(sp) = self.ui.end_thinking() {
+            sp.stop().await;
+        }
+
+        match res {
+            // Cancelled (Ctrl-C or the TUI cancel flag). Not an error.
+            None => {
+                self.ui.status("(cancelled)");
+                None
+            }
+            Some(Ok((msg, _stats))) => {
+                // Some backends deliver the whole message only in the final
+                // chunk with no streamed tokens; surface it through the sink
+                // so the reply still lands in the transcript / stdout.
+                if !got_token && !msg.content.is_empty() {
+                    self.ui.assistant_final(&msg.content);
+                }
+                Some(msg)
+            }
+            Some(Err(e)) => {
+                self.ui.status(&format!("{} {}", "Error:".bright_red(), e));
+                None
+            }
+        }
+    }
+
+    async fn run_review(&mut self) {
         let out = match git_cmds::diff_for_review() {
             Ok(out) => out,
             Err(e) => {
-                eprintln!("{} {}", "Error:".bright_red(), e);
+                self.ui.status(&format!("{} {}", "Error:".bright_red(), e));
                 return;
             }
         };
         if !out.exit_ok {
-            eprintln!(
+            self.ui.status(&format!(
                 "{} git diff failed: {}",
                 "Error:".bright_red(),
                 out.stderr.trim()
-            );
+            ));
             return;
         }
         if out.stdout.trim().is_empty() {
-            println!(
+            self.ui.status(&format!(
                 "{} No changes to review (working tree clean against HEAD).",
                 "ℹ".bright_blue()
-            );
+            ));
             return;
         }
 
@@ -3689,24 +3752,19 @@ impl ChatCLI {
             ),
         ];
 
-        println!(
+        self.ui.status(&format!(
             "{} Asking the model to review the diff...",
             "⚙".bright_blue()
-        );
-        match self.executor.chat(review_messages).await {
-            Ok(response) => {
-                println!("\n{}\n", "Review:".bright_yellow().bold());
-                println!("{}\n", response.bright_white());
-                if truncated {
-                    println!(
-                        "{} Diff was truncated to {} characters; re-run after splitting \
-                         the change for a complete review.",
-                        "ℹ".bright_blue(),
-                        MAX_DIFF_CHARS
-                    );
-                }
-            }
-            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        ));
+        // Stream the review live into the transcript; the reply is standalone
+        // (not persisted to history), matching the prior single-shot behavior.
+        if self.stream_single_shot(review_messages).await.is_some() && truncated {
+            self.ui.status(&format!(
+                "{} Diff was truncated to {} characters; re-run after splitting \
+                 the change for a complete review.",
+                "ℹ".bright_blue(),
+                MAX_DIFF_CHARS
+            ));
         }
     }
 
@@ -4873,14 +4931,14 @@ impl ChatCLI {
         let diff = match git_cmds::diff_for_review() {
             Ok(out) if !out.stdout.trim().is_empty() => out.stdout,
             Ok(_) => {
-                println!(
+                self.ui.status(&format!(
                     "{} Working tree is clean — nothing to review.",
                     "ℹ".bright_blue()
-                );
+                ));
                 return;
             }
             Err(e) => {
-                eprintln!("{} {}", "Error:".bright_red(), e);
+                self.ui.status(&format!("{} {}", "Error:".bright_red(), e));
                 return;
             }
         };
@@ -4892,12 +4950,11 @@ impl ChatCLI {
              security-clean, say so explicitly.\n\n```diff\n{diff}\n```"
         );
         self.history.push(Message::text("user", prompt));
-        match self.executor.chat(self.history.clone()).await {
-            Ok(reply) => {
-                println!("{} {}", "AI:".bright_cyan().bold(), reply);
-                self.history.push(Message::text("assistant", reply));
-            }
-            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        // Stream the review live; on success persist the assistant reply so it
+        // stays part of the conversation, matching the prior behavior. On
+        // cancel/error the user turn stays in history for a retry.
+        if let Some(msg) = self.stream_single_shot(self.history.clone()).await {
+            self.history.push(msg);
         }
     }
 
@@ -4912,15 +4969,19 @@ impl ChatCLI {
         let body = match cmd.output() {
             Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
             Ok(out) => {
-                eprintln!(
+                self.ui.status(&format!(
                     "{} gh pr view failed: {}",
                     "Error:".bright_red(),
                     String::from_utf8_lossy(&out.stderr).trim()
-                );
+                ));
                 return;
             }
             Err(e) => {
-                eprintln!("{} `gh` not available: {}", "Error:".bright_red(), e);
+                self.ui.status(&format!(
+                    "{} `gh` not available: {}",
+                    "Error:".bright_red(),
+                    e
+                ));
                 return;
             }
         };
@@ -4931,12 +4992,8 @@ impl ChatCLI {
              flag it.\n\n```\n{body}\n```"
         );
         self.history.push(Message::text("user", prompt));
-        match self.executor.chat(self.history.clone()).await {
-            Ok(reply) => {
-                println!("{} {}", "AI:".bright_cyan().bold(), reply);
-                self.history.push(Message::text("assistant", reply));
-            }
-            Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
+        if let Some(msg) = self.stream_single_shot(self.history.clone()).await {
+            self.history.push(msg);
         }
     }
 

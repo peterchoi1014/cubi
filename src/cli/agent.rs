@@ -30,7 +30,7 @@ pub(crate) fn resolve_tool_rationale(
 /// Ctrl-C and this future lets `agent_turn`'s `select!` observe it as an extra
 /// cancel branch. In the non-TUI path the flag is never set, so the branch
 /// simply never resolves and behavior is unchanged.
-async fn wait_for_cancel(flag: &std::sync::atomic::AtomicBool) {
+pub(crate) async fn wait_for_cancel(flag: &std::sync::atomic::AtomicBool) {
     while !flag.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
