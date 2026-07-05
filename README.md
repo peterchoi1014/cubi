@@ -101,19 +101,6 @@ cd cubi && cargo install --path .
 cubi
 ```
 
-You should see (5-row idle mascot followed by the greeting):
-
-```
-  ███████
-  █ ███ █
-███████████
-███████████
-  ███████
-
-hi, i'm Cubi — a pocket-sized AI
-/help · /quit to exit · Tab completes slash commands · Ctrl-R searches history
-```
-
 Type `/help` to list every slash command. Run a shell command by prefixing it
 with `!` (e.g. `!ls -la`). `Ctrl+C` interrupts; `/quit` exits.
 
