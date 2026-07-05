@@ -681,6 +681,28 @@ impl ChatCLI {
                 }
                 AgentCommand::NotAgent => {}
             }
+            // These three "streaming" commands (/review, /security-review,
+            // /autofix-pr) send a long single-shot chat to the model. They must
+            // run with the render task ACTIVE so their output streams live into
+            // the transcript and Ctrl-C cancels them — exactly like the
+            // `/<agent>` and `!`-shell inline paths above. Dispatch INLINE (live
+            // TuiSink, `tui_active` true, no capture/suspend handshake) rather
+            // than parking the render task via `run_captured_command`.
+            if Self::command_streams_inline(input) {
+                // Honor a user/plugin command of the same name first, matching
+                // the capture/suspend dispatch order; otherwise run the built-in
+                // streaming handler inline.
+                if self.try_user_command(input) {
+                    return true;
+                }
+                match self.handle_command(input).await {
+                    Ok(cont) => return cont,
+                    Err(e) => {
+                        self.ui.status(&format!("Error: {e}"));
+                        return true;
+                    }
+                }
+            }
             // Every other slash command: by default CAPTURE its stdout/stderr
             // and render it as a framed block inside the transcript (no
             // suspend, no "press Enter" prompt, staying on the alt screen).
@@ -689,7 +711,7 @@ impl ChatCLI {
             if Self::command_needs_terminal(input) {
                 return self.run_suspended_command(input, control_tx, guard).await;
             }
-            return self.run_captured_command(input, control_tx).await;
+            return self.run_captured_command(input, control_tx, guard).await;
         }
 
         // Shell escape: `!<cmd>` runs a shell command and shows its output as a
@@ -856,6 +878,24 @@ impl ChatCLI {
         matches!(commands::parse(input), Some((Cmd::Edit, _)))
     }
 
+    /// True for the slash commands that run a long single-shot / multi-model
+    /// model exchange live in the transcript (`/review`, `/security-review`,
+    /// `/autofix-pr`, `/consensus`). In the TUI these run INLINE with the
+    /// render task active so their output (streamed tokens for the reviews, or
+    /// the aggregated result + progress for consensus) lands in the transcript
+    /// and Ctrl-C cancels them, instead of being buffered by the
+    /// capture/suspend paths. Every other command returns `false` and takes the
+    /// capture (or suspend) route.
+    fn command_streams_inline(input: &str) -> bool {
+        matches!(
+            commands::parse(input),
+            Some((
+                Cmd::Review | Cmd::SecurityReview | Cmd::AutofixPr | Cmd::Consensus,
+                _
+            ))
+        )
+    }
+
     /// Run one slash command with its stdout/stderr CAPTURED and rendered as a
     /// framed block INSIDE the transcript, instead of suspending the TUI to the
     /// real terminal. This is the default path for every non-interactive
@@ -877,7 +917,42 @@ impl ChatCLI {
     /// via [`render_captured_command`](Self::render_captured_command) (the same
     /// seam `/mcp` uses); (7) fire `resume` so the render task rebuilds its
     /// stream and repaints the new block.
+    ///
+    /// **Platform:** the fd-capture body is Unix-only. Capturing the
+    /// process-global stdout on Windows is unreliable — Rust's own console
+    /// writes go through the Win32 standard handles (`WriteConsoleW`), not the
+    /// CRT fds this redirects, and the process-global redirect races the
+    /// parallel test harness. On non-Unix this delegates to
+    /// [`run_suspended_command`](Self::run_suspended_command), keeping the
+    /// working suspend/"press Enter" UX for general slash commands.
     async fn run_captured_command(
+        &mut self,
+        input: &str,
+        control_tx: &UnboundedSender<RenderControl>,
+        guard: &term::TerminalGuard,
+    ) -> bool {
+        // Windows (and any non-Unix): fd capture is unreliable here, so fall
+        // back to the suspend path that predates capture. Returns directly; the
+        // Unix capture body below is compiled out.
+        #[cfg(not(unix))]
+        {
+            return self.run_suspended_command(input, control_tx, guard).await;
+        }
+
+        #[cfg(unix)]
+        {
+            // The suspend path owns `guard`; the capture path stays on the alt
+            // screen and never touches it.
+            let _ = guard;
+            self.run_captured_command_unix(input, control_tx).await
+        }
+    }
+
+    /// The Unix capture body of [`run_captured_command`](Self::run_captured_command).
+    /// Split out so the `#[cfg(not(unix))]` delegation stays a trivial one-liner
+    /// and this large body carries no per-statement cfg noise.
+    #[cfg(unix)]
+    async fn run_captured_command_unix(
         &mut self,
         input: &str,
         control_tx: &UnboundedSender<RenderControl>,
@@ -1351,6 +1426,32 @@ mod render_loop_tests {
             assert!(
                 !ChatCLI::command_needs_terminal(cmd),
                 "{cmd} must take the capture path, not suspend"
+            );
+        }
+    }
+
+    #[test]
+    fn command_streams_inline_only_for_streaming_llm_commands() {
+        // These run a long model exchange live into the transcript and must run
+        // with the render task active (no capture/suspend).
+        for cmd in [
+            "/review",
+            "/security-review",
+            "/autofix-pr",
+            "/autofix-pr 42",
+            "/consensus",
+            "/consensus vote qwen3:8b,qwen3:8b say hi",
+        ] {
+            assert!(
+                ChatCLI::command_streams_inline(cmd),
+                "{cmd} must run inline so it streams + cancels"
+            );
+        }
+        // Everything else takes the capture/suspend route.
+        for cmd in ["/status", "/diff", "/mcp", "/edit"] {
+            assert!(
+                !ChatCLI::command_streams_inline(cmd),
+                "{cmd} must NOT take the inline streaming path"
             );
         }
     }

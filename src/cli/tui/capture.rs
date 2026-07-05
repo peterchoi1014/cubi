@@ -291,7 +291,14 @@ fn path_to_cstring(p: &Path) -> io::Result<CString> {
     CString::new(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
-#[cfg(test)]
+// These tests redirect the *process-global* fds 1/2 and assert on the captured
+// bytes. On Windows that is unsound: Rust's own console writes go through the
+// Win32 standard handles (`WriteConsoleW`), not the CRT fds this primitive
+// redirects, so the assertions would not hold; and the process-global redirect
+// races the parallel libtest harness there. The capture path is Unix-only in
+// production (`run_captured_command` delegates to the suspend path on Windows),
+// so these tests are gated to Unix where they remain fully meaningful.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -377,7 +384,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn captures_child_process_inherited_stdio() {
         let _g = lock();
@@ -386,23 +392,6 @@ mod tests {
                 .arg("child-inherited-out")
                 .status()
                 .expect("spawn echo")
-        });
-        assert!(status.success(), "child exited non-zero");
-        assert!(
-            out.contains("child-inherited-out"),
-            "child stdout (inherited fd) not captured: {out:?}"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn captures_child_process_inherited_stdio() {
-        let _g = lock();
-        let (status, out) = capture_fds(|| {
-            std::process::Command::new("cmd")
-                .args(["/C", "echo", "child-inherited-out"])
-                .status()
-                .expect("spawn cmd echo")
         });
         assert!(status.success(), "child exited non-zero");
         assert!(
