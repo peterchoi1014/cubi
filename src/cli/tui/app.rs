@@ -154,6 +154,12 @@ pub struct AppState {
     picker_candidates: Vec<String>,
     /// Index of the highlighted candidate within `picker_candidates`.
     picker_selected: usize,
+    /// Byte offset in the composer that [`Self::picker_accept`] replaces up to
+    /// (`0..picker_replace_end`). In command mode this is the end of the
+    /// leading `/token`; in subcommand mode it extends over any partially typed
+    /// subcommand token. Recomputed by [`Self::refresh_picker`] whenever the
+    /// picker opens; unused while it is closed.
+    picker_replace_end: usize,
     /// Latch set by [`Self::picker_dismiss`] (Esc): keeps the picker closed
     /// until the next composer edit, which resets it in [`Self::edit`].
     picker_dismissed_until_edit: bool,
@@ -183,6 +189,7 @@ impl AppState {
             picker_open: false,
             picker_candidates: Vec::new(),
             picker_selected: 0,
+            picker_replace_end: 0,
             picker_dismissed_until_edit: false,
         }
     }
@@ -809,24 +816,100 @@ impl AppState {
     }
 
     /// Recompute the picker candidates and open/close state from the current
-    /// composer. The picker opens when: the composer starts with `/`, the
-    /// cursor sits within the first (whitespace-delimited) token, there is at
-    /// least one case-insensitive prefix match in the catalog, and no Esc
-    /// dismissal is latched. Opening resets the selection to the top; while it
-    /// stays open the selection is clamped into range. Any other case closes.
+    /// composer. Two modes:
+    ///
+    /// * **Subcommand mode** — when the leading `/token` is an exact
+    ///   (case-insensitive) catalog command that has a subcommand vocabulary
+    ///   (e.g. `/agents`), the picker lists that command's subcommands
+    ///   (`/agents list`, `/agents enable`, …), prefix-filtered by any
+    ///   partially typed subcommand token. Closes once the cursor moves past
+    ///   the subcommand token onto a third token / args.
+    /// * **Command mode** — otherwise, while the cursor sits within the first
+    ///   token, prefix-filter the catalog command names (existing behavior).
+    ///
+    /// Either way the picker also closes when the composer doesn't start with
+    /// `/`, an Esc dismissal is latched, or there are no matches. Opening
+    /// resets the selection to the (best-match) top and records the composer
+    /// span [`Self::picker_accept`] replaces via `picker_replace_end`.
     fn refresh_picker(&mut self) {
         if self.picker_dismissed_until_edit || !self.composer.starts_with('/') {
             self.close_picker();
             return;
         }
-        let token_end = self.command_token_end();
-        // The picker only drives the command token; once the cursor moves past
-        // it (a space was typed) subcommand/`@file` completion takes over.
-        if self.cursor > token_end {
+        let head_end = self.command_token_end();
+        let head = &self.composer[..head_end];
+
+        // Is the leading token an exact command (normalized to the catalog's
+        // canonical casing) that has subcommands? Resolve via the registry so
+        // the subcommand vocabulary matches the parser. Clone the canonical
+        // name so no borrow of `command_catalog` outlives the mutations below.
+        let exact_with_subs = self
+            .command_catalog
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(head))
+            .and_then(|canonical| {
+                crate::commands::parse(canonical).and_then(|(cmd, _)| {
+                    let subs = crate::commands::subcommands(cmd);
+                    (!subs.is_empty()).then(|| (canonical.clone(), subs))
+                })
+            });
+
+        if let Some((canonical, subs)) = exact_with_subs {
+            // Locate the subcommand token: skip the whitespace run after the
+            // command, then take up to the next whitespace (byte-safe: we key
+            // off char boundaries, not raw byte arithmetic).
+            let after = &self.composer[head_end..];
+            let sub_start = head_end
+                + after
+                    .char_indices()
+                    .find(|(_, c)| !c.is_whitespace())
+                    .map_or(after.len(), |(i, _)| i);
+            let sub_end = self.composer[sub_start..]
+                .find(char::is_whitespace)
+                .map_or(self.composer.len(), |i| sub_start + i);
+            // The user has moved onto a third token / args — yield the picker.
+            if self.cursor > sub_end {
+                self.close_picker();
+                return;
+            }
+            let partial = &self.composer[sub_start..sub_end];
+            let partial_lower = partial.to_ascii_lowercase();
+            let mut matched: Vec<&str> = subs
+                .iter()
+                .copied()
+                .filter(|s| s.to_ascii_lowercase().starts_with(&partial_lower))
+                .collect();
+            // Keep the natural order (default first), but lift an
+            // exactly-typed subcommand to the front as the default selection.
+            matched.sort_by_key(|s| !s.eq_ignore_ascii_case(partial));
+            let candidates: Vec<String> =
+                matched.iter().map(|s| format!("{canonical} {s}")).collect();
+            // Don't block typing an unknown subcommand.
+            if candidates.is_empty() {
+                self.close_picker();
+                return;
+            }
+            // Accepting replaces the command plus any partial subcommand. When
+            // the composer is exactly the command (no trailing space) there is
+            // no subcommand span yet, so only the command token is replaced.
+            self.picker_replace_end = if head_end == self.composer.len() {
+                head_end
+            } else {
+                sub_end
+            };
+            self.picker_candidates = candidates;
+            self.picker_open = true;
+            self.picker_selected = 0;
+            return;
+        }
+
+        // Command mode: the picker only drives the command token; once the
+        // cursor moves past it (a space was typed) completion yields.
+        if self.cursor > head_end {
             self.close_picker();
             return;
         }
-        let token_lower = self.composer[..token_end].to_ascii_lowercase();
+        let token_lower = self.composer[..head_end].to_ascii_lowercase();
         let mut candidates: Vec<String> = self
             .command_catalog
             .iter()
@@ -844,6 +927,7 @@ impl AppState {
         // natural catalog order for the remaining prefix matches.
         candidates.sort_by_key(|c| !c.eq_ignore_ascii_case(&token_lower));
         self.picker_candidates = candidates;
+        self.picker_replace_end = head_end;
         self.picker_open = true;
         // `refresh_picker` only runs on a composer edit, which changes the
         // filter, so always reset to the (now best-match) first candidate.
@@ -887,16 +971,17 @@ impl AppState {
             .map(String::as_str)
     }
 
-    /// Accept the highlighted candidate (Tab): replace the leading command
-    /// token with the selected command followed by a single space, move the
-    /// cursor to the end, and close the picker so the user can type args.
+    /// Accept the highlighted candidate (Tab): replace the replaceable span
+    /// (`0..picker_replace_end`, the command token plus any partial subcommand)
+    /// with the selected candidate followed by a single space, move the cursor
+    /// to the end, and close the picker so the user can type args.
     pub fn picker_accept(&mut self) {
         let Some(cmd) = self.picker_candidates.get(self.picker_selected).cloned() else {
             return;
         };
-        let token_end = self.command_token_end();
+        let replace_end = self.picker_replace_end;
         let replacement = format!("{cmd} ");
-        self.composer.replace_range(0..token_end, &replacement);
+        self.composer.replace_range(0..replace_end, &replacement);
         self.cursor = replacement.len();
         self.close_picker();
     }
@@ -1713,19 +1798,22 @@ mod tests {
     #[test]
     fn picker_defaults_to_exact_match_over_longer_sibling() {
         // Typing a full command must highlight the exact match, not a longer
-        // catalog-earlier sibling (regression: `/mcp` ran `/mcp-tools`).
-        let s = picker_state(&["/mcp-tools", "/mcp-reload", "/mcp"], "/mcp");
+        // catalog-earlier sibling (regression: `/mcp` ran `/mcp-tools`). Use a
+        // no-subcommand pair so this exercises command mode: `/status` has no
+        // subcommands, so typing it stays in command mode rather than listing
+        // subcommands, yet is still a prefix of `/statusline`.
+        let s = picker_state(&["/statusline", "/status"], "/status");
         assert!(s.picker_open());
         assert_eq!(
             s.picker_selected_command(),
-            Some("/mcp"),
+            Some("/status"),
             "candidates: {:?}",
             s.picker_candidates()
         );
         // Shorter/exact leads regardless of catalog order.
         assert_eq!(
             s.picker_candidates().first().map(String::as_str),
-            Some("/mcp")
+            Some("/status")
         );
     }
 
@@ -1844,6 +1932,101 @@ mod tests {
                 .filter(|c| *c == "/status")
                 .count(),
             1
+        );
+    }
+
+    // --- Slash-command picker: subcommand mode ---------------------------
+
+    #[test]
+    fn exact_command_with_subs_lists_subcommands() {
+        // Typing an exact command that has subcommands lists them (default
+        // first), not command names.
+        let s = picker_state(&["/agents"], "/agents");
+        assert!(s.picker_open());
+        assert_eq!(
+            s.picker_candidates(),
+            &[
+                "/agents list".to_string(),
+                "/agents enable".to_string(),
+                "/agents disable".to_string(),
+            ]
+        );
+        assert_eq!(s.picker_selected_command(), Some("/agents list"));
+    }
+
+    #[test]
+    fn trailing_space_after_command_still_lists_subcommands() {
+        let s = picker_state(&["/agents"], "/agents ");
+        assert!(s.picker_open());
+        assert_eq!(
+            s.picker_candidates(),
+            &[
+                "/agents list".to_string(),
+                "/agents enable".to_string(),
+                "/agents disable".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_subcommand_filters_candidates() {
+        let s = picker_state(&["/agents"], "/agents en");
+        assert!(s.picker_open());
+        assert_eq!(s.picker_candidates(), &["/agents enable".to_string()]);
+        assert_eq!(s.picker_selected_command(), Some("/agents enable"));
+    }
+
+    #[test]
+    fn accept_subcommand_replaces_command_and_partial() {
+        let mut s = picker_state(&["/agents"], "/agents en");
+        assert_eq!(s.picker_selected_command(), Some("/agents enable"));
+        s.picker_accept();
+        assert_eq!(s.composer(), "/agents enable ");
+        assert_eq!(s.cursor(), s.composer().len());
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn cursor_past_subcommand_token_closes_picker() {
+        // A third token / args means the user is past subcommand selection.
+        let s = picker_state(&["/agents"], "/agents enable foo");
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn partial_command_not_exact_stays_in_command_mode() {
+        // `/st` is not an exact command, so command mode filters names.
+        let mut s = AppState::new();
+        s.set_command_catalog(crate::commands::command_names().map(String::from));
+        for c in "/st".chars() {
+            s.edit(EditAction::InsertChar(c));
+        }
+        assert!(s.picker_open());
+        assert!(
+            s.picker_candidates().iter().any(|c| c == "/status"),
+            "candidates: {:?}",
+            s.picker_candidates()
+        );
+        // No subcommand entry leaked in.
+        assert!(
+            !s.picker_candidates().iter().any(|c| c.contains(' ')),
+            "candidates: {:?}",
+            s.picker_candidates()
+        );
+    }
+
+    #[test]
+    fn exact_command_without_subs_stays_in_command_mode() {
+        // `/status` is exact but has no subcommands: command mode, listing the
+        // command name and its longer sibling — not subcommands.
+        let s = picker_state(&["/status", "/statusline"], "/status");
+        assert!(s.picker_open());
+        assert_eq!(s.picker_selected_command(), Some("/status"));
+        assert!(s.picker_candidates().iter().any(|c| c == "/statusline"));
+        assert!(
+            !s.picker_candidates().iter().any(|c| c.contains(' ')),
+            "candidates: {:?}",
+            s.picker_candidates()
         );
     }
 }
