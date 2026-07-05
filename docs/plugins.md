@@ -12,6 +12,13 @@ Plugins are prompt bundles discovered from `~/.cubi/plugins/`. Each direct child
 
 Use `cubi plugins list` to inspect discovered bundles. Use `cubi plugins reload` after editing plugin files; it reloads skills and plugins and reports added or removed bundles.
 
+> **Plugins vs. skills vs. agents.** *Plugins* (this doc) are namespaced
+> command bundles under `~/.cubi/plugins/`. *Skills* are standalone Markdown
+> prompts in `~/.cubi/skills/` managed with `/skills` (list/enable/disable).
+> *Custom agents* are Markdown definitions in `~/.cubi/agents/` (name,
+> description, model + system prompt) managed with `/agents` and runnable
+> directly as `/<name>`. All three inject their body as context for the turn.
+
 ## Managing plugins from the CLI
 
 | Command | What it does |

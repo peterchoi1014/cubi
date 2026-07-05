@@ -38,20 +38,11 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🧰 **Built-in tools** — shell, filesystem, git, web fetch/search, long-lived
   bash REPL, Jupyter notebooks, LSP code-intel, OS notifications, and a
   meta-`agent_run` tool for spawning focused subagents
-- 🎭 **Multi-model consensus** — `consensus_run` meta-tool and `/consensus`
-  slash command run the same goal under N local models in parallel and
-  arbitrate via vote, best-of-n, or judge. No other agent in the
-  comparison does this natively. On single-GPU setups, pass
-  `concurrency: 1` to the `consensus_run` tool to serialize the subagent
-  inference calls. Tool-enabled consensus is sequential by default to
-  avoid shared-worktree edit races; add `use_tools: true, isolate: true`
-  plus `isolated_time_cap_secs` (or `/consensus ... --isolate --max-steps 8
-  --isolated-time-cap-secs 300 ...`) to give each tool-using subagent
-  its own ephemeral git worktree and run them in parallel safely with an
-  optional per-subprocess wall-clock cap. Isolated tool consensus runs from
-  the matching relative subdirectory inside each worktree, but it still
-  requires the parent cwd to be trusted, refuses while `/plan` mode is on, and
-  requires a clean git status (commit, stash, or discard changes first).
+- 🎭 **Multi-model consensus** — the `consensus_run` meta-tool and `/consensus`
+  slash command run one goal under N local models in parallel and arbitrate by
+  vote, best-of-n, or judge. Pass `concurrency: 1` on single-GPU setups; add
+  `use_tools`/`isolate` to give each tool-using subagent its own ephemeral git
+  worktree for safe parallel edits. See `/help consensus` for the full syntax.
 - 🔌 **MCP support** — load external Model Context Protocol servers from
   `~/.cubi/mcp.json` and call their tools alongside built-ins
 - 🧰 **MCP registry** — `cubi mcp search/install/uninstall` for one-command

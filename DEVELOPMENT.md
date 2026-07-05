@@ -16,15 +16,16 @@ The release profile in [`Cargo.toml`](Cargo.toml) enables `lto = "thin"`,
 ## Test, lint, format
 
 ```bash
-cargo test --quiet                          # unit + integration suite
-cargo clippy --all-targets -- -D warnings   # lints; CI gates on this
-cargo fmt --all                             # also gated as --check in CI
+cargo test --quiet                                # unit + integration suite
+cargo +1.88 clippy --all-targets -- -D warnings   # lints (CI gates on MSRV 1.88)
+cargo fmt --all                                   # also gated as --check in CI
+cargo deny check                                  # advisories / licenses / bans
 ```
 
 A typical pre-push loop:
 
 ```bash
-cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --quiet
+cargo fmt --all && cargo +1.88 clippy --all-targets -- -D warnings && cargo test --quiet && cargo deny check
 ```
 
 ### Regression bench suite
@@ -42,7 +43,8 @@ covered by unit tests in `src/bench.rs` and `tests/bench.rs`.
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   CLI Interface                      │
-│              (Colored Terminal UI)                   │
+│        (full-screen TUI by default; --classic        │
+│         for the line-based readline REPL)            │
 └─────────────────┬───────────────────────────────────┘
                   │
                   ▼
@@ -70,7 +72,8 @@ covered by unit tests in `src/bench.rs` and `tests/bench.rs`.
 cubi/
 ├── src/
 │   ├── main.rs            # Application entry point
-│   ├── cli/               # Terminal UI, command dispatch, agent-loop driver
+│   ├── cli/               # CLI: full-screen TUI (`cli/tui/`) + classic REPL,
+│   │                      #   slash-command dispatch, agent-loop driver
 │   ├── commands.rs        # Slash-command registry (single source of truth)
 │   ├── agent_loop.rs      # Streaming tool-calling loop + `agent_run` meta-tool
 │   ├── consensus.rs       # Multi-model `consensus_run` meta-tool + arbitration
@@ -87,7 +90,10 @@ cubi/
 │   ├── project_memory.rs  # CUBI.md discovery & loading
 │   ├── memdir.rs          # Cross-session persistent memory store
 │   ├── sessions.rs        # Per-project auto-saved session checkpoints
-│   ├── todos.rs           # Per-project todo list
+│   ├── skills.rs          # ~/.cubi/skills Markdown skills (enable/disable)
+│   ├── agents.rs          # ~/.cubi/agents custom agents, runnable as /<name>
+│   ├── receipts.rs        # Tamper-evident hash-chained audit log
+│   ├── swebench.rs        # SWE-bench-Lite harness (`cubi swebench`)
 │   ├── hooks.rs           # Lifecycle hook registry (PreToolUse, etc.)
 │   ├── file_mentions.rs   # `@file` mentions + user-defined Markdown commands
 │   ├── git_cmds.rs        # Shell-out helpers for git slash commands
@@ -99,6 +105,8 @@ cubi/
 ├── DEVELOPMENT.md         # This file
 └── README.md              # Overview + quick start
 ```
+
+_Representative, not exhaustive — see [`src/`](src/) for the full module list._
 
 ## Key components
 

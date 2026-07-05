@@ -5,7 +5,7 @@ Use headless mode when cubi is part of a script or pipeline.
 - Inline prompt: `cubi -p "summarize this repo"` or `cubi --prompt "..."`.
 - Piped prompt: `git diff | cubi -p "summarize"` keeps the diff on stdin for shell composition; without `-p`, cubi reads piped stdin as the prompt: `printf 'hello' | cubi`.
 - System prompt: `cubi --system ./system.txt -p "review"` prepends file contents as instructions.
-- JSON events: `cubi --json --no-stream -p "run tests"` emits line-delimited `token`, `tool_call`, `tool_result`, `tool_timeout`, `compacted`, `budget_error`, `consensus_start`, `consensus_subagent_result`, `consensus_decision`, and `done` events.
+- JSON events: `cubi --json --no-stream -p "run tests"` emits line-delimited `token`, `tool_call`, `tool_result`, `tool_timeout`, `compacted`, `budget_error`, `consensus_start`, `consensus_subagent_result`, `consensus_decision`, `error`, and `done` events.
 - Streaming: one-shot mode buffers by default for predictable scripts; add `--stream` for live tokens.
 
 ## `cubi exec` shorthand
@@ -28,9 +28,8 @@ Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` co
 
 ## Error events
 
-The `error` JSON event has been extended (backward-compatibly) with
-optional `kind`, `exit_code`, and `hint` fields. The legacy `message`
-field is preserved unchanged.
+The `error` JSON event carries a `message` plus optional `kind`, `exit_code`,
+and `hint` fields.
 
 ```json
 {"type":"error","message":"could not connect to localhost:11434","kind":"connect_refused","exit_code":13,"hint":"is `ollama serve` running on localhost:11434?"}
