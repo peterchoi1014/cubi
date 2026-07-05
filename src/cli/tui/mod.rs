@@ -711,7 +711,7 @@ impl ChatCLI {
             if Self::command_needs_terminal(input) {
                 return self.run_suspended_command(input, control_tx, guard).await;
             }
-            return self.run_captured_command(input, control_tx).await;
+            return self.run_captured_command(input, control_tx, guard).await;
         }
 
         // Shell escape: `!<cmd>` runs a shell command and shows its output as a
@@ -917,7 +917,42 @@ impl ChatCLI {
     /// via [`render_captured_command`](Self::render_captured_command) (the same
     /// seam `/mcp` uses); (7) fire `resume` so the render task rebuilds its
     /// stream and repaints the new block.
+    ///
+    /// **Platform:** the fd-capture body is Unix-only. Capturing the
+    /// process-global stdout on Windows is unreliable — Rust's own console
+    /// writes go through the Win32 standard handles (`WriteConsoleW`), not the
+    /// CRT fds this redirects, and the process-global redirect races the
+    /// parallel test harness. On non-Unix this delegates to
+    /// [`run_suspended_command`](Self::run_suspended_command), keeping the
+    /// working suspend/"press Enter" UX for general slash commands.
     async fn run_captured_command(
+        &mut self,
+        input: &str,
+        control_tx: &UnboundedSender<RenderControl>,
+        guard: &term::TerminalGuard,
+    ) -> bool {
+        // Windows (and any non-Unix): fd capture is unreliable here, so fall
+        // back to the suspend path that predates capture. Returns directly; the
+        // Unix capture body below is compiled out.
+        #[cfg(not(unix))]
+        {
+            return self.run_suspended_command(input, control_tx, guard).await;
+        }
+
+        #[cfg(unix)]
+        {
+            // The suspend path owns `guard`; the capture path stays on the alt
+            // screen and never touches it.
+            let _ = guard;
+            self.run_captured_command_unix(input, control_tx).await
+        }
+    }
+
+    /// The Unix capture body of [`run_captured_command`](Self::run_captured_command).
+    /// Split out so the `#[cfg(not(unix))]` delegation stays a trivial one-liner
+    /// and this large body carries no per-statement cfg noise.
+    #[cfg(unix)]
+    async fn run_captured_command_unix(
         &mut self,
         input: &str,
         control_tx: &UnboundedSender<RenderControl>,

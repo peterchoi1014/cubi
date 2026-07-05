@@ -114,17 +114,6 @@ libc = "0.2"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 
-# Win32 console/handle APIs — Windows only. `capture_fds` (src/cli/tui/capture.rs)
-# must redirect the Win32 standard *handles* via `SetStdHandle`, not just the CRT
-# fds via `_dup2`: Rust's own `io::stdout()`/`eprintln!` writes reach a real
-# console through `WriteConsoleW`/`WriteFile` on the handle returned by
-# `GetStdHandle(STD_OUTPUT_HANDLE)`, which the CRT `_dup2(fd)` swap does NOT
-# affect. Without this the in-TUI command-output capture would collect nothing on
-# a Windows console. Gated to `cfg(windows)` so it never enters the macOS/Linux
-# build; MIT/Apache licensed (passes `cargo deny`).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
-
 [features]
 default = ["tree-sitter"]
 tree-sitter = [

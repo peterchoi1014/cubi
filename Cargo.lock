@@ -527,7 +527,6 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
