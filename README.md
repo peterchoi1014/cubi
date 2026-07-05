@@ -10,8 +10,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 
 > **What's new:** interactive `cubi` now launches a full-screen terminal UI by
 > default — markdown, syntax-highlighted code, colored diffs, framed tool calls,
-> an animated thinking indicator, a scrollbar, `/theme` support, and slash
-> commands, with native mouse/keyboard scrolling and selection. Pass
+> an animated thinking indicator, a scrollbar, `/theme` support, a slash-command
+> picker, and command output rendered inside the transcript. The mouse wheel
+> scrolls the transcript; keyboard `Up`/`Down` recall input history. Pass
 > `--classic` (or set `CUBI_CLASSIC=1`) for the classic line-based REPL. See
 > the "Interactive UI (TUI)" section below.
 
@@ -66,7 +67,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 - 🌿 **Git workflow** — `/diff`, `/commit`, `/commit-push-pr`, `/review`,
   `/worktree`, `/branch`, `/tag`, `/autofix-pr`, `/pr_comments` shell out to
   your installed `git`/`gh`
-- 🧩 **Plugins + skills + hooks** — reusable Markdown skill packs, namespaced
+- 🧩 **Plugins + skills + agents + hooks** — reusable Markdown skill packs
+  (`/skills`, enable/disable), custom agent definitions in `~/.cubi/agents/*.md`
+  runnable as `/<name>` (`/agents` to list/enable/disable), namespaced
   slash-command bundles, and `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/etc.
   lifecycle hooks
 - 🗺️ **Repo-map** — tree-sitter-based outline of the project's symbols,
@@ -129,13 +132,20 @@ input box and a live status line, and includes:
 - an animated "thinking…" indicator while the model works
 - a scrollbar that appears only when the transcript overflows
 - theme support via `/theme` (all slash commands work inside the TUI)
+- a **slash-command picker**: type `/` to filter available commands (built-ins
+  and your custom agents); `Tab` inserts the selected command, `Enter` runs it
+- **command output rendered in the transcript** — `/status`, `/diff`,
+  `/skills`, `/mcp`, `/consensus`, `/review`, etc. render inline (no drop to a
+  separate screen); long model commands stream live and are `Ctrl-C`-cancelable
 - shell escape: prefix input with `!` to run a shell command (e.g. `!git status`)
 
-Navigation uses the terminal's **native selection and scrolling**: the mouse
-wheel, `PageUp`/`PageDown`, and the arrow keys scroll the transcript, while
-click-drag text selection and copy keep working (the mouse is never captured).
-On exit — and when you resume a saved session — Cubi prints a copyable resume
-hint with the session id.
+Navigation: the **mouse wheel**, `PageUp`/`PageDown` scroll the transcript;
+keyboard **`Up`/`Down` recall your input history** (and move the picker
+selection while it's open). Because the wheel is used for scrolling, the mouse
+is captured, so **text selection uses `Shift`-drag** (`Option`-drag on macOS
+Terminal / iTerm2) — the standard convention for full-screen terminal apps. On
+exit — and when you resume a saved session — Cubi prints a copyable resume hint
+with the session id.
 
 Prefer the classic line-based readline REPL? Pass `--classic` (or set
 `CUBI_CLASSIC=1`). The TUI is also skipped automatically for non-TTY, piped,
@@ -198,6 +208,7 @@ codes, and the JSON event schema.
   non-Ollama backends
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** — build, test, lint, project structure,
   contributing
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to contribute; **[SECURITY.md](SECURITY.md)** — reporting vulnerabilities
 - [`docs/headless.md`](docs/headless.md) — scripts, JSON output, exit codes
 - [`docs/sessions.md`](docs/sessions.md) — saved sessions: resume, delete, prune
 - [`docs/plugins.md`](docs/plugins.md) — plugin discovery & command authoring
@@ -233,8 +244,10 @@ Highlights still to come:
 
 ## 🤝 Contributing
 
-Contributions welcome — see [DEVELOPMENT.md](DEVELOPMENT.md) for the build/test
-loop and code conventions. Open a PR against `main`.
+Contributions welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to
+get started and [DEVELOPMENT.md](DEVELOPMENT.md) for the build/test loop and
+code conventions. Open a PR against `main`. To report a security issue, see
+[SECURITY.md](SECURITY.md).
 
 ## 📝 License
 
