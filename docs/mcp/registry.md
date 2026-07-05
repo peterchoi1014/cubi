@@ -22,9 +22,13 @@ cubi mcp test <server> [--tool <name>] [--json]
 ```
 
 In the REPL the same operations are exposed as `/mcp-search`,
-`/mcp-install`, `/mcp-uninstall`, and (existing) `/mcp-tools`. After an
-install or uninstall the REPL automatically calls `/mcp-reload` so new tools
-become available in the running session.
+`/mcp-install`, and `/mcp-uninstall`. After an install or uninstall the REPL
+automatically reloads so new tools become available in the running session.
+The `/mcp` command manages configured servers directly —
+`/mcp list|enable <name>|disable <name>|add <name> <command|url>|remove
+<name>|reload` — and `/mcp-tools` lists available tools. Servers carry an
+`enabled` flag in `~/.cubi/mcp.json` (default true); `/mcp disable` skips a
+server at connect time without removing it.
 
 `install` prompts (via stdin) for every env var marked `required: true`.
 Pass `--env KEY=value` one or more times to skip the prompts (required for

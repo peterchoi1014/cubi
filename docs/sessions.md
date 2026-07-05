@@ -10,4 +10,8 @@ cubi checkpoints conversations per project so interrupted work can be resumed.
 - Prune old sessions: `cubi --prune-sessions --older-than 30d`.
 - Preview pruning: `cubi --prune-sessions --older-than 6m --dry-run`.
 
+Inside a running session, manage the current conversation with the slash
+commands `/sessions`, `/resume [id]`, `/fork`, `/rewind [n]`, and `/compact`
+(see `/help` for details).
+
 The global index lives at `~/.cubi/sessions/index.json`. Session files are stored under `~/.cubi/sessions/` and include the cwd, model, timestamps, and message history. Prefer the CLI commands over hand-editing the index so prefix lookups and pruning stay consistent.

@@ -4,7 +4,7 @@
 
 ### Required
 
-- **Rust** 1.85 or later — [rustup.rs](https://rustup.rs/)
+- **Rust** 1.88 or later — [rustup.rs](https://rustup.rs/)
 - A local LLM backend — one of:
   - **[Ollama](https://ollama.ai/)** (recommended)
   - **[llama.cpp](https://github.com/ggerganov/llama.cpp)** `llama-server`
