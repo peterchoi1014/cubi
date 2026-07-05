@@ -754,7 +754,7 @@ pub const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/mcp",
-        usage: "/mcp [list|enable <name>|disable <name>|add|remove <name>|reload]",
+        usage: "/mcp [list|enable <name>|disable <name>|add <name> <command|url>|remove <name>|reload]",
         help: "Show overall MCP status (servers, tools, resources)",
         cmd: Cmd::Mcp,
         subcommands: &["list", "enable", "disable", "add", "remove", "reload"],
@@ -1060,6 +1060,54 @@ pub fn default_subcommand(cmd: Cmd) -> Option<&'static str> {
     subcommands(cmd).first().copied()
 }
 
+/// The argument hint for a subcommand (e.g. `"<name>"` for `/agents enable`),
+/// parsed from the command's `usage` string, or `None` when the subcommand
+/// takes no args (e.g. `list`).
+///
+/// The hint is sourced from the `[...]` alternatives group of the `usage`
+/// string. Alternatives are split on `|` at bracket depth 0, where depth
+/// increments on `<` and decrements on `>`, so a nested pipe such as the one in
+/// `<command|url>` is not treated as a separator. The returned slice is a
+/// subslice of the `'static` `usage`, so the `&'static str` return is sound.
+pub fn subcommand_arg_hint(cmd: Cmd, sub: &str) -> Option<&'static str> {
+    let usage: &'static str = COMMANDS.iter().find(|s| s.cmd == cmd)?.usage;
+    // Content between the first `[` and its matching `]` (a subslice of the
+    // `'static` usage, so everything derived from it stays `'static`).
+    let open = usage.find('[')?;
+    let close = open + usage[open..].find(']')?;
+    let group: &'static str = &usage[open + 1..close];
+
+    // Split the alternatives on `|` at bracket depth 0 only.
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut alts: Vec<&'static str> = Vec::new();
+    for (i, c) in group.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '|' if depth == 0 => {
+                alts.push(&group[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    alts.push(&group[start..]);
+
+    for alt in alts {
+        let alt = alt.trim();
+        // Split off the first whitespace-delimited word (the subcommand name).
+        let (name, rest) = match alt.find(char::is_whitespace) {
+            Some(i) => (&alt[..i], alt[i..].trim()),
+            None => (alt, ""),
+        };
+        if name == sub {
+            return (!rest.is_empty()).then_some(rest);
+        }
+    }
+    None
+}
+
 /// Parses an input line that starts with `/` into a `(Cmd, args)` pair.
 ///
 /// * `args` is everything after the first whitespace, with leading/trailing
@@ -1320,5 +1368,24 @@ mod tests {
         let mcp = find_command("/mcp").expect("registered");
         assert!(mcp.usage.contains("reload"));
         assert!(mcp.usage.contains("enable <name>"));
+        assert!(mcp.usage.contains("add <name> <command|url>"));
+    }
+
+    #[test]
+    fn subcommand_arg_hint_parses_usage_alternatives() {
+        // A subcommand that takes an arg.
+        assert_eq!(subcommand_arg_hint(Cmd::Agents, "enable"), Some("<name>"));
+        // A subcommand that takes no args.
+        assert_eq!(subcommand_arg_hint(Cmd::Agents, "list"), None);
+        // Nested `|` inside `<...>` must NOT split the alternative.
+        assert_eq!(
+            subcommand_arg_hint(Cmd::Mcp, "add"),
+            Some("<name> <command|url>")
+        );
+        assert_eq!(subcommand_arg_hint(Cmd::Mcp, "reload"), None);
+        // Unknown subcommand -> None.
+        assert_eq!(subcommand_arg_hint(Cmd::Mcp, "bogus"), None);
+        // A command without a `[...]` group -> None.
+        assert_eq!(subcommand_arg_hint(Cmd::Status, "list"), None);
     }
 }

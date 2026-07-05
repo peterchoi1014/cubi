@@ -151,7 +151,15 @@ pub struct AppState {
     /// [`Self::refresh_picker`] on every composer mutation.
     picker_open: bool,
     /// The filtered command candidates shown in the picker, in catalog order.
+    /// These are the **values** — the exact command string that Tab inserts or
+    /// Enter runs, WITHOUT any `<...>` argument hint. Kept index-aligned with
+    /// [`Self::picker_labels`].
     picker_candidates: Vec<String>,
+    /// The **display** strings for the picker, index-aligned with
+    /// [`Self::picker_candidates`]. In subcommand mode these carry the
+    /// argument hint (e.g. `/agents enable <name>`); in command mode they equal
+    /// the value. Returned by [`Self::picker_candidates`] for rendering.
+    picker_labels: Vec<String>,
     /// Index of the highlighted candidate within `picker_candidates`.
     picker_selected: usize,
     /// Byte offset in the composer that [`Self::picker_accept`] replaces up to
@@ -188,6 +196,7 @@ impl AppState {
             command_catalog: Vec::new(),
             picker_open: false,
             picker_candidates: Vec::new(),
+            picker_labels: Vec::new(),
             picker_selected: 0,
             picker_replace_end: 0,
             picker_dismissed_until_edit: false,
@@ -217,9 +226,15 @@ impl AppState {
         self.picker_open
     }
 
-    /// The filtered command candidates shown in the picker (catalog order).
+    /// The filtered candidate **labels** shown in the picker (catalog order).
+    /// These are the display strings and may include an argument hint (e.g.
+    /// `/agents enable <name>`); use [`Self::picker_selected_command`] for the
+    /// value to insert or run.
+    // Intentionally returns the labels, not the like-named `picker_candidates`
+    // field (which holds the insert/run values without the hint).
+    #[allow(clippy::misnamed_getters)]
     pub fn picker_candidates(&self) -> &[String] {
-        &self.picker_candidates
+        &self.picker_labels
     }
 
     /// Index of the highlighted candidate within [`Self::picker_candidates`].
@@ -850,11 +865,11 @@ impl AppState {
             .and_then(|canonical| {
                 crate::commands::parse(canonical).and_then(|(cmd, _)| {
                     let subs = crate::commands::subcommands(cmd);
-                    (!subs.is_empty()).then(|| (canonical.clone(), subs))
+                    (!subs.is_empty()).then(|| (cmd, canonical.clone(), subs))
                 })
             });
 
-        if let Some((canonical, subs)) = exact_with_subs {
+        if let Some((cmd, canonical, subs)) = exact_with_subs {
             // Locate the subcommand token: skip the whitespace run after the
             // command, then take up to the next whitespace (byte-safe: we key
             // off char boundaries, not raw byte arithmetic).
@@ -882,10 +897,23 @@ impl AppState {
             // Keep the natural order (default first), but lift an
             // exactly-typed subcommand to the front as the default selection.
             matched.sort_by_key(|s| !s.eq_ignore_ascii_case(partial));
-            let candidates: Vec<String> =
-                matched.iter().map(|s| format!("{canonical} {s}")).collect();
+            // Build value/label pairs so display and insert/run stay aligned.
+            // The value is the plain command string (no hint); the label adds
+            // the subcommand's argument hint for clarity. Sort already ran, so
+            // pushing in order keeps both stores index-aligned.
+            let mut values: Vec<String> = Vec::with_capacity(matched.len());
+            let mut labels: Vec<String> = Vec::with_capacity(matched.len());
+            for s in &matched {
+                let value = format!("{canonical} {s}");
+                let label = match crate::commands::subcommand_arg_hint(cmd, s) {
+                    Some(hint) => format!("{value} {hint}"),
+                    None => value.clone(),
+                };
+                values.push(value);
+                labels.push(label);
+            }
             // Don't block typing an unknown subcommand.
-            if candidates.is_empty() {
+            if values.is_empty() {
                 self.close_picker();
                 return;
             }
@@ -897,7 +925,8 @@ impl AppState {
             } else {
                 sub_end
             };
-            self.picker_candidates = candidates;
+            self.picker_candidates = values;
+            self.picker_labels = labels;
             self.picker_open = true;
             self.picker_selected = 0;
             return;
@@ -926,6 +955,8 @@ impl AppState {
         // would run that instead of `/mcp`. Stable otherwise, preserving the
         // natural catalog order for the remaining prefix matches.
         candidates.sort_by_key(|c| !c.eq_ignore_ascii_case(&token_lower));
+        // Command mode: label == value, so mirror the values into the labels.
+        self.picker_labels = candidates.clone();
         self.picker_candidates = candidates;
         self.picker_replace_end = head_end;
         self.picker_open = true;
@@ -940,6 +971,7 @@ impl AppState {
     fn close_picker(&mut self) {
         self.picker_open = false;
         self.picker_candidates.clear();
+        self.picker_labels.clear();
         self.picker_selected = 0;
     }
 
@@ -1940,15 +1972,16 @@ mod tests {
     #[test]
     fn exact_command_with_subs_lists_subcommands() {
         // Typing an exact command that has subcommands lists them (default
-        // first), not command names.
+        // first), not command names. Labels carry the argument hint; the
+        // selected value does not.
         let s = picker_state(&["/agents"], "/agents");
         assert!(s.picker_open());
         assert_eq!(
             s.picker_candidates(),
             &[
                 "/agents list".to_string(),
-                "/agents enable".to_string(),
-                "/agents disable".to_string(),
+                "/agents enable <name>".to_string(),
+                "/agents disable <name>".to_string(),
             ]
         );
         assert_eq!(s.picker_selected_command(), Some("/agents list"));
@@ -1962,8 +1995,8 @@ mod tests {
             s.picker_candidates(),
             &[
                 "/agents list".to_string(),
-                "/agents enable".to_string(),
-                "/agents disable".to_string(),
+                "/agents enable <name>".to_string(),
+                "/agents disable <name>".to_string(),
             ]
         );
     }
@@ -1972,8 +2005,41 @@ mod tests {
     fn partial_subcommand_filters_candidates() {
         let s = picker_state(&["/agents"], "/agents en");
         assert!(s.picker_open());
-        assert_eq!(s.picker_candidates(), &["/agents enable".to_string()]);
+        // Label carries the hint, value does not.
+        assert_eq!(
+            s.picker_candidates(),
+            &["/agents enable <name>".to_string()]
+        );
         assert_eq!(s.picker_selected_command(), Some("/agents enable"));
+    }
+
+    #[test]
+    fn navigating_to_hinted_subcommand_selects_value_and_accept_omits_hint() {
+        // Typing the bare command lists all subs; navigating to `enable` and
+        // accepting must insert the value (no `<name>` hint text).
+        let mut s = picker_state(&["/agents"], "/agents");
+        s.picker_next(); // move to `/agents enable <name>` (label)
+        assert_eq!(s.picker_selected_command(), Some("/agents enable"));
+        s.picker_accept();
+        assert_eq!(s.composer(), "/agents enable ");
+        assert!(!s.composer().contains("<name>"));
+        assert!(!s.picker_open());
+    }
+
+    #[test]
+    fn mcp_add_label_carries_nested_pipe_hint_but_value_is_plain() {
+        // `add`'s hint contains a nested `<command|url>`; the label keeps it,
+        // the value stays plain.
+        let s = picker_state(&["/mcp"], "/mcp add");
+        assert!(s.picker_open());
+        assert!(
+            s.picker_candidates()
+                .iter()
+                .any(|c| c == "/mcp add <name> <command|url>"),
+            "labels: {:?}",
+            s.picker_candidates()
+        );
+        assert_eq!(s.picker_selected_command(), Some("/mcp add"));
     }
 
     #[test]
