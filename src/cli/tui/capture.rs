@@ -41,6 +41,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::NamedTempFile;
 
+// On Windows, Rust's own `io::stdout()` / `eprintln!` writes do NOT always go
+// through the CRT fd 1/2: when the stream is a console they are emitted via
+// `WriteConsoleW` (otherwise `WriteFile`) against the handle returned by
+// `GetStdHandle(STD_OUTPUT_HANDLE)`. The CRT `_dup2(fd)` swap below therefore
+// only redirects child-process / C-runtime writes, not Rust's own console
+// output. To capture the latter we ALSO swap the Win32 standard handles with
+// `SetStdHandle`. These APIs are not exposed by `libc`, hence `windows-sys`.
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+};
+
 /// True while a capture window is active (fd 1/2 redirected to a tempfile).
 /// Handlers that would otherwise prompt on the real terminal check this to
 /// abort safely: during [`begin`] fd 0 is intentionally left connected, so an
@@ -124,6 +138,13 @@ pub(crate) struct Redirect {
     tmp: NamedTempFile,
     /// `colored` override state to restore on drop.
     prev_color: bool,
+    /// Previous Win32 `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE` (as raw
+    /// `isize`s, so the guard stays `Send`), saved before the redirect so
+    /// `Drop` can put them back. Windows-only: Rust's own `io::stdout()` /
+    /// `eprintln!` writes reach a console through these Win32 handles (via
+    /// `WriteConsoleW`), bypassing the CRT `_dup2(fd)` swap.
+    #[cfg(windows)]
+    saved_std: [isize; 2],
 }
 
 impl Redirect {
@@ -163,12 +184,27 @@ impl Redirect {
                 libc::dup(2),
             ]
         };
+        // Windows: Rust's own stdout/stderr writes go through the Win32
+        // standard *handles* (WriteConsoleW / WriteFile on the handle from
+        // `GetStdHandle`), which the CRT `dup2` above does NOT touch. Save the
+        // current handles (as raw isizes) so `Drop` can put them back; the
+        // actual `SetStdHandle` swap happens only after the CRT redirect below
+        // succeeds. Restoring an unswapped handle to itself is a harmless no-op.
+        #[cfg(windows)]
+        let saved_std = unsafe {
+            [
+                GetStdHandle(STD_OUTPUT_HANDLE) as isize,
+                GetStdHandle(STD_ERROR_HANDLE) as isize,
+            ]
+        };
         let guard = Redirect {
             saved,
             write_fd,
             null_fd,
             tmp,
             prev_color,
+            #[cfg(windows)]
+            saved_std,
         };
         if saved[1] < 0 || saved[2] < 0 || (redirect_stdin && saved[0] < 0) {
             return Err(io::Error::last_os_error());
@@ -183,6 +219,21 @@ impl Redirect {
         };
         if !ok {
             return Err(io::Error::last_os_error());
+        }
+
+        // Windows: also point the Win32 standard handles at the tempfile so
+        // Rust's own console writes (the WriteConsoleW/WriteFile path) land in
+        // the capture, not just child-process / CRT writes. `get_osfhandle`
+        // yields the OS handle backing `write_fd`, so both the CRT fd and the
+        // Win32 handle share one file object — and one file offset, which
+        // `read_captured` rewinds with `lseek`. Best-effort: if this fails the
+        // CRT redirect still captures child output, and `Drop` restores the
+        // saved handles regardless.
+        #[cfg(windows)]
+        unsafe {
+            let h = libc::get_osfhandle(write_fd) as HANDLE;
+            SetStdHandle(STD_OUTPUT_HANDLE, h);
+            SetStdHandle(STD_ERROR_HANDLE, h);
         }
 
         // Keep ANSI color in the captured bytes even though the target is not a
@@ -231,6 +282,14 @@ impl Drop for Redirect {
             if self.saved[2] >= 0 {
                 libc::dup2(self.saved[2], 2);
                 libc::close(self.saved[2]);
+            }
+            // Windows: restore the Win32 standard handles before closing
+            // `write_fd`, so the handles never briefly point at a closed OS
+            // handle. On non-Windows this is compiled out entirely.
+            #[cfg(windows)]
+            {
+                SetStdHandle(STD_OUTPUT_HANDLE, self.saved_std[0] as HANDLE);
+                SetStdHandle(STD_ERROR_HANDLE, self.saved_std[1] as HANDLE);
             }
             libc::close(self.write_fd);
             if self.null_fd >= 0 {
