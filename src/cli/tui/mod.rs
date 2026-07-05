@@ -689,6 +689,12 @@ impl ChatCLI {
             // TuiSink, `tui_active` true, no capture/suspend handshake) rather
             // than parking the render task via `run_captured_command`.
             if Self::command_streams_inline(input) {
+                // Honor a user/plugin command of the same name first, matching
+                // the capture/suspend dispatch order; otherwise run the built-in
+                // streaming handler inline.
+                if self.try_user_command(input) {
+                    return true;
+                }
                 match self.handle_command(input).await {
                     Ok(cont) => return cont,
                     Err(e) => {

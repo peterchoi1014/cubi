@@ -4949,12 +4949,16 @@ impl ChatCLI {
              etc.), explain the impact, and suggest a remediation. If the diff is \
              security-clean, say so explicitly.\n\n```diff\n{diff}\n```"
         );
+        let turn_start = self.history.len();
         self.history.push(Message::text("user", prompt));
         // Stream the review live; on success persist the assistant reply so it
         // stays part of the conversation, matching the prior behavior. On
-        // cancel/error the user turn stays in history for a retry.
+        // cancel/error, drop the just-pushed user turn so the (large) prompt
+        // doesn't linger in the context window with no reply.
         if let Some(msg) = self.stream_single_shot(self.history.clone()).await {
             self.history.push(msg);
+        } else {
+            self.history.truncate(turn_start);
         }
     }
 
@@ -4991,9 +4995,13 @@ impl ChatCLI {
              suggestions by file and explain reasoning. If a comment is unclear, \
              flag it.\n\n```\n{body}\n```"
         );
+        let turn_start = self.history.len();
         self.history.push(Message::text("user", prompt));
         if let Some(msg) = self.stream_single_shot(self.history.clone()).await {
             self.history.push(msg);
+        } else {
+            // Cancel/error: drop the orphaned user turn.
+            self.history.truncate(turn_start);
         }
     }
 
