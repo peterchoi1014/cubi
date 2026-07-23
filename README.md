@@ -84,7 +84,7 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
 ```bash
 # 1. Install Ollama and pull the default model
 brew install ollama && ollama serve &
-ollama pull qwen3:8b
+ollama pull qwen3.5:9b
 
 # 2. Build and run cubi
 git clone https://github.com/peterchoi1014/cubi.git

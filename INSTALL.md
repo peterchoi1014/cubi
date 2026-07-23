@@ -41,16 +41,17 @@ below.
 ## 2. Pull a model
 
 ```bash
-# Recommended default — most reliable tool-calling (~5.2 GB)
-ollama pull qwen3:8b
+# Recommended default — reliable tool-calling, 256K context (~5.6 GB)
+ollama pull qwen3.5:9b
 ```
 
 Other options:
 
 | Model | Size | Speed | Quality | Use case |
 | --- | --- | --- | --- | --- |
-| `qwen3:8b` | 5.2 GB | ⚡ | ⭐⭐⭐⭐⭐ | **Default** — most reliable tool-calling |
-| `qwen3:4b` | 2.6 GB | ⚡⚡ | ⭐⭐⭐⭐ | Tool-capable, fits smaller machines |
+| `qwen3.5:9b` | ~5.6 GB | ⚡ | ⭐⭐⭐⭐⭐ | **Default** — reliable tool-calling, 256K context |
+| `qwen3.5:4b` | ~2.6 GB | ⚡⚡ | ⭐⭐⭐⭐ | Tool-capable, fits smaller machines |
+| `qwen3:8b` | 5.2 GB | ⚡ | ⭐⭐⭐⭐⭐ | Prior default (Qwen3, 32K context) |
 | `devstral` | 14 GB | ⚡ | ⭐⭐⭐⭐⭐ | Best for code/agent workflows, 131K context |
 | `qwen2.5:3b` | 1.9 GB | ⚡⚡⚡ | ⭐⭐⭐ | Smaller tool-capable model |
 | `phi4-mini` | 2.5 GB | ⚡⚡ | ⭐⭐⭐ | Microsoft's tool-capable mini |
@@ -112,11 +113,11 @@ directory is writable.
 
 ## Choosing a model
 
-The CLI uses `qwen3:8b` by default. Override at startup with `CUBI_MODEL`, or
+The CLI uses `qwen3.5:9b` by default. Override at startup with `CUBI_MODEL`, or
 switch interactively with `/model`:
 
 ```bash
-CUBI_MODEL=qwen3:4b cubi
+CUBI_MODEL=qwen3.5:4b cubi
 ```
 
 ## Optional features

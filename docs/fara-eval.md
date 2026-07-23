@@ -90,13 +90,20 @@ Sources:
   For local feasibility, target the smaller **Fara-9B/4B** (or the GGUF
   **Fara-7B** so Ollama works) before the 27B, which needs substantial GPU VRAM.
 
-## Suggested next step
+## Decision
 
-Decide which goal we're chasing before writing code:
+We are chasing **"a better local generalist model"**, so Fara1.5 does not apply
+(it is a specialized browser CUA, per the mismatches above). The generalist
+upgrade landed alongside this note: the default model was bumped from
+`qwen3:8b` to **`qwen3.5:9b`** — the direct Qwen3 successor on Ollama, same
+weight class, 256K native context (up from 32K), with improved native
+tool-calling. See `src/main.rs` (`DEFAULT_MODEL`), the context-window registry
+in `src/llm.rs`, and the updated onboarding/help/README/INSTALL copy. The
+`qwen3.5:4b` variant is the small-machine fallback. The nightly `cubi bench`
+regression baseline stays pinned to `qwen3:8b` in CI on purpose.
 
-- **"A better local generalist model"** → keep the current tool-calling models;
-  Fara doesn't apply.
-- **"Browser computer-use as a Cubi feature"** → scope the multimodal +
-  browser-action-layer work above as its own milestone, prototype against
-  Fara-9B on a GPU box (or Fara-7B GGUF locally), and treat the 27B as the
-  quality ceiling rather than the starting point.
+If the **"browser computer-use as a Cubi feature"** path is ever revived, Fara
+becomes relevant again: scope the multimodal + browser-action-layer work above
+as its own milestone, prototype against Fara-9B on a GPU box (or Fara-7B GGUF
+locally), and treat the 27B as the quality ceiling rather than the starting
+point.

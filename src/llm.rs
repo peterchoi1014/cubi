@@ -1021,6 +1021,10 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
         // we conservatively report the native value since the backend
         // doesn't always enable YaRN by default.
         "qwen3" => Some(32_768),
+        // Qwen3.5 ships a 256K native context window across the family
+        // (0.8B through the larger MoE variants). See
+        // https://ollama.com/library/qwen3.5.
+        "qwen3.5" => Some(256_000),
         // Qwen3-Coder ships with a 256K native context (extensible to 1M).
         "qwen3-coder" => Some(256_000),
         "codellama" => Some(16_384),
@@ -1200,6 +1204,8 @@ mod tests {
         // a row trips this test instead of silently regressing the
         // budget warning for users on those models.
         assert_eq!(context_window_for_model("qwen3:8b"), Some(32_768));
+        assert_eq!(context_window_for_model("qwen3.5:9b"), Some(256_000));
+        assert_eq!(context_window_for_model("qwen3.5:4b"), Some(256_000));
         // Coder variants: recognized distinctly from their instruct siblings.
         assert_eq!(context_window_for_model("qwen2.5-coder:7b"), Some(128_000));
         assert_eq!(context_window_for_model("qwen2.5-coder:14b"), Some(128_000));

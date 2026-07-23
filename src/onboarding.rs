@@ -307,9 +307,9 @@ pub async fn run_if_needed(
             println!(
                 "{} Recommended for tool-calling: {}. Alternatives: {} (best for code) or {} (smallest).",
                 "ℹ".bright_blue(),
-                "qwen3:8b".bright_cyan(),
+                "qwen3.5:9b".bright_cyan(),
                 "devstral".bright_cyan(),
-                "qwen3:4b".bright_cyan(),
+                "qwen3.5:4b".bright_cyan(),
             );
             let pick = prompt(&format!(
                 "Pick a default model [1-{}] (press Enter to skip): ",

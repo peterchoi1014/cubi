@@ -77,18 +77,19 @@ use std::sync::{Arc, Mutex};
 /// Default model used when the user has not configured one. Can be overridden
 /// at runtime by setting the `CUBI_MODEL` environment variable.
 ///
-/// Picked because Qwen3 4B currently has the best native tool-calling
-/// reliability of any small (<5B) model on Ollama — important because the
-/// agent loop in `agent_loop.rs` advertises ~27 built-in tools plus any MCP
-/// tools via Ollama's `tools:` field. Tiny non-tool-trained models (the
-/// previous `llama3.2:1b` default) routinely garbled their replies into
+/// Picked because the Qwen3 line has the best native tool-calling
+/// reliability of any locally-runnable model on Ollama — important because
+/// the agent loop in `agent_loop.rs` advertises ~27 built-in tools plus any
+/// MCP tools via Ollama's `tools:` field. Tiny non-tool-trained models (the
+/// original `llama3.2:1b` default) routinely garbled their replies into
 /// pseudo-JSON instead of either calling a tool or answering normally.
 // Default model when neither $CUBI_MODEL nor config.default_model is set.
-// Bumped from qwen3:4b to qwen3:8b: the 8B variant is materially more
-// reliable at multi-turn native tool calling (which the agent loop
-// depends on) while still fitting in <6GB RAM. The 4B fallback is still
-// advertised below for users on smaller machines.
-const DEFAULT_MODEL: &str = "qwen3:8b";
+// Bumped from qwen3:8b to qwen3.5:9b: the Qwen3.5 generation is the direct
+// successor to Qwen3, sits in the same weight class (fits comparable RAM),
+// ships a 256K native context window (up from Qwen3's 32K), and further
+// improves the multi-turn native tool-calling the agent loop depends on.
+// The qwen3.5:4b fallback is still advertised below for smaller machines.
+const DEFAULT_MODEL: &str = "qwen3.5:9b";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1497,9 +1498,9 @@ async fn main() -> Result<()> {
              Consider switching to {} (best), {} (best for code), or {} (smallest).",
             "Warning:".bright_yellow(),
             model.bright_cyan(),
-            "qwen3:8b".bright_cyan(),
+            "qwen3.5:9b".bright_cyan(),
             "devstral".bright_cyan(),
-            "qwen3:4b".bright_cyan(),
+            "qwen3.5:4b".bright_cyan(),
         );
     }
 
@@ -2159,7 +2160,7 @@ fn print_bench_help() {
          FLAGS:\n  \
          --suite <quick|all>       Task subset to run. `quick` is\n  \
                                   difficulty=easy only (default: quick).\n  \
-         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3:8b).\n  \
+         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3.5:9b).\n  \
          --task <id>               Run only the named task (debugging).\n  \
          --output <dir>            Output directory for results\n  \
                                   (default: bench/results/<unix-ts>/).\n  \
@@ -2188,7 +2189,7 @@ fn print_swebench_help() {
          FLAGS:\n  \
          --dataset <path.jsonl>    SWE-bench-Lite instances, one JSON per line\n  \
                                    (export from princeton-nlp/SWE-bench_Lite). Required.\n  \
-         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3:8b).\n  \
+         --model <name>            Model to drive (default: $CUBI_MODEL or qwen3.5:9b).\n  \
          --instance <id>           Run a single instance by id.\n  \
          --limit <n>               Cap the number of instances.\n  \
          --repos-root <dir>        Directory of pre-cloned repos (offline);\n  \
