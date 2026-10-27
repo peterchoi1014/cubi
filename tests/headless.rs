@@ -1,9 +1,19 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command as StdCommand;
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::thread;
 use tempfile::tempdir;
 
 fn cubi(home: &Path) -> Command {
@@ -13,6 +23,89 @@ fn cubi(home: &Path) -> Command {
         .env("CUBI_NO_ONBOARD", "1")
         .env("CUBI_COLOR", "off");
     cmd
+}
+
+#[cfg(unix)]
+struct OpenAiHttpFixture {
+    base_url: String,
+    address: std::net::SocketAddr,
+    requests: Arc<AtomicUsize>,
+    response_count: usize,
+    task: thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl OpenAiHttpFixture {
+    fn spawn(responses: Vec<(&'static str, serde_json::Value)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&requests);
+        let response_count = responses.len();
+        let task = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_http_request(&mut stream);
+                recorded.fetch_add(1, Ordering::SeqCst);
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            address,
+            requests,
+            response_count,
+            task,
+        }
+    }
+
+    fn finish(self) -> usize {
+        let observed = self.requests.load(Ordering::SeqCst);
+        for _ in observed..self.response_count {
+            let mut stream = TcpStream::connect(self.address).unwrap();
+            stream
+                .write_all(b"POST /shutdown HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        }
+        self.task.join().unwrap();
+        observed
+    }
+}
+
+#[cfg(unix)]
+fn read_http_request(stream: &mut TcpStream) {
+    let mut request = Vec::new();
+    let (header_end, content_length) = loop {
+        let mut chunk = [0_u8; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count > 0, "connection closed before request headers");
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = index + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            break (header_end, content_length);
+        }
+    };
+    while request.len() < header_end + content_length {
+        let mut chunk = [0_u8; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count > 0, "connection closed before request body");
+        request.extend_from_slice(&chunk[..count]);
+    }
 }
 
 #[test]
@@ -555,6 +648,216 @@ fn headless_step_exhaustion_is_incomplete_with_one_terminal_json_event() {
     assert_eq!(terminal["stats"]["request_count"], 12);
     assert_eq!(terminal["stats"]["prompt_tokens"], 12);
     assert_eq!(terminal["stats"]["completion_tokens"], 12);
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_subagent_provider_error_preserves_prior_usage_on_one_terminal_event() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let file = project.path().join("fixture.txt");
+    fs::write(&file, "fixture").unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({
+            "trusted_roots": [project.path().canonicalize().unwrap()]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let fixture = OpenAiHttpFixture::spawn(vec![
+        (
+            "200 OK",
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": serde_json::json!({"path": file}).to_string()
+                            }
+                        }]
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 3,
+                    "prompt_tokens_details": {"cached_tokens": 5}
+                }
+            }),
+        ),
+        (
+            "500 Internal Server Error",
+            serde_json::json!({"error": {"message": "fixture failure"}}),
+        ),
+    ]);
+
+    let output = cubi(home.path())
+        .current_dir(project.path())
+        .env("OPENAI_BASE_URL", &fixture.base_url)
+        .env("OPENAI_API_KEY", "test-key")
+        .env("CUBI_LLM_MAX_RETRIES", "0")
+        .args([
+            "--json",
+            "--no-stream",
+            "--internal-subagent",
+            "--internal-max-steps",
+            "2",
+            "-p",
+            "read the fixture",
+        ])
+        .assert()
+        .failure()
+        .code(10)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(fixture.finish(), 2);
+
+    let events: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event["type"].as_str(), Some("done" | "error")))
+            .count(),
+        1
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "error");
+    assert_eq!(terminal["kind"], "server_error");
+    assert_eq!(terminal["exit_code"], 10);
+    assert_eq!(terminal["steps_used"], 2);
+    assert_eq!(terminal["stats"]["request_count"], 1);
+    assert_eq!(terminal["stats"]["prompt_tokens"], 20);
+    assert_eq!(terminal["stats"]["completion_tokens"], 3);
+    assert_eq!(terminal["stats"]["cached_prompt_tokens"], 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_in_process_child_preserves_completed_request_usage() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let large_file = project.path().join("large.txt");
+    fs::write(&large_file, "x".repeat(40_000)).unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({
+            "trusted_roots": [project.path().canonicalize().unwrap()]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let usage = serde_json::json!({
+        "prompt_tokens": 20,
+        "completion_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 5}
+    });
+    let fixture = OpenAiHttpFixture::spawn(vec![
+        (
+            "200 OK",
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-agent",
+                            "type": "function",
+                            "function": {
+                                "name": "agent_run",
+                                "arguments": serde_json::json!({
+                                    "goal": "read the large file and report it",
+                                    "max_steps": 2
+                                })
+                                .to_string()
+                            }
+                        }]
+                    }
+                }],
+                "usage": usage
+            }),
+        ),
+        (
+            "200 OK",
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": serde_json::json!({"path": large_file}).to_string()
+                            }
+                        }]
+                    }
+                }],
+                "usage": usage
+            }),
+        ),
+        (
+            "200 OK",
+            serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "parent recovered"}
+                }],
+                "usage": usage
+            }),
+        ),
+    ]);
+
+    let output = cubi(home.path())
+        .current_dir(project.path())
+        .env("OPENAI_BASE_URL", &fixture.base_url)
+        .env("OPENAI_API_KEY", "test-key")
+        .env("CUBI_CONTEXT_WINDOW", "4096")
+        .env("CUBI_LLM_MAX_RETRIES", "0")
+        .env("CUBI_TOOL_PROFILE", "coding")
+        .args(["--json", "--no-stream", "-p", "delegate the file read"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        fixture.finish(),
+        3,
+        "the rejected child follow-up must not reach the backend"
+    );
+
+    let events: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event["type"].as_str(), Some("done" | "error")))
+            .count(),
+        1
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "done");
+    assert_eq!(terminal["stats"]["request_count"], 3);
+    assert_eq!(terminal["stats"]["prompt_tokens"], 60);
+    assert_eq!(terminal["stats"]["completion_tokens"], 9);
+    assert_eq!(terminal["stats"]["cached_prompt_tokens"], 15);
 }
 
 #[cfg(unix)]

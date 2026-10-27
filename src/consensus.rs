@@ -620,17 +620,18 @@ async fn run_tool_subagents(
                     error: None,
                 }
             }
-            Err(e) => SubagentOutput {
-                model: model.clone(),
-                output: String::new(),
-                steps_used: 0,
-                tool_calls: 0,
-                stats: ChatStats {
-                    elapsed_ms,
-                    ..ChatStats::default()
-                },
-                error: Some(truncate(&e.to_string(), 400)),
-            },
+            Err(mut e) => {
+                e.stats.elapsed_ms = elapsed_ms.max(e.stats.elapsed_ms);
+                let error = truncate(&e.to_string(), 400);
+                SubagentOutput {
+                    model: model.clone(),
+                    output: String::new(),
+                    steps_used: e.steps_used,
+                    tool_calls: e.tool_calls,
+                    stats: e.stats,
+                    error: Some(error),
+                }
+            }
         };
         subagent_outputs.push(sub);
     }
