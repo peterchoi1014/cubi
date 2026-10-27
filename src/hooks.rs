@@ -59,9 +59,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const HOOK_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hook lifecycle event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -356,12 +358,75 @@ impl HookRegistry {
             .arg("-c")
             .arg(command)
             .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, child_command.output())
-            .await
-            .map_err(|_| anyhow::anyhow!("hook timed out after {} ms", timeout.as_millis()))??;
-        Ok(output.status.code().unwrap_or(2))
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            child_command.as_std_mut().process_group(0);
+        }
+        let mut child = child_command.spawn()?;
+        let pid = child
+            .id()
+            .context("hook process exited before its PID was available")?;
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => Ok(status?.code().unwrap_or(2)),
+            Err(_) => {
+                if let Err(error) = terminate_hook_process_tree(&mut child, pid).await {
+                    return Err(anyhow::anyhow!(
+                        "hook timed out after {} ms; process-tree cleanup failed: {}",
+                        timeout.as_millis(),
+                        error
+                    ));
+                }
+                Err(anyhow::anyhow!(
+                    "hook timed out after {} ms",
+                    timeout.as_millis()
+                ))
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+async fn terminate_hook_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let process_group = i32::try_from(pid).context("hook PID does not fit a Unix process ID")?;
+    // SAFETY: `kill` receives the negated PID of the child configured above as a process-group
+    // leader. SIGKILL does not dereference Rust memory, and ESRCH is handled as an exit race.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("failed to kill hook process group");
+        }
+    }
+    tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .context("timed out waiting for killed hook process group")??;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_hook_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let mut taskkill = crate::config::async_command("taskkill");
+    taskkill
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, taskkill.status())
+        .await
+        .context("timed out running taskkill for hook process tree")??;
+    if !status.success() {
+        anyhow::bail!("taskkill failed with status {}", status);
+    }
+    tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .context("timed out waiting for killed hook process tree")??;
+    Ok(())
 }
 
 /// Writes the global hooks config at `~/.cubi/hooks.json`.
@@ -578,17 +643,123 @@ mod tests {
         assert_eq!(HookEvent::Stop.as_str(), "Stop");
     }
 
-    #[tokio::test]
-    async fn stalled_hook_is_terminated_at_timeout() {
+    #[test]
+    fn stalled_hook_is_terminated_at_timeout() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "hooks::tests::stalled_hook_process_tree_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CUBI_STALLED_HOOK_HELPER", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_outer_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = status_tx.send(child.wait());
+        });
+
+        match status_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(status) => assert!(status.unwrap().success()),
+            Err(error) => {
+                terminate_outer_process_tree(child_pid);
+                let _ = status_rx.recv_timeout(Duration::from_secs(5));
+                panic!("stalled hook test process exceeded outer deadline: {error}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn stalled_hook_process_tree_helper() {
+        if std::env::var_os("CUBI_STALLED_HOOK_HELPER").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let pid_path = pid_file.to_string_lossy().replace('\\', "/");
+        let mut env = HashMap::new();
+        env.insert("HOOK_PID_FILE".to_string(), pid_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
         let started = std::time::Instant::now();
-        let result = HookRegistry::run_hook_command_with_timeout(
-            "while :; do :; done",
-            &HashMap::new(),
-            std::time::Duration::from_millis(25),
-        )
-        .await;
+        let result = runtime.block_on(HookRegistry::run_hook_command_with_timeout(
+            r#"sh -c 'echo $$ > "$HOOK_PID_FILE"; while :; do :; done' & while [ ! -s "$HOOK_PID_FILE" ]; do :; done; while :; do :; done"#,
+            &env,
+            Duration::from_secs(2),
+        ));
 
         assert!(result.is_err());
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let grandchild_pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_process_is_gone(grandchild_pid);
+    }
+
+    #[cfg(unix)]
+    fn configure_outer_process_group(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    fn configure_outer_process_group(_command: &mut std::process::Command) {}
+
+    #[cfg(unix)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let pid = i32::try_from(pid).unwrap();
+        // SAFETY: `kill` is called with a negated, live child PID that was configured as the
+        // process-group leader; SIGKILL does not dereference Rust memory.
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        assert_eq!(result, 0, "failed to kill outer test process group");
+    }
+
+    #[cfg(windows)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to kill outer test process tree");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_is_gone(pid: u32) {
+        let pid = i32::try_from(pid).unwrap();
+        // SAFETY: signal 0 only queries a numeric PID and does not dereference Rust memory.
+        let result = unsafe { libc::kill(pid, 0) };
+        let error = std::io::Error::last_os_error();
+        assert_eq!(result, -1, "grandchild process {pid} is still alive");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(windows)]
+    fn assert_process_is_gone(pid: u32) {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains(&format!("\"{pid}\"")),
+            "grandchild process {pid} is still alive: {stdout}"
+        );
     }
 }
