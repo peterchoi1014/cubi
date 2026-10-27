@@ -67,6 +67,9 @@ cubi bench
 # Explicit model and JSON summary on stdout:
 cubi bench --suite quick --model qwen3.5:9b --json
 
+# Write run artifacts outside the repository:
+cubi bench --suite quick --output /tmp/cubi-bench-results
+
 # One task at a time, keeping the agent's working copy for inspection:
 cubi bench --task rust-fizzbuzz --keep-workdir
 
@@ -95,8 +98,14 @@ cap is far too small, or the model is not emitting tool calls at all); a
 number close to what the task needs means a modest bump will do. `null` means
 no event log was produced at all.
 
-Results land in `bench/results/<unix-ts>/`. The `summary.json` schema is
-stable; CI consumes it as an artifact.
+Results land in `bench/results/<unix-ts>/` by default. Pass `--output <dir>`
+to write `summary.json` and per-task event logs directly into another
+directory, without adding a timestamp subdirectory. Relative output paths
+are resolved from the invocation directory, and missing directories are
+created. The integration tests use temporary output directories so
+`cargo test --test bench` leaves `bench/results/` untouched.
+
+The `summary.json` schema is stable; CI consumes it as an artifact.
 
 Each per-task result retains bounded diagnostics: the last 4 KiB of agent
 stderr and the last 4 KiB each of verifier stdout/stderr. Verifiers have a
