@@ -363,6 +363,48 @@ pub struct ChatStreamChunk {
     pub eval_duration: Option<u64>,
 }
 
+struct StreamToolCall {
+    index: Option<usize>,
+    call: ToolCall,
+}
+
+impl StreamToolCall {
+    fn has_same_identity(&self, other: &Self) -> bool {
+        if self.index.is_some()
+            || self.call.id.is_some()
+            || other.index.is_some()
+            || other.call.id.is_some()
+        {
+            self.index == other.index && self.call.id == other.call.id
+        } else {
+            self.call == other.call
+        }
+    }
+}
+
+fn stream_tool_call_indices(line: &str) -> Vec<Option<usize>> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")?
+                .get("tool_calls")?
+                .as_array()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|call| {
+                            call.get("index")
+                                .or_else(|| call.get("function")?.get("index"))
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|index| usize::try_from(index).ok())
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// Per-call inference statistics. Populated from whatever the provider
 /// returned (Ollama: native counts/durations; OpenAI: `usage`). Existing
 /// token and elapsed fields remain additive counters. Provider-specific
@@ -634,7 +676,7 @@ impl OllamaClient {
         let mut buf = Vec::new();
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
-        let mut tool_calls = Vec::new();
+        let mut tool_calls: Vec<StreamToolCall> = Vec::new();
         let mut stats = ChatStats::default();
         let mut time_to_first_token_ms = None;
         let mut done_reason: Option<String> = None;
@@ -648,7 +690,7 @@ impl OllamaClient {
         let mut handle_line = |line: &[u8],
                                content: &mut String,
                                final_msg: &mut Option<Message>,
-                               tool_calls: &mut Vec<ToolCall>,
+                               tool_calls: &mut Vec<StreamToolCall>,
                                stats: &mut ChatStats,
                                time_to_first_token_ms: &mut Option<u64>,
                                done_reason: &mut Option<String>,
@@ -663,6 +705,7 @@ impl OllamaClient {
                 Ok(c) => c,
                 Err(_) => return Ok(()), // tolerate a malformed mid-stream line
             };
+            let tool_call_indices = stream_tool_call_indices(trimmed);
             let mut message = parsed.message;
             if !message.content.is_empty() {
                 let clean = stripper.feed(&message.content);
@@ -674,8 +717,15 @@ impl OllamaClient {
                 }
             }
             if let Some(calls) = message.tool_calls.take() {
-                for call in calls {
-                    if !tool_calls.contains(&call) {
+                for (position, call) in calls.into_iter().enumerate() {
+                    let call = StreamToolCall {
+                        index: tool_call_indices.get(position).copied().flatten(),
+                        call,
+                    };
+                    if !tool_calls
+                        .iter()
+                        .any(|existing| existing.has_same_identity(&call))
+                    {
                         tool_calls.push(call);
                     }
                 }
@@ -699,7 +749,12 @@ impl OllamaClient {
                 // Replace fragmentary content with the accumulated text so
                 // callers don't have to reconstruct it.
                 message.content = content.clone();
-                message.tool_calls = (!tool_calls.is_empty()).then(|| std::mem::take(tool_calls));
+                message.tool_calls = (!tool_calls.is_empty()).then(|| {
+                    std::mem::take(tool_calls)
+                        .into_iter()
+                        .map(|tool_call| tool_call.call)
+                        .collect()
+                });
                 *final_msg = Some(message);
             }
             Ok(())
@@ -891,6 +946,16 @@ mod tests {
         })
     }
 
+    fn indexed_bash_tool_call(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "function": {
+                "index": index,
+                "name": "bash",
+                "arguments": {"command": "pwd"}
+            }
+        })
+    }
+
     #[tokio::test]
     async fn stream_preserves_tool_call_from_non_final_chunk() {
         let _lock = crate::llm::ENV_LOCK.lock().await;
@@ -1026,6 +1091,66 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(message.tool_calls.expect("tool call preserved").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_distinct_equal_tool_calls_by_index() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let calls = [indexed_bash_tool_call(0), indexed_bash_tool_call(1)];
+        let early = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": calls
+            },
+            "done": false
+        });
+        let final_chunk = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": calls
+            },
+            "done": true
+        });
+        let body = format!("{}\n{}\n", early, final_chunk).into_bytes();
+        let (base_url, server) = serve_chunked(vec![body]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("tool calls preserved");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
+    }
+
+    #[tokio::test]
+    async fn buffered_response_preserves_distinct_equal_tool_calls() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [indexed_bash_tool_call(0), indexed_bash_tool_call(1)]
+            },
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let (message, _) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("tool calls preserved");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
     }
 
     #[tokio::test]
