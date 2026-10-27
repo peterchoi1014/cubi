@@ -63,6 +63,12 @@ knobs let interactive users disable the same affordances individually:
   Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider
   response that stops at this limit is reported as truncated rather than as a
   successful completion.
+- `CUBI_TEMPERATURE=…` — override the model profile's temperature with a
+  finite, non-negative number.
+- `CUBI_TOP_P=…` — override the model profile's nucleus probability with a
+  finite value in `(0, 1]`.
+- `CUBI_TOP_K=…` — override the model profile's top-k cutoff with a positive
+  integer. OpenAI-compatible requests use llama-server's `top_k` extension.
 - `CUBI_THINK=on|off` — set Ollama's native `think` request field. The field is
   omitted when this variable is unset.
 - `CUBI_KEEP_ALIVE=…` — pass an Ollama `keep_alive` value such as `10m` or
@@ -93,6 +99,15 @@ knobs let interactive users disable the same affordances individually:
 servers are selected with `OPENAI_BASE_URL`; remote endpoints also require
 `OPENAI_API_KEY` (or `CUBI_API_KEY`). A loopback `OPENAI_BASE_URL` using
 `localhost`, `127.0.0.0/8`, or `::1` does not require a dummy API key.
+
+Sampling values resolve independently in this order: environment override,
+model-profile default, then omission from the request. Invalid overrides stop
+request construction with a clear error. Model ids containing `bonsai`
+(case-insensitive) use Cubi's local Bonsai profile: 262,144 nominal context
+tokens, tool calling enabled, zero estimated cost, and defaults
+`temperature=0.7`, `top_p=0.95`, `top_k=20`. A llama-server instance served
+with a smaller context (for example `-c 8192`) still uses that configured
+effective window rather than the profile's nominal capacity.
 
 ```sh
 # Native Ollama on another local port

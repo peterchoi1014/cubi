@@ -39,10 +39,11 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   bash REPL, Jupyter notebooks, LSP code-intel, OS notifications, and a
   meta-`agent_run` tool for spawning focused subagents
 - 🎭 **Multi-model consensus** — the `consensus_run` meta-tool and `/consensus`
-  slash command run one goal under N local models in parallel and arbitrate by
-  vote, best-of-n, or judge. Pass `concurrency: 1` on single-GPU setups; add
-  `use_tools`/`isolate` to give each tool-using subagent its own ephemeral git
-  worktree for safe parallel edits. See `/help consensus` for the full syntax.
+  slash command run one goal under N models and arbitrate by vote, best-of-n,
+  or judge. Local inference defaults to one active generation; set an explicit
+  positive `concurrency` after measuring your backend. Add `use_tools`/`isolate`
+  to give each tool-using subagent its own ephemeral git worktree for safe
+  parallel edits. See `/help consensus` for the full syntax.
 - 🔌 **MCP support** — load external Model Context Protocol servers from
   `~/.cubi/mcp.json` and call their tools alongside built-ins
 - 🧰 **MCP registry** — `cubi mcp search/install/uninstall` for one-command
@@ -106,18 +107,34 @@ OpenAI-compatible endpoint. Remote OpenAI-compatible services require
 `OPENAI_API_KEY` (or `CUBI_API_KEY`); loopback URLs on `localhost`,
 `127.0.0.0/8`, or `::1` work without a dummy key.
 
+Model profiles centralize nominal context, tool capability, locality, pricing,
+and default sampling. Model ids containing `bonsai` (case-insensitive) use the
+first-class local Bonsai profile: 262,144 nominal context tokens, native tool
+calling, zero estimated cost, and sampling defaults `temperature=0.7`,
+`top_p=0.95`, `top_k=20`. The server's configured context remains the effective
+request limit; the nominal profile does not override a smaller served window.
+
 Generation and transport controls are shared across interactive and headless
 runs:
 
 - `CUBI_MAX_TOKENS` sets Ollama `options.num_predict` or OpenAI `max_tokens`.
+- `CUBI_TEMPERATURE` overrides the profile temperature with a finite,
+  non-negative number.
+- `CUBI_TOP_P` overrides the profile nucleus probability with a finite value in
+  `(0, 1]`.
+- `CUBI_TOP_K` overrides the profile top-k cutoff with a positive integer.
 - `CUBI_THINK=on|off` controls Ollama's native `think` field.
 - `CUBI_KEEP_ALIVE` passes Ollama's model-residency value through unchanged.
 - `CUBI_HTTP_TIMEOUT_SECS` sets the stream-idle/read timeout (default 300
   seconds); connections use a fixed 10-second timeout and generations have no
   total-request deadline.
 
-Unset optional controls are omitted from provider request bodies. A response
-stopped by the output-token limit is reported as truncated.
+Sampling precedence is environment override, then model-profile default, then
+field omission. Invalid sampling overrides fail request construction with a
+configuration error. Ollama receives sampling under `options`; OpenAI-compatible
+servers receive `temperature`, `top_p`, and the llama-server-compatible
+`top_k` extension. A response stopped by the output-token limit is reported as
+truncated.
 
 ## 🖥️ Interactive UI (TUI)
 

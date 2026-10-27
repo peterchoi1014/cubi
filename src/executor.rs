@@ -8,7 +8,7 @@ pub struct AIExecutor {
 }
 
 impl AIExecutor {
-    pub async fn new(model: String, _cpu_workers: usize) -> Result<Self> {
+    pub async fn new(model: String) -> Result<Self> {
         Ok(Self::new_from_env(model))
     }
 
@@ -92,6 +92,10 @@ impl AIExecutor {
     /// Backend endpoint URL, or `None` for the fake test backend.
     pub fn base_url(&self) -> Option<&str> {
         self.backend.base_url()
+    }
+
+    pub fn is_local_backend(&self) -> bool {
+        self.backend.is_local()
     }
 
     /// Lists models the configured backend reports. Used by `/doctor`

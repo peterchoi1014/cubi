@@ -142,8 +142,8 @@ pub struct ConsensusRequest {
     /// tool-enabled consensus clamps this into the subagent loop cap.
     pub max_steps_per_subagent: usize,
     /// Maximum number of subagents in flight at once. In LLM-only mode,
-    /// `0` means `models.len()`; isolated tool mode uses its own safer
-    /// default and cap.
+    /// `0` means one local generation or `models.len()` for remote backends;
+    /// isolated tool mode uses its own safer default and cap.
     pub concurrency: usize,
     /// When false (the default), each subagent is a single LLM-only call.
     /// When true, each subagent may use tools and runs sequentially
@@ -273,7 +273,7 @@ pub fn consensus_run_spec() -> ToolSpec {
                     "concurrency": {
                         "type": "integer",
                         "default": 0,
-                        "description": format!("0 = LLM-only parallel (len(models)); 1 = sequential. In shared-tree tool mode (use_tools=true, isolate=false), subagents are forced sequential regardless of this value. WARNING: isolated tool mode spawns a full model-driving `cubi` subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
+                        "description": format!("0 = one active LLM-only generation for Ollama or loopback OpenAI-compatible backends, and len(models) for remote backends; positive values are explicit concurrency. In shared-tree tool mode (use_tools=true, isolate=false), subagents are forced sequential regardless of this value. WARNING: isolated tool mode spawns a full model-driving `cubi` subprocess per subagent, is memory-heavy, defaults to sequential ({}), and caps requested concurrency at {}.", CONSENSUS_ISOLATED_DEFAULT_CONCURRENCY, CONSENSUS_ISOLATED_MAX_CONCURRENCY)
                     },
                     "use_tools": {
                         "type": "boolean",
@@ -490,12 +490,8 @@ async fn run_inner_with_isolated_runner(
 }
 
 async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec<SubagentOutput> {
-    let permits = if req.concurrency == 0 {
-        req.models.len()
-    } else {
-        req.concurrency.min(req.models.len())
-    };
-    let semaphore = Arc::new(Semaphore::new(permits.max(1)));
+    let permits = llm_subagent_permits(req.concurrency, req.models.len(), executor);
+    let semaphore = Arc::new(Semaphore::new(permits));
 
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     for (idx, model) in req.models.iter().cloned().enumerate() {
@@ -560,6 +556,19 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
     }
     indexed.sort_by_key(|(i, _)| *i);
     indexed.into_iter().map(|(_, o)| o).collect()
+}
+
+fn llm_subagent_permits(concurrency: usize, models: usize, executor: &AIExecutor) -> usize {
+    let requested = if concurrency == 0 {
+        if executor.is_local_backend() {
+            1
+        } else {
+            models
+        }
+    } else {
+        concurrency.min(models)
+    };
+    requested.max(1)
 }
 
 /// Run tool-enabled consensus subagents **sequentially**.
@@ -1461,6 +1470,39 @@ mod tests {
                 crate::permissions::Permissions::default(),
             )),
         }
+    }
+
+    #[test]
+    fn llm_default_concurrency_is_one_for_local_backends() {
+        let ollama = AIExecutor::with_backend(
+            crate::llm::LlmBackend::Ollama(crate::ollama::OllamaClient::new()),
+            "local-model".to_string(),
+        );
+        let loopback_openai = AIExecutor::with_backend(
+            crate::llm::LlmBackend::OpenAi(crate::llm::OpenAiClient::new(
+                "http://127.0.0.1:8080/v1".to_string(),
+                String::new(),
+            )),
+            "local-model".to_string(),
+        );
+
+        assert_eq!(llm_subagent_permits(0, 3, &ollama), 1);
+        assert_eq!(llm_subagent_permits(0, 3, &loopback_openai), 1);
+        assert_eq!(llm_subagent_permits(2, 3, &ollama), 2);
+    }
+
+    #[test]
+    fn llm_default_concurrency_remains_parallel_for_remote_backends() {
+        let remote = AIExecutor::with_backend(
+            crate::llm::LlmBackend::OpenAi(crate::llm::OpenAiClient::new(
+                "https://api.openai.com/v1".to_string(),
+                "test-key".to_string(),
+            )),
+            "remote-model".to_string(),
+        );
+
+        assert_eq!(llm_subagent_permits(0, 3, &remote), 3);
+        assert_eq!(llm_subagent_permits(1, 3, &remote), 1);
     }
 
     // Env-var manipulation is process-global; serialize tests that

@@ -29,6 +29,7 @@ mod mcp_manager;
 mod mcp_registry;
 mod memdir;
 mod migrations;
+mod model_profile;
 mod oauth;
 mod ollama;
 mod onboarding;
@@ -1409,7 +1410,6 @@ async fn main() -> Result<()> {
     // removes the previous hard-coded lock-in.
     let model_owned = onboarding::resolve_model(&config, DEFAULT_MODEL);
     let model: &str = &model_owned;
-    let cpu_workers = 6;
 
     // Seed the TUI transcript with the normal startup output that the
     // alternate screen would otherwise wipe. Fires whenever the TUI will
@@ -1429,7 +1429,7 @@ async fn main() -> Result<()> {
     let plan_mode = Arc::new(AtomicBool::new(false));
 
     // Create executor before provider-specific startup checks.
-    let executor = AIExecutor::new(model.to_string(), cpu_workers)
+    let executor = AIExecutor::new(model.to_string())
         .await
         .context("Failed to create AI executor")?;
 

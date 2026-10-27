@@ -234,22 +234,7 @@ pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
 /// through as "probably fine" so we don't nag users running tool-capable
 /// models we just haven't seen yet.
 pub fn is_known_non_tool_capable(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    // Strip any `:tag` suffix so we match on the family name.
-    let family = m.split(':').next().unwrap_or(&m);
-    // Tiny llama3.2 variants (1b, 3b-without-tools-tuning) are the main
-    // offender that triggered this check.
-    if family == "llama3.2" {
-        if let Some(tag) = m.split(':').nth(1) {
-            // The 1b tag is known-bad; 3b is borderline but works for
-            // simple cases — only flag 1b to avoid false positives.
-            return tag.starts_with("1b");
-        }
-    }
-    matches!(
-        family,
-        "tinyllama" | "smollm" | "smollm2" | "gemma" | "gemma2" | "gemma3" | "phi" | "phi3"
-    ) || family.starts_with("orca-mini")
+    crate::model_profile::lookup(model).is_some_and(|profile| !profile.tool_calling)
 }
 
 /// Runs the first-run wizard if appropriate, mutating `config` and the

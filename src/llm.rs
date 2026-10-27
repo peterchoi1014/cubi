@@ -157,6 +157,14 @@ impl LlmBackend {
             Self::Fake => None,
         }
     }
+
+    pub fn is_local(&self) -> bool {
+        match self {
+            Self::Ollama(_) => true,
+            Self::OpenAi(client) => is_loopback_url(client.base_url()),
+            Self::Fake => false,
+        }
+    }
 }
 
 // ─── OpenAI-compatible provider ─────────────────────────────────────────────
@@ -512,6 +520,16 @@ impl OpenAiClient {
         if let Some(max_tokens) = current_max_tokens() {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
+        let sampling = crate::model_profile::sampling_for_model(model)?;
+        if let Some(temperature) = sampling.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(top_p) = sampling.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = sampling.top_k {
+            body["top_k"] = serde_json::json!(top_k);
+        }
 
         tracing::debug!(
             target: "cubi::llm",
@@ -659,6 +677,16 @@ impl OpenAiClient {
         }
         if let Some(max_tokens) = current_max_tokens() {
             body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        let sampling = crate::model_profile::sampling_for_model(model)?;
+        if let Some(temperature) = sampling.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(top_p) = sampling.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = sampling.top_k {
+            body["top_k"] = serde_json::json!(top_k);
         }
 
         tracing::debug!(
@@ -1125,75 +1153,7 @@ pub fn context_window_for_model(model: &str) -> Option<usize> {
             }
         }
     }
-    // Normalize: strip version tags for matching.
-    let model_lower = model.to_lowercase();
-
-    // Tag-specific overrides for families where Ollama ships different
-    // context windows per parameter size. Must run before the bare-name
-    // match below.
-    match model_lower.as_str() {
-        // Gemma 3: 270M and 1B variants ship with a 32K window; 4B/12B/27B
-        // are 128K. See https://ollama.com/library/gemma3.
-        "gemma3:270m" | "gemma3:1b" => return Some(32_768),
-        _ => {}
-    }
-
-    let without_tag = model_lower.split(':').next().unwrap_or(&model_lower);
-    // HuggingFace-style ids carry an `org/` repo prefix (e.g.
-    // "zai-org/glm-5.2") and provider prefixes like "ollama/llama3" do the
-    // same. Match on the final path segment so they map identically to the
-    // bare family names below.
-    let base = without_tag.rsplit('/').next().unwrap_or(without_tag);
-
-    match base {
-        // Ollama models
-        "llama3.3" | "llama3.2" | "llama3.1" | "llama3" => Some(128_000),
-        "llama2" => Some(4_096),
-        "mistral" | "mixtral" => Some(32_768),
-        "mistral-small3.2" | "mistral-small3.1" | "mistral-small" => Some(131_072),
-        "devstral" => Some(131_072),
-        "qwen2.5" | "qwen2" => Some(128_000),
-        // Qwen2.5-Coder shares the Qwen2.5 generation's 128K (YaRN-extended)
-        // window; map it alongside its instruct sibling.
-        "qwen2.5-coder" => Some(128_000),
-        // Qwen3 ships with a 32K native window; YaRN can extend it but
-        // we conservatively report the native value since the backend
-        // doesn't always enable YaRN by default.
-        "qwen3" => Some(32_768),
-        // Qwen3.5 ships a 256K native context window across the family
-        // (0.8B through the larger MoE variants). See
-        // https://ollama.com/library/qwen3.5.
-        "qwen3.5" => Some(256_000),
-        // Qwen3-Coder ships with a 256K native context (extensible to 1M).
-        "qwen3-coder" => Some(256_000),
-        "codellama" => Some(16_384),
-        "phi3" | "phi-3" => Some(128_000),
-        // Phi-4 (14B dense) ships with a 16K window per Microsoft's model
-        // card; only phi4-mini is 128K.
-        "phi4" | "phi-4" => Some(16_384),
-        "phi4-mini" => Some(128_000),
-        "gemma2" | "gemma" => Some(8_192),
-        "gemma3" => Some(128_000),
-        // Gemma 4 ships with a 256K context window across its variants.
-        // See https://ai.google.dev/gemma/docs/releases.
-        "gemma4" => Some(256_000),
-        "deepseek-coder" => Some(16_384),
-        "granite3.3" | "granite3.2" | "granite3.1" => Some(131_072),
-        "hermes3" => Some(131_072),
-        "command-r7b" | "command-r" => Some(131_072),
-        // GLM-5.2 (Z.ai / Zhipu, MIT-licensed) ships with a solid 1M-token
-        // context for long-horizon agentic work. See https://z.ai/blog/glm-5.2.
-        "glm-5.2" | "glm5.2" => Some(1_000_000),
-        // OpenAI models
-        "gpt-4o" | "gpt-4o-mini" => Some(128_000),
-        "gpt-4-turbo" | "gpt-4" => Some(128_000),
-        "gpt-3.5-turbo" => Some(16_384),
-        "o1" | "o1-mini" | "o1-preview" => Some(128_000),
-        // Claude (via OpenAI-compatible proxy)
-        "claude-3-opus" | "claude-3-sonnet" | "claude-3-haiku" => Some(200_000),
-        "claude-3.5-sonnet" | "claude-3.5-haiku" => Some(200_000),
-        _ => None,
-    }
+    crate::model_profile::lookup(model).and_then(|profile| profile.nominal_context_window)
 }
 
 #[cfg(test)]
@@ -1542,6 +1502,81 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&request).unwrap();
 
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_request_sampling_uses_env_then_profile_then_omits() {
+        let _lock = ENV_LOCK.lock().await;
+        let cases = [
+            (
+                "Ternary-Bonsai-27B",
+                Some(("0.2", "0.8", "7")),
+                Some((0.2, 0.8, 7)),
+            ),
+            ("Ternary-Bonsai-27B", None, Some((0.7, 0.95, 20))),
+            ("unknown-model", None, None),
+        ];
+
+        for (model, overrides, expected) in cases {
+            let values = match overrides {
+                Some((temperature, top_p, top_k)) => [
+                    ("CUBI_TEMPERATURE", Some(temperature)),
+                    ("CUBI_TOP_P", Some(top_p)),
+                    ("CUBI_TOP_K", Some(top_k)),
+                    ("CUBI_LLM_MAX_RETRIES", Some("0")),
+                ],
+                None => [
+                    ("CUBI_TEMPERATURE", None),
+                    ("CUBI_TOP_P", None),
+                    ("CUBI_TOP_K", None),
+                    ("CUBI_LLM_MAX_RETRIES", Some("0")),
+                ],
+            };
+            let _env = EnvGuard::set(&values);
+            let response = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            });
+            let (base_url, server) =
+                serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+            let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+            client.chat_with_tools(model, vec![], None).await.unwrap();
+            let request = server.await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+            match expected {
+                Some((temperature, top_p, top_k)) => {
+                    assert_eq!(body["temperature"], temperature);
+                    assert_eq!(body["top_p"], top_p);
+                    assert_eq!(body["top_k"], top_k);
+                }
+                None => {
+                    assert!(body.get("temperature").is_none());
+                    assert!(body.get("top_p").is_none());
+                    assert!(body.get("top_k").is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_request_rejects_invalid_sampling_override() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_TEMPERATURE", None),
+            ("CUBI_TOP_P", Some("1.5")),
+            ("CUBI_TOP_K", None),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let client = OpenAiClient::new("http://127.0.0.1:1/v1".to_string(), "test-key".to_string());
+
+        let error = client
+            .chat_with_tools("unknown-model", vec![], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CUBI_TOP_P"));
+        assert!(error.to_string().contains("(0, 1]"));
     }
 
     #[tokio::test]

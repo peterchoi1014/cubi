@@ -18,7 +18,7 @@ pub(crate) fn normalize_assistant_message(
     m
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -46,6 +46,12 @@ pub struct ChatOptions {
     pub num_ctx: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u64>,
 }
 
 /// Native tool definition forwarded to Ollama. Mirrors the OpenAI-compatible
@@ -139,13 +145,22 @@ pub struct ToolCallFunction {
     pub arguments: serde_json::Value,
 }
 
-fn chat_options_for_model(model: &str) -> Option<ChatOptions> {
+fn chat_options_for_model(model: &str) -> Result<Option<ChatOptions>> {
     let num_ctx = resolve_num_ctx(model, current_num_ctx_override());
     let num_predict = crate::llm::current_max_tokens();
-    (num_ctx.is_some() || num_predict.is_some()).then_some(ChatOptions {
+    let sampling = crate::model_profile::sampling_for_model(model)?;
+    Ok((num_ctx.is_some()
+        || num_predict.is_some()
+        || sampling.temperature.is_some()
+        || sampling.top_p.is_some()
+        || sampling.top_k.is_some())
+    .then_some(ChatOptions {
         num_ctx,
         num_predict,
-    })
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+    }))
 }
 
 fn current_num_ctx_override() -> Option<usize> {
@@ -448,16 +463,17 @@ impl OllamaClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<(Message, ChatStats)> {
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+            tools,
+            options: chat_options_for_model(model)?,
+            think: current_think(),
+            keep_alive: current_keep_alive(),
+        };
         with_retry(3, || {
-            let request = ChatRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                stream: false,
-                tools: tools.clone(),
-                options: chat_options_for_model(model),
-                think: current_think(),
-                keep_alive: current_keep_alive(),
-            };
+            let request = request.clone();
             async move {
                 tracing::debug!(target: "cubi::llm::ollama", model = %model, "ollama chat request");
                 let response = self
@@ -525,16 +541,17 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            tools: tools.clone(),
+            options: chat_options_for_model(model)?,
+            think: current_think(),
+            keep_alive: current_keep_alive(),
+        };
         let response = with_retry(3, || {
-            let request = ChatRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                stream: true,
-                tools: tools.clone(),
-                options: chat_options_for_model(model),
-                think: current_think(),
-                keep_alive: current_keep_alive(),
-            };
+            let request = request.clone();
             async move {
                 let response = self
                     .client
@@ -972,6 +989,79 @@ mod tests {
         assert!(body.get("keep_alive").is_none());
     }
 
+    #[tokio::test]
+    async fn request_sampling_uses_env_then_profile_then_omits() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let cases = [
+            (
+                "Ternary-Bonsai-27B",
+                Some(("0.2", "0.8", "7")),
+                Some((0.2, 0.8, 7)),
+            ),
+            ("Ternary-Bonsai-27B", None, Some((0.7, 0.95, 20))),
+            ("unknown-model", None, None),
+        ];
+
+        for (model, overrides, expected) in cases {
+            let values = match overrides {
+                Some((temperature, top_p, top_k)) => [
+                    ("CUBI_TEMPERATURE", Some(temperature)),
+                    ("CUBI_TOP_P", Some(top_p)),
+                    ("CUBI_TOP_K", Some(top_k)),
+                    ("CUBI_NUM_CTX", None),
+                    ("CUBI_MAX_TOKENS", None),
+                ],
+                None => [
+                    ("CUBI_TEMPERATURE", None),
+                    ("CUBI_TOP_P", None),
+                    ("CUBI_TOP_K", None),
+                    ("CUBI_NUM_CTX", None),
+                    ("CUBI_MAX_TOKENS", None),
+                ],
+            };
+            let _env = EnvGuard::set(&values);
+            let response = serde_json::json!({
+                "message": {"role": "assistant", "content": "ok"},
+                "done": true
+            });
+            let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+            let client = OllamaClient::with_base_url(base_url);
+
+            client.chat_with_tools(model, vec![], None).await.unwrap();
+            let request = server.await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+            match expected {
+                Some((temperature, top_p, top_k)) => {
+                    assert_eq!(body["options"]["temperature"], temperature);
+                    assert_eq!(body["options"]["top_p"], top_p);
+                    assert_eq!(body["options"]["top_k"], top_k);
+                }
+                None => assert!(body.get("options").is_none()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_rejects_invalid_sampling_override() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_TEMPERATURE", Some("-0.1")),
+            ("CUBI_TOP_P", None),
+            ("CUBI_TOP_K", None),
+            ("CUBI_NUM_CTX", None),
+        ]);
+        let client = OllamaClient::with_base_url("http://127.0.0.1:1".to_string());
+
+        let error = client
+            .chat_with_tools("unknown-model", vec![], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CUBI_TEMPERATURE"));
+        assert!(error.to_string().contains("non-negative"));
+    }
+
     #[test]
     fn message_text_constructor_omits_tool_fields() {
         let m = Message::text("user", "hello");
@@ -1090,6 +1180,9 @@ mod tests {
             options: Some(ChatOptions {
                 num_ctx: Some(4_096),
                 num_predict: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
             }),
             think: None,
             keep_alive: None,
