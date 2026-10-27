@@ -3849,14 +3849,14 @@ mod tests {
 
         assert!(result.is_error.is_none(), "got {:?}", result);
         let expected = [
-            ".config/visible.rs",
-            "keep.generated.rs",
-            "src/a.rs",
-            "src/nested/b.rs",
-            "z.rs",
+            dir.path().join(".config").join("visible.rs"),
+            dir.path().join("keep.generated.rs"),
+            dir.path().join("src").join("a.rs"),
+            dir.path().join("src").join("nested").join("b.rs"),
+            dir.path().join("z.rs"),
         ]
         .iter()
-        .map(|name| format!("{}\n", dir.path().join(name).display()))
+        .map(|path| format!("{}\n", path.display()))
         .collect::<String>();
         assert_eq!(result.content[0].text, expected);
     }
@@ -3907,7 +3907,7 @@ mod tests {
                 result.content[0].text,
                 format!(
                     "{}\n{}\n",
-                    base.join("nested/visible.rs").display(),
+                    base.join("nested").join("visible.rs").display(),
                     base.join("visible.rs").display()
                 ),
                 "explicit base with {}",
