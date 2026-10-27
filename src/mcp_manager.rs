@@ -503,7 +503,15 @@ impl McpManager {
     }
 
     pub fn list_tools(&self) -> Vec<&Tool> {
-        self.tools.values().map(|(_, tool)| tool).collect()
+        let mut tools: Vec<&(String, Tool)> = self.tools.values().collect();
+        tools.sort_by(|(owner_a, tool_a), (owner_b, tool_b)| {
+            let builtin_a = owner_a == "builtin";
+            let builtin_b = owner_b == "builtin";
+            builtin_b
+                .cmp(&builtin_a)
+                .then_with(|| tool_a.name.cmp(&tool_b.name))
+        });
+        tools.into_iter().map(|(_, tool)| tool).collect()
     }
 
     pub fn has_tools(&self) -> bool {
@@ -893,6 +901,60 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].0, "serverX");
         assert_eq!(failed[0].1, "broken pipe");
+    }
+
+    #[test]
+    fn independently_constructed_registries_return_identical_tool_order() {
+        let mut first = empty_manager();
+        first.tools.insert(
+            "mcp_zeta".to_string(),
+            ("server-z".to_string(), fake_tool("mcp_zeta")),
+        );
+        first.tools.insert(
+            "builtin_zeta".to_string(),
+            ("builtin".to_string(), fake_tool("builtin_zeta")),
+        );
+        first.tools.insert(
+            "mcp_alpha".to_string(),
+            ("server-a".to_string(), fake_tool("mcp_alpha")),
+        );
+        first.tools.insert(
+            "builtin_alpha".to_string(),
+            ("builtin".to_string(), fake_tool("builtin_alpha")),
+        );
+
+        let mut second = empty_manager();
+        second.tools.insert(
+            "builtin_alpha".to_string(),
+            ("builtin".to_string(), fake_tool("builtin_alpha")),
+        );
+        second.tools.insert(
+            "mcp_alpha".to_string(),
+            ("server-a".to_string(), fake_tool("mcp_alpha")),
+        );
+        second.tools.insert(
+            "builtin_zeta".to_string(),
+            ("builtin".to_string(), fake_tool("builtin_zeta")),
+        );
+        second.tools.insert(
+            "mcp_zeta".to_string(),
+            ("server-z".to_string(), fake_tool("mcp_zeta")),
+        );
+
+        let first_names: Vec<&str> = first
+            .list_tools()
+            .into_iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let second_names: Vec<&str> = second
+            .list_tools()
+            .into_iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+
+        let expected = vec!["builtin_alpha", "builtin_zeta", "mcp_alpha", "mcp_zeta"];
+        assert_eq!(first_names, expected);
+        assert_eq!(second_names, expected);
     }
 
     #[test]

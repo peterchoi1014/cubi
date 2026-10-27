@@ -60,9 +60,14 @@ knobs let interactive users disable the same affordances individually:
   default; a positive override raises that ceiling (still bounded by the
   model's real window).
 - `CUBI_READ_FILE_MAX_LINES=…` / `CUBI_READ_FILE_MAX_BYTES=…` — tune the
-  cap applied to unbounded `read_file` calls (defaults 400 lines / 50 KiB).
-  Raise for large-context models; lower for small-context ones. Ranged
-  reads (`start_line`/`end_line`) are never capped.
+  shared model-facing tool-output budget (defaults 400 lines / 50 KiB).
+  `read_file` applies it to both full and ranged reads and returns continuation
+  guidance when truncated. Raise for large-context models; lower for
+  small-context ones.
+- `CUBI_TOOL_PROFILE=coding` — select the focused coding catalog once for the
+  session: `read_file`, `grep`, `search_glob`, `edit_file`, `write_file`,
+  `bash`, `list_files`, and `repo_map`, plus the agent meta-tools when enabled.
+  The full catalog remains the default.
 
 Examples:
 

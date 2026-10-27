@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::{BufRead as _, BufReader as StdBufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
@@ -67,6 +69,16 @@ impl ToolResult {
         Self {
             content: vec![ToolContent {
                 content_type: "text".to_string(),
+                text: cap_model_facing_output(text),
+            }],
+            is_error: None,
+        }
+    }
+
+    fn success_prebounded(text: String) -> Self {
+        Self {
+            content: vec![ToolContent {
+                content_type: "text".to_string(),
                 text,
             }],
             is_error: None,
@@ -77,7 +89,7 @@ impl ToolResult {
         Self {
             content: vec![ToolContent {
                 content_type: "text".to_string(),
-                text,
+                text: cap_model_facing_output(text),
             }],
             is_error: Some(true),
         }
@@ -154,7 +166,7 @@ impl BuiltinToolRegistry {
         plan_mode: Arc<AtomicBool>,
         journal: FileJournal,
     ) -> Self {
-        let tools = vec![
+        let mut tools = vec![
             Self::bash_tool(),
             Self::read_file_tool(),
             Self::list_files_tool(),
@@ -194,6 +206,7 @@ impl BuiltinToolRegistry {
             #[cfg(feature = "browser")]
             Self::browser_close_tool(),
         ];
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         Self {
             tools,
@@ -633,8 +646,6 @@ impl BuiltinToolRegistry {
     fn execute_read_file(&self, args: serde_json::Value) -> Result<ToolResult> {
         let path = args["path"].as_str().context("Missing 'path' parameter")?;
 
-        let content = fs::read_to_string(path).context(format!("Failed to read file: {}", path))?;
-
         let start_line = match parse_read_file_line_arg(&args, "start_line") {
             Ok(line) => line,
             Err(error) => return Ok(ToolResult::error(error.to_string())),
@@ -644,17 +655,14 @@ impl BuiltinToolRegistry {
             Err(error) => return Ok(ToolResult::error(error.to_string())),
         };
 
-        let result = if start_line.is_some() || end_line.is_some() {
-            match read_file_line_range(&content, start_line, end_line) {
-                Ok(range) => range,
+        let (max_lines, max_bytes) = read_file_caps();
+        let result =
+            match read_file_bounded(Path::new(path), start_line, end_line, max_lines, max_bytes) {
+                Ok(result) => result,
                 Err(message) => return Ok(ToolResult::error(message)),
-            }
-        } else {
-            let (max_lines, max_bytes) = read_file_caps();
-            read_file_with_cap(&content, max_lines, max_bytes)
-        };
+            };
 
-        Ok(ToolResult::success(result))
+        Ok(ToolResult::success_prebounded(result))
     }
 
     fn execute_list_files(&self, args: serde_json::Value) -> Result<ToolResult> {
@@ -718,19 +726,38 @@ impl BuiltinToolRegistry {
             .context("Missing 'pattern' parameter")?;
         let base_path = args["base_path"].as_str().unwrap_or(".");
 
-        // Use glob crate for pattern matching
-        let _glob_pattern = format!("{}/{}", base_path, pattern);
+        let base = Path::new(base_path);
+        let mut matcher_builder = ignore::overrides::OverrideBuilder::new(base);
+        if let Err(error) = matcher_builder.add(pattern) {
+            return Ok(ToolResult::error(format!(
+                "Invalid glob pattern {}: {}",
+                pattern, error
+            )));
+        }
+        let matcher = match matcher_builder.build() {
+            Ok(matcher) => matcher,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Invalid glob pattern {}: {}",
+                    pattern, error
+                )));
+            }
+        };
+        let mut paths = Vec::new();
+        if let Err(error) = collect_search_paths(base, &mut paths) {
+            return Ok(ToolResult::error(format!(
+                "Failed to search {}: {}",
+                base.display(),
+                error
+            )));
+        }
+        paths.sort();
 
-        // For now, use basic shell globbing via bash
-        let command = format!("find {} -name '{}'", base_path, pattern.replace("**", "*"));
-
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output()
-            .context("Failed to execute glob search")?;
-
-        let result = String::from_utf8_lossy(&output.stdout).to_string();
+        let result = paths
+            .into_iter()
+            .filter(|path| matcher.matched(path, path.is_dir()).is_whitelist())
+            .map(|path| format!("{}\n", path.display()))
+            .collect::<String>();
 
         Ok(ToolResult::success(if result.is_empty() {
             format!("No files found matching pattern: {}", pattern)
@@ -764,35 +791,40 @@ impl BuiltinToolRegistry {
         let recursive = args["recursive"].as_bool().unwrap_or(false);
         let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
 
-        let mut cmd_args = vec!["grep"];
-
+        let mut command = Command::new("grep");
         if ignore_case {
-            cmd_args.push("-i");
+            command.arg("-i");
         }
         if recursive {
-            cmd_args.push("-r");
+            command.arg("-r");
         }
-        cmd_args.push("-n"); // Show line numbers
-        cmd_args.push(pattern);
-        cmd_args.push(path);
-
-        let output = Command::new("grep")
-            .args(&cmd_args)
+        let output = command
+            .arg("-n")
+            .arg("-e")
+            .arg(pattern)
+            .arg("--")
+            .arg(path)
             .output()
             .context("Failed to execute grep")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if !stderr.is_empty() {
-            return Ok(ToolResult::error(stderr));
+        match output.status.code() {
+            Some(0) => Ok(ToolResult::success(stdout)),
+            Some(1) => Ok(ToolResult::success(format!(
+                "No matches found for pattern: {}",
+                pattern
+            ))),
+            Some(code) => Ok(ToolResult::error(if stderr.is_empty() {
+                format!("grep failed with exit code {}", code)
+            } else {
+                stderr
+            })),
+            None => Ok(ToolResult::error(
+                "grep terminated without an exit code".to_string(),
+            )),
         }
-
-        Ok(ToolResult::success(if stdout.is_empty() {
-            format!("No matches found for pattern: {}", pattern)
-        } else {
-            stdout
-        }))
     }
 
     fn execute_edit_file(&self, args: serde_json::Value) -> Result<ToolResult> {
@@ -2989,6 +3021,19 @@ fn notebook_save(nb: &serde_json::Value, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn collect_search_paths(base: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        paths.push(path.clone());
+        if file_type.is_dir() {
+            collect_search_paths(&path, paths)?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_read_file_line_arg(args: &serde_json::Value, name: &str) -> Result<Option<usize>> {
     let Some(value) = args.get(name).filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -3004,40 +3049,100 @@ fn parse_read_file_line_arg(args: &serde_json::Value, name: &str) -> Result<Opti
         .map(Some)
 }
 
-fn read_file_line_range(
-    content: &str,
+fn read_file_bounded(
+    path: &Path,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    max_lines: usize,
+    max_bytes: usize,
 ) -> std::result::Result<String, String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
     let start = start_line.unwrap_or(1);
-
-    if total_lines == 0 {
-        return if start == 1 && end_line.unwrap_or(1) == 1 {
-            Ok(String::new())
-        } else {
-            Err("Requested line range is outside an empty file.".to_string())
-        };
-    }
-
-    let end = end_line.unwrap_or(total_lines);
-    if start > total_lines {
+    if end_line.is_some_and(|end| start > end) {
         return Err(format!(
-            "Invalid line range: start_line ({start}) is beyond end of file ({total_lines} lines)."
-        ));
-    }
-    if start > end {
-        return Err(format!(
-            "Invalid line range: start_line ({start}) must be less than or equal to end_line ({end})."
+            "Invalid line range: start_line ({start}) must be less than or equal to end_line ({}).",
+            end_line.unwrap_or(start)
         ));
     }
 
-    let start_idx = start - 1;
-    let end_idx = end.min(total_lines);
-    Ok(lines[start_idx..end_idx].join("\n"))
+    let file = File::open(path)
+        .map_err(|error| format!("Failed to read file {}: {}", path.display(), error))?;
+    let mut reader = StdBufReader::new(file);
+    let mut line = String::new();
+    let mut result = String::new();
+    let mut current_line = 0usize;
+    let mut shown_lines = 0usize;
+    let mut next_start_line = None;
+    let mut truncated_mid_line = false;
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Failed to read file {}: {}", path.display(), error))?;
+        if bytes_read == 0 {
+            break;
+        }
+        current_line += 1;
+
+        if current_line < start {
+            continue;
+        }
+        if end_line.is_some_and(|end| current_line > end) {
+            break;
+        }
+        if shown_lines >= max_lines {
+            next_start_line = Some(current_line);
+            break;
+        }
+
+        let remaining = max_bytes.saturating_sub(result.len());
+        if line.len() > remaining {
+            let prefix = utf8_prefix(&line, remaining);
+            result.push_str(prefix);
+            next_start_line = Some(current_line);
+            truncated_mid_line = true;
+            break;
+        }
+
+        result.push_str(&line);
+        shown_lines += 1;
+        if end_line == Some(current_line) {
+            break;
+        }
+    }
+
+    if current_line == 0 {
+        if start != 1 || end_line.is_some_and(|end| end != 1) {
+            return Err("Requested line range is outside an empty file.".to_string());
+        }
+    } else if current_line < start {
+        return Err(format!(
+            "Invalid line range: start_line ({start}) is beyond end of file ({current_line} lines)."
+        ));
+    }
+
+    if (start_line.is_some() || end_line.is_some()) && result.ends_with('\n') {
+        result.pop();
+        if result.ends_with('\r') {
+            result.pop();
+        }
+    }
+
+    if let Some(next_line) = next_start_line {
+        result.push_str(&format!(
+            "\n\n[read_file output truncated: limit: {max_lines} lines or {max_bytes} bytes; next start_line={next_line}. Re-run read_file with start_line/end_line (start_line={next_line} and a narrow end_line); use grep to find relevant line numbers first.]"
+        ));
+        if truncated_mid_line {
+            result.push_str(
+                " The last shown line was cut at the byte limit; repeating that start_line will return the line from its beginning.",
+            );
+        }
+    }
+
+    Ok(result)
 }
 
+#[cfg(test)]
 fn read_file_with_cap(content: &str, max_lines: usize, max_bytes: usize) -> String {
     let total_bytes = content.len();
     let total_lines = content.lines().count();
@@ -3046,6 +3151,40 @@ fn read_file_with_cap(content: &str, max_lines: usize, max_bytes: usize) -> Stri
         return content.to_string();
     }
 
+    let (head, shown_lines, truncated_mid_line) = output_prefix(content, max_lines, max_bytes);
+
+    let mut result = head;
+    result.push_str(&format!(
+        "\n\n[read_file output truncated: showing the first {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {max_lines} lines or {max_bytes} bytes). Re-run read_file with start_line/end_line for the specific range you need; use grep to find relevant line numbers first.]",
+        result.len()
+    ));
+    if truncated_mid_line {
+        result.push_str(" The last shown line was cut at the byte limit.");
+    }
+    result
+}
+
+fn cap_model_facing_output(text: String) -> String {
+    let (max_lines, max_bytes) = read_file_caps();
+    let total_bytes = text.len();
+    let total_lines = text.lines().count();
+    if total_bytes <= max_bytes && total_lines <= max_lines {
+        return text;
+    }
+
+    let (head, shown_lines, truncated_mid_line) = output_prefix(&text, max_lines, max_bytes);
+    let mut result = head;
+    result.push_str(&format!(
+        "\n\n[tool output truncated: showing {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {max_lines} lines or {max_bytes} bytes). Refine the request, narrow its path or pattern, or request a smaller range to continue.]",
+        result.len()
+    ));
+    if truncated_mid_line {
+        result.push_str(" The last shown line was cut at the byte limit.");
+    }
+    result
+}
+
+fn output_prefix(content: &str, max_lines: usize, max_bytes: usize) -> (String, usize, bool) {
     let mut head = String::new();
     let mut shown_lines = 0usize;
     let mut truncated_mid_line = false;
@@ -3075,15 +3214,7 @@ fn read_file_with_cap(content: &str, max_lines: usize, max_bytes: usize) -> Stri
         break;
     }
 
-    let mut result = head;
-    result.push_str(&format!(
-        "\n\n[read_file output truncated: showing the first {shown_lines} of {total_lines} lines and {} of {total_bytes} bytes (limit: {max_lines} lines or {max_bytes} bytes). Re-run read_file with start_line/end_line for the specific range you need; use grep to find relevant line numbers first.]",
-        result.len()
-    ));
-    if truncated_mid_line {
-        result.push_str(" The last shown line was cut at the byte limit.");
-    }
-    result
+    (head, shown_lines, truncated_mid_line)
 }
 
 fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
@@ -3499,6 +3630,186 @@ mod tests {
         assert!(text.contains("start_line/end_line"));
         assert!(text.contains("grep"));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_caps_open_ended_ranges_with_next_start_line() {
+        let dir = unique_project_tmp("read-range-truncate");
+        let path = dir.join("large.txt");
+        let mut content = String::new();
+        for i in 1..=(READ_FILE_DEFAULT_MAX_LINES + 10) {
+            content.push_str(&format!("line {i}\n"));
+        }
+        fs::write(&path, content).unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "read_file",
+                json!({ "path": path.to_str().unwrap(), "start_line": 2 }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        let text = &result.content[0].text;
+        assert!(text.contains("line 2"));
+        assert!(text.contains(&format!("line {}", READ_FILE_DEFAULT_MAX_LINES + 1)));
+        assert!(!text.contains(&format!("line {}", READ_FILE_DEFAULT_MAX_LINES + 2)));
+        assert!(text.contains("read_file output truncated"));
+        assert!(text.contains(&format!(
+            "next start_line={}",
+            READ_FILE_DEFAULT_MAX_LINES + 2
+        )));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_results_share_model_facing_output_budget() {
+        let oversized = "result line\n".repeat(READ_FILE_DEFAULT_MAX_LINES + 20);
+
+        let success = ToolResult::success(oversized.clone());
+        let error = ToolResult::error(oversized.clone());
+
+        for result in [success, error] {
+            let text = &result.content[0].text;
+            assert!(text.len() < oversized.len());
+            assert!(text.contains("tool output truncated"));
+            assert!(text.contains("Refine the request"));
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_finds_match_in_path_with_spaces() {
+        let dir = unique_project_tmp("grep path with spaces");
+        let path = dir.join("fixture file.txt");
+        fs::write(&path, "first\nneedle\nlast\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "grep",
+                json!({ "pattern": "needle", "path": path.to_str().unwrap() }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert!(result.content[0].text.contains("2:needle"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_reports_no_match_as_success() {
+        let dir = unique_project_tmp("grep-no-match");
+        let path = dir.join("fixture.txt");
+        fs::write(&path, "haystack\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "grep",
+                json!({ "pattern": "needle", "path": path.to_str().unwrap() }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert!(result.content[0].text.contains("No matches found"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_treats_leading_dash_pattern_as_expression() {
+        let dir = unique_project_tmp("grep-leading-dash");
+        let path = dir.join("fixture.txt");
+        fs::write(&path, "ordinary\n--flag\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "grep",
+                json!({ "pattern": "--flag", "path": path.to_str().unwrap() }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert!(result.content[0].text.contains("2:--flag"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn search_glob_treats_hostile_base_path_as_data() {
+        let dir = unique_project_tmp("glob-injection");
+        let marker = dir.join("PWNED");
+        let hostile = format!("{}; printf PWNED > {}; #", dir.display(), marker.display());
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "search_glob",
+                json!({ "pattern": "*.rs", "base_path": hostile }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(
+            result.is_error.is_some() || !result.content[0].text.contains("PWNED"),
+            "hostile path must not execute shell syntax: {:?}",
+            result
+        );
+        assert!(!marker.exists(), "search_glob must not execute a command");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn search_glob_handles_spaces_and_double_star_patterns() {
+        let dir = unique_project_tmp("glob path with spaces");
+        let nested = dir.join("nested dir").join("deeper");
+        fs::create_dir_all(&nested).unwrap();
+        let matching = nested.join("fixture.rs");
+        fs::write(&matching, "fn main() {}\n").unwrap();
+        fs::write(nested.join("fixture.txt"), "not rust\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "search_glob",
+                json!({ "pattern": "**/*.rs", "base_path": dir.to_str().unwrap() }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert!(
+            result.content[0]
+                .text
+                .contains(&matching.display().to_string())
+        );
+        assert!(!result.content[0].text.contains("fixture.txt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn search_glob_supports_standard_character_classes() {
+        let dir = unique_project_tmp("glob-character-class");
+        fs::write(dir.join("fixture1.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.join("fixture2.rs"), "fn main() {}\n").unwrap();
+        let registry = registry_with_trust(&dir, false);
+
+        let result = registry
+            .execute(
+                "search_glob",
+                json!({ "pattern": "fixture[12].rs", "base_path": dir.to_str().unwrap() }),
+            )
+            .await
+            .expect("call ok");
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert!(result.content[0].text.contains("fixture1.rs"));
+        assert!(result.content[0].text.contains("fixture2.rs"));
         fs::remove_dir_all(&dir).ok();
     }
 

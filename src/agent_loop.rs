@@ -21,8 +21,10 @@
 
 use anyhow::Result;
 use serde_json::json;
+use std::sync::OnceLock;
 
 use crate::executor::AIExecutor;
+use crate::mcp_client::Tool;
 use crate::mcp_manager::McpManager;
 use crate::ollama::{ChatStats, Message, ToolFunction, ToolSpec};
 
@@ -62,6 +64,34 @@ pub const CONSENSUS_TOOL_NAME: &str = "consensus_run";
 /// `agent_run` or `consensus_run` inside it would re-enable unbounded nested
 /// subagent/consensus spawning.
 pub const DISABLE_META_TOOLS_ENV: &str = "CUBI_DISABLE_META_TOOLS";
+pub const TOOL_PROFILE_ENV: &str = "CUBI_TOOL_PROFILE";
+
+const CODING_TOOL_NAMES: [&str; 8] = [
+    "bash",
+    "edit_file",
+    "grep",
+    "list_files",
+    "read_file",
+    "repo_map",
+    "search_glob",
+    "write_file",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolProfile {
+    Full,
+    Coding,
+}
+
+impl ToolProfile {
+    fn selected() -> Self {
+        static SELECTED: OnceLock<ToolProfile> = OnceLock::new();
+        *SELECTED.get_or_init(|| match std::env::var(TOOL_PROFILE_ENV) {
+            Ok(value) if value.eq_ignore_ascii_case("coding") => Self::Coding,
+            _ => Self::Full,
+        })
+    }
+}
 
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
@@ -84,22 +114,45 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
         // without other tools for the subagent to use, so we skip it too.
         return None;
     }
-    let mut specs: Vec<ToolSpec> = mcp_tools
+    let specs = build_tool_specs_for_profile(
+        mcp_tools,
+        ToolProfile::selected(),
+        !meta_tools_disabled_by_env(),
+    );
+    (!specs.is_empty()).then_some(specs)
+}
+
+fn build_tool_specs_for_profile(
+    tools: Vec<&Tool>,
+    profile: ToolProfile,
+    include_meta_tools: bool,
+) -> Vec<ToolSpec> {
+    let mut selected: Vec<&Tool> = tools
         .into_iter()
-        .map(|t| ToolSpec {
+        .filter(|tool| {
+            profile == ToolProfile::Full || CODING_TOOL_NAMES.contains(&tool.name.as_str())
+        })
+        .collect();
+    if profile == ToolProfile::Coding {
+        selected.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    let mut specs: Vec<ToolSpec> = selected
+        .into_iter()
+        .map(|tool| ToolSpec {
             tool_type: "function".to_string(),
             function: ToolFunction {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
             },
         })
         .collect();
-    if !meta_tools_disabled_by_env() {
+    if include_meta_tools && !specs.is_empty() {
         specs.push(agent_run_spec());
         specs.push(crate::consensus::consensus_run_spec());
     }
-    Some(specs)
+    specs
 }
 
 pub fn meta_tools_disabled_by_env() -> bool {
@@ -346,7 +399,15 @@ pub async fn run_subagent_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_client::{Content, ToolCallResult};
+    use crate::mcp_client::{Content, Tool, ToolCallResult};
+
+    fn fake_tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: format!("description for {}", name),
+            input_schema: json!({}),
+        }
+    }
 
     #[test]
     fn render_tool_result_joins_text_blocks() {
@@ -408,6 +469,47 @@ mod tests {
         assert!(
             spec.function.parameters["properties"]["goal"].is_object(),
             "goal parameter must be an object"
+        );
+    }
+
+    #[test]
+    fn coding_profile_advertises_exact_core_and_meta_tool_set() {
+        let tools = [
+            "write_file",
+            "think",
+            "read_file",
+            "external_mcp_tool",
+            "repo_map",
+            "bash",
+            "search_glob",
+            "grep",
+            "edit_file",
+            "list_files",
+        ]
+        .into_iter()
+        .map(fake_tool)
+        .collect::<Vec<_>>();
+
+        let specs = build_tool_specs_for_profile(tools.iter().collect(), ToolProfile::Coding, true);
+        let names: Vec<&str> = specs
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "edit_file",
+                "grep",
+                "list_files",
+                "read_file",
+                "repo_map",
+                "search_glob",
+                "write_file",
+                AGENT_TOOL_NAME,
+                "consensus_run",
+            ]
         );
     }
 
