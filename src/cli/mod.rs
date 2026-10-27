@@ -3,6 +3,7 @@ use crate::agent_loop::{
 };
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::completer::SlashHelper;
+use crate::context_budget;
 use crate::executor::AIExecutor;
 use crate::exit_code::{self, ExitCode};
 use crate::file_mentions::{self, UserCommand};
@@ -52,7 +53,6 @@ const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
 mod compaction;
-mod context_budget;
 mod edit_cmd;
 mod multiline;
 mod render;
@@ -4423,7 +4423,7 @@ impl ChatCLI {
             plan.summarized_count
         ));
 
-        let summary_prompt = vec![
+        let mut summary_prompt = vec![
             Message::text(
                 "system",
                 "You are a summarizer. Produce a concise bullet-point summary of the \
@@ -4432,6 +4432,17 @@ impl ChatCLI {
             ),
             Message::text("user", plan.transcript.clone()),
         ];
+        if let Some(budget) = context_budget::effective_budget(
+            self.executor.get_model(),
+            self.executor.provider_name(),
+        ) {
+            context_budget::truncate_message_to_fit(
+                &mut summary_prompt,
+                None,
+                1,
+                budget.prompt_limit,
+            );
+        }
 
         let summary_result = if let Some(cancel) = cancel.as_ref() {
             tokio::select! {
@@ -4464,13 +4475,24 @@ impl ChatCLI {
                 ));
 
                 if compaction::memory_extraction_enabled() {
-                    let extract_prompt = vec![
+                    let mut extract_prompt = vec![
                         Message::text(
                             "system",
                             "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
                         ),
                         Message::text("user", &summary),
                     ];
+                    if let Some(budget) = context_budget::effective_budget(
+                        self.executor.get_model(),
+                        self.executor.provider_name(),
+                    ) {
+                        context_budget::truncate_message_to_fit(
+                            &mut extract_prompt,
+                            None,
+                            1,
+                            budget.prompt_limit,
+                        );
+                    }
                     let extracted = if let Some(cancel) = cancel.as_ref() {
                         tokio::select! {
                             biased;
@@ -8335,6 +8357,87 @@ mod tests {
                 .map(|exit| exit.code),
             Some(ExitCode::Cancelled)
         );
+    }
+
+    #[test]
+    fn compact_summarization_request_stays_within_budget() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_COMPACT_EXTRACT_MEMORIES",
+            "CUBI_CONTEXT_WINDOW",
+            "CUBI_FAKE_LLM",
+            "CUBI_MAX_PROMPT_TOKENS_OVERRIDE",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let fixture = crate::test_support::OpenAiFixture::spawn(vec![serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "bounded summary"}
+                }]
+            })])
+            .await;
+            // SAFETY: environment mutation is serialized by the shared test locks.
+            unsafe {
+                std::env::set_var("OPENAI_BASE_URL", &fixture.base_url);
+                std::env::set_var("OPENAI_API_KEY", "test-key");
+                std::env::set_var("CUBI_CONTEXT_WINDOW", "1024");
+                std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES");
+                std::env::remove_var("CUBI_FAKE_LLM");
+                std::env::remove_var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE");
+            }
+            let executor = AIExecutor::new_from_env("budget-fixture-model".to_string());
+            let mut cli = ChatCLI::new(
+                executor,
+                None,
+                Arc::new(Mutex::new(Permissions::default())),
+                Arc::new(AtomicBool::new(false)),
+                FileJournal::default(),
+            );
+            for index in 0..4 {
+                cli.history.push(Message::text(
+                    "user",
+                    format!("user {index} {}", "u".repeat(8_000)),
+                ));
+                cli.history.push(Message::text(
+                    "assistant",
+                    format!("assistant {index} {}", "a".repeat(8_000)),
+                ));
+            }
+
+            cli.compact(None).await.unwrap();
+
+            let requests = fixture.requests.lock().unwrap().clone();
+            fixture.shutdown().await;
+            assert_eq!(requests.len(), 1);
+            let messages = requests[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    Message::text(
+                        message["role"].as_str().unwrap(),
+                        message["content"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let budget = context_budget::effective_budget(
+                cli.executor.get_model(),
+                cli.executor.provider_name(),
+            )
+            .unwrap();
+            assert!(
+                context_budget::estimate_request_tokens(&messages, None) <= budget.prompt_limit,
+                "summarization request exceeded prompt limit"
+            );
+        });
     }
 
     #[test]

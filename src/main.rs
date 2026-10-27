@@ -11,6 +11,7 @@ mod completer;
 mod completions;
 mod config;
 mod consensus;
+mod context_budget;
 mod doctor;
 mod event_sink;
 mod executor;
@@ -54,6 +55,8 @@ mod spinner;
 mod style;
 mod swebench;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod themes;
 mod thinking_filter;
 mod tips;

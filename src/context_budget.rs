@@ -1,15 +1,16 @@
 use crate::ollama::{Message, ToolSpec};
+use anyhow::Result;
 
 const DEFAULT_OLLAMA_NUM_CTX_CAP: usize = 32_768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ContextBudget {
-    pub window: usize,
-    pub completion_reserve: usize,
-    pub prompt_limit: usize,
+pub(crate) struct ContextBudget {
+    pub(crate) window: usize,
+    pub(crate) completion_reserve: usize,
+    pub(crate) prompt_limit: usize,
 }
 
-pub(super) fn effective_budget(model: &str, provider: &str) -> Option<ContextBudget> {
+pub(crate) fn effective_budget(model: &str, provider: &str) -> Option<ContextBudget> {
     let (ollama_override, openai_override) =
         crate::config::with(|config| (config.generation.num_ctx, config.generation.context_window));
     effective_budget_with_overrides(model, provider, ollama_override, openai_override)
@@ -41,7 +42,7 @@ fn effective_budget_with_overrides(
     })
 }
 
-pub(super) fn estimate_request_tokens(messages: &[Message], tools: Option<&[ToolSpec]>) -> usize {
+pub(crate) fn estimate_request_tokens(messages: &[Message], tools: Option<&[ToolSpec]>) -> usize {
     let message_tokens = messages
         .iter()
         .map(|message| {
@@ -59,6 +60,55 @@ pub(super) fn estimate_request_tokens(messages: &[Message], tools: Option<&[Tool
         })
         .sum::<usize>();
     message_tokens + tools.map(serialized_tokens).unwrap_or(0)
+}
+
+pub(crate) fn ensure_request_fits(
+    model: &str,
+    provider: &str,
+    messages: &[Message],
+    tools: Option<&[ToolSpec]>,
+) -> Result<()> {
+    let Some(budget) = effective_budget(model, provider) else {
+        return Ok(());
+    };
+    let needed = estimate_request_tokens(messages, tools);
+    if needed <= budget.prompt_limit {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "cubi: refusing model request before send: would exceed context window \
+         ({} tokens estimated, prompt limit is {}; {} reserved for completion)",
+        needed,
+        budget.prompt_limit,
+        budget.completion_reserve
+    )
+}
+
+pub(crate) fn truncate_message_to_fit(
+    messages: &mut [Message],
+    tools: Option<&[ToolSpec]>,
+    message_index: usize,
+    prompt_limit: usize,
+) -> bool {
+    if estimate_request_tokens(messages, tools) <= prompt_limit {
+        return true;
+    }
+    let original = std::mem::take(&mut messages[message_index].content);
+    let fixed_tokens = estimate_request_tokens(messages, tools);
+    if fixed_tokens > prompt_limit {
+        messages[message_index].content = original;
+        return false;
+    }
+    let max_bytes = prompt_limit
+        .saturating_sub(fixed_tokens)
+        .saturating_mul(4)
+        .min(original.len());
+    let mut end = max_bytes;
+    while !original.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    messages[message_index].content = original[..end].to_string();
+    estimate_request_tokens(messages, tools) <= prompt_limit
 }
 
 fn serialized_tokens(value: &(impl serde::Serialize + ?Sized)) -> usize {
@@ -120,5 +170,16 @@ mod tests {
             with_tools > without_tools + 1_000,
             "serialized schemas must be counted"
         );
+    }
+
+    #[test]
+    fn truncation_uses_the_complete_request_estimator() {
+        let mut messages = vec![
+            Message::text("system", "summarize"),
+            Message::text("user", "x".repeat(4_000)),
+        ];
+
+        assert!(truncate_message_to_fit(&mut messages, None, 1, 128));
+        assert!(estimate_request_tokens(&messages, None) <= 128);
     }
 }

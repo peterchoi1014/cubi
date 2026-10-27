@@ -39,6 +39,12 @@ impl AIExecutor {
     }
 
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            None,
+        )?;
         self.backend.chat(&self.model, messages).await
     }
 
@@ -51,6 +57,12 @@ impl AIExecutor {
     where
         F: FnMut(&str),
     {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend
             .chat_stream(&self.model, messages, tools, on_token)
             .await
@@ -61,6 +73,12 @@ impl AIExecutor {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend
             .chat_with_tools(&self.model, messages, tools)
             .await
@@ -76,6 +94,12 @@ impl AIExecutor {
         model: &str,
         messages: Vec<Message>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            model,
+            self.backend.provider_name(),
+            &messages,
+            None,
+        )?;
         self.backend.chat_with_tools(model, messages, None).await
     }
 
@@ -88,6 +112,12 @@ impl AIExecutor {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend.chat_with_tools(model, messages, tools).await
     }
 

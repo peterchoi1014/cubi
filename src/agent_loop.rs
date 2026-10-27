@@ -631,4 +631,97 @@ mod tests {
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0].function.name, "bash");
     }
+
+    #[test]
+    fn subagent_blocks_oversized_post_tool_request_before_backend() {
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_CONTEXT_WINDOW",
+            "CUBI_FAKE_LLM",
+            "CUBI_MAX_PROMPT_TOKENS_OVERRIDE",
+            "CUBI_TOOL_PROFILE",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let large_file = temp.path().join("large.txt");
+        std::fs::write(&large_file, "x".repeat(40_000)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let fixture = crate::test_support::OpenAiFixture::spawn(vec![
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-read",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": serde_json::json!({"path": large_file}).to_string()
+                                }
+                            }]
+                        }
+                    }]
+                }),
+                serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "final"}
+                    }]
+                }),
+            ])
+            .await;
+            // SAFETY: environment mutation is serialized by the shared test locks.
+            unsafe {
+                std::env::set_var("OPENAI_BASE_URL", &fixture.base_url);
+                std::env::set_var("OPENAI_API_KEY", "test-key");
+                std::env::set_var("CUBI_CONTEXT_WINDOW", "4096");
+                std::env::set_var("CUBI_TOOL_PROFILE", "coding");
+                std::env::remove_var("CUBI_FAKE_LLM");
+                std::env::remove_var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE");
+            }
+            let executor = AIExecutor::new_from_env("budget-fixture-model".to_string());
+            let permissions = Arc::new(Mutex::new(crate::permissions::Permissions::default()));
+            let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut mcp = Some(
+                McpManager::new(Arc::clone(&permissions), plan_mode)
+                    .await
+                    .unwrap(),
+            );
+            let access = ToolAccess {
+                hooks: crate::hooks::HookRegistry::empty(),
+                policy: crate::policy::Policy::default(),
+                permissions,
+            };
+
+            let result = run_subagent(
+                &executor,
+                &mut mcp,
+                access,
+                HashSet::from(["read_file".to_string()]),
+                "Read the requested file and report its contents.",
+                2,
+            )
+            .await;
+
+            let requests = fixture.requests.lock().unwrap().clone();
+            fixture.shutdown().await;
+            let error = result.expect_err("the post-tool request must be rejected locally");
+            assert!(
+                error.to_string().contains("context window"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                requests.len(),
+                1,
+                "the oversized follow-up must never reach the backend"
+            );
+        });
+    }
 }
