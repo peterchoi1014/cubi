@@ -806,14 +806,26 @@ impl OpenAiClient {
             if trimmed.is_empty() {
                 return Ok(());
             }
-            if trimmed == "data: [DONE]" {
+            if trimmed.starts_with(':')
+                || trimmed.starts_with("event:")
+                || trimmed.starts_with("id:")
+                || trimmed.starts_with("retry:")
+            {
+                return Ok(());
+            }
+            let data = trimmed
+                .strip_prefix("data:")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if data.is_empty() {
+                return Ok(());
+            }
+            if data == "[DONE]" {
                 *terminal_event_seen = true;
                 return Ok(());
             }
-            let data = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
-            let Ok(chunk) = serde_json::from_str::<OaiStreamChunk>(data) else {
-                return Ok(());
-            };
+            let chunk = serde_json::from_str::<OaiStreamChunk>(data)
+                .context("malformed OpenAI stream data frame")?;
             if let Some(u) = chunk.usage {
                 *usage = Some(u);
             }
@@ -1363,6 +1375,48 @@ mod tests {
 
         assert!(error.to_string().contains("premature EOF"));
         assert!(error.to_string().contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_rejects_malformed_frame_after_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let tool_call = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/main.rs\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let terminal = serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        });
+        let body = format!(
+            "data: {}\n\ndata: {{malformed}}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            tool_call, terminal
+        )
+        .into_bytes();
+        let (base_url, server) = serve_chunked("text/event-stream", vec![body]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("malformed OpenAI stream data frame")
+        );
     }
 
     #[tokio::test]

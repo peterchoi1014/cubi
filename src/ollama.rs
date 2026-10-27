@@ -701,10 +701,8 @@ impl OllamaClient {
             if trimmed.is_empty() {
                 return Ok(());
             }
-            let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
-                Ok(c) => c,
-                Err(_) => return Ok(()), // tolerate a malformed mid-stream line
-            };
+            let parsed: ChatStreamChunk =
+                serde_json::from_str(trimmed).context("malformed Ollama stream frame")?;
             let tool_call_indices = stream_tool_call_indices(trimmed);
             let mut message = parsed.message;
             if !message.content.is_empty() {
@@ -1126,6 +1124,34 @@ mod tests {
         let calls = message.tool_calls.expect("tool calls preserved");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_malformed_frame_after_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let early = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [indexed_bash_tool_call(0)]
+            },
+            "done": false
+        });
+        let final_chunk = serde_json::json!({
+            "message": {"role": "assistant", "content": ""},
+            "done": true
+        });
+        let body = format!("{}\n{{malformed}}\n{}\n", early, final_chunk).into_bytes();
+        let (base_url, server) = serve_chunked(vec![body]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("malformed Ollama stream frame"));
     }
 
     #[tokio::test]
