@@ -657,17 +657,26 @@ mod tests {
             .env("CUBI_STALLED_HOOK_HELPER", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            // Captured so a CI failure shows the helper's assertion. Hook
+            // descendants get null stdio, so none of them can hold this pipe.
+            .stderr(std::process::Stdio::piped());
         configure_outer_process_group(&mut command);
-        let mut child = command.spawn().unwrap();
+        let child = command.spawn().unwrap();
         let child_pid = child.id();
         let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = status_tx.send(child.wait());
+            let _ = status_tx.send(child.wait_with_output());
         });
 
         match status_rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(status) => assert!(status.unwrap().success()),
+            Ok(output) => {
+                let output = output.unwrap();
+                assert!(
+                    output.status.success(),
+                    "stalled hook helper failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             Err(error) => {
                 terminate_outer_process_tree(child_pid);
                 let _ = status_rx.recv_timeout(Duration::from_secs(5));
@@ -741,12 +750,21 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_process_is_gone(pid: u32) {
-        let pid = i32::try_from(pid).unwrap();
-        // SAFETY: signal 0 only queries a numeric PID and does not dereference Rust memory.
-        let result = unsafe { libc::kill(pid, 0) };
-        let error = std::io::Error::last_os_error();
-        assert_eq!(result, -1, "grandchild process {pid} is still alive");
-        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        // The killed grandchild is reparented to init and can remain a zombie
+        // until init reaps it, which `kill(pid, 0)` still reports as alive. A
+        // zombie has already terminated, so accept "not listed" or state Z.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "grandchild process {} is still running (ps stat {:?})",
+            pid,
+            stat
+        );
     }
 
     #[cfg(windows)]
