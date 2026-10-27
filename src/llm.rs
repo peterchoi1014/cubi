@@ -30,6 +30,28 @@ use std::time::Duration;
 
 use crate::ollama::{ChatStats, Message, OllamaClient, ToolCall, ToolCallFunction, ToolSpec};
 
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(current_http_read_timeout())
+        .build()
+        .expect("static reqwest client configuration must be valid")
+}
+
+fn current_http_read_timeout() -> Duration {
+    crate::config::with(|config| config.generation.http_timeout)
+}
+
+pub(crate) fn current_max_tokens() -> Option<u64> {
+    crate::config::with(|config| config.generation.max_tokens)
+}
+
 // ─── Provider enum (object-safe dispatch without async_trait) ────────────────
 
 /// Enum-based LLM provider dispatch. Avoids the need for `dyn` with async
@@ -127,6 +149,14 @@ impl LlmBackend {
             Self::Fake => None,
         }
     }
+
+    pub fn is_local(&self) -> bool {
+        match self {
+            Self::Ollama(_) => true,
+            Self::OpenAi(client) => is_loopback_url(client.base_url()),
+            Self::Fake => false,
+        }
+    }
 }
 
 // ─── OpenAI-compatible provider ─────────────────────────────────────────────
@@ -154,11 +184,21 @@ struct OaiUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OaiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OaiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OaiChoice {
     message: OaiMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,22 +319,29 @@ impl OpenAiClient {
         Self {
             base_url,
             api_key,
-            client: reqwest::Client::new(),
+            client: build_http_client(),
         }
     }
 
-    /// Creates a client from environment variables.
+    /// Creates a client from the resolved startup configuration.
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("CUBI_API_KEY").ok())?;
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
+        let provider = crate::config::with(|config| config.provider.clone());
+        let openai_base_url = provider
+            .openai_base_url
+            .filter(|url| !url.trim().is_empty());
+        let api_key = provider
+            .openai_api_key
+            .or(provider.api_key)
+            .filter(|key| !key.trim().is_empty());
+        if api_key.is_none() && !openai_base_url.as_deref().is_some_and(is_loopback_url) {
+            return None;
+        }
+        let base_url = openai_base_url
+            .or(provider.base_url)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         Some(Self::new(
             base_url.trim_end_matches('/').to_string(),
-            api_key,
+            api_key.unwrap_or_default(),
         ))
     }
 
@@ -303,6 +350,14 @@ impl OpenAiClient {
     /// rather than hard-coding any specific URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
     }
 
     fn convert_messages(messages: &[Message]) -> Vec<OaiRequestMessage> {
@@ -383,31 +438,59 @@ impl OpenAiClient {
             .collect()
     }
 
-    fn oai_message_to_message(oai: OaiMessage) -> Message {
+    fn oai_message_to_message(oai: OaiMessage) -> Result<Message> {
         let content =
             crate::thinking_filter::strip_thinking_blocks(&oai.content.unwrap_or_default());
-        let tool_calls = oai.tool_calls.map(|calls| {
-            calls
-                .into_iter()
-                .map(|c| ToolCall {
-                    id: c.id,
-                    call_type: c.call_type,
-                    function: ToolCallFunction {
-                        name: c.function.name,
-                        arguments: serde_json::from_str(&c.function.arguments)
-                            .unwrap_or(serde_json::Value::Object(Default::default())),
-                    },
-                })
-                .collect()
-        });
-        Message {
+        let tool_calls = oai
+            .tool_calls
+            .map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|c| {
+                        let arguments =
+                            parse_tool_call_arguments(&c.function.name, &c.function.arguments)?;
+                        Ok(ToolCall {
+                            id: c.id,
+                            call_type: c.call_type,
+                            function: ToolCallFunction {
+                                name: c.function.name,
+                                arguments,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        Ok(Message {
             role: "assistant".to_string(),
             content,
             tool_calls,
             tool_name: None,
             tool_call_id: None,
-        }
+        })
     }
+}
+
+fn parse_tool_call_arguments(name: &str, raw: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(raw).with_context(|| {
+        format!(
+            "Failed to parse tool-call arguments for `{}`; original arguments: {}",
+            name, raw
+        )
+    })
+}
+
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 impl OpenAiClient {
@@ -435,6 +518,19 @@ impl OpenAiClient {
                 body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
             }
         }
+        if let Some(max_tokens) = current_max_tokens() {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        let sampling = crate::model_profile::sampling_for_model(model)?;
+        if let Some(temperature) = sampling.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(top_p) = sampling.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = sampling.top_k {
+            body["top_k"] = serde_json::json!(top_k);
+        }
 
         tracing::debug!(
             target: "cubi::llm",
@@ -448,9 +544,7 @@ impl OpenAiClient {
         let mut attempt: u32 = 0;
         let response = loop {
             let send_result = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .authenticate(self.client.post(&url))
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -527,6 +621,12 @@ impl OpenAiClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No choices in OpenAI response"))?;
+        if choice.finish_reason.as_deref() == Some("length") {
+            anyhow::bail!(
+                "OpenAI response was truncated by the output-token limit; partial content: {}",
+                choice.message.content.as_deref().unwrap_or_default()
+            );
+        }
 
         let stats = ChatStats {
             prompt_tokens: oai_resp
@@ -540,8 +640,22 @@ impl OpenAiClient {
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cached_prompt_tokens: oai_resp
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens),
+            request_count: 1,
+            last_prompt_tokens: oai_resp.usage.as_ref().map(|usage| usage.prompt_tokens),
+            ..ChatStats::default()
         };
-        Ok((Self::oai_message_to_message(choice.message), stats))
+        Ok((
+            crate::ollama::normalize_assistant_message(
+                Self::oai_message_to_message(choice.message)?,
+                tools.as_deref(),
+            ),
+            stats,
+        ))
     }
 
     pub async fn chat_stream<F>(
@@ -570,6 +684,19 @@ impl OpenAiClient {
                 body["tools"] = serde_json::to_value(Self::convert_tools(tools))?;
             }
         }
+        if let Some(max_tokens) = current_max_tokens() {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        let sampling = crate::model_profile::sampling_for_model(model)?;
+        if let Some(temperature) = sampling.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(top_p) = sampling.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(top_k) = sampling.top_k {
+            body["top_k"] = serde_json::json!(top_k);
+        }
 
         tracing::debug!(
             target: "cubi::llm",
@@ -586,9 +713,7 @@ impl OpenAiClient {
         // streamed tokens to the caller.
         let response = loop {
             let send_result = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .authenticate(self.client.post(&url))
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -656,72 +781,141 @@ impl OpenAiClient {
         };
 
         let mut stream = response.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut content = String::new();
         let mut tool_calls_builder: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
         let mut usage: Option<OaiUsage> = None;
+        let mut terminal_event_seen = false;
+        let mut finish_reason: Option<String> = None;
+        let mut time_to_first_token_ms = None;
         // Strips Qwen3-style <think>…</think> reasoning blocks from
         // streamed tokens before forwarding to the UI and recording.
         let mut stripper = crate::thinking_filter::ThinkStripper::new();
 
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("Stream read failed")?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].to_string();
-                buf.drain(..=nl);
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed == "data: [DONE]" {
-                    continue;
+        let mut handle_line = |line: &[u8],
+                               content: &mut String,
+                               tool_calls_builder: &mut Vec<(String, String, String)>,
+                               usage: &mut Option<OaiUsage>,
+                               terminal_event_seen: &mut bool,
+                               finish_reason: &mut Option<String>,
+                               time_to_first_token_ms: &mut Option<u64>,
+                               stripper: &mut crate::thinking_filter::ThinkStripper|
+         -> Result<()> {
+            let line = std::str::from_utf8(line).context("OpenAI stream returned invalid UTF-8")?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            if trimmed.starts_with(':')
+                || trimmed.starts_with("event:")
+                || trimmed.starts_with("id:")
+                || trimmed.starts_with("retry:")
+            {
+                return Ok(());
+            }
+            let data = trimmed
+                .strip_prefix("data:")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if data.is_empty() {
+                return Ok(());
+            }
+            if data == "[DONE]" {
+                *terminal_event_seen = true;
+                return Ok(());
+            }
+            let chunk = serde_json::from_str::<OaiStreamChunk>(data)
+                .context("malformed OpenAI stream data frame")?;
+            if let Some(u) = chunk.usage {
+                *usage = Some(u);
+            }
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    *terminal_event_seen = true;
+                    *finish_reason = Some(reason);
                 }
-                let data = trimmed.strip_prefix("data: ").unwrap_or(trimmed);
-                let Ok(chunk) = serde_json::from_str::<OaiStreamChunk>(data) else {
-                    continue;
-                };
-                if let Some(u) = chunk.usage {
-                    usage = Some(u);
-                }
-                for choice in chunk.choices {
-                    if let Some(text) = &choice.delta.content {
-                        if !text.is_empty() {
-                            let clean = stripper.feed(text);
-                            if !clean.is_empty() {
-                                on_token(&clean);
-                                content.push_str(&clean);
-                            }
+                if let Some(text) = &choice.delta.content {
+                    if !text.is_empty() {
+                        let clean = stripper.feed(text);
+                        if !clean.is_empty() {
+                            time_to_first_token_ms
+                                .get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                            on_token(&clean);
+                            content.push_str(&clean);
                         }
                     }
-                    if let Some(tcs) = &choice.delta.tool_calls {
-                        for tc in tcs {
-                            let idx = tc.index.unwrap_or(0);
-                            while tool_calls_builder.len() <= idx {
-                                tool_calls_builder.push((
-                                    String::new(),
-                                    String::new(),
-                                    String::new(),
-                                ));
+                }
+                if let Some(tcs) = &choice.delta.tool_calls {
+                    for tc in tcs {
+                        let idx = tc.index.unwrap_or(0);
+                        while tool_calls_builder.len() <= idx {
+                            tool_calls_builder.push((String::new(), String::new(), String::new()));
+                        }
+                        if let Some(id) = &tc.id {
+                            tool_calls_builder[idx].0 = id.clone();
+                        }
+                        if let Some(f) = &tc.function {
+                            if let Some(name) = &f.name {
+                                tool_calls_builder[idx].1 = name.clone();
                             }
-                            if let Some(id) = &tc.id {
-                                tool_calls_builder[idx].0 = id.clone();
-                            }
-                            if let Some(f) = &tc.function {
-                                if let Some(name) = &f.name {
-                                    tool_calls_builder[idx].1 = name.clone();
-                                }
-                                if let Some(args) = &f.arguments {
-                                    tool_calls_builder[idx].2.push_str(args);
-                                }
+                            if let Some(args) = &f.arguments {
+                                tool_calls_builder[idx].2.push_str(args);
                             }
                         }
                     }
                 }
             }
+            Ok(())
+        };
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.context("Stream read failed")?;
+            buf.extend_from_slice(&bytes);
+
+            while let Some(nl) = buf.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = buf.drain(..=nl).collect();
+                line.pop();
+                handle_line(
+                    &line,
+                    &mut content,
+                    &mut tool_calls_builder,
+                    &mut usage,
+                    &mut terminal_event_seen,
+                    &mut finish_reason,
+                    &mut time_to_first_token_ms,
+                    &mut stripper,
+                )?;
+            }
+        }
+        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+            let remaining = std::mem::take(&mut buf);
+            handle_line(
+                &remaining,
+                &mut content,
+                &mut tool_calls_builder,
+                &mut usage,
+                &mut terminal_event_seen,
+                &mut finish_reason,
+                &mut time_to_first_token_ms,
+                &mut stripper,
+            )?;
         }
         let tail = stripper.flush();
         if !tail.is_empty() {
             on_token(&tail);
             content.push_str(&tail);
+        }
+        if !terminal_event_seen {
+            anyhow::bail!(
+                "OpenAI stream ended at premature EOF with partial content: {}",
+                content
+            );
+        }
+        if finish_reason.as_deref() == Some("length") {
+            anyhow::bail!(
+                "OpenAI response was truncated by the output-token limit; partial content: {}",
+                content
+            );
         }
 
         let tool_calls = if tool_calls_builder.is_empty() {
@@ -730,16 +924,15 @@ impl OpenAiClient {
             Some(
                 tool_calls_builder
                     .into_iter()
-                    .map(|(id, name, args)| ToolCall {
-                        id: if id.is_empty() { None } else { Some(id) },
-                        call_type: Some("function".to_string()),
-                        function: ToolCallFunction {
-                            name,
-                            arguments: serde_json::from_str(&args)
-                                .unwrap_or(serde_json::Value::Object(Default::default())),
-                        },
+                    .map(|(id, name, args)| {
+                        let arguments = parse_tool_call_arguments(&name, &args)?;
+                        Ok(ToolCall {
+                            id: if id.is_empty() { None } else { Some(id) },
+                            call_type: Some("function".to_string()),
+                            function: ToolCallFunction { name, arguments },
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
             )
         };
 
@@ -747,25 +940,34 @@ impl OpenAiClient {
             prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
             completion_tokens: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            time_to_first_token_ms,
+            cached_prompt_tokens: usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens),
+            request_count: 1,
+            last_prompt_tokens: usage.as_ref().map(|usage| usage.prompt_tokens),
+            ..ChatStats::default()
         };
 
         Ok((
-            Message {
-                role: "assistant".to_string(),
-                content,
-                tool_calls,
-                tool_name: None,
-                tool_call_id: None,
-            },
+            crate::ollama::normalize_assistant_message(
+                Message {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls,
+                    tool_name: None,
+                    tool_call_id: None,
+                },
+                tools.as_deref(),
+            ),
             stats,
         ))
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let response = self
-            .client
-            .get(format!("{}/models", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .authenticate(self.client.get(format!("{}/models", self.base_url)))
             .send()
             .await
             .context("Failed to list models from OpenAI-compatible API")?;
@@ -790,7 +992,7 @@ impl OpenAiClient {
 }
 
 fn fake_content() -> String {
-    std::env::var("CUBI_FAKE_LLM_RESPONSE").unwrap_or_else(|_| "hi".to_string())
+    crate::config::with(|config| config.fake.response.clone())
 }
 
 /// Per-model response lookup for the `Fake` backend. Resolution order:
@@ -799,37 +1001,34 @@ fn fake_content() -> String {
 ///      tests to script different "model" outputs in the same process.
 ///   2. Fallback to [`fake_content`] (single global response).
 pub(crate) fn fake_content_for(model: &str) -> String {
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_MODEL_RESPONSES") {
-        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
-            if let Some(v) = map.get(model) {
-                return v.clone();
-            }
-        }
-    }
-    fake_content()
+    crate::config::with(|config| {
+        config
+            .fake
+            .model_responses
+            .get(model)
+            .unwrap_or(&config.fake.response)
+            .clone()
+    })
 }
 
 fn fake_message_for(model: &str, messages: &[Message]) -> Message {
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_TOOL_CALL") {
+    let fake = crate::config::with(|config| config.fake.clone());
+    if let Some(call) = fake.tool_call {
         // Normally the scripted tool call is emitted once (until a tool
         // result appears in history) so tests can drive a single
         // model→tool→model round-trip. Setting
         // `CUBI_FAKE_LLM_TOOL_CALL_REPEAT=1` removes that gate so the fake
         // backend re-issues the call on every step — used to exercise the
         // headless consecutive-tool-error safety valve.
-        let repeat = std::env::var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let repeat = fake.tool_call_repeat;
         if repeat || !messages.iter().any(|message| message.role == "tool") {
-            if let Ok(call) = serde_json::from_str::<ToolCall>(&raw) {
-                return Message {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![call]),
-                    tool_name: None,
-                    tool_call_id: None,
-                };
-            }
+            return Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Some(vec![call]),
+                tool_name: None,
+                tool_call_id: None,
+            };
         }
     }
     Message::text("assistant", fake_content_for(model))
@@ -843,10 +1042,8 @@ pub(crate) fn fake_check_fail(model: &str) -> Result<()> {
     if model.is_empty() {
         return Ok(());
     }
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_FAIL_MODELS") {
-        if raw.split(',').any(|m| m.trim() == model) {
-            anyhow::bail!("fake backend: scripted failure for model `{model}`");
-        }
+    if crate::config::with(|config| config.fake.fail_models.iter().any(|m| m == model)) {
+        anyhow::bail!("fake backend: scripted failure for model `{model}`");
     }
     Ok(())
 }
@@ -856,6 +1053,9 @@ fn fake_stats() -> ChatStats {
         prompt_tokens: 1,
         completion_tokens: 1,
         elapsed_ms: 1,
+        request_count: 1,
+        last_prompt_tokens: Some(1),
+        ..ChatStats::default()
     }
 }
 
@@ -923,26 +1123,20 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 fn current_max_retries() -> u32 {
-    if let Ok(v) = std::env::var("CUBI_LLM_MAX_RETRIES") {
-        if let Ok(n) = v.parse::<u32>() {
-            return n;
-        }
-    }
-    let cfg = crate::onboarding::AppConfig::load();
-    cfg.llm_max_retries
+    crate::config::with(|config| config.generation.max_retries)
 }
 
 /// Creates the appropriate LLM provider based on environment configuration.
 pub fn create_provider() -> LlmBackend {
-    if std::env::var("CUBI_FAKE_LLM").is_ok() {
+    if crate::config::with(|config| config.fake.enabled) {
         return LlmBackend::Fake;
     }
     if let Some(client) = OpenAiClient::from_env() {
         return LlmBackend::OpenAi(client);
     }
 
-    let ollama = match std::env::var("CUBI_BASE_URL") {
-        Ok(url) if !url.is_empty() => OllamaClient::with_base_url(url),
+    let ollama = match crate::config::with(|config| config.provider.base_url.clone()) {
+        Some(url) if !url.is_empty() => OllamaClient::with_base_url(url),
         _ => OllamaClient::new(),
     };
     LlmBackend::Ollama(ollama)
@@ -979,87 +1173,566 @@ pub fn estimate_conversation_tokens(messages: &[Message]) -> usize {
 /// budget-error path be exercised without depending on a particular
 /// model's real window size.
 pub fn context_window_for_model(model: &str) -> Option<usize> {
-    if let Ok(raw) = std::env::var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE") {
-        if let Ok(n) = raw.parse::<usize>() {
-            if n > 0 {
-                return Some(n);
-            }
-        }
+    if let Some(n) = crate::config::with(|config| config.generation.prompt_tokens_override) {
+        return Some(n);
     }
-    // Normalize: strip version tags for matching.
-    let model_lower = model.to_lowercase();
-
-    // Tag-specific overrides for families where Ollama ships different
-    // context windows per parameter size. Must run before the bare-name
-    // match below.
-    match model_lower.as_str() {
-        // Gemma 3: 270M and 1B variants ship with a 32K window; 4B/12B/27B
-        // are 128K. See https://ollama.com/library/gemma3.
-        "gemma3:270m" | "gemma3:1b" => return Some(32_768),
-        _ => {}
-    }
-
-    let without_tag = model_lower.split(':').next().unwrap_or(&model_lower);
-    // HuggingFace-style ids carry an `org/` repo prefix (e.g.
-    // "zai-org/glm-5.2") and provider prefixes like "ollama/llama3" do the
-    // same. Match on the final path segment so they map identically to the
-    // bare family names below.
-    let base = without_tag.rsplit('/').next().unwrap_or(without_tag);
-
-    match base {
-        // Ollama models
-        "llama3.3" | "llama3.2" | "llama3.1" | "llama3" => Some(128_000),
-        "llama2" => Some(4_096),
-        "mistral" | "mixtral" => Some(32_768),
-        "mistral-small3.2" | "mistral-small3.1" | "mistral-small" => Some(131_072),
-        "devstral" => Some(131_072),
-        "qwen2.5" | "qwen2" => Some(128_000),
-        // Qwen2.5-Coder shares the Qwen2.5 generation's 128K (YaRN-extended)
-        // window; map it alongside its instruct sibling.
-        "qwen2.5-coder" => Some(128_000),
-        // Qwen3 ships with a 32K native window; YaRN can extend it but
-        // we conservatively report the native value since the backend
-        // doesn't always enable YaRN by default.
-        "qwen3" => Some(32_768),
-        // Qwen3.5 ships a 256K native context window across the family
-        // (0.8B through the larger MoE variants). See
-        // https://ollama.com/library/qwen3.5.
-        "qwen3.5" => Some(256_000),
-        // Qwen3-Coder ships with a 256K native context (extensible to 1M).
-        "qwen3-coder" => Some(256_000),
-        "codellama" => Some(16_384),
-        "phi3" | "phi-3" => Some(128_000),
-        // Phi-4 (14B dense) ships with a 16K window per Microsoft's model
-        // card; only phi4-mini is 128K.
-        "phi4" | "phi-4" => Some(16_384),
-        "phi4-mini" => Some(128_000),
-        "gemma2" | "gemma" => Some(8_192),
-        "gemma3" => Some(128_000),
-        // Gemma 4 ships with a 256K context window across its variants.
-        // See https://ai.google.dev/gemma/docs/releases.
-        "gemma4" => Some(256_000),
-        "deepseek-coder" => Some(16_384),
-        "granite3.3" | "granite3.2" | "granite3.1" => Some(131_072),
-        "hermes3" => Some(131_072),
-        "command-r7b" | "command-r" => Some(131_072),
-        // GLM-5.2 (Z.ai / Zhipu, MIT-licensed) ships with a solid 1M-token
-        // context for long-horizon agentic work. See https://z.ai/blog/glm-5.2.
-        "glm-5.2" | "glm5.2" => Some(1_000_000),
-        // OpenAI models
-        "gpt-4o" | "gpt-4o-mini" => Some(128_000),
-        "gpt-4-turbo" | "gpt-4" => Some(128_000),
-        "gpt-3.5-turbo" => Some(16_384),
-        "o1" | "o1-mini" | "o1-preview" => Some(128_000),
-        // Claude (via OpenAI-compatible proxy)
-        "claude-3-opus" | "claude-3-sonnet" | "claude-3-haiku" => Some(200_000),
-        "claude-3.5-sonnet" | "claude-3.5-haiku" => Some(200_000),
-        _ => None,
-    }
+    crate::model_profile::lookup(model).and_then(|profile| profile.nominal_context_window)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn set(values: &[(&'static str, Option<&str>)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    // SAFETY: env-mutating tests are serialized by `ENV_LOCK`.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                    (*name, previous)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                // SAFETY: the guard is dropped while its test still holds `ENV_LOCK`.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn serve_chunked(
+        content_type: &str,
+        parts: Vec<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut header_end = None;
+            let mut content_length = 0;
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if header_end.is_none()
+                    && let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let end = index + 4;
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    header_end = Some(end);
+                }
+                if header_end.is_some_and(|end| request.len() >= end + content_length) {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n\
+                         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        content_type
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for part in parts {
+                socket
+                    .write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&part).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+
+            let body_start = header_end.unwrap();
+            String::from_utf8(request[body_start..body_start + content_length].to_vec()).unwrap()
+        });
+        (format!("http://{}/v1", address), handle)
+    }
+
+    fn advertised_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            tool_type: "function".to_string(),
+            function: crate::ollama::ToolFunction {
+                name: name.to_string(),
+                description: "test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_usage_preserves_cached_prompt_tokens_when_reported() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 13}
+            }
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, String::new());
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.prompt_tokens, 21);
+        assert_eq!(stats.completion_tokens, 8);
+        assert_eq!(stats.cached_prompt_tokens, Some(13));
+        assert_eq!(stats.last_prompt_tokens, Some(21));
+        assert_eq!(stats.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn openai_usage_leaves_cached_prompt_tokens_unknown_when_absent() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 8
+            }
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, String::new());
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.cached_prompt_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_rejects_premature_eof_without_terminal_event() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {"content": "partial"}, "finish_reason": null}]
+        });
+        let body = format!("data: {}\n\n", chunk).into_bytes();
+        let (base_url, server) = serve_chunked("text/event-stream", vec![body]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("premature EOF"));
+        assert!(error.to_string().contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_rejects_malformed_frame_after_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let tool_call = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/main.rs\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let terminal = serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        });
+        let body = format!(
+            "data: {}\n\ndata: {{malformed}}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            tool_call, terminal
+        )
+        .into_bytes();
+        let (base_url, server) = serve_chunked("text/event-stream", vec![body]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("malformed OpenAI stream data frame")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_stream_preserves_multibyte_utf8_split_across_writes() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {"content": "café"}, "finish_reason": "stop"}]
+        });
+        let bytes = format!("data: {}\n\ndata: [DONE]\n\n", chunk).into_bytes();
+        let split = bytes
+            .windows("é".len())
+            .position(|window| window == "é".as_bytes())
+            .unwrap()
+            + 1;
+        let parts = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+        let (base_url, server) = serve_chunked("text/event-stream", parts).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+        let mut streamed = String::new();
+
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |token| streamed.push_str(token))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(streamed, "café");
+        assert_eq!(message.content, "café");
+    }
+
+    #[tokio::test]
+    async fn openai_non_streaming_normalizes_advertised_bare_json_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let (message, _) = client
+            .chat_with_tools(
+                "test-model",
+                vec![],
+                Some(vec![advertised_tool("read_file")]),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(message.content, "");
+        let calls = message.tool_calls.expect("advertised tool call normalized");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments["path"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn openai_non_streaming_leaves_unadvertised_bare_json_as_text() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}}]
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let (message, _) = client
+            .chat_with_tools(
+                "test-model",
+                vec![],
+                Some(vec![advertised_tool("write_file")]),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(message.content, content);
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_stream_normalizes_advertised_bare_json_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+        });
+        let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk).into_bytes();
+        let (base_url, server) = serve_chunked("text/event-stream", vec![body]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let (message, _) = client
+            .chat_stream(
+                "test-model",
+                vec![],
+                Some(vec![advertised_tool("read_file")]),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(message.content, "");
+        assert_eq!(
+            message.tool_calls.expect("tool call normalized")[0]
+                .function
+                .name,
+            "read_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_preserves_malformed_tool_arguments_in_parse_error() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let malformed = r#"{"path":"src/main.rs""#;
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": malformed}
+                    }]
+                }
+            }]
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let error = client
+            .chat_with_tools(
+                "test-model",
+                vec![],
+                Some(vec![advertised_tool("read_file")]),
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("tool-call argument"));
+        assert!(error.to_string().contains(malformed));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_reports_length_finish_as_truncated() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {"content": "partial"}, "finish_reason": "length"}]
+        });
+        let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk).into_bytes();
+        let (base_url, server) = serve_chunked("text/event-stream", vec![body]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("truncated"));
+        assert!(error.to_string().contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn openai_request_includes_max_tokens_only_when_configured() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_MAX_TOKENS", Some("321")),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        assert_eq!(body["max_tokens"], 321);
+    }
+
+    #[tokio::test]
+    async fn openai_request_omits_max_tokens_when_unset() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_MAX_TOKENS", None),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+        client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_request_sampling_uses_env_then_profile_then_omits() {
+        let _lock = ENV_LOCK.lock().await;
+        let cases = [
+            (
+                "Ternary-Bonsai-27B",
+                Some(("0.2", "0.8", "7")),
+                Some((0.2, 0.8, 7)),
+            ),
+            ("Ternary-Bonsai-27B", None, Some((0.7, 0.95, 20))),
+            ("unknown-model", None, None),
+        ];
+
+        for (model, overrides, expected) in cases {
+            let values = match overrides {
+                Some((temperature, top_p, top_k)) => [
+                    ("CUBI_TEMPERATURE", Some(temperature)),
+                    ("CUBI_TOP_P", Some(top_p)),
+                    ("CUBI_TOP_K", Some(top_k)),
+                    ("CUBI_LLM_MAX_RETRIES", Some("0")),
+                ],
+                None => [
+                    ("CUBI_TEMPERATURE", None),
+                    ("CUBI_TOP_P", None),
+                    ("CUBI_TOP_K", None),
+                    ("CUBI_LLM_MAX_RETRIES", Some("0")),
+                ],
+            };
+            let _env = EnvGuard::set(&values);
+            let response = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            });
+            let (base_url, server) =
+                serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+            let client = OpenAiClient::new(base_url, "test-key".to_string());
+
+            client.chat_with_tools(model, vec![], None).await.unwrap();
+            let request = server.await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+            match expected {
+                Some((temperature, top_p, top_k)) => {
+                    assert_eq!(body["temperature"], temperature);
+                    assert_eq!(body["top_p"], top_p);
+                    assert_eq!(body["top_k"], top_k);
+                }
+                None => {
+                    assert!(body.get("temperature").is_none());
+                    assert!(body.get("top_p").is_none());
+                    assert!(body.get("top_k").is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_request_rejects_invalid_sampling_override() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_TEMPERATURE", None),
+            ("CUBI_TOP_P", Some("1.5")),
+            ("CUBI_TOP_K", None),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let client = OpenAiClient::new("http://127.0.0.1:1/v1".to_string(), "test-key".to_string());
+
+        let error = client
+            .chat_with_tools("unknown-model", vec![], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CUBI_TOP_P"));
+        assert!(error.to_string().contains("(0, 1]"));
+    }
+
+    #[tokio::test]
+    async fn loopback_openai_base_url_works_without_api_key() {
+        let _lock = ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let _env = EnvGuard::set(&[
+            ("OPENAI_BASE_URL", Some(&base_url)),
+            ("OPENAI_API_KEY", None),
+            ("CUBI_API_KEY", None),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let client = OpenAiClient::from_env().expect("loopback endpoint selects OpenAI provider");
+
+        let (message, _) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert_eq!(message.content, "ok");
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
 
     #[test]
     fn classify_retry_retries_5xx_until_max() {

@@ -9,6 +9,13 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 
+#[cfg(not(windows))]
+fn bench_command(output_dir: &std::path::Path) -> Command {
+    let mut command = Command::cargo_bin("cubi").unwrap();
+    command.arg("bench").arg("--output").arg(output_dir);
+    command
+}
+
 #[test]
 fn bench_help_prints_usage() {
     Command::cargo_bin("cubi")
@@ -41,6 +48,58 @@ fn bench_rejects_unknown_flag() {
         .stderr(contains("unexpected argument"));
 }
 
+#[cfg(not(windows))]
+#[test]
+fn bench_writes_artifacts_only_to_requested_output_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = dir.path().join("tasks/output-task");
+    std::fs::create_dir_all(task.join("repo")).unwrap();
+    std::fs::write(
+        task.join("task.toml"),
+        r#"id = "output-task"
+difficulty = "easy"
+description = "output directory fixture"
+prompt = "finish"
+time_cap_seconds = 10
+step_cap = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(task.join("verify.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    let output_dir = dir.path().join("custom results/nested");
+
+    bench_command(std::path::Path::new("custom results/nested"))
+        .current_dir(dir.path())
+        .args([
+            "--tasks-root",
+            "tasks",
+            "--task",
+            "output-task",
+            "--model",
+            "fake-model",
+            "--json",
+        ])
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .assert()
+        .success();
+
+    let summary_path = output_dir.join("summary.json");
+    assert!(summary_path.is_file(), "missing {}", summary_path.display());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(summary_path).unwrap()).unwrap();
+    assert_eq!(summary["per_task"][0]["status"], "pass");
+    let events = std::path::Path::new(summary["per_task"][0]["events_path"].as_str().unwrap());
+    assert_eq!(
+        events,
+        std::fs::canonicalize(&output_dir)
+            .unwrap()
+            .join("output-task.events.jsonl")
+    );
+    assert!(!std::fs::read(events).unwrap().is_empty());
+    assert!(!dir.path().join("bench/results").exists());
+}
+
 /// End-to-end scoring run driven by the `Fake` backend, so it needs no local
 /// model — only `cargo` (already required to build Cubi) for `verify.sh`.
 ///
@@ -66,16 +125,11 @@ fn bench_rejects_unknown_flag() {
 #[cfg(not(windows))]
 #[test]
 fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
-    Command::cargo_bin("cubi")
-        .unwrap()
-        .args([
-            "bench",
-            "--task",
-            "rust-typo-fix",
-            "--model",
-            "fake-model",
-            "--json",
-        ])
+    let leaked_cubi_home = tempfile::tempdir().unwrap();
+    let results = tempfile::tempdir().unwrap();
+    bench_command(results.path())
+        .args(["--task", "rust-typo-fix", "--model", "fake-model", "--json"])
+        .env("CUBI_HOME", leaked_cubi_home.path())
         .env("CUBI_FAKE_LLM", "1")
         .env(
             "CUBI_FAKE_LLM_TOOL_CALL",
@@ -86,6 +140,95 @@ fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
         .success()
         .stdout(contains("\"status\": \"pass\""))
         .stdout(contains("\"score_pct\": 100.0"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bench_reports_verifier_timeout_as_infrastructure_error() {
+    let tasks = tempfile::tempdir().unwrap();
+    let results = tempfile::tempdir().unwrap();
+    let task = tasks.path().join("timeout-task");
+    std::fs::create_dir_all(task.join("repo")).unwrap();
+    std::fs::write(
+        task.join("task.toml"),
+        r#"id = "timeout-task"
+difficulty = "easy"
+description = "timeout fixture"
+prompt = "finish"
+time_cap_seconds = 10
+step_cap = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(task.join("verify.sh"), "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+
+    bench_command(results.path())
+        .args(["--task", "timeout-task", "--tasks-root"])
+        .arg(tasks.path())
+        .args(["--model", "fake-model", "--json"])
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env("CUBI_BENCH_VERIFY_TIMEOUT_SECS", "1")
+        .assert()
+        .code(2)
+        .stdout(contains("\"status\": \"error\""))
+        .stdout(contains("verifier timed out"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bench_bounds_captured_verifier_diagnostics() {
+    let tasks = tempfile::tempdir().unwrap();
+    let results = tempfile::tempdir().unwrap();
+    let task = tasks.path().join("diagnostic-task");
+    std::fs::create_dir_all(task.join("repo")).unwrap();
+    std::fs::write(
+        task.join("task.toml"),
+        r#"id = "diagnostic-task"
+difficulty = "easy"
+description = "diagnostic fixture"
+prompt = "finish"
+time_cap_seconds = 10
+step_cap = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        task.join("verify.sh"),
+        "#!/bin/sh\n\
+         awk 'BEGIN { for (i = 0; i < 5000; i++) printf \"o\"; print \"OUT_END\" }'\n\
+         awk 'BEGIN { for (i = 0; i < 5000; i++) printf \"e\"; print \"ERR_END\" }' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+
+    let output = bench_command(results.path())
+        .args(["--task", "diagnostic-task", "--tasks-root"])
+        .arg(tasks.path())
+        .args(["--model", "fake-model", "--json"])
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let result = &summary["per_task"][0];
+    let stdout = result["verifier_stdout_tail"].as_str().unwrap();
+    let stderr = result["verifier_stderr_tail"].as_str().unwrap();
+    assert!(
+        stdout.len() <= 4096,
+        "stdout tail was {} bytes",
+        stdout.len()
+    );
+    assert!(
+        stderr.len() <= 4096,
+        "stderr tail was {} bytes",
+        stderr.len()
+    );
+    assert!(stdout.ends_with("OUT_END\n"));
+    assert!(stderr.ends_with("ERR_END\n"));
 }
 
 /// Negative control for the test above: an agent that only *reads* the file
@@ -99,16 +242,9 @@ fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
 #[cfg(not(windows))]
 #[test]
 fn bench_scores_a_fail_when_the_agent_does_not_fix_the_task() {
-    Command::cargo_bin("cubi")
-        .unwrap()
-        .args([
-            "bench",
-            "--task",
-            "rust-typo-fix",
-            "--model",
-            "fake-model",
-            "--json",
-        ])
+    let results = tempfile::tempdir().unwrap();
+    bench_command(results.path())
+        .args(["--task", "rust-typo-fix", "--model", "fake-model", "--json"])
         .env("CUBI_FAKE_LLM", "1")
         .env(
             "CUBI_FAKE_LLM_TOOL_CALL",

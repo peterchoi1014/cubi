@@ -9,7 +9,9 @@ mod commands;
 mod compat;
 mod completer;
 mod completions;
+mod config;
 mod consensus;
+mod context_budget;
 mod doctor;
 mod event_sink;
 mod executor;
@@ -29,6 +31,7 @@ mod mcp_manager;
 mod mcp_registry;
 mod memdir;
 mod migrations;
+mod model_profile;
 mod oauth;
 mod ollama;
 mod onboarding;
@@ -52,6 +55,8 @@ mod spinner;
 mod style;
 mod swebench;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 mod themes;
 mod thinking_filter;
 mod tips;
@@ -91,9 +96,23 @@ use std::sync::{Arc, Mutex};
 // The qwen3.5:4b fallback is still advertised below for smaller machines.
 const DEFAULT_MODEL: &str = "qwen3.5:9b";
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing();
+struct StartupModelCheck {
+    models: Vec<String>,
+    found: bool,
+}
+
+async fn validate_startup_model(executor: &AIExecutor, model: &str) -> Result<StartupModelCheck> {
+    let models = executor.list_models().await?;
+    let found = (executor.provider_name() == "openai" && models.is_empty())
+        || models.iter().any(|available| available.starts_with(model));
+    Ok(StartupModelCheck { models, found })
+}
+
+fn main() -> Result<()> {
+    let environment = config::Environment::capture();
+    init_tracing(environment.value("CUBI_LOG"));
+    let mut model_override = None;
+    let mut debug = false;
 
     // Lightweight argv handling. We don't pull in clap because the chat
     // loop has no flags of its own; this just makes `cubi --version`,
@@ -485,7 +504,7 @@ async fn main() -> Result<()> {
             }
             "--no-banner" => cli_flags.no_banner = true,
             "--debug" => {
-                user_error::set_debug_flag(true);
+                debug = true;
             }
             "--trace-tools" => {
                 i += 1;
@@ -663,11 +682,10 @@ async fn main() -> Result<()> {
                         std::process::exit(2);
                     }
                 };
-                // Apply frontmatter overrides: model via env so
-                // resolve_model picks it up; system via cli_flags.
+                // Frontmatter is a CLI-level override, above environment and
+                // persisted configuration, without changing the process env.
                 if let Some(model) = &script.model {
-                    // SAFETY: argv parsing is single-threaded.
-                    unsafe { std::env::set_var("CUBI_MODEL", model) };
+                    model_override = Some(model.clone());
                 }
                 if let Some(sys) = &script.system {
                     cli_flags.system_prompt = Some(sys.clone());
@@ -1056,53 +1074,44 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
-    if std::env::var("CUBI_NO_BANNER")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        cli_flags.no_banner = true;
+    let chat_session = matches!(
+        primary,
+        PrimaryCommand::Interactive | PrimaryCommand::Resume(_)
+    );
+    if chat_session {
+        compat::migrate_config_dir(environment.home_dir().as_deref());
     }
-    if !cli_flags.quiet
-        && std::env::var("CUBI_QUIET")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.quiet = true;
-        cli_flags.no_banner = true;
-    }
-    if !cli_flags.tui
-        && std::env::var("CUBI_TUI")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.tui = true;
-    }
-    if !cli_flags.classic
-        && std::env::var("CUBI_CLASSIC")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.classic = true;
-    }
-    if cli_flags.quiet {
-        // Suppress the global "thinking…" / tool-call spinner via the
-        // existing env knob so we don't have to thread a flag through
-        // every spinner call site.
-        // SAFETY: this runs during early argv processing in `main`,
-        // before any task is spawned that reads CUBI_NO_SPINNER or
-        // otherwise concurrently touches the process environment.
-        // Tokio's runtime worker threads exist by this point (since
-        // we're inside `#[tokio::main]`), but they're idle until we
-        // hand them work below, so there are no concurrent env
-        // readers racing with this set_var.
-        unsafe { std::env::set_var("CUBI_NO_SPINNER", "1") };
-    }
-    if std::env::var("CUBI_EXPLAIN_TOOLS")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        cli_flags.explain_tools = true;
-    }
+    let mut config = AppConfig::load_from_home(environment.home_dir().as_deref());
+    let runtime_config = config::install(config::RuntimeConfig::resolve(
+        &environment,
+        config.clone(),
+        &config::StartupOverrides {
+            model: model_override,
+            trace_tools: trace_tools_path.clone(),
+            events: events_path.clone(),
+            receipts: receipts_path,
+            quiet: cli_flags.quiet,
+            no_banner: cli_flags.no_banner,
+            tui: cli_flags.tui,
+            classic: cli_flags.classic,
+            explain_tools: cli_flags.explain_tools,
+            debug,
+            chat_session,
+        },
+    ))?;
+    runtime_config.read(|config| {
+        cli_flags.quiet = config.ui.quiet;
+        cli_flags.no_banner = config.ui.no_banner;
+        cli_flags.tui = config.ui.tui;
+        cli_flags.classic = config.ui.classic;
+        cli_flags.explain_tools = config.ui.explain_tools;
+    });
+
+    // Configuration is fully resolved before any runtime worker can read it.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
 
     if doctor_fix && !matches!(primary, PrimaryCommand::Doctor) {
         eprintln!("cubi: --fix is only valid with the `doctor` subcommand.");
@@ -1332,18 +1341,9 @@ async fn main() -> Result<()> {
     // needed here — headless / one-shot / JSON already route away from the TUI.
     let use_tui = !cli_flags.classic && !headless && !cli_flags.json;
 
-    // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
-    // to their new CUBI_* names and rename ~/.ai-chat-cli/ → ~/.cubi/
-    // exactly once. Both no-op if there's nothing to migrate.
-    compat::promote_legacy_env();
-    compat::migrate_config_dir();
-
     // Initialize permissions early — the onboarding wizard may want to
     // mutate it when the user trusts the cwd.
     let permissions = Arc::new(Mutex::new(Permissions::load()));
-
-    // Persistent user config (model preference, onboarding flag, ...).
-    let mut config = AppConfig::load();
 
     // Apply forward-only config migrations and persist if anything
     // changed (e.g. first time this binary saw the file).
@@ -1360,26 +1360,6 @@ async fn main() -> Result<()> {
     // Initialise telemetry early so onboarding events can be recorded.
     telemetry::init(config.telemetry);
 
-    // Apply persisted UI prefs from config (theme/output-style/color/vim)
-    // into the env-var slots that the rest of the CLI already reads.
-    if let Some(t) = &config.theme {
-        // SAFETY: single-threaded during startup.
-        unsafe { std::env::set_var("CUBI_THEME", t) };
-    }
-    if let Some(s) = &config.output_style {
-        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", s) };
-    }
-    if let Some(c) = &config.color {
-        unsafe { std::env::set_var("CUBI_COLOR", c) };
-        match c.as_str() {
-            "off" => colored::control::set_override(false),
-            "on" => colored::control::set_override(true),
-            _ => {}
-        }
-    }
-    if let Some(v) = &config.vim_mode {
-        unsafe { std::env::set_var("CUBI_VIM_MODE", v) };
-    }
     style::init_color_control();
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
@@ -1395,9 +1375,9 @@ async fn main() -> Result<()> {
 
     // Resolve the model from env > config > baked-in fallback. This
     // removes the previous hard-coded lock-in.
-    let model_owned = onboarding::resolve_model(&config, DEFAULT_MODEL);
+    runtime_config.update(|runtime| runtime.apply_onboarding(config.clone()));
+    let model_owned = runtime_config.read(|runtime| runtime.model.clone());
     let model: &str = &model_owned;
-    let cpu_workers = 6;
 
     // Seed the TUI transcript with the normal startup output that the
     // alternate screen would otherwise wipe. Fires whenever the TUI will
@@ -1417,7 +1397,7 @@ async fn main() -> Result<()> {
     let plan_mode = Arc::new(AtomicBool::new(false));
 
     // Create executor before provider-specific startup checks.
-    let executor = AIExecutor::new(model.to_string(), cpu_workers)
+    let executor = AIExecutor::new(model.to_string())
         .await
         .context("Failed to create AI executor")?;
 
@@ -1427,10 +1407,11 @@ async fn main() -> Result<()> {
             format!("{} Using fake test provider", "✓".bright_green()),
         );
     } else if executor.provider_name() == "openai" {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let base_url = runtime_config.read(|config| {
+            config.provider.openai_base_url.clone()
+                .or_else(|| config.provider.base_url.clone())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+        });
         status_line(
             headless,
             format!(
@@ -1448,8 +1429,8 @@ async fn main() -> Result<()> {
             ),
         );
     } else {
-        match ollama_client.list_models().await {
-            Ok(models) => {
+        match validate_startup_model(&executor, model).await {
+            Ok(check) => {
                 status_line(
                     headless,
                     format!(
@@ -1459,12 +1440,12 @@ async fn main() -> Result<()> {
                     ),
                 );
 
-                if !models.iter().any(|m| m.starts_with(model)) {
+                if !check.found {
                     eprintln!(
                         "{} Model '{}' not found. Available models: {:?}",
                         "Warning:".bright_yellow(),
                         model,
-                        models
+                        check.models
                     );
                     eprintln!(
                         "\nInstall the model with: {}",
@@ -1654,14 +1635,9 @@ async fn main() -> Result<()> {
     // tamper-evident JSONL audit log. Side-channel: failures degrade
     // to a warning so a misconfigured path can't kill an otherwise
     // healthy session.
-    let receipts_target = receipts_path
-        .clone()
-        .or_else(|| {
-            std::env::var("CUBI_RECEIPTS")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
-        .or_else(|| config.receipts.clone().filter(|v| !v.is_empty()));
+    let receipts_target = runtime_config.read(|config| {
+        config.paths.receipts.as_ref().map(|path| path.to_string_lossy().into_owned())
+    });
     if let Some(target) = receipts_target {
         let signing_key = match receipts::load_default_signing_key() {
             Ok(k) => k,
@@ -1754,6 +1730,7 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+        })
 }
 
 #[derive(Debug)]
@@ -1872,6 +1849,7 @@ fn kind_for_legacy_exit(code: ExitCode) -> user_error::ErrorKind {
         ExitCode::Tool => user_error::ErrorKind::Tool,
         ExitCode::Budget => user_error::ErrorKind::Budget,
         ExitCode::Network => user_error::ErrorKind::ConnectRefused,
+        ExitCode::Incomplete => user_error::ErrorKind::Other,
         ExitCode::Cancelled => user_error::ErrorKind::Cancelled,
     }
 }
@@ -1984,7 +1962,7 @@ async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
             return 2;
         }
     }
-    let mut cmd = std::process::Command::new(&handler);
+    let mut cmd = crate::config::command(&handler);
     for a in args {
         cmd.arg(a);
     }
@@ -2353,7 +2331,7 @@ fn print_help() {
                                         TUI (interactive sessions only). Also\n  \
                                         honors CUBI_CLASSIC=1. (--tui / CUBI_TUI\n  \
                                         are now the default and a no-op.)\n\n\
-         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 14 incomplete · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n  \
@@ -2365,7 +2343,7 @@ fn print_help() {
 }
 
 fn print_config() -> Result<()> {
-    let config = AppConfig::load();
+    let config = config::with(|config| config.app.clone());
     let mut value = serde_json::to_value(&config)?;
     redact_secrets(&mut value);
     if let Some(obj) = value.as_object_mut() {
@@ -2537,14 +2515,14 @@ fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
 /// (e.g. `CUBI_LOG=cubi=debug`). When unset, no subscriber is installed
 /// so the binary stays quiet by default. Output is always stderr —
 /// never stdout — to avoid polluting machine-readable JSON output.
-fn init_tracing() {
-    let Ok(filter) = std::env::var("CUBI_LOG") else {
+fn init_tracing(filter: Option<&str>) {
+    let Some(filter) = filter else {
         return;
     };
     if filter.is_empty() {
         return;
     }
-    let env_filter = match tracing_subscriber::EnvFilter::try_new(&filter) {
+    let env_filter = match tracing_subscriber::EnvFilter::try_new(filter) {
         Ok(f) => f,
         Err(err) => {
             eprintln!("cubi: ignoring invalid CUBI_LOG={filter:?}: {err}");
@@ -2714,5 +2692,53 @@ mod redact_tests {
         assert_eq!(v["user_password"], "<redacted>");
         assert_eq!(v["nested"]["inner_key"], "<redacted>");
         assert_eq!(v["nested"]["ok"], "fine");
+    }
+}
+
+#[cfg(test)]
+mod startup_model_tests {
+    use super::validate_startup_model;
+    use crate::executor::AIExecutor;
+    use crate::llm::LlmBackend;
+    use crate::ollama::OllamaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn startup_model_check_uses_configured_executor_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8(request[..count].to_vec()).unwrap();
+            let body = r#"{"models":[{"name":"fixture-model:latest"}]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let backend =
+            LlmBackend::Ollama(OllamaClient::with_base_url(format!("http://{}", address)));
+        let executor = AIExecutor::with_backend(backend, "fixture-model".to_string());
+
+        let check = validate_startup_model(&executor, "fixture-model")
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(check.found);
+        assert_eq!(check.models, vec!["fixture-model:latest"]);
+        assert!(request.starts_with("GET /api/tags HTTP/1.1"));
     }
 }

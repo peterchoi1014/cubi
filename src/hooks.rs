@@ -59,7 +59,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+
+const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const HOOK_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hook lifecycle event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,22 +133,30 @@ pub struct HooksConfig {
 #[derive(Debug, Clone)]
 pub struct HookRegistry {
     hooks: Vec<HookDef>,
+    skipped_untrusted_project: bool,
 }
 
 impl HookRegistry {
     /// Loads hooks from project-local and global config files.
     /// Project-local hooks are prepended (run first).
-    pub fn load() -> Self {
+    pub fn load(permissions: &crate::permissions::Permissions) -> Self {
         let mut hooks = Vec::new();
 
         // Project-local: .cubi/hooks.json in cwd
         // If a local config exists, it overrides the global config entirely.
         let mut found_local = false;
+        let mut skipped_untrusted_project = false;
         if let Ok(cwd) = std::env::current_dir() {
             let local_path = cwd.join(".cubi").join("hooks.json");
-            if let Some(cfg) = Self::load_file(&local_path) {
-                hooks.extend(cfg.hooks);
-                found_local = true;
+            if local_path.exists() {
+                if permissions.contains(&cwd) {
+                    if let Some(cfg) = Self::load_file(&local_path) {
+                        hooks.extend(cfg.hooks);
+                        found_local = true;
+                    }
+                } else {
+                    skipped_untrusted_project = true;
+                }
             }
         }
 
@@ -157,19 +169,32 @@ impl HookRegistry {
             }
         }
 
-        Self { hooks }
+        Self {
+            hooks,
+            skipped_untrusted_project,
+        }
     }
 
     /// Creates a registry with specific hooks (for testing).
     #[cfg(test)]
     pub fn with_hooks(hooks: Vec<HookDef>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            skipped_untrusted_project: false,
+        }
     }
 
     /// Creates an empty registry.
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            hooks: Vec::new(),
+            skipped_untrusted_project: false,
+        }
+    }
+
+    pub fn skipped_untrusted_project(&self) -> bool {
+        self.skipped_untrusted_project
     }
 
     /// Returns `true` if any hooks are registered.
@@ -192,7 +217,11 @@ impl HookRegistry {
     /// Fires PreToolUse hooks for the given tool. Returns `Allow` if all
     /// hooks pass (exit 0) or no hooks match. Returns `Deny` if any hook
     /// exits with code 1.
-    pub fn fire_pre_tool_use(&self, tool_name: &str, args: &serde_json::Value) -> HookDecision {
+    pub async fn fire_pre_tool_use(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> HookDecision {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -208,7 +237,7 @@ impl HookRegistry {
                 serde_json::to_string(args).unwrap_or_default(),
             );
 
-            match Self::run_hook_command(&hook.command, &env) {
+            match Self::run_hook_command(&hook.command, &env).await {
                 Ok(1) => {
                     return HookDecision::Deny(format!(
                         "PreToolUse hook denied `{}`: {}",
@@ -226,7 +255,7 @@ impl HookRegistry {
     }
 
     /// Fires PostToolUse hooks for the given tool.
-    pub fn fire_post_tool_use(&self, tool_name: &str, result: &str, is_error: bool) {
+    pub async fn fire_post_tool_use(&self, tool_name: &str, result: &str, is_error: bool) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -240,14 +269,14 @@ impl HookRegistry {
             env.insert("HOOK_TOOL_RESULT".to_string(), result.to_string());
             env.insert("HOOK_TOOL_ERROR".to_string(), is_error.to_string());
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!("Warning: PostToolUse hook failed: {} ({})", hook.command, e);
             }
         }
     }
 
     /// Fires SessionStart hooks.
-    pub fn fire_session_start(&self, model: &str) {
+    pub async fn fire_session_start(&self, model: &str) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -262,7 +291,7 @@ impl HookRegistry {
                 env.insert("HOOK_CWD".to_string(), cwd.display().to_string());
             }
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!(
                     "Warning: SessionStart hook failed: {} ({})",
                     hook.command, e
@@ -272,7 +301,7 @@ impl HookRegistry {
     }
 
     /// Fires Stop hooks.
-    pub fn fire_stop(&self) {
+    pub async fn fire_stop(&self) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -283,7 +312,7 @@ impl HookRegistry {
             let mut env = HashMap::new();
             env.insert("HOOK_EVENT".to_string(), "Stop".to_string());
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!("Warning: Stop hook failed: {} ({})", hook.command, e);
             }
         }
@@ -315,14 +344,89 @@ impl HookRegistry {
 
     /// Executes a hook command with the given environment variables.
     /// Returns the exit code.
-    fn run_hook_command(command: &str, env: &HashMap<String, String>) -> Result<i32> {
-        let output = Command::new("sh")
+    async fn run_hook_command(command: &str, env: &HashMap<String, String>) -> Result<i32> {
+        Self::run_hook_command_with_timeout(command, env, HOOK_TIMEOUT).await
+    }
+
+    async fn run_hook_command_with_timeout(
+        command: &str,
+        env: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<i32> {
+        let mut child_command = crate::config::async_command("sh");
+        child_command
             .arg("-c")
             .arg(command)
             .envs(env)
-            .output()?;
-        Ok(output.status.code().unwrap_or(2))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            child_command.as_std_mut().process_group(0);
+        }
+        let mut child = child_command.spawn()?;
+        let pid = child
+            .id()
+            .context("hook process exited before its PID was available")?;
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => Ok(status?.code().unwrap_or(2)),
+            Err(_) => {
+                if let Err(error) = terminate_hook_process_tree(&mut child, pid).await {
+                    return Err(anyhow::anyhow!(
+                        "hook timed out after {} ms; process-tree cleanup failed: {}",
+                        timeout.as_millis(),
+                        error
+                    ));
+                }
+                Err(anyhow::anyhow!(
+                    "hook timed out after {} ms",
+                    timeout.as_millis()
+                ))
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+async fn terminate_hook_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let process_group = i32::try_from(pid).context("hook PID does not fit a Unix process ID")?;
+    // SAFETY: `kill` receives the negated PID of the child configured above as a process-group
+    // leader. SIGKILL does not dereference Rust memory, and ESRCH is handled as an exit race.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("failed to kill hook process group");
+        }
+    }
+    tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .context("timed out waiting for killed hook process group")??;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_hook_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let mut taskkill = crate::config::async_command("taskkill");
+    taskkill
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, taskkill.status())
+        .await
+        .context("timed out running taskkill for hook process tree")??;
+    if !status.success() {
+        anyhow::bail!("taskkill failed with status {}", status);
+    }
+    tokio::time::timeout(HOOK_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .context("timed out waiting for killed hook process tree")??;
+    Ok(())
 }
 
 /// Writes the global hooks config at `~/.cubi/hooks.json`.
@@ -427,76 +531,78 @@ mod tests {
         assert!(HookRegistry::matches_tool(&hook, "anything"));
     }
 
-    #[test]
-    fn fire_pre_tool_use_allows_when_no_hooks() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_allows_when_no_hooks() {
         let reg = HookRegistry::empty();
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_pre_tool_use_allows_on_exit_0() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_allows_on_exit_0() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: None,
             command: "true".to_string(), // exit 0
         }]);
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_pre_tool_use_denies_on_exit_1() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_denies_on_exit_1() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: None,
             command: "exit 1".to_string(),
         }]);
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert!(matches!(decision, HookDecision::Deny(_)));
     }
 
-    #[test]
-    fn fire_pre_tool_use_skips_non_matching_tools() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_skips_non_matching_tools() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: Some("bash".to_string()),
             command: "exit 1".to_string(),
         }]);
         // Should allow because the hook only matches "bash", not "write_file"
-        let decision = reg.fire_pre_tool_use("write_file", &serde_json::json!({}));
+        let decision = reg
+            .fire_pre_tool_use("write_file", &serde_json::json!({}))
+            .await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_session_start_runs_without_error() {
+    #[tokio::test]
+    async fn fire_session_start_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::SessionStart,
             match_tool: None,
             command: "true".to_string(),
         }]);
         // Should not panic.
-        reg.fire_session_start("llama3.2:1b");
+        reg.fire_session_start("llama3.2:1b").await;
     }
 
-    #[test]
-    fn fire_stop_runs_without_error() {
+    #[tokio::test]
+    async fn fire_stop_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::Stop,
             match_tool: None,
             command: "true".to_string(),
         }]);
-        reg.fire_stop();
+        reg.fire_stop().await;
     }
 
-    #[test]
-    fn fire_post_tool_use_runs_without_error() {
+    #[tokio::test]
+    async fn fire_post_tool_use_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PostToolUse,
             match_tool: None,
             command: "true".to_string(),
         }]);
-        reg.fire_post_tool_use("bash", "output", false);
+        reg.fire_post_tool_use("bash", "output", false).await;
     }
 
     #[test]
@@ -535,5 +641,134 @@ mod tests {
         assert_eq!(HookEvent::PostToolUse.as_str(), "PostToolUse");
         assert_eq!(HookEvent::SessionStart.as_str(), "SessionStart");
         assert_eq!(HookEvent::Stop.as_str(), "Stop");
+    }
+
+    #[test]
+    fn stalled_hook_is_terminated_at_timeout() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "hooks::tests::stalled_hook_process_tree_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CUBI_STALLED_HOOK_HELPER", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_outer_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = status_tx.send(child.wait());
+        });
+
+        match status_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(status) => assert!(status.unwrap().success()),
+            Err(error) => {
+                terminate_outer_process_tree(child_pid);
+                let _ = status_rx.recv_timeout(Duration::from_secs(5));
+                panic!("stalled hook test process exceeded outer deadline: {error}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn stalled_hook_process_tree_helper() {
+        if std::env::var_os("CUBI_STALLED_HOOK_HELPER").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let pid_path = pid_file.to_string_lossy().replace('\\', "/");
+        let mut env = HashMap::new();
+        env.insert("HOOK_PID_FILE".to_string(), pid_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(HookRegistry::run_hook_command_with_timeout(
+            r#"sh -c 'echo $$ > "$HOOK_PID_FILE"; while :; do :; done' & while [ ! -s "$HOOK_PID_FILE" ]; do :; done; while :; do :; done"#,
+            &env,
+            Duration::from_secs(2),
+        ));
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let grandchild_pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_process_is_gone(grandchild_pid);
+    }
+
+    #[cfg(unix)]
+    fn configure_outer_process_group(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    fn configure_outer_process_group(_command: &mut std::process::Command) {}
+
+    #[cfg(unix)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let pid = i32::try_from(pid).unwrap();
+        // SAFETY: `kill` is called with a negated, live child PID that was configured as the
+        // process-group leader; SIGKILL does not dereference Rust memory.
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        assert_eq!(result, 0, "failed to kill outer test process group");
+    }
+
+    #[cfg(windows)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to kill outer test process tree");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_is_gone(pid: u32) {
+        // The killed grandchild is reparented to init and can remain a zombie
+        // until init reaps it, which `kill(pid, 0)` still reports as alive. A
+        // zombie has already terminated, so accept "not listed" or state Z.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "grandchild process {} is still running (ps stat {:?})",
+            pid,
+            stat
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_process_is_gone(pid: u32) {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains(&format!("\"{pid}\"")),
+            "grandchild process {pid} is still alive: {stdout}"
+        );
     }
 }

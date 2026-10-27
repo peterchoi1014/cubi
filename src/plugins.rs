@@ -128,10 +128,8 @@ impl PluginManifest {
 }
 
 pub fn plugins_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CUBI_PLUGINS_DIR") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Some(path) = crate::config::with(|config| config.paths.plugins_dir.clone()) {
+        return Some(path);
     }
     crate::sessions::cubi_dir().map(|d| d.join("plugins"))
 }

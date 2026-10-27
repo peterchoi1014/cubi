@@ -44,10 +44,8 @@ impl OAuthToken {
 
 impl OAuthStore {
     pub fn storage_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("CUBI_OAUTH_FILE") {
-            if !p.trim().is_empty() {
-                return Some(PathBuf::from(p));
-            }
+        if let Some(path) = crate::config::with(|config| config.paths.oauth_file.clone()) {
+            return Some(path);
         }
         Some(crate::sessions::cubi_dir()?.join("oauth.json"))
     }

@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -418,7 +420,7 @@ fn ensure_worktree_parent_under_git_common_dir(
 }
 
 fn run_git(repo_dir: &Path, args: &[&OsStr]) -> Result<Output> {
-    Command::new("git")
+    crate::config::command("git")
         .current_dir(repo_dir)
         .args(args)
         .output()

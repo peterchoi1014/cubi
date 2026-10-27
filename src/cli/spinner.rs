@@ -34,12 +34,11 @@ pub fn format_frame(idx: usize, name: &str, elapsed: Duration) -> String {
 }
 
 /// Returns true when a spinner should be suppressed because the
-/// environment doesn't want decorative output. Pure: reads env once per
-/// call so unit tests can `std::env::set_var` in a serialised section.
+/// resolved configuration doesn't want decorative output.
 fn env_suppresses_spinner() -> bool {
-    std::env::var("NO_COLOR").is_ok()
-        || std::env::var("CUBI_NO_COLOR").is_ok()
-        || std::env::var("CUBI_NO_SPINNER").is_ok()
+    crate::config::with(|config| {
+        config.ui.no_color || config.ui.cubi_no_color || config.ui.no_spinner
+    })
 }
 
 /// Handle to a running tool spinner. Drop or call [`ToolSpinner::finish`]

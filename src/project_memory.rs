@@ -99,13 +99,10 @@ Keep it short and focused on things the assistant should always know.\n\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // `read_memory` / `write_starter_if_absent` operate on the process's
-    // current working directory, which is global mutable state. Serialize
-    // any test that touches the FS via this mutex so parallel test threads
-    // don't race each other.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    // current working directory, which is global mutable state shared with
+    // other modules' tests, so they take the crate-wide cwd lock.
 
     #[test]
     fn starter_template_has_expected_sections() {
@@ -117,7 +114,7 @@ mod tests {
     #[test]
     fn write_starter_then_read_roundtrip() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::compat::test_env::cwd_guard();
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -152,7 +149,7 @@ mod tests {
     #[test]
     fn read_memory_returns_none_when_absent() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::compat::test_env::cwd_guard();
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

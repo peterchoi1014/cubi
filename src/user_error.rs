@@ -152,15 +152,14 @@ impl UserError {
     }
 }
 
-/// Returns true when the user has opted into debug output. Reads
-/// process env at call time; tests should use [`debug_mode_with`]
-/// to avoid touching the global environment.
+/// Returns true when the user has opted into debug output through the
+/// resolved startup configuration or the explicit debug switch.
 pub fn debug_mode() -> bool {
-    debug_mode_with(|k| std::env::var(k).ok(), DEBUG_FLAG.load_relaxed())
+    DEBUG_FLAG.load_relaxed() || crate::config::with(|config| config.debug)
 }
 
-/// Pure helper for [`debug_mode`]. Visible for unit tests so we can
-/// vary the environment and CLI flag independently of the process.
+/// Resolves the debug setting from captured startup input. Tests can vary
+/// the environment and CLI flag independently of the process.
 pub fn debug_mode_with<F>(env: F, debug_flag: bool) -> bool
 where
     F: Fn(&str) -> Option<String>,

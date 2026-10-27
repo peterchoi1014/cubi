@@ -137,6 +137,8 @@ pub struct InstanceResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass_to_pass_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stderr_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -433,7 +435,7 @@ pub async fn run(args: SweBenchArgs) -> Result<i32> {
     let model = args
         .model
         .clone()
-        .or_else(|| std::env::var("CUBI_MODEL").ok())
+        .or_else(|| crate::config::with(|config| config.model_override.clone()))
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
 
     let output_dir = args.output.clone().unwrap_or_else(default_output_dir);
@@ -593,7 +595,7 @@ async fn prepare_repo(inst: &Instance, repos_root: Option<&Path>, dest: &Path) -
 
 /// Run `git` in `dir`, returning an error if it exits non-zero.
 async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
-    let out = tokio::process::Command::new("git")
+    let out = crate::config::async_command("git")
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -617,7 +619,7 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
 async fn capture_diff(dir: &Path) -> Result<String> {
     // Stage everything so new files show up, then emit a diff against HEAD.
     run_git(dir, &["add", "-A"]).await?;
-    let out = tokio::process::Command::new("git")
+    let out = crate::config::async_command("git")
         .args(["diff", "--cached", "--no-color"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -660,6 +662,7 @@ async fn run_one_instance(
         fail_to_pass_total: None,
         pass_to_pass_passed: None,
         pass_to_pass_total: None,
+        agent_stderr_tail: None,
         error: Some(msg),
     };
 
@@ -723,7 +726,18 @@ async fn run_one_instance(
         );
     }
 
-    let mut cmd = tokio::process::Command::new(cubi_bin);
+    if let Err(e) = crate::config::with(|config| config.write_child_config(home_dir.path(), model))
+    {
+        return (
+            empty_pred(String::new()),
+            err_result(
+                format!("seed config: {e:#}"),
+                start.elapsed().as_secs_f64(),
+                None,
+            ),
+        );
+    }
+    let mut cmd = crate::config::async_command(cubi_bin);
     cmd.arg("-p")
         .arg(&prompt)
         .arg("--json")
@@ -733,37 +747,39 @@ async fn run_one_instance(
         .arg("--events")
         .arg(&events_path)
         .env("CUBI_MODEL", model)
-        .env("HOME", home_dir.path())
-        .env("USERPROFILE", home_dir.path())
         .env("CUBI_NO_BANNER", "1")
         .env("CUBI_NO_ONBOARD", "1")
         .current_dir(&repo_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::bench::configure_isolated_child_env(&mut cmd, home_dir.path());
 
-    let cubi_exit_code: Option<i32> = match cmd.spawn() {
-        Ok(mut child) => {
+    let agent_output = match cmd.spawn() {
+        Ok(child) => {
             let timeout = Duration::from_secs(args.time_cap_seconds);
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(exit)) => exit.code(),
-                Ok(Err(e)) => {
-                    let _ = child.kill().await;
+            match crate::bench::capture_child(child, timeout).await {
+                Ok(output) if !output.timed_out => output,
+                Ok(output) => {
+                    return (
+                        empty_pred(String::new()),
+                        InstanceResult {
+                            agent_stderr_tail: (!output.stderr_tail.is_empty())
+                                .then_some(output.stderr_tail),
+                            ..err_result(
+                                format!("exceeded time cap {}s", args.time_cap_seconds),
+                                start.elapsed().as_secs_f64(),
+                                None,
+                            )
+                        },
+                    );
+                }
+                Err(e) => {
                     return (
                         empty_pred(String::new()),
                         err_result(
                             format!("cubi wait error: {e}"),
-                            start.elapsed().as_secs_f64(),
-                            None,
-                        ),
-                    );
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    return (
-                        empty_pred(String::new()),
-                        err_result(
-                            format!("exceeded time cap {}s", args.time_cap_seconds),
                             start.elapsed().as_secs_f64(),
                             None,
                         ),
@@ -782,6 +798,25 @@ async fn run_one_instance(
             );
         }
     };
+    let cubi_exit_code = agent_output.exit_code;
+    let agent_stderr_tail =
+        (!agent_output.stderr_tail.is_empty()).then_some(agent_output.stderr_tail);
+    if crate::bench::infrastructure_exit(cubi_exit_code) {
+        return (
+            empty_pred(String::new()),
+            InstanceResult {
+                agent_stderr_tail,
+                ..err_result(
+                    format!(
+                        "agent infrastructure failure (exit code {:?})",
+                        cubi_exit_code
+                    ),
+                    start.elapsed().as_secs_f64(),
+                    cubi_exit_code,
+                )
+            },
+        );
+    }
 
     // Capture the agent's edit BEFORE any test patch is applied.
     let patch = match capture_diff(&repo_dir).await {
@@ -810,6 +845,7 @@ async fn run_one_instance(
         fail_to_pass_total: None,
         pass_to_pass_passed: None,
         pass_to_pass_total: None,
+        agent_stderr_tail,
         error: None,
     };
 
@@ -862,7 +898,7 @@ async fn score_locally(inst: &Instance, repo_dir: &Path) -> Result<(Resolution, 
     pytest_args.extend(node_ids.iter().map(|s| s.to_string()));
 
     let interpreter = python_interpreter();
-    let out = tokio::process::Command::new(&interpreter)
+    let out = crate::config::async_command(&interpreter)
         .arg("-m")
         .arg("pytest")
         .args(&pytest_args)
@@ -887,13 +923,13 @@ async fn score_locally(inst: &Instance, repo_dir: &Path) -> Result<(Resolution, 
 /// `CUBI_SWEBENCH_PYTHON`, then prefers `python3` (common on dev machines),
 /// falling back to `python` (the alias inside the pinned Docker envs).
 fn python_interpreter() -> String {
-    if let Ok(p) = std::env::var("CUBI_SWEBENCH_PYTHON") {
+    if let Some(p) = crate::config::with(|config| config.swebench_python.clone()) {
         if !p.trim().is_empty() {
             return p;
         }
     }
     for cand in ["python3", "python"] {
-        if std::process::Command::new(cand)
+        if crate::config::command(cand)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -911,7 +947,7 @@ fn python_interpreter() -> String {
 async fn apply_patch(dir: &Path, patch: &str) -> Result<()> {
     let patch_file = dir.join(".cubi-test.patch");
     std::fs::write(&patch_file, patch).context("write patch file")?;
-    let git_ok = tokio::process::Command::new("git")
+    let git_ok = crate::config::async_command("git")
         .args(["apply", "--whitespace=nowarn"])
         .arg(&patch_file)
         .current_dir(dir)
@@ -923,7 +959,7 @@ async fn apply_patch(dir: &Path, patch: &str) -> Result<()> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !git_ok {
-        let status = tokio::process::Command::new("patch")
+        let status = crate::config::async_command("patch")
             .args(["-p1", "-i"])
             .arg(&patch_file)
             .current_dir(dir)
@@ -1119,6 +1155,7 @@ SKIPPED [1] tests/test_foo.py:12: needs network
             fail_to_pass_total: None,
             pass_to_pass_passed: None,
             pass_to_pass_total: None,
+            agent_stderr_tail: None,
             error: None,
         };
         let results = vec![

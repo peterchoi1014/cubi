@@ -17,6 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+const DIAGNOSTIC_TAIL_BYTES: usize = 4 * 1024;
 
 /// Parsed `task.toml` describing one bench task.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -52,6 +55,12 @@ pub struct TaskResult {
     pub tokens_out: Option<u64>,
     pub events_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stderr_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier_stdout_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier_stderr_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -62,6 +71,155 @@ pub enum TaskStatus {
     Fail,
     Timeout,
     Error,
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedProcess {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+}
+
+pub(crate) fn configure_isolated_child_env(command: &mut tokio::process::Command, home: &Path) {
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env(crate::sessions::CUBI_HOME_ENV, home)
+        .env_remove("CUBI_EVENTS")
+        .env_remove("CUBI_RECEIPTS")
+        .env_remove("CUBI_TRACE_TOOLS")
+        .env_remove("CUBI_POLICY_FILE");
+
+    let parent_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    match std::env::var_os("RUSTUP_HOME").or_else(|| {
+        parent_home
+            .as_ref()
+            .map(|p| p.join(".rustup").into_os_string())
+    }) {
+        Some(value) => {
+            command.env("RUSTUP_HOME", value);
+        }
+        None => {
+            command.env_remove("RUSTUP_HOME");
+        }
+    }
+    match std::env::var_os("CARGO_HOME").or_else(|| {
+        parent_home
+            .as_ref()
+            .map(|p| p.join(".cargo").into_os_string())
+    }) {
+        Some(value) => {
+            command.env("CARGO_HOME", value);
+        }
+        None => {
+            command.env_remove("CARGO_HOME");
+        }
+    }
+    match std::env::var_os("RUSTUP_TOOLCHAIN") {
+        Some(value) => {
+            command.env("RUSTUP_TOOLCHAIN", value);
+        }
+        None => {
+            command.env_remove("RUSTUP_TOOLCHAIN");
+        }
+    }
+    // Every bench/swebench task is a copy of the same crate, so a shared
+    // parent CARGO_TARGET_DIR lets one task reuse another task's build
+    // artifacts (e.g. a negative control picking up a fixed library).
+    // Give each isolated home its own target directory instead.
+    command.env("CARGO_TARGET_DIR", home.join("cargo-target"));
+}
+
+pub(crate) async fn capture_child(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+) -> std::io::Result<CapturedProcess> {
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_tail(stdout)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_tail(stderr)));
+
+    let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => (status.code(), false),
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            (None, true)
+        }
+    };
+
+    Ok(CapturedProcess {
+        exit_code,
+        timed_out,
+        stdout_tail: join_tail(stdout_task).await?,
+        stderr_tail: join_tail(stderr_task).await?,
+    })
+}
+
+async fn read_tail<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::with_capacity(DIAGNOSTIC_TAIL_BYTES);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..count]);
+        if tail.len() > DIAGNOSTIC_TAIL_BYTES {
+            let excess = tail.len() - DIAGNOSTIC_TAIL_BYTES;
+            tail.drain(..excess);
+        }
+    }
+    Ok(tail)
+}
+
+async fn join_tail(
+    task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> std::io::Result<String> {
+    let Some(task) = task else {
+        return Ok(String::new());
+    };
+    let bytes = task
+        .await
+        .map_err(|error| std::io::Error::other(format!("diagnostic reader failed: {error}")))??;
+    Ok(bound_diagnostic(&String::from_utf8_lossy(&bytes)))
+}
+
+fn bound_diagnostic(value: &str) -> String {
+    if value.len() <= DIAGNOSTIC_TAIL_BYTES {
+        return value.to_string();
+    }
+    let mut start = value.len() - DIAGNOSTIC_TAIL_BYTES;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
+}
+
+fn diagnostic(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn verifier_timeout() -> Duration {
+    crate::config::with(|config| config.bench_verify_timeout)
+}
+
+pub(crate) fn infrastructure_exit(exit_code: Option<i32>) -> bool {
+    matches!(exit_code, Some(2 | 10 | 13))
 }
 
 /// Aggregated summary written to `<output>/summary.json`. Stable
@@ -367,7 +525,7 @@ pub async fn run(args: BenchArgs) -> Result<i32> {
     let model = args
         .model
         .clone()
-        .or_else(|| std::env::var("CUBI_MODEL").ok())
+        .or_else(|| crate::config::with(|config| config.model_override.clone()))
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
 
     let tasks_root = args
@@ -444,6 +602,9 @@ pub async fn run(args: BenchArgs) -> Result<i32> {
                 tokens_in: None,
                 tokens_out: None,
                 events_path: None,
+                agent_stderr_tail: None,
+                verifier_stdout_tail: None,
+                verifier_stderr_tail: None,
                 error: Some(format!("{e:#}")),
             },
         };
@@ -557,6 +718,9 @@ async fn run_one_task(
             tokens_in: None,
             tokens_out: None,
             events_path: None,
+            agent_stderr_tail: None,
+            verifier_stdout_tail: None,
+            verifier_stderr_tail: None,
             error: Some(format!("seed trust: {e:#}")),
         });
     }
@@ -565,7 +729,8 @@ async fn run_one_task(
     let _step_cap = step_cap_override.unwrap_or(task.step_cap); // reserved: cubi has no public --max-steps flag yet
 
     let start = Instant::now();
-    let mut cmd = tokio::process::Command::new(cubi_bin);
+    crate::config::with(|config| config.write_child_config(home_dir.path(), model))?;
+    let mut cmd = crate::config::async_command(cubi_bin);
     cmd.arg("-p")
         .arg(&task.prompt)
         .arg("--json")
@@ -575,68 +740,30 @@ async fn run_one_task(
         .arg("--events")
         .arg(&events_path)
         .env("CUBI_MODEL", model)
-        // Redirect dotfile state (`~/.cubi/sessions/`, telemetry log,
-        // policy, todos, …) into a per-task tempdir so the bench never
-        // touches the developer's real home. `home_dir()` in this crate
-        // honors `HOME` (and `USERPROFILE` on Windows) before falling
-        // back to the platform lookup.
-        .env("HOME", home_dir.path())
-        .env("USERPROFILE", home_dir.path())
         .env("CUBI_NO_BANNER", "1")
+        .env("CUBI_NO_ONBOARD", "1")
         .current_dir(workdir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_isolated_child_env(&mut cmd, home_dir.path());
     let _ = quiet_stdout; // reserved: a future verbose mode may stream cubi output through.
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn cubi for task {}", task.id))?;
 
     let time_cap_seconds = scaled_time_cap(task.time_cap_seconds, time_cap_multiplier);
     let timeout = Duration::from_secs(time_cap_seconds);
-    let cubi_exit_code: Option<i32>;
-    let status: Option<TaskStatus>;
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(exit)) => {
-            cubi_exit_code = exit.code();
-            status = None; // determined by verify step
-        }
-        Ok(Err(e)) => {
-            cubi_exit_code = None;
-            status = Some(TaskStatus::Error);
-            // best-effort cleanup
-            let _ = child.kill().await;
-            // Same reasoning as the timeout arm below: salvage whatever
-            // progress the partial event log records.
+    let agent = match capture_child(child, timeout).await {
+        Ok(output) => output,
+        Err(error) => {
             let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
             return Ok(TaskResult {
                 task_id: task.id.clone(),
                 model: model.to_string(),
-                status: status.unwrap(),
-                elapsed_seconds: start.elapsed().as_secs_f64(),
-                steps_used,
-                verify_exit_code: None,
-                cubi_exit_code,
-                tokens_in,
-                tokens_out,
-                events_path: Some(events_path.display().to_string()),
-                error: Some(format!("wait error: {e}")),
-            });
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            // Parse whatever the agent managed to write before the cap. A
-            // timeout that reports `steps_used: null` is indistinguishable
-            // between "never got started" and "was one step from done", which
-            // is precisely the number needed to size `--time-cap-multiplier`.
-            // The event log is appended per event, so the partial file left by
-            // the killed child is still valid JSONL up to the last whole line.
-            let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
-            return Ok(TaskResult {
-                task_id: task.id.clone(),
-                model: model.to_string(),
-                status: TaskStatus::Timeout,
+                status: TaskStatus::Error,
                 elapsed_seconds: start.elapsed().as_secs_f64(),
                 steps_used,
                 verify_exit_code: None,
@@ -644,31 +771,110 @@ async fn run_one_task(
                 tokens_in,
                 tokens_out,
                 events_path: Some(events_path.display().to_string()),
-                // Report the cap actually enforced, not the unscaled one from
-                // task.toml, so a scaled CI run isn't misleading.
-                error: Some(format!("exceeded time_cap_seconds = {}", time_cap_seconds)),
+                agent_stderr_tail: None,
+                verifier_stdout_tail: None,
+                verifier_stderr_tail: None,
+                error: Some(format!("agent wait error: {error}")),
             });
         }
+    };
+    if agent.timed_out {
+        // Parse whatever the agent managed to write before the cap. A
+        // timeout that reports `steps_used: null` is indistinguishable
+        // between "never got started" and "was one step from done", which
+        // is precisely the number needed to size `--time-cap-multiplier`.
+        // The event log is appended per event, so the partial file left by
+        // the killed child is still valid JSONL up to the last whole line.
+        let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
+        return Ok(TaskResult {
+            task_id: task.id.clone(),
+            model: model.to_string(),
+            status: TaskStatus::Timeout,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            steps_used,
+            verify_exit_code: None,
+            cubi_exit_code: None,
+            tokens_in,
+            tokens_out,
+            events_path: Some(events_path.display().to_string()),
+            agent_stderr_tail: diagnostic(agent.stderr_tail),
+            verifier_stdout_tail: None,
+            verifier_stderr_tail: None,
+            // Report the cap actually enforced, not the unscaled one from
+            // task.toml, so a scaled CI run isn't misleading.
+            error: Some(format!("exceeded time_cap_seconds = {}", time_cap_seconds)),
+        });
+    }
+    let cubi_exit_code = agent.exit_code;
+    let agent_stderr_tail = diagnostic(agent.stderr_tail);
+    if infrastructure_exit(cubi_exit_code) {
+        let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
+        return Ok(TaskResult {
+            task_id: task.id.clone(),
+            model: model.to_string(),
+            status: TaskStatus::Error,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            steps_used,
+            verify_exit_code: None,
+            cubi_exit_code,
+            tokens_in,
+            tokens_out,
+            events_path: Some(events_path.display().to_string()),
+            agent_stderr_tail,
+            verifier_stdout_tail: None,
+            verifier_stderr_tail: None,
+            error: Some(format!(
+                "agent infrastructure failure (exit code {:?})",
+                cubi_exit_code
+            )),
+        });
     }
 
     // Run verify.sh from inside the workdir. `verify.sh` is documented
     // as POSIX sh, so invoke `sh` rather than `bash`.
-    let verify_out = tokio::process::Command::new("sh")
+    let mut verify_cmd = crate::config::async_command("sh");
+    verify_cmd
         .arg(&verify_script)
         .current_dir(workdir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .kill_on_drop(true);
+    configure_isolated_child_env(&mut verify_cmd, home_dir.path());
+    let verify_child = verify_cmd
+        .spawn()
+        .with_context(|| format!("spawn verify.sh for task {}", task.id))?;
+    let verify_out = capture_child(verify_child, verifier_timeout())
         .await
         .with_context(|| format!("run verify.sh for task {}", task.id))?;
-    let verify_exit_code = verify_out.status.code();
+    if verify_out.timed_out {
+        let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
+        return Ok(TaskResult {
+            task_id: task.id.clone(),
+            model: model.to_string(),
+            status: TaskStatus::Error,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            steps_used,
+            verify_exit_code: None,
+            cubi_exit_code,
+            tokens_in,
+            tokens_out,
+            events_path: Some(events_path.display().to_string()),
+            agent_stderr_tail,
+            verifier_stdout_tail: diagnostic(verify_out.stdout_tail),
+            verifier_stderr_tail: diagnostic(verify_out.stderr_tail),
+            error: Some(format!(
+                "verifier timed out after {}s",
+                verifier_timeout().as_secs()
+            )),
+        });
+    }
+    let verify_exit_code = verify_out.exit_code;
     let final_status = if verify_exit_code == Some(0) {
         TaskStatus::Pass
     } else {
         TaskStatus::Fail
     };
-    let final_status = status.unwrap_or(final_status);
 
     // Best-effort: count agent steps + tokens from the events file.
     let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
@@ -698,6 +904,9 @@ async fn run_one_task(
         tokens_in,
         tokens_out,
         events_path: Some(events_path.display().to_string()),
+        agent_stderr_tail,
+        verifier_stdout_tail: diagnostic(verify_out.stdout_tail),
+        verifier_stderr_tail: diagnostic(verify_out.stderr_tail),
         error: None,
     })
 }
@@ -764,6 +973,20 @@ fn parse_events_metrics(path: &Path) -> (Option<u32>, Option<u64>, Option<u64>) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn isolated_child_env_uses_a_per_home_cargo_target_dir() {
+        let home = std::path::PathBuf::from("/tmp/cubi-bench-home-for-test");
+        let mut command = tokio::process::Command::new("true");
+        configure_isolated_child_env(&mut command, &home);
+        let target_dir = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+            .and_then(|(_, value)| value)
+            .map(std::path::PathBuf::from);
+        assert_eq!(target_dir, Some(home.join("cargo-target")));
+    }
+
     fn mk_result(id: &str, status: TaskStatus, elapsed: f64) -> TaskResult {
         TaskResult {
             task_id: id.to_string(),
@@ -776,6 +999,9 @@ mod tests {
             tokens_in: Some(100),
             tokens_out: Some(50),
             events_path: None,
+            agent_stderr_tail: None,
+            verifier_stdout_tail: None,
+            verifier_stderr_tail: None,
             error: None,
         }
     }

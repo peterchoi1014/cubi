@@ -41,7 +41,7 @@ impl ToolTracer {
     pub fn from_args(flag_path: Option<&str>) -> Option<Self> {
         let path = flag_path
             .map(PathBuf::from)
-            .or_else(|| std::env::var("CUBI_TRACE_TOOLS").ok().map(PathBuf::from))?;
+            .or_else(|| crate::config::with(|config| config.paths.trace_tools.clone()))?;
         Some(Self::new(path))
     }
 

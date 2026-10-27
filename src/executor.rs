@@ -5,10 +5,11 @@ use anyhow::Result;
 pub struct AIExecutor {
     backend: LlmBackend,
     model: String,
+    config: crate::config::SharedConfig,
 }
 
 impl AIExecutor {
-    pub async fn new(model: String, _cpu_workers: usize) -> Result<Self> {
+    pub async fn new(model: String) -> Result<Self> {
         Ok(Self::new_from_env(model))
     }
 
@@ -16,6 +17,7 @@ impl AIExecutor {
         Self {
             backend: create_provider(),
             model,
+            config: crate::config::shared(),
         }
     }
 
@@ -25,10 +27,24 @@ impl AIExecutor {
     /// binary's parallel runners).
     #[cfg(test)]
     pub fn with_backend(backend: LlmBackend, model: String) -> Self {
-        Self { backend, model }
+        Self {
+            backend,
+            model,
+            config: crate::config::shared(),
+        }
+    }
+
+    pub(crate) fn runtime_config(&self) -> crate::config::SharedConfig {
+        self.config.clone()
     }
 
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            None,
+        )?;
         self.backend.chat(&self.model, messages).await
     }
 
@@ -41,6 +57,12 @@ impl AIExecutor {
     where
         F: FnMut(&str),
     {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend
             .chat_stream(&self.model, messages, tools, on_token)
             .await
@@ -51,6 +73,12 @@ impl AIExecutor {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            &self.model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend
             .chat_with_tools(&self.model, messages, tools)
             .await
@@ -66,6 +94,12 @@ impl AIExecutor {
         model: &str,
         messages: Vec<Message>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            model,
+            self.backend.provider_name(),
+            &messages,
+            None,
+        )?;
         self.backend.chat_with_tools(model, messages, None).await
     }
 
@@ -78,6 +112,12 @@ impl AIExecutor {
         messages: Vec<Message>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<(Message, ChatStats)> {
+        crate::context_budget::ensure_request_fits(
+            model,
+            self.backend.provider_name(),
+            &messages,
+            tools.as_deref(),
+        )?;
         self.backend.chat_with_tools(model, messages, tools).await
     }
 
@@ -94,6 +134,10 @@ impl AIExecutor {
         self.backend.base_url()
     }
 
+    pub fn is_local_backend(&self) -> bool {
+        self.backend.is_local()
+    }
+
     /// Lists models the configured backend reports. Used by `/doctor`
     /// so it can probe whichever backend is actually selected (Ollama
     /// or any OpenAI-compatible local server like `llama-server` or
@@ -107,6 +151,7 @@ impl AIExecutor {
         if !models.is_empty() && !models.iter().any(|m| m.starts_with(&model) || m == &model) {
             anyhow::bail!("Model '{}' not found. Available: {:?}", model, models);
         }
+        self.config.update(|config| config.model = model.clone());
         self.model = model;
         Ok(())
     }

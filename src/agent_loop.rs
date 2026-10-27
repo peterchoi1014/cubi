@@ -19,12 +19,18 @@
 //! single iteration of streaming chat — no behavioral regression for users
 //! who haven't pulled a tool-capable model yet.
 
+use crate::config::ToolProfile;
 use anyhow::Result;
 use serde_json::json;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
+use crate::cli::tool_dispatch::{ToolAccess, ToolCallHost, ToolOutcome, dispatch_tool};
 use crate::executor::AIExecutor;
+use crate::mcp_client::Tool;
 use crate::mcp_manager::McpManager;
-use crate::ollama::{ChatStats, Message, ToolFunction, ToolSpec};
+use crate::ollama::{ChatStats, Message, ToolCall, ToolFunction, ToolSpec};
 
 /// Maximum number of "model → tool → model" iterations per user turn before
 /// the loop bails out with a diagnostic. Generous enough for realistic
@@ -62,6 +68,18 @@ pub const CONSENSUS_TOOL_NAME: &str = "consensus_run";
 /// `agent_run` or `consensus_run` inside it would re-enable unbounded nested
 /// subagent/consensus spawning.
 pub const DISABLE_META_TOOLS_ENV: &str = "CUBI_DISABLE_META_TOOLS";
+pub const TOOL_PROFILE_ENV: &str = "CUBI_TOOL_PROFILE";
+
+const CODING_TOOL_NAMES: [&str; 8] = [
+    "bash",
+    "edit_file",
+    "grep",
+    "list_files",
+    "read_file",
+    "repo_map",
+    "search_glob",
+    "write_file",
+];
 
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
@@ -84,26 +102,49 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
         // without other tools for the subagent to use, so we skip it too.
         return None;
     }
-    let mut specs: Vec<ToolSpec> = mcp_tools
+    let specs = build_tool_specs_for_profile(
+        mcp_tools,
+        crate::config::with(|config| config.tool_profile),
+        !meta_tools_disabled_by_env(),
+    );
+    (!specs.is_empty()).then_some(specs)
+}
+
+fn build_tool_specs_for_profile(
+    tools: Vec<&Tool>,
+    profile: ToolProfile,
+    include_meta_tools: bool,
+) -> Vec<ToolSpec> {
+    let mut selected: Vec<&Tool> = tools
         .into_iter()
-        .map(|t| ToolSpec {
+        .filter(|tool| {
+            profile == ToolProfile::Full || CODING_TOOL_NAMES.contains(&tool.name.as_str())
+        })
+        .collect();
+    if profile == ToolProfile::Coding {
+        selected.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    let mut specs: Vec<ToolSpec> = selected
+        .into_iter()
+        .map(|tool| ToolSpec {
             tool_type: "function".to_string(),
             function: ToolFunction {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
             },
         })
         .collect();
-    if !meta_tools_disabled_by_env() {
+    if include_meta_tools && !specs.is_empty() {
         specs.push(agent_run_spec());
         specs.push(crate::consensus::consensus_run_spec());
     }
-    Some(specs)
+    specs
 }
 
 pub fn meta_tools_disabled_by_env() -> bool {
-    std::env::var_os(DISABLE_META_TOOLS_ENV).is_some()
+    crate::config::with(|config| config.disable_meta_tools)
 }
 
 /// `ToolSpec` for the [`AGENT_TOOL_NAME`] meta-tool. Kept in this module so
@@ -192,6 +233,60 @@ pub struct SubagentRunResult {
     pub tool_calls: usize,
 }
 
+struct SubagentToolHost<'a> {
+    mcp: &'a mut Option<McpManager>,
+    access: &'a ToolAccess,
+    approved_tools: &'a HashSet<String>,
+}
+
+impl ToolCallHost for SubagentToolHost<'_> {
+    fn approve_tool(&mut self, tool_name: &str) -> bool {
+        let trusted = std::env::current_dir().ok().is_some_and(|cwd| {
+            self.access
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&cwd)
+        });
+        trusted || self.approved_tools.contains(tool_name)
+    }
+
+    fn execute_authorized<'a>(
+        &'a mut self,
+        call: &'a ToolCall,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + 'a>> {
+        Box::pin(async move {
+            if call.function.name == AGENT_TOOL_NAME {
+                return ToolOutcome::error("[tool error] nested `agent_run` is not allowed");
+            }
+            if call.function.name == CONSENSUS_TOOL_NAME {
+                return ToolOutcome::error("[tool error] nested `consensus_run` is not allowed");
+            }
+            let Some(mcp) = self.mcp.as_mut() else {
+                return ToolOutcome::error(format!(
+                    "[tool error] no MCP manager available to execute `{}`",
+                    call.function.name
+                ));
+            };
+            match mcp
+                .call_tool(&call.function.name, call.function.arguments.clone())
+                .await
+            {
+                Ok(result) => {
+                    let is_error = result.is_error == Some(true);
+                    let text = render_tool_result(&result);
+                    if is_error {
+                        ToolOutcome::error(text)
+                    } else {
+                        ToolOutcome::success(text)
+                    }
+                }
+                Err(error) => ToolOutcome::error(format!("[tool error] {error}")),
+            }
+        })
+    }
+}
+
 /// Runs a subagent loop with a fresh context. Returns the subagent's final
 /// assistant message text. Used by the top-level agent loop in response to
 /// an `agent_run` tool call from the parent model.
@@ -203,14 +298,21 @@ pub struct SubagentRunResult {
 pub async fn run_subagent(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
+    access: ToolAccess,
+    approved_tools: HashSet<String>,
     goal: &str,
     requested_max_steps: usize,
-) -> Result<String> {
-    Ok(
-        run_subagent_with_model(executor, mcp, None, goal, requested_max_steps)
-            .await?
-            .output,
+) -> Result<SubagentRunResult> {
+    run_subagent_with_model(
+        executor,
+        mcp,
+        access,
+        approved_tools,
+        None,
+        goal,
+        requested_max_steps,
     )
+    .await
 }
 
 /// Runs the same subagent loop as [`run_subagent`] but optionally overrides
@@ -218,6 +320,8 @@ pub async fn run_subagent(
 pub async fn run_subagent_with_model(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
+    access: ToolAccess,
+    approved_tools: HashSet<String>,
     model: Option<&str>,
     goal: &str,
     requested_max_steps: usize,
@@ -234,6 +338,11 @@ pub async fn run_subagent_with_model(
     ];
     let mut total_stats = ChatStats::default();
     let mut tool_calls = 0usize;
+    let mut tool_host = SubagentToolHost {
+        mcp,
+        access: &access,
+        approved_tools: &approved_tools,
+    };
 
     for step in 0..max_steps {
         let (msg, stats) = match model {
@@ -288,24 +397,7 @@ pub async fn run_subagent_with_model(
             // emit the name anyway. Reject explicitly so it shows up as
             // a tool error and the model gives up rather than us
             // silently doing nothing.
-            let result_text = if call.function.name == AGENT_TOOL_NAME {
-                "[tool error] nested `agent_run` is not allowed".to_string()
-            } else if call.function.name == CONSENSUS_TOOL_NAME {
-                "[tool error] nested `consensus_run` is not allowed".to_string()
-            } else if let Some(m) = mcp.as_mut() {
-                match m
-                    .call_tool(&call.function.name, call.function.arguments.clone())
-                    .await
-                {
-                    Ok(r) => render_tool_result(&r),
-                    Err(e) => format!("[tool error] {e}"),
-                }
-            } else {
-                format!(
-                    "[tool error] no MCP manager available to execute `{}`",
-                    call.function.name
-                )
-            };
+            let result_text = dispatch_tool(&access, &mut tool_host, &call).await.text;
             history.push(Message::tool_result(
                 &call.function.name,
                 result_text,
@@ -346,7 +438,17 @@ pub async fn run_subagent_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_client::{Content, ToolCallResult};
+    use crate::mcp_client::{Content, Tool, ToolCallResult};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    fn fake_tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: format!("description for {}", name),
+            input_schema: json!({}),
+        }
+    }
 
     #[test]
     fn render_tool_result_joins_text_blocks() {
@@ -387,6 +489,42 @@ mod tests {
         assert!(render_tool_result(&r).contains("[tool reported error"));
     }
 
+    #[tokio::test]
+    async fn subagent_dispatch_inherits_parent_policy_denial() {
+        let access = ToolAccess {
+            hooks: crate::hooks::HookRegistry::empty(),
+            policy: crate::policy::Policy {
+                denied_tools: BTreeSet::from(["read_file".to_string()]),
+                note: None,
+            },
+            permissions: Arc::new(Mutex::new(crate::permissions::Permissions::default())),
+        };
+        let mut no_mcp = None;
+        let approved_tools = HashSet::from(["read_file".to_string()]);
+        let mut host = SubagentToolHost {
+            mcp: &mut no_mcp,
+            access: &access,
+            approved_tools: &approved_tools,
+        };
+        let call = ToolCall {
+            id: Some("call-read".to_string()),
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "secret.txt"}),
+            },
+        };
+
+        let outcome = dispatch_tool(&access, &mut host, &call).await;
+
+        assert_eq!(
+            outcome.kind,
+            crate::cli::tool_dispatch::ToolOutcomeKind::Denied
+        );
+        assert!(outcome.text.contains("admin policy"));
+        assert!(!outcome.text.contains("no MCP manager"));
+    }
+
     #[test]
     fn render_tool_result_describes_non_text_content() {
         let r = ToolCallResult {
@@ -408,6 +546,47 @@ mod tests {
         assert!(
             spec.function.parameters["properties"]["goal"].is_object(),
             "goal parameter must be an object"
+        );
+    }
+
+    #[test]
+    fn coding_profile_advertises_exact_core_and_meta_tool_set() {
+        let tools = [
+            "write_file",
+            "think",
+            "read_file",
+            "external_mcp_tool",
+            "repo_map",
+            "bash",
+            "search_glob",
+            "grep",
+            "edit_file",
+            "list_files",
+        ]
+        .into_iter()
+        .map(fake_tool)
+        .collect::<Vec<_>>();
+
+        let specs = build_tool_specs_for_profile(tools.iter().collect(), ToolProfile::Coding, true);
+        let names: Vec<&str> = specs
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "edit_file",
+                "grep",
+                "list_files",
+                "read_file",
+                "repo_map",
+                "search_glob",
+                "write_file",
+                AGENT_TOOL_NAME,
+                "consensus_run",
+            ]
         );
     }
 
@@ -451,5 +630,98 @@ mod tests {
         let stripped = without_meta_tools(specs).unwrap();
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0].function.name, "bash");
+    }
+
+    #[test]
+    fn subagent_blocks_oversized_post_tool_request_before_backend() {
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_CONTEXT_WINDOW",
+            "CUBI_FAKE_LLM",
+            "CUBI_MAX_PROMPT_TOKENS_OVERRIDE",
+            "CUBI_TOOL_PROFILE",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let large_file = temp.path().join("large.txt");
+        std::fs::write(&large_file, "x".repeat(40_000)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let fixture = crate::test_support::OpenAiFixture::spawn(vec![
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-read",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": serde_json::json!({"path": large_file}).to_string()
+                                }
+                            }]
+                        }
+                    }]
+                }),
+                serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "final"}
+                    }]
+                }),
+            ])
+            .await;
+            // SAFETY: environment mutation is serialized by the shared test locks.
+            unsafe {
+                std::env::set_var("OPENAI_BASE_URL", &fixture.base_url);
+                std::env::set_var("OPENAI_API_KEY", "test-key");
+                std::env::set_var("CUBI_CONTEXT_WINDOW", "4096");
+                std::env::set_var("CUBI_TOOL_PROFILE", "coding");
+                std::env::remove_var("CUBI_FAKE_LLM");
+                std::env::remove_var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE");
+            }
+            let executor = AIExecutor::new_from_env("budget-fixture-model".to_string());
+            let permissions = Arc::new(Mutex::new(crate::permissions::Permissions::default()));
+            let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut mcp = Some(
+                McpManager::new(Arc::clone(&permissions), plan_mode)
+                    .await
+                    .unwrap(),
+            );
+            let access = ToolAccess {
+                hooks: crate::hooks::HookRegistry::empty(),
+                policy: crate::policy::Policy::default(),
+                permissions,
+            };
+
+            let result = run_subagent(
+                &executor,
+                &mut mcp,
+                access,
+                HashSet::from(["read_file".to_string()]),
+                "Read the requested file and report its contents.",
+                2,
+            )
+            .await;
+
+            let requests = fixture.requests.lock().unwrap().clone();
+            fixture.shutdown().await;
+            let error = result.expect_err("the post-tool request must be rejected locally");
+            assert!(
+                error.to_string().contains("context window"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                requests.len(),
+                1,
+                "the oversized follow-up must never reach the backend"
+            );
+        });
     }
 }

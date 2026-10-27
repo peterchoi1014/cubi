@@ -57,7 +57,8 @@ pub fn done_with_window(stats: &ChatStats, window: Option<usize>) -> Value {
         let pct = if w == 0 {
             0u32
         } else {
-            let pct = stats.prompt_tokens.saturating_mul(100) / (w as u64);
+            let prompt_tokens = stats.last_prompt_tokens.unwrap_or(stats.prompt_tokens);
+            let pct = prompt_tokens.saturating_mul(100) / (w as u64);
             u32::try_from(pct).unwrap_or(u32::MAX)
         };
         if let Some(obj) = v.as_object_mut() {
@@ -146,11 +147,19 @@ pub fn emit_compacted(enabled: bool, summarized_messages: usize, window: usize) 
     v
 }
 
-pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
+pub fn budget_error(
+    needed: usize,
+    window: usize,
+    prompt_limit: usize,
+    completion_reserve: usize,
+    model: &str,
+) -> Value {
     json!({
         "type": "budget_error",
         "needed": needed,
         "window": window,
+        "prompt_limit": prompt_limit,
+        "completion_reserve": completion_reserve,
         "model": model,
     })
 }
@@ -229,6 +238,7 @@ mod tests {
             prompt_tokens: 12,
             completion_tokens: 34,
             elapsed_ms: 56,
+            ..ChatStats::default()
         };
         let v = done(&stats);
         assert_eq!(v["type"], "done");
@@ -240,13 +250,19 @@ mod tests {
     #[test]
     fn done_with_window_attaches_utilization() {
         let stats = ChatStats {
-            prompt_tokens: 250,
+            prompt_tokens: 1_250,
             completion_tokens: 0,
             elapsed_ms: 0,
+            request_count: 2,
+            wall_clock_ms: Some(99),
+            last_prompt_tokens: Some(250),
+            ..ChatStats::default()
         };
         let v = done_with_window(&stats, Some(1000));
         assert_eq!(v["window"], 1000);
         assert_eq!(v["utilization_pct"], 25);
+        assert_eq!(v["stats"]["request_count"], 2);
+        assert_eq!(v["stats"]["wall_clock_ms"], 99);
         // None should leave the payload unmodified beyond `done`.
         let v2 = done_with_window(&stats, None);
         assert!(v2.get("window").is_none());
@@ -259,6 +275,7 @@ mod tests {
             prompt_tokens: 250,
             completion_tokens: 0,
             elapsed_ms: 0,
+            ..ChatStats::default()
         };
         let v = done_with_window(&stats, Some(0));
         assert_eq!(v["window"], 0);
@@ -325,6 +342,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 elapsed_ms: 42,
+                ..ChatStats::default()
             },
             None,
         );
@@ -346,6 +364,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 elapsed_ms: 5,
+                ..ChatStats::default()
             },
             Some("boom"),
         );

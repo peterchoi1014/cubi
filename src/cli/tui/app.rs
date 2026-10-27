@@ -1240,6 +1240,7 @@ mod tests {
                 prompt_tokens: 12,
                 completion_tokens: 34,
                 elapsed_ms: 56,
+                ..ChatStats::default()
             },
             window: Some(8000),
         });

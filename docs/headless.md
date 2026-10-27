@@ -24,7 +24,18 @@ Flags meant to influence the run (e.g. `--system`, `--model`) must
 appear *before* `exec`; everything after `exec` is treated as prompt
 text.
 
-Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `130` cancelled.
+Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `14` incomplete (the agent stopped before a final reply), `130` cancelled.
+
+The terminal `done` event carries a turn aggregate in `stats`. Existing
+`prompt_tokens`, `completion_tokens`, and `elapsed_ms` fields retain their
+meaning. Additive fields include `request_count`, `wall_clock_ms`,
+`last_prompt_tokens`, client-measured `time_to_first_token_ms`, Ollama-native
+`load_duration_ms`, `prompt_eval_duration_ms`, and `eval_duration_ms`, plus
+OpenAI-compatible `cached_prompt_tokens`. Provider-specific values are `null`
+when the provider did not report them. The aggregate includes tool-loop
+follow-ups, automatic compaction calls, and in-process `agent_run` children.
+Top-level `utilization_pct` uses `last_prompt_tokens` against the effective
+window rather than cumulative prompt tokens.
 
 ## Error events
 
@@ -59,10 +70,66 @@ knobs let interactive users disable the same affordances individually:
   cubi derives `num_ctx` from the model's known window, clamped to a safe
   default; a positive override raises that ceiling (still bounded by the
   model's real window).
+- `CUBI_MAX_TOKENS=…` — set a positive output-token cap. Cubi sends it as
+  Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider
+  response that stops at this limit is reported as truncated rather than as a
+  successful completion.
+- `CUBI_TEMPERATURE=…` — override the model profile's temperature with a
+  finite, non-negative number.
+- `CUBI_TOP_P=…` — override the model profile's nucleus probability with a
+  finite value in `(0, 1]`.
+- `CUBI_TOP_K=…` — override the model profile's top-k cutoff with a positive
+  integer. OpenAI-compatible requests use llama-server's `top_k` extension.
+- `CUBI_THINK=on|off` — set Ollama's native `think` request field. The field is
+  omitted when this variable is unset.
+- `CUBI_KEEP_ALIVE=…` — pass an Ollama `keep_alive` value such as `10m` or
+  `-1`. The field is omitted when this variable is unset.
+- `CUBI_HTTP_TIMEOUT_SECS=…` — set the positive per-read/stream-idle HTTP
+  timeout in seconds (default 300). HTTP connections also have a fixed
+  10-second connect timeout; Cubi does not impose a total generation timeout.
+- `CUBI_CONTEXT_WINDOW=…` — set the served context window for an
+  OpenAI-compatible backend. Cubi clamps it to the model's known nominal
+  window, reserves completion headroom, and applies the resulting prompt
+  budget before every model request.
+- `CUBI_COMPACT_EXTRACT_MEMORIES=1` — opt in to the additional
+  post-compaction model call that extracts persistent memories. It is off by
+  default so compaction adds only the summarization call.
 - `CUBI_READ_FILE_MAX_LINES=…` / `CUBI_READ_FILE_MAX_BYTES=…` — tune the
-  cap applied to unbounded `read_file` calls (defaults 400 lines / 50 KiB).
-  Raise for large-context models; lower for small-context ones. Ranged
-  reads (`start_line`/`end_line`) are never capped.
+  shared model-facing tool-output budget (defaults 400 lines / 50 KiB).
+  `read_file` applies it to both full and ranged reads and returns continuation
+  guidance when truncated. Raise for large-context models; lower for
+  small-context ones.
+- `CUBI_TOOL_PROFILE=coding` — select the focused coding catalog once for the
+  session: `read_file`, `grep`, `search_glob`, `edit_file`, `write_file`,
+  `bash`, `list_files`, and `repo_map`, plus the agent meta-tools when enabled.
+  The full catalog remains the default.
+
+## Provider environment
+
+`CUBI_BASE_URL` selects a custom native Ollama endpoint. OpenAI-compatible
+servers are selected with `OPENAI_BASE_URL`; remote endpoints also require
+`OPENAI_API_KEY` (or `CUBI_API_KEY`). A loopback `OPENAI_BASE_URL` using
+`localhost`, `127.0.0.0/8`, or `::1` does not require a dummy API key.
+
+Sampling values resolve independently in this order: environment override,
+model-profile default, then omission from the request. Invalid overrides stop
+request construction with a clear error. Model ids containing `bonsai`
+(case-insensitive) use Cubi's local Bonsai profile: 262,144 nominal context
+tokens, tool calling enabled, zero estimated cost, and defaults
+`temperature=0.7`, `top_p=0.95`, `top_k=20`. A llama-server instance served
+with a smaller context (for example `-c 8192`) still uses that configured
+effective window rather than the profile's nominal capacity.
+
+```sh
+# Native Ollama on another local port
+CUBI_BASE_URL=http://127.0.0.1:11435 cubi -p "hello"
+
+# llama-server / MLX / LM Studio on loopback, with no dummy key
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 cubi -p "hello"
+
+# Remote OpenAI-compatible service
+OPENAI_BASE_URL=https://example.invalid/v1 OPENAI_API_KEY=... cubi -p "hello"
+```
 
 Examples:
 
@@ -95,8 +162,10 @@ Event types currently emitted:
 - `mcp_status_change` — `{type, ts, before, after}` where each side is
   `{ok, failed, not_loaded}`. Emitted when the agent loop detects an
   MCP server transition during a turn.
-- `turn_end` — `{type, ts, usage, model}`. `usage` carries
-  `{prompt_tokens, completion_tokens, elapsed_ms}`.
+- `turn_end` — `{type, ts, usage, model}`. `usage` carries the same complete
+  turn aggregate described for terminal `done` events, including request
+  count, wall-clock time, optional provider timings, and last-request prompt
+  occupancy.
 - `consensus_start` — `{type, ts, goal, models, strategy,
   max_steps_per_subagent}`. Emitted
   before any subagent dispatches when the `consensus_run` meta-tool

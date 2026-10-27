@@ -165,6 +165,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 2,
             elapsed_ms: 3,
+            ..ChatStats::default()
         };
         sink.usage_footer(&stats, Some(8000));
         match rx.try_recv() {

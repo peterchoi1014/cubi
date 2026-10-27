@@ -67,6 +67,9 @@ cubi bench
 # Explicit model and JSON summary on stdout:
 cubi bench --suite quick --model qwen3.5:9b --json
 
+# Write run artifacts outside the repository:
+cubi bench --suite quick --output /tmp/cubi-bench-results
+
 # One task at a time, keeping the agent's working copy for inspection:
 cubi bench --task rust-fizzbuzz --keep-workdir
 
@@ -95,8 +98,22 @@ cap is far too small, or the model is not emitting tool calls at all); a
 number close to what the task needs means a modest bump will do. `null` means
 no event log was produced at all.
 
-Results land in `bench/results/<unix-ts>/`. The `summary.json` schema is
-stable; CI consumes it as an artifact.
+Results land in `bench/results/<unix-ts>/` by default. Pass `--output <dir>`
+to write `summary.json` and per-task event logs directly into another
+directory, without adding a timestamp subdirectory. Relative output paths
+are resolved from the invocation directory, and missing directories are
+created. The integration tests use temporary output directories so
+`cargo test --test bench` leaves `bench/results/` untouched.
+
+The `summary.json` schema is stable; CI consumes it as an artifact.
+
+Each per-task result retains bounded diagnostics: the last 4 KiB of agent
+stderr and the last 4 KiB each of verifier stdout/stderr. Verifiers have a
+120-second timeout by default; `CUBI_BENCH_VERIFY_TIMEOUT_SECS` can lower or
+raise it for controlled harness tests and unusually slow tasks. A verifier
+timeout and agent startup/provider failures use status `error` (infrastructure
+failure). A completed agent whose bounded verifier exits non-zero uses status
+`fail` (model/task failure). Agent deadline expiry remains status `timeout`.
 
 ## Adding a task
 
@@ -128,6 +145,20 @@ silently pin the score at 0% rather than erroring:
    the `--events` log are resolved from the *harness* cwd but used from the
    *workdir*, so `tasks_root` and the output dir are canonicalized up front.
    A relative `verify.sh` path makes `sh` exit 2 without running the tests.
+3. **`CUBI_HOME` must match the throwaway home.** Cubi gives `CUBI_HOME`
+   precedence over `HOME`/`USERPROFILE`, so inheriting a parent value would
+   leak sessions, policy, and trust into scored runs. The agent and verifier
+   receive the isolated value explicitly, while `CUBI_EVENTS`,
+   `CUBI_RECEIPTS`, `CUBI_TRACE_TOOLS`, and `CUBI_POLICY_FILE` are cleared.
+4. **Rust toolchain roots stay deliberate.** Isolating `HOME` changes
+   rustup/cargo defaults. The harness therefore preserves explicit
+   `RUSTUP_HOME`, `CARGO_HOME`, and `RUSTUP_TOOLCHAIN` values, deriving the
+   first two from the parent home when unset. This keeps a verifier under
+   `cargo +1.88 test` on the installed toolchain instead of attempting a
+   fresh sync inside the temporary home. `CARGO_TARGET_DIR` is always set to
+   a `cargo-target` directory inside the task's isolated home, because every
+   task is a copy of the same crate and a shared target directory would let
+   one task reuse another task's build artifacts.
 
 `tests/bench.rs` guards both with an end-to-end pass/fail pair that scripts
 the `Fake` LLM backend (`CUBI_FAKE_LLM` + `CUBI_FAKE_LLM_TOOL_CALL`), so they

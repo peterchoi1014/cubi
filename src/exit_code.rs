@@ -17,6 +17,9 @@ pub enum ExitCode {
     /// `Model = 10` so headless scripts can branch on connectivity
     /// problems separately from provider/model errors.
     Network = 13,
+    /// The agent stopped before producing a final assistant reply (for
+    /// example after exhausting its step budget).
+    Incomplete = 14,
     Cancelled = 130,
 }
 

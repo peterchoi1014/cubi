@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +148,7 @@ pub struct StdioClient {
 
 impl StdioClient {
     async fn new(command: String, args: Vec<String>, env: HashMap<String, String>) -> Result<Self> {
-        let mut cmd = Command::new(&command);
+        let mut cmd = crate::config::async_command(&command);
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

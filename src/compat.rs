@@ -6,22 +6,24 @@
 //!    variable lived under `AI_CHAT_CLI_*` or `AICHAT_*`. We renamed the
 //!    canonical names to `CUBI_*` but don't want to break users who
 //!    already wired the old names into shells, dotfiles, CI configs,
-//!    etc. `promote_legacy_env` runs once at startup and copies any
-//!    legacy values into their new names *iff* the new name is unset.
+//!    etc. `promote_legacy_env` copies legacy values into their new names in
+//!    the startup snapshot *iff* the new name is unset.
 //!
 //! 2. **Config directory migration** — persistent state previously lived
-//!    in `~/.cubi/` (config.json, sessions, trust, telemetry,
+//!    in `~/.ai-chat-cli/` (config.json, sessions, trust, telemetry,
 //!    oauth tokens, memdir, …). We now use `~/.cubi/`. The first time
 //!    the new binary runs on a machine with an existing
-//!    `~/.cubi/` and no `~/.cubi/`, we rename the directory in
+//!    `~/.ai-chat-cli/` and no `~/.cubi/`, we rename the directory in
 //!    place so the user keeps their settings.
 //!
 //! Both helpers are idempotent and safe to call unconditionally at
 //! startup. They never overwrite a value the user has explicitly set
 //! under the new name.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// All env vars renamed by the Cubi rebrand. Left column is the new
 /// canonical name we read everywhere in the source tree; right column
@@ -43,55 +45,34 @@ const ENV_RENAMES: &[(&str, &str)] = &[
     ("CUBI_RATE_LIMIT_BACKOFF_MS", "AICHAT_RATE_LIMIT_BACKOFF_MS"),
 ];
 
-/// Copy any legacy env vars into their new names if the new name is
-/// unset. Call once near the top of `main` before any module reads env.
-pub fn promote_legacy_env() {
+/// Promote aliases in the captured startup input, never in the process env.
+pub fn promote_legacy_env(values: &mut BTreeMap<OsString, OsString>) {
     for (new, old) in ENV_RENAMES {
-        if std::env::var_os(new).is_some() {
+        if values.contains_key(std::ffi::OsStr::new(new)) {
             continue;
         }
-        if let Some(v) = std::env::var_os(old) {
-            // SAFETY: called from `main` before any threads are spawned.
-            unsafe {
-                std::env::set_var(new, v);
-            }
+        if let Some(v) = values.get(std::ffi::OsStr::new(old)).cloned() {
+            values.insert(OsString::from(new), v);
         }
     }
     // Provider-keyed API key env vars are constructed dynamically (e.g.
     // `CUBI_OPENAI_API_KEY`), so they aren't in the static table above.
     // Sweep the environment for any `AICHAT_*_API_KEY` and promote.
-    let keys: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+    let keys: Vec<(String, std::ffi::OsString)> = values
+        .iter()
         .filter_map(|(k, v)| {
             let key = k.to_str()?;
             if let Some(rest) = key.strip_prefix("AICHAT_") {
                 if rest.ends_with("_API_KEY") {
-                    return Some((format!("CUBI_{rest}"), v));
+                    return Some((format!("CUBI_{rest}"), v.clone()));
                 }
             }
             None
         })
         .collect();
     for (new, v) in keys {
-        if std::env::var_os(&new).is_none() {
-            // SAFETY: called from `main` before any threads are spawned.
-            unsafe {
-                std::env::set_var(&new, v);
-            }
-        }
+        values.entry(OsString::from(new)).or_insert(v);
     }
-}
-
-/// Returns the resolved path to the new config directory (`~/.cubi/`),
-/// or `None` if the home directory can't be determined.
-pub fn cubi_dir() -> Option<PathBuf> {
-    crate::sessions::cubi_dir()
-}
-
-/// Legacy config directory from the pre-rebrand era (`~/.ai-chat-cli/`).
-/// Returned for migration purposes; production code should not read from
-/// this path directly.
-pub fn legacy_dir() -> Option<PathBuf> {
-    Some(crate::sessions::home_dir()?.join(".ai-chat-cli"))
 }
 
 /// Rename `~/.ai-chat-cli/` → `~/.cubi/` exactly once, when the new
@@ -99,10 +80,12 @@ pub fn legacy_dir() -> Option<PathBuf> {
 /// missing, the new directory is already populated, or the rename
 /// fails (we log a warning and let downstream code create a fresh
 /// `~/.cubi/`).
-pub fn migrate_config_dir() {
-    let (Some(new), Some(old)) = (cubi_dir(), legacy_dir()) else {
+pub fn migrate_config_dir(home: Option<&Path>) {
+    let Some(home) = home else {
         return;
     };
+    let new = home.join(".cubi");
+    let old = home.join(".ai-chat-cli");
     if new.exists() {
         return;
     }
@@ -138,12 +121,25 @@ pub(crate) mod test_env {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    struct EnvRestore {
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize every test that changes the process working directory or
+    /// relies on it staying put (for example by using cwd-relative paths).
+    /// The working directory is process-wide, so all such tests across
+    /// modules must share this one lock. Take it before any other test lock.
+    pub(crate) fn cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+        CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) struct EnvRestore {
         old: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl EnvRestore {
-        fn capture(names: &[&'static str]) -> Self {
+        /// The caller holds `env_guard()` until this restore guard is dropped.
+        pub(crate) fn capture(names: &[&'static str]) -> Self {
             Self {
                 old: names
                     .iter()
@@ -156,6 +152,8 @@ pub(crate) mod test_env {
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             for (name, value) in &self.old {
+                // SAFETY: callers retain the shared environment lock until
+                // this guard has restored every captured value.
                 unsafe {
                     match value {
                         Some(value) => std::env::set_var(name, value),
@@ -177,6 +175,8 @@ pub(crate) mod test_env {
             "CUBI_OAUTH_FILE",
             "CUBI_PLUGINS_DIR",
         ]);
+        // SAFETY: the shared environment lock is held through fixture use
+        // and restoration, serializing tests that mutate these paths.
         unsafe {
             std::env::set_var(crate::sessions::CUBI_HOME_ENV, cubi_home.path());
             std::env::set_var("HOME", other_home.path());
@@ -196,14 +196,52 @@ mod tests {
     #[test]
     fn config_dirs_use_cubi_home_before_platform_home() {
         test_env::with_cubi_home(|cubi_home, other_home| {
-            let cubi = cubi_dir().expect("cubi dir");
-            let legacy = legacy_dir().expect("legacy dir");
+            let legacy = cubi_home.join(".ai-chat-cli");
+            fs::create_dir(&legacy).unwrap();
+            fs::write(
+                legacy.join("config.json"),
+                r#"{"default_model":"legacy-model"}"#,
+            )
+            .unwrap();
+            let env = crate::config::Environment::capture();
 
-            assert_eq!(cubi, cubi_home.join(".cubi"));
-            assert_eq!(legacy, cubi_home.join(".ai-chat-cli"));
-            assert!(!cubi.starts_with(other_home));
-            assert!(!legacy.starts_with(other_home));
+            migrate_config_dir(env.home_dir().as_deref());
+
+            let config = crate::onboarding::AppConfig::load_from_home(Some(cubi_home));
+            assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
+            assert!(!legacy.exists());
+            assert!(!other_home.join(".cubi").exists());
         });
+    }
+
+    #[test]
+    fn legacy_aliases_preserve_values_and_respect_canonical_presence() {
+        for (new, old) in ENV_RENAMES {
+            for (canonical, expected) in [
+                (None, "legacy-value"),
+                (Some(""), ""),
+                (Some("canonical-value"), "canonical-value"),
+            ] {
+                let mut values =
+                    BTreeMap::from([(OsString::from(old), OsString::from("legacy-value"))]);
+                if let Some(value) = canonical {
+                    values.insert(OsString::from(new), OsString::from(value));
+                }
+
+                promote_legacy_env(&mut values);
+
+                assert_eq!(
+                    values.get(std::ffi::OsStr::new(new)),
+                    Some(&OsString::from(expected)),
+                    "{}",
+                    new
+                );
+                assert_eq!(
+                    values.get(std::ffi::OsStr::new(old)),
+                    Some(&OsString::from("legacy-value"))
+                );
+            }
+        }
     }
 
     #[test]

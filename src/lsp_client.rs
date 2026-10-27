@@ -23,7 +23,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::time::timeout;
 
 /// What to ask the LSP server for. The protocol method names are deliberately
@@ -183,7 +183,7 @@ pub async fn run_lsp_query(
     let root_uri = path_to_file_uri(workspace_root);
 
     let fut = async move {
-        let mut child = Command::new(server_command)
+        let mut child = crate::config::async_command(server_command)
             .args(server_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

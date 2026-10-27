@@ -444,7 +444,9 @@ impl ChatCLI {
         }
 
         // Lifecycle hooks + receipt, mirroring `run()` (interactive mode).
-        self.hooks.fire_session_start(self.executor.get_model());
+        self.hooks
+            .fire_session_start(self.executor.get_model())
+            .await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionStart {
                 model: self.executor.get_model().to_string(),
@@ -570,7 +572,7 @@ impl ChatCLI {
         guard.restore();
         drop(guard);
 
-        self.hooks.fire_stop();
+        self.hooks.fire_stop().await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionEnd,
             &serde_json::json!({"mode": "tui"}),
@@ -1146,6 +1148,7 @@ mod render_loop_tests {
                     prompt_tokens: 1,
                     completion_tokens: 2,
                     elapsed_ms: 3,
+                    ..ChatStats::default()
                 },
                 window: Some(8000),
             })

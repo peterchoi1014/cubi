@@ -3,6 +3,7 @@ use crate::agent_loop::{
 };
 use crate::commands::{self, COMMANDS, Cmd};
 use crate::completer::SlashHelper;
+use crate::context_budget;
 use crate::executor::AIExecutor;
 use crate::exit_code::{self, ExitCode};
 use crate::file_mentions::{self, UserCommand};
@@ -11,6 +12,7 @@ use crate::git_cmds;
 use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
+#[cfg(test)]
 use crate::oauth;
 use crate::ollama::{ChatStats, Message, ToolCall};
 use crate::onboarding::AppConfig;
@@ -23,7 +25,6 @@ use crate::sessions::{DeleteSessionResult, FindSessionResult, SessionFile, Sessi
 use crate::settings_sync;
 use crate::skills::{self, Skill};
 use crate::style::CubiStyle;
-use crate::themes;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use rustyline::Editor;
@@ -51,12 +52,15 @@ const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
+mod compaction;
 mod edit_cmd;
 mod multiline;
 mod render;
 mod repl;
+mod settings;
 mod spinner;
 mod status;
+pub(crate) mod tool_dispatch;
 mod tui;
 mod ui_sink;
 
@@ -79,6 +83,7 @@ use render::welcome_banner_rows;
 use repl::repl_history_path;
 
 pub struct ChatCLI {
+    config: crate::config::SharedConfig,
     executor: AIExecutor,
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
@@ -128,6 +133,10 @@ pub struct ChatCLI {
     /// Cumulative provider-reported usage for *this run* (does not persist
     /// across `/resume`). Surfaced by `/stats`.
     session_stats: ChatStats,
+    /// Model usage produced inside meta-tools while the parent tool call is
+    /// executing. The agent loop drains this into the active turn before the
+    /// next provider request.
+    pending_turn_stats: ChatStats,
     /// Suppresses REPL-only decoration so one-shot output remains pipeable.
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
@@ -274,6 +283,11 @@ impl Default for CliFlags {
 }
 
 impl ChatCLI {
+    pub(super) fn effective_context_window(&self) -> Option<usize> {
+        context_budget::effective_budget(self.executor.get_model(), self.executor.provider_name())
+            .map(|budget| budget.window)
+    }
+
     fn emit_status(&mut self, msg: impl std::fmt::Display) {
         if self.json_enabled && self.headless_mode {
             return;
@@ -315,6 +329,7 @@ impl ChatCLI {
         journal: FileJournal,
         flags: CliFlags,
     ) -> Self {
+        let config = executor.runtime_config();
         let mut cli = Self {
             executor,
             history: Vec::new(),
@@ -322,7 +337,12 @@ impl ChatCLI {
             todos: TodoList::load_for_current_dir(),
             memdir: Memdir::load(),
             user_commands: file_mentions::load_user_commands(),
-            hooks: HookRegistry::load(),
+            hooks: {
+                let guard = permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                HookRegistry::load(&guard)
+            },
             skills: skills::load_skills(),
             approved_tools: HashSet::new(),
             plan_mode,
@@ -336,11 +356,12 @@ impl ChatCLI {
             markdown_enabled: flags.markdown,
             stats_footer_enabled: flags.stats_footer,
             session_stats: ChatStats::default(),
+            pending_turn_stats: ChatStats::default(),
             headless_mode: false,
             json_enabled: flags.json,
             mcp_counts: flags.mcp_counts,
             no_banner: flags.no_banner,
-            app_config: AppConfig::load(),
+            app_config: config.read(|config| config.app.clone()),
             pinned: Vec::new(),
             tool_tracer: None,
             usage_history: Vec::new(),
@@ -353,7 +374,7 @@ impl ChatCLI {
             receipts: None,
             explain_tools_enabled: flags.explain_tools,
             history_cursor: 0,
-            history_page_size: resolve_history_page_size(),
+            history_page_size: config.read(|config| config.ui.history_page_size),
             ui: Box::new(ui_sink::LineSink::new(ui_sink::SinkFlags {
                 headless: false,
                 json: false,
@@ -362,10 +383,16 @@ impl ChatCLI {
             cancel: Arc::new(AtomicBool::new(false)),
             tui_active: false,
             startup_transcript: Vec::new(),
+            config,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
             cli.history.push(Message::text("system", system_prompt));
+        }
+        if cli.hooks.skipped_untrusted_project() {
+            eprintln!(
+                "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them."
+            );
         }
 
         // Auto-inject project memory (CUBI.md) into context, if present.
@@ -377,8 +404,7 @@ impl ChatCLI {
         // Steer reply formatting via the configured output style. We push
         // a system message rather than mutating per-prompt so the
         // preset rides along with every assistant turn for the session.
-        let style = std::env::var("CUBI_OUTPUT_STYLE")
-            .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string());
+        let style = cli.config.read(|config| config.ui.output_style.clone());
         cli.history.push(Message::text(
             "system",
             format!("SYSTEM: {}", output_styles::system_prompt_for(&style)),
@@ -483,7 +509,9 @@ impl ChatCLI {
         if self.json_enabled {
             self.markdown_enabled = false;
         }
-        self.hooks.fire_session_start(self.executor.get_model());
+        self.hooks
+            .fire_session_start(self.executor.get_model())
+            .await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionStart {
                 model: self.executor.get_model().to_string(),
@@ -500,7 +528,7 @@ impl ChatCLI {
         self.history.push(Message::text("user", expanded));
         self.journal.start_turn();
         let result = self.agent_turn(turn_start).await;
-        self.hooks.fire_stop();
+        self.hooks.fire_stop().await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionEnd,
             &serde_json::json!({"mode": "headless"}),
@@ -1105,8 +1133,16 @@ impl ChatCLI {
                 if arg.eq_ignore_ascii_case("preview") {
                     self.compact_preview();
                 } else if arg.is_empty() {
-                    if let Err(e) = self.compact().await {
-                        eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                    match self.compact(None).await {
+                        Ok(result) => {
+                            if !result.stats.is_empty() {
+                                self.session_stats.add(&result.stats);
+                                self.usage_history.push(result.stats);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                        }
                     }
                 } else {
                     println!(
@@ -1978,6 +2014,18 @@ impl ChatCLI {
                     self.session_stats.elapsed_ms
                 );
             }
+            println!(
+                "  {}: {} (this run)",
+                "model requests".bright_cyan(),
+                self.session_stats.request_count
+            );
+            if let Some(wall_ms) = self.session_stats.wall_clock_ms {
+                println!(
+                    "  {}: {} ms (completed turns)",
+                    "turn wall time".bright_cyan(),
+                    wall_ms
+                );
+            }
         }
         println!(
             "  {}: {}/{} pending",
@@ -2207,7 +2255,7 @@ impl ChatCLI {
         }
 
         // 3. `git` on PATH.
-        match std::process::Command::new("git").arg("--version").output() {
+        match crate::config::command("git").arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let v = String::from_utf8_lossy(&out.stdout);
                 println!(
@@ -2703,7 +2751,18 @@ impl ChatCLI {
             });
             match crate::hooks::save_global(&hooks) {
                 Ok(()) => {
-                    self.hooks = HookRegistry::load();
+                    self.hooks = {
+                        let guard = self
+                            .permissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        HookRegistry::load(&guard)
+                    };
+                    if self.hooks.skipped_untrusted_project() {
+                        self.emit_status(
+                            "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them.",
+                        );
+                    }
                     println!("{} Hook added.", "✓".bright_green());
                 }
                 Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
@@ -2723,7 +2782,18 @@ impl ChatCLI {
             hooks.remove(index - 1);
             match crate::hooks::save_global(&hooks) {
                 Ok(()) => {
-                    self.hooks = HookRegistry::load();
+                    self.hooks = {
+                        let guard = self
+                            .permissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        HookRegistry::load(&guard)
+                    };
+                    if self.hooks.skipped_untrusted_project() {
+                        self.emit_status(
+                            "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them.",
+                        );
+                    }
                     println!("{} Hook removed.", "✓".bright_green());
                 }
                 Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
@@ -3295,7 +3365,7 @@ impl ChatCLI {
             return;
         }
         let (program, flag) = shell_program();
-        match std::process::Command::new(program)
+        match crate::config::command(program)
             .arg(flag)
             .arg(command)
             .status()
@@ -4259,7 +4329,7 @@ impl ChatCLI {
     /// explicit estimates (we don't know the exact summary length until
     /// the LLM produces it).
     fn compact_preview(&self) {
-        const KEEP_RECENT: usize = 6;
+        const KEEP_RECENT: usize = 3;
         // Hard upper bound for the synthesized summary message. Used so
         // the preview can report a meaningful "post-compact upper bound"
         // even though the real summary length depends on the LLM.
@@ -4269,7 +4339,7 @@ impl ChatCLI {
 
         if plan.summarize_count == 0 {
             println!(
-                "{} Nothing to compact ({} non-system messages, keeps last {}).",
+                "{} Nothing to compact ({} non-system messages, keeps last {} turns).",
                 "ℹ".bright_blue(),
                 plan.non_system_count,
                 KEEP_RECENT
@@ -4283,7 +4353,7 @@ impl ChatCLI {
             "—".bright_black()
         );
         println!(
-            "  {} would summarize {} non-system message{} ({} kept verbatim, plus system+pinned).",
+            "  {} would summarize {} non-system message{} ({} kept verbatim in complete turns, plus system+pinned).",
             "▸".bright_cyan(),
             plan.summarize_count,
             if plan.summarize_count == 1 { "" } else { "s" },
@@ -4329,121 +4399,124 @@ impl ChatCLI {
     /// (0 when nothing was compacted), or an error when the summarizer
     /// call failed. The count lets `agent_turn` emit a `compacted` JSON
     /// event with an accurate `summarized_messages` field.
-    async fn compact(&mut self) -> Result<usize> {
-        // We keep the last N non-system messages intact and summarize
-        // everything before that.
-        const KEEP_RECENT: usize = 6; // ~3 exchanges
+    async fn compact(&mut self, cancel: Option<Arc<AtomicBool>>) -> Result<CompactionResult> {
+        const KEEP_RECENT_TURNS: usize = 3;
+        const SUMMARY_TOKEN_BUDGET: usize = 400;
+        const SUMMARY_SYSTEM_PROMPT: &str = "You are a summarizer. Produce a concise bullet-point summary of the \
+             following conversation. Preserve key decisions, facts, and outcomes. \
+             Do NOT include conversational filler. Output only the summary.";
 
-        let non_system_indices: Vec<usize> = self
-            .history
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role != "system")
-            .map(|(i, _)| i)
-            .collect();
-
-        if non_system_indices.len() <= KEEP_RECENT {
-            println!(
-                "{} Conversation is too short to compact ({} non-system messages).",
-                "ℹ".bright_blue(),
-                non_system_indices.len()
-            );
-            return Ok(0);
-        }
-
-        // Split: messages to summarize vs. messages to keep.
-        let cutoff_idx = non_system_indices[non_system_indices.len() - KEEP_RECENT];
-        let to_summarize: Vec<&Message> = self.history[..cutoff_idx]
-            .iter()
-            .filter(|m| m.role != "system")
-            .collect();
-
-        if to_summarize.is_empty() {
-            println!("{} Nothing to compact.", "ℹ".bright_blue());
-            return Ok(0);
-        }
-
-        // Build a condensed transcript for the summarizer.
-        let mut transcript = String::new();
-        for msg in &to_summarize {
-            let role_label = match msg.role.as_str() {
-                "user" => "User",
-                "assistant" => "Assistant",
-                "tool" => "Tool",
-                _ => &msg.role,
+        let budget = context_budget::effective_budget(
+            self.executor.get_model(),
+            self.executor.provider_name(),
+        );
+        let mut keep_recent_turns = KEEP_RECENT_TURNS;
+        let (plan, summary_prompt) = loop {
+            let Some(plan) = compaction::plan_compaction(&self.history, keep_recent_turns) else {
+                if keep_recent_turns == KEEP_RECENT_TURNS {
+                    let non_system_count = self
+                        .history
+                        .iter()
+                        .filter(|message| message.role != "system")
+                        .count();
+                    self.emit_status(format!(
+                        "{} Conversation is too short to compact ({} non-system messages).",
+                        "ℹ".bright_blue(),
+                        non_system_count
+                    ));
+                    return Ok(CompactionResult::default());
+                }
+                anyhow::bail!(
+                    "cubi: cannot compact a complete conversation turn within the prompt limit"
+                );
             };
-            // Truncate very long messages for the summarizer (char-safe).
-            let content = if msg.content.chars().count() > 500 {
-                let truncated: String = msg.content.chars().take(500).collect();
-                format!("{}…", truncated)
-            } else {
-                msg.content.clone()
-            };
-            transcript.push_str(&format!("{}: {}\n", role_label, content));
-        }
+            let summary_prompt = vec![
+                Message::text("system", SUMMARY_SYSTEM_PROMPT),
+                Message::text("user", plan.transcript.clone()),
+            ];
+            if budget.is_none_or(|budget| {
+                context_budget::estimate_request_tokens(&summary_prompt, None)
+                    <= budget.prompt_limit
+            }) {
+                break (plan, summary_prompt);
+            }
+            keep_recent_turns += 1;
+        };
 
-        println!(
+        self.emit_status(format!(
             "{} Compacting {} messages into a summary…",
             "⚙".bright_blue(),
-            to_summarize.len()
-        );
+            plan.summarized_count
+        ));
 
-        let summary_prompt = vec![
-            Message::text(
-                "system",
-                "You are a summarizer. Produce a concise bullet-point summary of the \
-                 following conversation. Preserve key decisions, facts, and outcomes. \
-                 Do NOT include conversational filler. Output only the summary.",
-            ),
-            Message::text("user", transcript),
-        ];
+        let summary_result = if let Some(cancel) = cancel.as_ref() {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => Err(exit_code::err(
+                    ExitCode::Cancelled,
+                    "cubi: compaction cancelled (Ctrl-C)",
+                )),
+                _ = agent::wait_for_cancel(cancel) => Err(exit_code::err(
+                    ExitCode::Cancelled,
+                    "cubi: compaction cancelled (Ctrl-C)",
+                )),
+                result = self.executor.chat_with_tools(summary_prompt, None) => result,
+            }
+        } else {
+            self.executor.chat_with_tools(summary_prompt, None).await
+        };
 
-        match self.executor.chat(summary_prompt).await {
-            Ok(summary) => {
-                let summarized_count = to_summarize.len();
-                // Rebuild history: keep all messages at their original positions,
-                // but replace old non-system messages before cutoff with a single
-                // summary. Messages at/after cutoff are preserved as-is.
-                let mut new_history: Vec<Message> = Vec::new();
+        match summary_result {
+            Ok((summary_message, mut stats)) => {
+                let summarized_count = plan.summarized_count;
+                let summary = summary_message.content;
+                let summary = compaction::bound_summary(&summary, SUMMARY_TOKEN_BUDGET);
+                self.history = plan.rebuild(&summary);
 
-                // Keep system messages that appeared before the cutoff
-                // (this includes PINNED_SYSTEM_TAG entries, which must
-                // survive compaction so the user's pinned context isn't
-                // silently dropped along with the summarized turns).
-                for msg in &self.history[..cutoff_idx] {
-                    if msg.role == "system" {
-                        new_history.push(msg.clone());
-                    }
-                }
-
-                // Insert the compacted summary.
-                new_history.push(Message::text(
-                    "system",
-                    format!(
-                        "SYSTEM: Compacted summary of earlier conversation:\n\n{}",
-                        summary
-                    ),
-                ));
-
-                // Append all messages from cutoff onward (recent messages kept intact).
-                new_history.extend(self.history[cutoff_idx..].iter().cloned());
-
-                self.history = new_history;
-
-                println!(
+                self.emit_status(format!(
                     "{} Compacted. History now has {} messages.",
                     "✓".bright_green(),
                     self.history.len()
-                );
+                ));
 
-                let extract_prompt = vec![
-                    Message::text(
-                        "system",
-                        "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
-                    ),
-                    Message::text("user", &summary),
-                ];
-                if let Ok(extracted) = self.executor.chat(extract_prompt).await {
+                if compaction::memory_extraction_enabled() {
+                    let mut extract_prompt = vec![
+                        Message::text(
+                            "system",
+                            "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
+                        ),
+                        Message::text("user", &summary),
+                    ];
+                    if let Some(budget) = context_budget::effective_budget(
+                        self.executor.get_model(),
+                        self.executor.provider_name(),
+                    ) {
+                        context_budget::truncate_message_to_fit(
+                            &mut extract_prompt,
+                            None,
+                            1,
+                            budget.prompt_limit,
+                        );
+                    }
+                    let extracted = if let Some(cancel) = cancel.as_ref() {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => Err(exit_code::err(
+                                ExitCode::Cancelled,
+                                "cubi: memory extraction cancelled (Ctrl-C)",
+                            )),
+                            _ = agent::wait_for_cancel(cancel) => Err(exit_code::err(
+                                ExitCode::Cancelled,
+                                "cubi: memory extraction cancelled (Ctrl-C)",
+                            )),
+                            result = self.executor.chat_with_tools(extract_prompt, None) => result,
+                        }
+                    } else {
+                        self.executor.chat_with_tools(extract_prompt, None).await
+                    }?;
+                    let (extracted_message, extract_stats) = extracted;
+                    stats.add(&extract_stats);
+                    let extracted = extracted_message.content;
                     if extracted.contains("- ") {
                         let bullets: Vec<_> = extracted
                             .lines()
@@ -4458,16 +4531,19 @@ impl ChatCLI {
                             }
                             self.persist_memdir();
                             self.inject_memdir();
-                            println!(
+                            self.emit_status(format!(
                                 "{} Extracted {} memories to memdir.",
                                 "ℹ".bright_blue(),
                                 bullets.len()
-                            );
+                            ));
                         }
                     }
                 }
                 self.checkpoint_session();
-                Ok(summarized_count)
+                Ok(CompactionResult {
+                    summarized_count,
+                    stats,
+                })
             }
             Err(e) => Err(e),
         }
@@ -4483,23 +4559,34 @@ impl ChatCLI {
     /// or the model's window is unknown (in which case we can't make
     /// an informed decision and let the request through — the provider
     /// will return its own error).
-    pub(super) fn check_token_budget(&self, _turn_start: usize) -> Result<bool> {
+    pub(super) fn check_token_budget(
+        &self,
+        _turn_start: usize,
+        tools: Option<&[crate::ollama::ToolSpec]>,
+    ) -> Result<bool> {
         let model = self.executor.get_model().to_string();
-        let Some(window) = crate::llm::context_window_for_model(&model) else {
+        let Some(budget) = context_budget::effective_budget(&model, self.executor.provider_name())
+        else {
             return Ok(false);
         };
-        let needed = crate::llm::estimate_conversation_tokens(&self.history);
-        if needed <= window {
+        let needed = context_budget::estimate_request_tokens(&self.history, tools);
+        if needed <= budget.prompt_limit {
             return Ok(false);
         }
         let json_enabled = self.json_enabled && self.headless_mode;
         if json_enabled {
-            Self::emit_json_event(crate::json_events::budget_error(needed, window, &model));
+            Self::emit_json_event(crate::json_events::budget_error(
+                needed,
+                budget.window,
+                budget.prompt_limit,
+                budget.completion_reserve,
+                &model,
+            ));
             return Err(exit_code::err(
                 ExitCode::Budget,
                 format!(
-                    "cubi: would exceed context window ({} tokens estimated, model window is {})",
-                    needed, window
+                    "cubi: would exceed context window ({} tokens estimated, prompt limit is {}; {} reserved for completion)",
+                    needed, budget.prompt_limit, budget.completion_reserve
                 ),
             ));
         }
@@ -4509,7 +4596,7 @@ impl ChatCLI {
                 format!(
                     "cubi: refusing — prompt ({} est. tokens) exceeds {} window of {} tokens. \
                      Run /compact or shorten the prompt and retry.",
-                    needed, model, window
+                    needed, model, budget.prompt_limit
                 ),
             ));
         }
@@ -4517,7 +4604,7 @@ impl ChatCLI {
             "{} prompt would exceed the model's context window ({} estimated tokens > {} window for {}).",
             "[budget]".bright_red(),
             needed,
-            window,
+            budget.prompt_limit,
             model.bright_cyan()
         );
         eprintln!(
@@ -4595,50 +4682,67 @@ impl ChatCLI {
     /// tokens cross `compact_threshold_pct`, invoke [`compact`] before
     /// the next LLM call. No-op when the model's window is unknown
     /// (we'd be guessing) or when `auto_compact` is disabled.
-    pub(super) async fn maybe_auto_compact(&mut self) {
+    pub(super) async fn maybe_auto_compact(
+        &mut self,
+        tools: Option<&[crate::ollama::ToolSpec]>,
+    ) -> Result<ChatStats> {
         if !self.app_config.auto_compact {
-            return;
+            return Ok(ChatStats::default());
         }
         let model = self.executor.get_model().to_string();
-        let Some(window) = crate::llm::context_window_for_model(&model) else {
-            return;
+        let Some(budget) = context_budget::effective_budget(&model, self.executor.provider_name())
+        else {
+            return Ok(ChatStats::default());
         };
         let threshold =
             crate::onboarding::clamp_compact_threshold(self.app_config.compact_threshold_pct)
                 as usize;
-        let estimated = crate::llm::estimate_conversation_tokens(&self.history);
+        let estimated = context_budget::estimate_request_tokens(&self.history, tools);
         // window * threshold / 100 — order chosen to keep precision and
         // stay inside usize on tiny windows.
-        let cutoff = window.saturating_mul(threshold) / 100;
+        let cutoff = budget.prompt_limit.saturating_mul(threshold) / 100;
         if estimated < cutoff {
-            return;
+            return Ok(ChatStats::default());
         }
         let json_enabled = self.json_enabled && self.headless_mode;
-        match self.compact().await {
-            Ok(0) => {
+        match self.compact(Some(Arc::clone(&self.cancel))).await {
+            Ok(result) if result.summarized_count == 0 => {
                 tracing::debug!(
                     target: "cubi::cli",
                     estimated,
                     cutoff,
                     "auto-compact skipped: nothing to summarize",
                 );
+                Ok(result.stats)
             }
-            Ok(n) => {
+            Ok(result) => {
                 if !json_enabled {
                     println!(
                         "{} auto-compacted {} earlier turn(s) into a summary",
                         "⚙".bright_blue(),
-                        n
+                        result.summarized_count
                     );
                 }
-                Self::emit_json_event_if(json_enabled, crate::json_events::compacted(n, window));
+                Self::emit_json_event_if(
+                    json_enabled,
+                    crate::json_events::compacted(result.summarized_count, budget.window),
+                );
+                Ok(result.stats)
             }
             Err(e) => {
+                if e.downcast_ref::<exit_code::AppExit>()
+                    .is_some_and(|exit| exit.code == ExitCode::Cancelled)
+                {
+                    return Err(e);
+                }
                 tracing::warn!(
                     target: "cubi::cli",
                     error = %e,
                     "auto-compact failed; continuing with full history",
                 );
+                let mut stats = ChatStats::default();
+                stats.add_unreported_request();
+                Ok(stats)
             }
         }
     }
@@ -4900,7 +5004,7 @@ impl ChatCLI {
     /// `/pr_comments` — shells out to `gh pr view --comments` if installed.
     fn run_pr_comments(&self, args: &str) {
         let arg_pr = args.trim();
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = crate::config::command("gh");
         cmd.arg("pr").arg("view").arg("--comments");
         if !arg_pr.is_empty() {
             cmd.arg(arg_pr);
@@ -4965,7 +5069,7 @@ impl ChatCLI {
     /// `/autofix-pr` — fetch PR comments and ask the model to propose fixes.
     async fn run_autofix_pr(&mut self, args: &str) {
         let arg_pr = args.trim();
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = crate::config::command("gh");
         cmd.arg("pr").arg("view").arg("--comments");
         if !arg_pr.is_empty() {
             cmd.arg(arg_pr);
@@ -5290,168 +5394,6 @@ impl ChatCLI {
         }
     }
 
-    /// `/passes` and `/effort` — show or set the agent-loop pass budget. We
-    /// stash it in the `EffortConfig` config field. The agent loop reads
-    /// `AGENT_PASSES_OVERRIDE` env var if set; we set that here so the
-    /// change takes effect mid-session without rebuilding the loop.
-    fn handle_effort(&self, cmd: Cmd, args: &str) {
-        let arg = args.trim();
-        if arg.is_empty() {
-            let current = std::env::var("AGENT_PASSES_OVERRIDE")
-                .unwrap_or_else(|_| format!("{}", agent_loop::MAX_AGENT_STEPS));
-            println!(
-                "{} max passes: {} (default {})",
-                "ℹ".bright_blue(),
-                current.bright_cyan(),
-                agent_loop::MAX_AGENT_STEPS
-            );
-            return;
-        }
-        let n = if matches!(cmd, Cmd::Effort) {
-            match arg.to_ascii_lowercase().as_str() {
-                "low" => 4,
-                "medium" | "med" => 8,
-                "high" => 12,
-                other => {
-                    if let Ok(n) = other.parse::<u32>() {
-                        n
-                    } else {
-                        eprintln!(
-                            "{} Use low|medium|high or a number 1..=12",
-                            "Error:".bright_red()
-                        );
-                        return;
-                    }
-                }
-            }
-        } else {
-            match arg.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => {
-                    eprintln!("{} /passes expects a number 1..=12", "Error:".bright_red());
-                    return;
-                }
-            }
-        };
-        if !(1..=12).contains(&n) {
-            eprintln!("{} must be 1..=12", "Error:".bright_red());
-            return;
-        }
-        unsafe { std::env::set_var("AGENT_PASSES_OVERRIDE", n.to_string()) };
-        println!("{} max passes set to {}", "✓".bright_green(), n);
-    }
-
-    /// Loads the on-disk AppConfig, applies `mutate`, persists. Errors
-    /// are surfaced but never fatal — handlers fall back to "in-memory
-    /// only" (still affects the env vars for the current process) so a
-    /// read-only $HOME doesn't break the slash commands.
-    fn update_config(&self, mutate: impl FnOnce(&mut AppConfig)) -> Result<()> {
-        let mut cfg = AppConfig::load();
-        mutate(&mut cfg);
-        cfg.save()
-    }
-
-    fn handle_theme(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        if arg.is_empty() {
-            println!(
-                "{} theme: {} (set with /theme [{}])",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_THEME")
-                    .unwrap_or_else(|_| "auto".to_string())
-                    .bright_cyan(),
-                themes::VALID_THEMES.join("|")
-            );
-            return;
-        }
-        if !themes::is_valid_theme(&arg) {
-            eprintln!(
-                "{} Unknown theme '{}'. Expected {}.",
-                "Error:".bright_red(),
-                arg,
-                themes::VALID_THEMES.join("|")
-            );
-            return;
-        }
-        // SAFETY: handled on the readline thread, no race.
-        unsafe { std::env::set_var("CUBI_THEME", &arg) };
-        if let Err(e) = self.update_config(|c| c.theme = Some(arg.clone())) {
-            eprintln!(
-                "{} theme set in this session but not persisted: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        println!("{} theme set to {}", "✓".bright_green(), arg);
-    }
-
-    fn handle_color(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} colored output is {} (toggle with /color on|off)",
-                "ℹ".bright_blue(),
-                if colored::control::SHOULD_COLORIZE.should_colorize() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            "on" => {
-                crate::style::set_color_override(true);
-                if let Err(e) = self.update_config(|c| c.color = Some("on".to_string())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!("{} colored output ON", "✓".bright_green());
-            }
-            "off" => {
-                crate::style::set_color_override(false);
-                if let Err(e) = self.update_config(|c| c.color = Some("off".to_string())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!("colored output OFF");
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
-    fn handle_output_style(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        if arg.is_empty() {
-            println!(
-                "{} output style: {} (set with /output-style [{}])",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_OUTPUT_STYLE")
-                    .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string())
-                    .bright_cyan(),
-                output_styles::VALID_STYLES.join("|")
-            );
-            return;
-        }
-        if !output_styles::is_valid_style(&arg) {
-            eprintln!(
-                "{} Unknown style '{}'. Expected {}.",
-                "Error:".bright_red(),
-                arg,
-                output_styles::VALID_STYLES.join("|")
-            );
-            return;
-        }
-        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", &arg) };
-        if let Err(e) = self.update_config(|c| c.output_style = Some(arg.clone())) {
-            eprintln!(
-                "{} style set in this session but not persisted: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        println!("{} output style set to {}", "✓".bright_green(), arg);
-    }
-
     fn show_statusline(&self) {
         let plan = if self.plan_mode.load(Ordering::SeqCst) {
             "plan"
@@ -5506,10 +5448,15 @@ impl ChatCLI {
     /// Immutable snapshot of the fields the status line can display, built
     /// from live `ChatCLI` state. Rendering lives in `status::StatusState`.
     fn status_snapshot(&self) -> crate::cli::status::StatusState {
+        let context_used = self
+            .session_stats
+            .last_prompt_tokens
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .or_else(|| Some(crate::llm::estimate_conversation_tokens(&self.history)));
         crate::cli::status::StatusState {
             model: self.executor.get_model().to_string(),
-            context_used: Some(crate::llm::estimate_conversation_tokens(&self.history)),
-            context_window: crate::llm::context_window_for_model(self.executor.get_model()),
+            context_used,
+            context_window: self.effective_context_window(),
             cwd: std::env::current_dir().unwrap_or_default(),
             prompt_tokens: self.session_stats.prompt_tokens,
             completion_tokens: self.session_stats.completion_tokens,
@@ -5554,182 +5501,6 @@ impl ChatCLI {
             println!("  {} {}", k.bright_cyan(), v);
         }
         println!();
-    }
-
-    fn handle_vim(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} vim mode: {} (toggle with /vim on|off; takes effect next session)",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_VIM_MODE")
-                    .unwrap_or_else(|_| "off".to_string())
-                    .bright_cyan()
-            ),
-            "on" | "off" => {
-                unsafe { std::env::set_var("CUBI_VIM_MODE", &arg) };
-                if let Err(e) = self.update_config(|c| c.vim_mode = Some(arg.clone())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!(
-                    "{} vim mode {} (restart the CLI to apply)",
-                    "✓".bright_green(),
-                    arg
-                );
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
-    fn handle_login(&self, args: &str) {
-        let parsed = match oauth::parse_login_args(args) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{} {}", "Error:".bright_red(), e);
-                println!(
-                    "{} Usage: /login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
-                    "Info:".bright_yellow()
-                );
-                return;
-            }
-        };
-        let mut store = oauth::OAuthStore::load();
-        store.upsert_login(&parsed);
-        if let Err(e) = store.save() {
-            eprintln!(
-                "{} failed to persist OAuth token: {}",
-                "Error:".bright_red(),
-                e
-            );
-            return;
-        }
-        let env_var = oauth::provider_env_var(&parsed.provider);
-        unsafe { std::env::set_var(&env_var, &parsed.access_token) };
-        println!(
-            "{} OAuth token saved for '{}' and loaded into {}",
-            "✓".bright_green(),
-            parsed.provider.bright_cyan(),
-            env_var.bright_cyan()
-        );
-    }
-
-    fn handle_logout(&self, args: &str) {
-        let provider = if args.trim().is_empty() {
-            "ollama"
-        } else {
-            args.trim()
-        };
-        let mut store = oauth::OAuthStore::load();
-        let removed = store.remove_provider(provider);
-        if let Err(e) = store.save() {
-            eprintln!(
-                "{} failed to persist OAuth store: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        let var = oauth::provider_env_var(provider);
-        unsafe { std::env::remove_var(&var) };
-        println!(
-            "{} cleared {} from this process{}",
-            "✓".bright_green(),
-            var.bright_cyan(),
-            if removed {
-                " and removed persisted OAuth token"
-            } else {
-                ""
-            }
-        );
-    }
-
-    fn show_oauth_refresh(&self, args: &str) {
-        let provider_filter = args.trim().to_ascii_lowercase();
-        let store = oauth::OAuthStore::load();
-        if store.providers.is_empty() {
-            println!(
-                "{} No OAuth tokens are stored yet. Use /login <provider> <access-token> first.",
-                "ℹ".bright_blue()
-            );
-            return;
-        }
-
-        let mut refreshed = 0usize;
-        for (provider, token) in &store.providers {
-            if !provider_filter.is_empty() && provider != &provider_filter {
-                continue;
-            }
-            let env_var = oauth::provider_env_var(provider);
-            if token.is_expired() {
-                println!(
-                    "{} {} token is expired; not loading {}",
-                    "⚠".bright_yellow(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan()
-                );
-                continue;
-            }
-            unsafe { std::env::set_var(&env_var, &token.access_token) };
-            refreshed += 1;
-            match token.expires_at_unix {
-                Some(ts) => println!(
-                    "{} refreshed {} into {} (expires at unix={})",
-                    "✓".bright_green(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan(),
-                    ts.to_string().bright_black()
-                ),
-                None => println!(
-                    "{} refreshed {} into {} (no expiry set)",
-                    "✓".bright_green(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan()
-                ),
-            }
-        }
-        if refreshed == 0 {
-            if !provider_filter.is_empty() {
-                println!(
-                    "{} No non-expired token found for provider '{}'.",
-                    "ℹ".bright_blue(),
-                    provider_filter.bright_cyan()
-                );
-            } else {
-                println!(
-                    "{}",
-                    "ℹ No non-expired OAuth tokens to refresh.".bright_blue()
-                );
-            }
-        }
-    }
-
-    fn handle_privacy_settings(&self, args: &str) {
-        let arg = args.trim();
-        if arg.is_empty() {
-            let telemetry = std::env::var("CUBI_TELEMETRY").unwrap_or_else(|_| "off".to_string());
-            println!(
-                "\n{}\n  telemetry: {} (no remote analytics implemented yet)\n  \
-                 local data: ~/.cubi/ (sessions, memdir, schedule, messages, triggers)\n  \
-                 set with: /privacy-settings telemetry on|off\n",
-                "Privacy:".bright_yellow().bold(),
-                telemetry.bright_cyan()
-            );
-            return;
-        }
-        let parts: Vec<&str> = arg.split_whitespace().collect();
-        match parts.as_slice() {
-            ["telemetry", v] if matches!(*v, "on" | "off") => {
-                unsafe { std::env::set_var("CUBI_TELEMETRY", *v) };
-                println!("{} telemetry set to {}", "✓".bright_green(), v);
-            }
-            _ => eprintln!(
-                "{} Usage: /privacy-settings telemetry on|off",
-                "Error:".bright_red()
-            ),
-        }
     }
 
     /// Renders the `/mcp` status as a String so the classic REPL and the TUI
@@ -6077,11 +5848,21 @@ impl ChatCLI {
     }
 
     fn show_cost(&self) {
-        let tokens = self.history.iter().map(|m| m.content.len()).sum::<usize>() / 4;
+        let total_tokens = self
+            .session_stats
+            .prompt_tokens
+            .saturating_add(self.session_stats.completion_tokens);
+        let cost = crate::pricing::format_cost(
+            crate::pricing::lookup(self.executor.get_model()),
+            self.session_stats.prompt_tokens,
+            self.session_stats.completion_tokens,
+        );
         println!(
-            "\n{}\n  estimated tokens: ~{}\n  estimated cost:   $0.00 (local Ollama)\n",
+            "\n{}\n  provider tokens: {}\n  model requests:  {}\n  cost:            {}\n",
             "Cost:".bright_yellow().bold(),
-            tokens
+            total_tokens,
+            self.session_stats.request_count,
+            cost
         );
     }
 
@@ -6146,8 +5927,20 @@ impl ChatCLI {
         // a user abort.
         let run_fut = async {
             if use_tools {
-                crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
-                    .await
+                let access = tool_dispatch::ToolAccess {
+                    hooks: self.hooks.clone(),
+                    policy: self.policy.clone(),
+                    permissions: Arc::clone(&self.permissions),
+                };
+                crate::consensus::run_with_tools(
+                    req,
+                    &self.executor,
+                    &sink,
+                    &mut self.mcp_manager,
+                    access,
+                    self.approved_tools.clone(),
+                )
+                .await
             } else {
                 crate::consensus::run(req, &self.executor, &sink).await
             }
@@ -6327,32 +6120,6 @@ impl ChatCLI {
         println!();
     }
 
-    fn handle_debug_tool_call(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} debug-tool-call: {} (toggle with /debug-tool-call on|off)",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_DEBUG_TOOL_CALL")
-                    .unwrap_or_else(|_| "off".to_string())
-                    .bright_cyan()
-            ),
-            "on" => {
-                unsafe { std::env::set_var("CUBI_DEBUG_TOOL_CALL", "on") };
-                println!("{} debug-tool-call ON", "✓".bright_green());
-            }
-            "off" => {
-                unsafe { std::env::remove_var("CUBI_DEBUG_TOOL_CALL") };
-                println!("debug-tool-call OFF");
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
     fn show_upgrade(&self) {
         println!(
             "\n{}\n  cd ~/code/cubi && git pull && cargo install --path . --locked\n  \
@@ -6385,17 +6152,6 @@ impl ChatCLI {
             "{} No Slack integration is bundled. You can drive cubi from \
              a Slack bot by piping prompts through `--batch` mode.",
             "ℹ".bright_blue()
-        );
-    }
-
-    fn reset_limits(&self) {
-        // The Ollama client tracks retries per-call (no persistent state), so
-        // "resetting" is informational. Clear the env-var override if set so
-        // backoff returns to defaults.
-        unsafe { std::env::remove_var("CUBI_RATE_LIMIT_BACKOFF_MS") };
-        println!(
-            "{} Rate-limit / retry state cleared (Ollama retries are per-call).",
-            "✓".bright_green()
         );
     }
 
@@ -6446,7 +6202,7 @@ impl ChatCLI {
             ("xclip", &["-selection", "clipboard"])
         };
 
-        let mut child = match std::process::Command::new(program)
+        let mut child = match crate::config::command(program)
             .args(extra)
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -6937,6 +6693,7 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
             prompt_tokens: sub.prompt_tokens,
             completion_tokens: sub.completion_tokens,
             elapsed_ms: sub.elapsed_ms,
+            ..crate::ollama::ChatStats::default()
         };
         let payload = crate::json_events::consensus_subagent_result(
             &sub.model,
@@ -7045,12 +6802,15 @@ fn pad_col(s: &str, width: usize) -> String {
 
 /// Reads `CUBI_HISTORY_PAGE` (clamped to a sane range) to size the
 /// `/history` pager. Falls back to 10 when unset or unparsable.
+#[cfg(test)]
 pub(crate) fn resolve_history_page_size() -> usize {
-    std::env::var("CUBI_HISTORY_PAGE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| (1..=500).contains(n))
-        .unwrap_or(10)
+    crate::config::with(|config| config.ui.history_page_size)
+}
+
+#[derive(Debug, Default)]
+struct CompactionResult {
+    summarized_count: usize,
+    stats: ChatStats,
 }
 
 /// Builds a one-line dim usage-footer string. Pure formatter so callers
@@ -7062,14 +6822,18 @@ pub(crate) fn format_usage_footer_line(
 ) -> String {
     let total = turn.prompt_tokens + turn.completion_tokens;
     let cum = cumulative.prompt_tokens + cumulative.completion_tokens;
-    format!(
-        "usage: prompt={p} completion={c} total={t} • session {cum} • {cost}",
+    let mut line = format!(
+        "usage: prompt={p} completion={c} total={t} requests={requests}",
         p = turn.prompt_tokens,
         c = turn.completion_tokens,
         t = total,
-        cum = cum,
-        cost = cost_label,
-    )
+        requests = turn.request_count,
+    );
+    if let Some(wall_ms) = turn.wall_clock_ms {
+        line.push_str(&format!(" wall={}ms", wall_ms));
+    }
+    line.push_str(&format!(" • session {} • {}", cum, cost_label));
+    line
 }
 
 /// One row in the `/usage` table.
@@ -7078,6 +6842,8 @@ pub(crate) struct UsageRow {
     pub label: String,
     pub prompt: u64,
     pub completion: u64,
+    pub requests: u64,
+    pub wall_ms: Option<u64>,
     pub cost: String,
 }
 
@@ -7090,20 +6856,30 @@ pub(crate) fn build_usage_rows(
     let mut rows = Vec::with_capacity(per_turn.len() + 1);
     let mut cum_p: u64 = 0;
     let mut cum_c: u64 = 0;
+    let mut cum_requests: u64 = 0;
+    let mut cum_wall_ms: Option<u64> = None;
     for (idx, s) in per_turn.iter().enumerate() {
         rows.push(UsageRow {
             label: format!("turn {}", idx + 1),
             prompt: s.prompt_tokens,
             completion: s.completion_tokens,
+            requests: s.request_count,
+            wall_ms: s.wall_clock_ms,
             cost: crate::pricing::format_cost(pricing, s.prompt_tokens, s.completion_tokens),
         });
         cum_p += s.prompt_tokens;
         cum_c += s.completion_tokens;
+        cum_requests = cum_requests.saturating_add(s.request_count);
+        if let Some(wall_ms) = s.wall_clock_ms {
+            cum_wall_ms = Some(cum_wall_ms.unwrap_or(0).saturating_add(wall_ms));
+        }
     }
     rows.push(UsageRow {
         label: "session".to_string(),
         prompt: cum_p,
         completion: cum_c,
+        requests: cum_requests,
+        wall_ms: cum_wall_ms,
         cost: crate::pricing::format_cost(pricing, cum_p, cum_c),
     });
     rows
@@ -7113,16 +6889,22 @@ pub(crate) fn build_usage_rows(
 pub(crate) fn format_usage_table(rows: &[UsageRow]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<10} {:>8} {:>10} {:>8} {}\n",
-        "turn", "prompt", "completion", "total", "cost"
+        "{:<10} {:>8} {:>10} {:>8} {:>8} {:>9} {}\n",
+        "turn", "prompt", "completion", "total", "requests", "wall ms", "cost"
     ));
     for r in rows {
+        let wall_ms = r
+            .wall_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".to_string());
         out.push_str(&format!(
-            "{:<10} {:>8} {:>10} {:>8} {}\n",
+            "{:<10} {:>8} {:>10} {:>8} {:>8} {:>9} {}\n",
             r.label,
             r.prompt,
             r.completion,
             r.prompt + r.completion,
+            r.requests,
+            wall_ms,
             r.cost,
         ));
     }
@@ -7166,16 +6948,10 @@ pub(crate) fn compact_preview_plan(
     keep_recent: usize,
     summary_budget: usize,
 ) -> CompactPreview {
-    let non_system_indices: Vec<usize> = history
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role != "system")
-        .map(|(i, _)| i)
-        .collect();
-    let non_system_count = non_system_indices.len();
+    let non_system_count = history.iter().filter(|m| m.role != "system").count();
     let current_tokens = crate::llm::estimate_conversation_tokens(history);
 
-    if non_system_count <= keep_recent {
+    let Some(plan) = compaction::plan_compaction(history, keep_recent) else {
         return CompactPreview {
             non_system_count,
             summarize_count: 0,
@@ -7185,23 +6961,10 @@ pub(crate) fn compact_preview_plan(
             upper_bound_tokens: current_tokens,
             estimated_savings: 0,
         };
-    }
-
-    let cutoff_idx = non_system_indices[non_system_count - keep_recent];
-    let summarize_count = history[..cutoff_idx]
-        .iter()
-        .filter(|m| m.role != "system")
-        .count();
-    let retained: Vec<&crate::ollama::Message> = history
-        .iter()
-        .enumerate()
-        .filter(|(i, m)| m.role == "system" || *i >= cutoff_idx)
-        .map(|(_, m)| m)
-        .collect();
-    let retained_tokens: usize = retained
-        .iter()
-        .map(|m| 4 + crate::llm::estimate_tokens(&m.content))
-        .sum();
+    };
+    let summarize_count = plan.summarized_count;
+    let keep_recent_count = plan.retained_count;
+    let retained_tokens = plan.retained_tokens();
     // Reserve role overhead for the synthesized summary system message
     // plus the configured budget so the upper bound mirrors what
     // `estimate_conversation_tokens` would report post-compact.
@@ -7210,7 +6973,7 @@ pub(crate) fn compact_preview_plan(
     CompactPreview {
         non_system_count,
         summarize_count,
-        keep_recent_count: keep_recent,
+        keep_recent_count,
         current_tokens,
         retained_tokens,
         upper_bound_tokens,
@@ -7398,7 +7161,7 @@ async fn shell_capture(command: &str) -> (bool, String, u64) {
     }
     let (program, flag) = shell_program();
     let started = std::time::Instant::now();
-    let result = tokio::process::Command::new(program)
+    let result = crate::config::async_command(program)
         .arg(flag)
         .arg(command)
         .output()
@@ -7430,7 +7193,7 @@ async fn shell_capture(command: &str) -> (bool, String, u64) {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn user(s: &str) -> Message {
         Message::text("user", s)
@@ -7486,11 +7249,13 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             elapsed_ms: 200,
+            ..crate::ollama::ChatStats::default()
         };
         let cum = crate::ollama::ChatStats {
             prompt_tokens: 300,
             completion_tokens: 150,
             elapsed_ms: 600,
+            ..crate::ollama::ChatStats::default()
         };
         let line = format_usage_footer_line(&turn, &cum, "$0.01");
         assert!(line.contains("prompt=100"));
@@ -7507,11 +7272,13 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 elapsed_ms: 1,
+                ..crate::ollama::ChatStats::default()
             },
             crate::ollama::ChatStats {
                 prompt_tokens: 30,
                 completion_tokens: 40,
                 elapsed_ms: 1,
+                ..crate::ollama::ChatStats::default()
             },
         ];
         let rows = build_usage_rows(&per_turn, None);
@@ -7591,14 +7358,12 @@ mod tests {
     #[test]
     fn resolve_history_page_size_uses_default_when_unset() {
         let _guard = env_lock().lock().expect("env lock not poisoned");
-        let prev = std::env::var("CUBI_HISTORY_PAGE").ok();
-        // SAFETY: serialized via the env lock above.
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&["CUBI_HISTORY_PAGE"]);
+        // SAFETY: both environment locks are held through fixture restoration.
         unsafe { std::env::remove_var("CUBI_HISTORY_PAGE") };
         let size = resolve_history_page_size();
         assert_eq!(size, 10);
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("CUBI_HISTORY_PAGE", v) };
-        }
     }
 
     // ---- /compact preview planner ----
@@ -7630,10 +7395,10 @@ mod tests {
             )));
         }
         let plan = compact_preview_plan(&h, 6, 400);
-        // 20 non-system; keep last 6, summarize 14.
+        // 10 complete turns; keep last 6 turns, summarize 4 turns.
         assert_eq!(plan.non_system_count, 20);
-        assert_eq!(plan.summarize_count, 14);
-        assert_eq!(plan.keep_recent_count, 6);
+        assert_eq!(plan.summarize_count, 8);
+        assert_eq!(plan.keep_recent_count, 12);
         assert!(plan.current_tokens > plan.retained_tokens);
         // Upper bound is retained + role overhead + summary budget.
         assert_eq!(plan.upper_bound_tokens, plan.retained_tokens + 4 + 400);
@@ -8021,21 +7786,37 @@ mod tests {
         )
     }
 
-    fn temp_oauth_path(suffix: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!("cubi-{suffix}-{nanos}.json"))
-            .display()
-            .to_string()
+    #[test]
+    fn debug_tool_call_changes_without_mutating_process_environment() {
+        let _guard = env_lock().lock().expect("lock should not be poisoned");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&["CUBI_DEBUG_TOOL_CALL"]);
+        let previous = std::env::var_os("CUBI_DEBUG_TOOL_CALL");
+        let cli = new_test_cli();
+
+        cli.handle_debug_tool_call(if previous.is_some() { "off" } else { "on" });
+        let after = std::env::var_os("CUBI_DEBUG_TOOL_CALL");
+        assert_eq!(
+            cli.config.read(|config| config.debug_tool_call.clone()),
+            previous.is_none().then(|| "on".to_string())
+        );
+
+        assert_eq!(after, previous);
     }
 
     #[test]
     fn login_and_logout_persist_and_remove_provider_tokens() {
         let _guard = env_lock().lock().expect("lock should not be poisoned");
-        let oauth_path = temp_oauth_path("oauth");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_OAUTH_FILE",
+            "CUBI_GITHUB_API_KEY",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        let oauth_path = home.path().join("oauth.json");
+        // SAFETY: all environment-test locks remain held through restoration.
         unsafe {
             std::env::set_var("CUBI_OAUTH_FILE", &oauth_path);
             std::env::remove_var("CUBI_GITHUB_API_KEY");
@@ -8051,20 +7832,20 @@ mod tests {
         assert_eq!(token.access_token, "token123");
         assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
         assert_eq!(
-            std::env::var("CUBI_GITHUB_API_KEY").ok().as_deref(),
-            Some("token123")
+            cli.config
+                .read(|config| config.provider.keys.get("CUBI_GITHUB_API_KEY").cloned()),
+            Some(std::ffi::OsString::from("token123"))
         );
+        assert!(std::env::var("CUBI_GITHUB_API_KEY").is_err());
 
         cli.handle_logout("github");
         let after_logout = oauth::OAuthStore::load();
         assert!(after_logout.get_provider("github").is_none());
+        assert!(
+            cli.config
+                .read(|config| !config.provider.keys.contains_key("CUBI_GITHUB_API_KEY"))
+        );
         assert!(std::env::var("CUBI_GITHUB_API_KEY").is_err());
-
-        let _ = std::fs::remove_file(&oauth_path);
-        unsafe {
-            std::env::remove_var("CUBI_OAUTH_FILE");
-            std::env::remove_var("CUBI_GITHUB_API_KEY");
-        }
     }
 
     #[test]
@@ -8488,39 +8269,306 @@ mod tests {
 
     #[test]
     fn pinned_system_messages_survive_compact_rebuild() {
-        // Simulates the rebuild step from `compact()` directly: pinned
-        // system messages must be retained verbatim and reappear before
-        // the summary in the new history.
         let mut cli = new_test_cli();
         cli.pin("keep me through compaction");
-        // Stuff some user/assistant turns to be summarized.
         for i in 0..10 {
             cli.history.push(Message::text("user", format!("u{}", i)));
             cli.history
                 .push(Message::text("assistant", format!("a{}", i)));
         }
-        // Replicate the rebuild rule: every system message in the
-        // pre-cutoff slice survives. With KEEP_RECENT = 6, cutoff_idx
-        // is at index of the 6th-from-last non-system message.
-        let non_system_indices: Vec<usize> = cli
-            .history
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role != "system")
-            .map(|(i, _)| i)
-            .collect();
-        let cutoff_idx = non_system_indices[non_system_indices.len() - 6];
-        let preserved: Vec<&Message> = cli.history[..cutoff_idx]
-            .iter()
-            .filter(|m| m.role == "system")
-            .collect();
+        let rebuilt = compaction::plan_compaction(&cli.history, 3)
+            .expect("history should compact")
+            .rebuild("summary");
+
         assert!(
-            preserved
+            rebuilt
                 .iter()
                 .any(|m| m.content.starts_with(PINNED_SYSTEM_TAG)
                     && m.content.contains("keep me through compaction")),
             "pinned system message must be preserved across compact rebuild"
         );
+    }
+
+    #[test]
+    fn compact_does_not_extract_memories_without_opt_in() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        // The fake-LLM env vars are also mutated by consensus tests; share
+        // their lock so a parallel test cannot swap the scripted reply.
+        let _fake_llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let previous_fake = std::env::var("CUBI_FAKE_LLM").ok();
+        let previous_response = std::env::var("CUBI_FAKE_LLM_RESPONSE").ok();
+        let previous_extract = std::env::var("CUBI_COMPACT_EXTRACT_MEMORIES").ok();
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            std::env::set_var("CUBI_FAKE_LLM", "1");
+            std::env::set_var("CUBI_FAKE_LLM_RESPONSE", "- must not persist");
+            std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES");
+        }
+        let mut cli = new_test_cli();
+        let temp = tempfile::tempdir().unwrap();
+        cli.memdir = Memdir::with_path(temp.path().join("memories.json"));
+        for i in 0..4 {
+            cli.history.push(Message::text("user", format!("u{i}")));
+            cli.history
+                .push(Message::text("assistant", format!("a{i}")));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let summarized = runtime.block_on(cli.compact(None)).unwrap();
+
+        assert!(summarized.summarized_count > 0);
+        assert!(cli.memdir.is_empty());
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            match previous_fake {
+                Some(value) => std::env::set_var("CUBI_FAKE_LLM", value),
+                None => std::env::remove_var("CUBI_FAKE_LLM"),
+            }
+            match previous_response {
+                Some(value) => std::env::set_var("CUBI_FAKE_LLM_RESPONSE", value),
+                None => std::env::remove_var("CUBI_FAKE_LLM_RESPONSE"),
+            }
+            match previous_extract {
+                Some(value) => std::env::set_var("CUBI_COMPACT_EXTRACT_MEMORIES", value),
+                None => std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES"),
+            }
+        }
+    }
+
+    #[test]
+    fn compact_honors_turn_cancellation_before_model_call() {
+        let mut cli = new_test_cli();
+        for i in 0..4 {
+            cli.history.push(Message::text("user", format!("u{i}")));
+            cli.history
+                .push(Message::text("assistant", format!("a{i}")));
+        }
+        let cancel = Arc::new(AtomicBool::new(true));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(cli.compact(Some(cancel)))
+            .expect_err("pre-set turn cancellation should abort compaction");
+
+        assert_eq!(
+            error
+                .downcast_ref::<exit_code::AppExit>()
+                .map(|exit| exit.code),
+            Some(ExitCode::Cancelled)
+        );
+    }
+
+    #[test]
+    fn compact_summarization_request_stays_within_budget() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_COMPACT_EXTRACT_MEMORIES",
+            "CUBI_CONTEXT_WINDOW",
+            "CUBI_FAKE_LLM",
+            "CUBI_MAX_PROMPT_TOKENS_OVERRIDE",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let fixture = crate::test_support::OpenAiFixture::spawn(vec![serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "bounded summary"}
+                }]
+            })])
+            .await;
+            // SAFETY: environment mutation is serialized by the shared test locks.
+            unsafe {
+                std::env::set_var("OPENAI_BASE_URL", &fixture.base_url);
+                std::env::set_var("OPENAI_API_KEY", "test-key");
+                std::env::set_var("CUBI_CONTEXT_WINDOW", "2048");
+                std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES");
+                std::env::remove_var("CUBI_FAKE_LLM");
+                std::env::remove_var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE");
+            }
+            let executor = AIExecutor::new_from_env("budget-fixture-model".to_string());
+            let mut cli = ChatCLI::new(
+                executor,
+                None,
+                Arc::new(Mutex::new(Permissions::default())),
+                Arc::new(AtomicBool::new(false)),
+                FileJournal::default(),
+            );
+            let turn_markers = (0..6)
+                .map(|index| format!("UNIQUE-TURN-{index}"))
+                .collect::<Vec<_>>();
+            for marker in &turn_markers {
+                cli.history.push(Message::text(
+                    "user",
+                    format!("{marker} user {}", "u".repeat(1_500)),
+                ));
+                cli.history.push(Message::text(
+                    "assistant",
+                    format!("{marker} assistant {}", "a".repeat(1_500)),
+                ));
+            }
+
+            cli.compact(None).await.unwrap();
+
+            let requests = fixture.requests.lock().unwrap().clone();
+            fixture.shutdown().await;
+            assert_eq!(requests.len(), 1);
+            let messages = requests[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    Message::text(
+                        message["role"].as_str().unwrap(),
+                        message["content"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let budget = context_budget::effective_budget(
+                cli.executor.get_model(),
+                cli.executor.provider_name(),
+            )
+            .unwrap();
+            assert!(
+                context_budget::estimate_request_tokens(&messages, None) <= budget.prompt_limit,
+                "summarization request exceeded prompt limit"
+            );
+            let summarizer_input = &messages[1].content;
+            for marker in &turn_markers[..3] {
+                assert!(
+                    summarizer_input.contains(marker)
+                        || cli
+                            .history
+                            .iter()
+                            .any(|message| message.content.contains(marker)),
+                    "{marker} was neither represented in the summarizer input nor retained"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn large_tool_result_triggers_compaction_before_follow_up_request() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        // The fake-LLM env vars are also mutated by consensus tests; share
+        // their lock so a parallel test cannot swap the scripted reply.
+        let _fake_llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let large_file = temp.path().join("large.txt");
+        fs::write(&large_file, "x".repeat(8_000)).unwrap();
+        let previous: Vec<(&str, Option<String>)> = [
+            "CUBI_FAKE_LLM",
+            "CUBI_FAKE_LLM_RESPONSE",
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            "CUBI_FAKE_LLM_TOOL_CALL_REPEAT",
+            "CUBI_CONTEXT_WINDOW",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var(name).ok()))
+        .collect();
+        let tool_call = serde_json::json!({
+            "function": {
+                "name": "read_file",
+                "arguments": {"path": large_file}
+            }
+        })
+        .to_string();
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            std::env::set_var("CUBI_FAKE_LLM", "1");
+            std::env::set_var("CUBI_FAKE_LLM_RESPONSE", "final");
+            std::env::set_var("CUBI_FAKE_LLM_TOOL_CALL", tool_call);
+            std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT");
+            std::env::set_var("CUBI_CONTEXT_WINDOW", "8000");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut permissions = Permissions::default();
+        permissions.trust_dir(&cwd).unwrap();
+        let permissions = Arc::new(Mutex::new(permissions));
+        let plan_mode = Arc::new(AtomicBool::new(false));
+        let manager = runtime
+            .block_on(McpManager::new(
+                Arc::clone(&permissions),
+                Arc::clone(&plan_mode),
+            ))
+            .unwrap();
+        let executor = AIExecutor::new_from_env("compaction-fixture-model".to_string());
+        let mut cli = ChatCLI::new(
+            executor,
+            Some(manager),
+            permissions,
+            plan_mode,
+            FileJournal::default(),
+        );
+        cli.headless_mode = true;
+        cli.stream_enabled = false;
+        cli.app_config = AppConfig::default();
+        for i in 0..5 {
+            cli.history.push(Message::text(
+                "user",
+                format!("older user turn {i} {}", "u".repeat(80)),
+            ));
+            cli.history.push(Message::text(
+                "assistant",
+                format!("older assistant turn {i} {}", "a".repeat(80)),
+            ));
+        }
+        let turn_start = cli.history.len();
+        cli.history
+            .push(Message::text("user", "read the large file"));
+        cli.journal.start_turn();
+        let tools = cli.build_turn_tool_specs();
+        let budget = context_budget::effective_budget(
+            cli.executor.get_model(),
+            cli.executor.provider_name(),
+        )
+        .unwrap();
+        let initial_estimate =
+            context_budget::estimate_request_tokens(&cli.history, tools.as_deref());
+        assert!(
+            initial_estimate
+                < budget.prompt_limit * usize::from(cli.app_config.compact_threshold_pct) / 100,
+            "fixture must start below the auto-compaction threshold"
+        );
+
+        runtime.block_on(cli.agent_turn(turn_start)).unwrap();
+
+        assert_eq!(
+            cli.history
+                .iter()
+                .filter(|message| compaction::is_compacted_summary(message))
+                .count(),
+            1,
+            "the post-tool request should compact older turns"
+        );
+        assert_eq!(cli.history.last().unwrap().content, "final");
+        runtime.block_on(cli.shutdown());
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            for (name, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[test]

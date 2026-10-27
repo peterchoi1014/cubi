@@ -47,54 +47,19 @@ impl ModelPricing {
     }
 }
 
-/// Built-in (prefix, pricing) table. Order matters — the first matching
-/// prefix wins, so list more-specific entries before less-specific ones.
-const TABLE: &[(&str, ModelPricing)] = &[
-    // OpenAI (USD / 1k tokens, public list, late 2024)
-    ("gpt-4o-mini", ModelPricing::priced(0.00015, 0.0006)),
-    ("gpt-4o", ModelPricing::priced(0.0025, 0.01)),
-    ("gpt-4.1-mini", ModelPricing::priced(0.0004, 0.0016)),
-    ("gpt-4.1", ModelPricing::priced(0.002, 0.008)),
-    // Anthropic
-    ("claude-3-5-sonnet", ModelPricing::priced(0.003, 0.015)),
-    ("claude-3-5-haiku", ModelPricing::priced(0.001, 0.005)),
-    ("claude-3-opus", ModelPricing::priced(0.015, 0.075)),
-    // Local-model prefixes — return zero-cost entries so the formatter
-    // can show "$0.00 (local)".
-    ("ollama/", ModelPricing::local()),
-    ("llama", ModelPricing::local()),
-    ("qwen", ModelPricing::local()),
-    ("phi", ModelPricing::local()),
-    ("mistral", ModelPricing::local()),
-    ("gemma", ModelPricing::local()),
-    ("glm", ModelPricing::local()),
-];
-
 /// Returns the [`ModelPricing`] for `model_id` if any built-in prefix
 /// matches, else `None`. Comparison is case-insensitive.
 pub fn lookup(model_id: &str) -> Option<ModelPricing> {
-    let id = model_id.to_ascii_lowercase();
-    if let Some(pricing) = lookup_prefix(&id) {
-        return Some(pricing);
+    let profile = crate::model_profile::lookup(model_id)?;
+    let price = profile.pricing?;
+    if profile.locality == crate::model_profile::Locality::Local {
+        Some(ModelPricing::local())
+    } else {
+        Some(ModelPricing::priced(
+            price.prompt_per_1k,
+            price.completion_per_1k,
+        ))
     }
-    // HuggingFace ids carry an `org/` repo prefix (e.g. "zai-org/glm-5.2").
-    // The full id is checked first above so provider catch-alls like
-    // "ollama/" still win; only retry on the final path segment when the
-    // whole id didn't match.
-    let stripped = id.rsplit('/').next().unwrap_or(&id);
-    if stripped != id {
-        return lookup_prefix(stripped);
-    }
-    None
-}
-
-fn lookup_prefix(id: &str) -> Option<ModelPricing> {
-    for (prefix, pricing) in TABLE {
-        if id.starts_with(prefix) {
-            return Some(*pricing);
-        }
-    }
-    None
 }
 
 /// Formats a USD cost as `$X.XXXX` or `$X.XX (local)`. Returns `—` when
@@ -130,6 +95,7 @@ mod tests {
     fn lookup_local_prefixes_return_zero_cost() {
         for id in [
             "ollama/llama3",
+            "ollama/gpt-4o",
             "llama3.2:1b",
             "qwen3:4b",
             "phi4-mini",

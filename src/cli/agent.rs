@@ -36,26 +36,6 @@ pub(crate) async fn wait_for_cancel(flag: &std::sync::atomic::AtomicBool) {
     }
 }
 
-fn subprocess_step_cap_events(
-    message: &str,
-    steps_used: usize,
-    stats: &ChatStats,
-    window: Option<usize>,
-) -> Vec<serde_json::Value> {
-    let mut error = crate::json_events::error(message);
-    if let Some(obj) = error.as_object_mut() {
-        obj.insert("steps_used".to_string(), serde_json::json!(steps_used));
-    }
-    let final_event = serde_json::json!({
-        "type": "final",
-        "value": message,
-        "steps_used": steps_used,
-        "error": true,
-    });
-    let done = subprocess_done_event(stats, window, steps_used);
-    vec![final_event, error, done]
-}
-
 fn format_time_cap(duration: Duration) -> String {
     let millis = duration.as_millis();
     if millis >= 1000 && millis % 1000 == 0 {
@@ -100,13 +80,14 @@ impl ChatCLI {
         json_enabled: bool,
     ) -> anyhow::Error {
         let message = format!("subagent time cap reached after {}", format_time_cap(cap));
-        if self.subprocess_subagent_mode && json_enabled {
-            let window = crate::llm::context_window_for_model(self.executor.get_model());
-            for event in subprocess_step_cap_events(&message, steps_used, stats, window) {
-                Self::emit_json_event(event);
-            }
-        }
+        let _ = (steps_used, stats, json_enabled);
         exit_code::err(ExitCode::Tool, format!("cubi: {message}"))
+    }
+
+    fn record_turn_stats(&mut self, stats: &mut ChatStats, started: std::time::Instant) {
+        stats.wall_clock_ms = Some(started.elapsed().as_millis() as u64);
+        self.session_stats.add(stats);
+        self.usage_history.push(stats.clone());
     }
 
     fn meta_tool_blocked_in_subagent_mode(&self, tool_name: &str) -> Option<String> {
@@ -133,7 +114,7 @@ impl ChatCLI {
         }
     }
 
-    fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
+    pub(super) fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
         let cwd = std::env::current_dir().ok();
         let trusted = cwd
             .as_deref()
@@ -186,46 +167,25 @@ impl ChatCLI {
         }
     }
 
-    async fn execute_tool_call(&mut self, call: &ToolCall) -> String {
-        // Fire PreToolUse hook — may deny the call.
-        use crate::hooks::HookDecision;
-        let hook_decision = self
-            .hooks
-            .fire_pre_tool_use(&call.function.name, &call.function.arguments);
+    async fn execute_tool_call(&mut self, call: &ToolCall) -> super::tool_dispatch::ToolOutcome {
+        let access = super::tool_dispatch::ToolAccess {
+            hooks: self.hooks.clone(),
+            policy: self.policy.clone(),
+            permissions: Arc::clone(&self.permissions),
+        };
+        super::tool_dispatch::dispatch_tool(&access, self, call).await
+    }
 
-        if let HookDecision::Deny(reason) = hook_decision {
-            let msg = format!(
-                "  {} {}",
-                "✗".bright_red(),
-                "denied by PreToolUse hook".bright_red()
-            );
-            self.emit_status(msg);
-            format!("[tool denied] {reason}")
-        } else if self.policy.is_denied(&call.function.name) {
-            format!(
-                "[tool denied] `{}` is blocked by admin policy",
-                call.function.name
-            )
-        } else if !self
-            .permissions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .check_tool_allowed(&call.function.name)
-        {
-            format!(
-                "[tool denied] `{}` is blocked by your tool permissions",
-                call.function.name
-            )
-        } else if !self.prompt_tool_approval(&call.function.name) {
-            format!(
-                "[tool denied] user declined approval for `{}`",
-                call.function.name
-            )
-        } else if call.function.name == AGENT_TOOL_NAME && agent_loop::meta_tools_disabled_by_env()
-        {
-            "[tool error] nested `agent_run` is not allowed".to_string()
+    pub(super) async fn execute_authorized_tool_call(
+        &mut self,
+        call: &ToolCall,
+    ) -> super::tool_dispatch::ToolOutcome {
+        use super::tool_dispatch::ToolOutcome;
+
+        if call.function.name == AGENT_TOOL_NAME && agent_loop::meta_tools_disabled_by_env() {
+            ToolOutcome::error("[tool error] nested `agent_run` is not allowed")
         } else if let Some(error) = self.meta_tool_blocked_in_subagent_mode(&call.function.name) {
-            error
+            ToolOutcome::error(error)
         } else if call.function.name == AGENT_TOOL_NAME {
             // Meta-tool: spawn a focused subagent with fresh context. Handled
             // here (not in `McpManager`) because it needs the executor to
@@ -239,7 +199,7 @@ impl ChatCLI {
                 .map(|n| n as usize)
                 .unwrap_or(SUBAGENT_DEFAULT_STEPS);
             if goal.is_empty() {
-                "[tool error] `agent_run` requires a non-empty `goal`".to_string()
+                ToolOutcome::error("[tool error] `agent_run` requires a non-empty `goal`")
             } else {
                 let start_msg = format!(
                     "  {} subagent goal: {}",
@@ -250,30 +210,37 @@ impl ChatCLI {
                 match agent_loop::run_subagent(
                     &self.executor,
                     &mut self.mcp_manager,
+                    super::tool_dispatch::ToolAccess {
+                        hooks: self.hooks.clone(),
+                        policy: self.policy.clone(),
+                        permissions: Arc::clone(&self.permissions),
+                    },
+                    self.approved_tools.clone(),
                     &goal,
                     max_steps,
                 )
                 .await
                 {
                     Ok(report) => {
+                        self.pending_turn_stats.add(&report.stats);
                         let done_msg = format!("  {} subagent done", "↳".bright_magenta());
                         self.emit_status(done_msg);
-                        report
+                        ToolOutcome::success(report.output)
                     }
-                    Err(e) => format!("[tool error] subagent failed: {e}"),
+                    Err(e) => ToolOutcome::error(format!("[tool error] subagent failed: {e}")),
                 }
             }
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME
             && agent_loop::meta_tools_disabled_by_env()
         {
-            "[tool error] nested `consensus_run` is not allowed".to_string()
+            ToolOutcome::error("[tool error] nested `consensus_run` is not allowed")
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME {
             // Meta-tool: spawn N consensus subagents in parallel. The
             // subagent token usage is folded into `session_stats` here
             // so `/cost` reflects the full bill.
             match self.execute_consensus_tool_call(call).await {
-                Ok(text) => text,
-                Err(e) => format!("[tool error] consensus_run failed: {e}"),
+                Ok(text) => ToolOutcome::success(text),
+                Err(e) => ToolOutcome::error(format!("[tool error] consensus_run failed: {e}")),
             }
         } else {
             match self.mcp_manager.as_mut() {
@@ -281,7 +248,14 @@ impl ChatCLI {
                     .call_tool(&call.function.name, call.function.arguments.clone())
                     .await
                 {
-                    Ok(r) => agent_loop::render_tool_result(&r),
+                    Ok(r) => {
+                        let text = agent_loop::render_tool_result(&r);
+                        if r.is_error == Some(true) {
+                            ToolOutcome::error(text)
+                        } else {
+                            ToolOutcome::success(text)
+                        }
+                    }
                     Err(e) => {
                         if let Some(timeout) =
                             e.downcast_ref::<crate::mcp_manager::ToolTimeoutError>()
@@ -290,16 +264,16 @@ impl ChatCLI {
                                 self.json_enabled && self.headless_mode,
                                 crate::json_events::tool_timeout(&timeout.name, timeout.secs),
                             );
-                            format!("[tool error] {timeout}")
+                            ToolOutcome::error(format!("[tool error] {timeout}"))
                         } else {
-                            format!("[tool error] {e}")
+                            ToolOutcome::error(format!("[tool error] {e}"))
                         }
                     }
                 },
-                None => format!(
+                None => ToolOutcome::error(format!(
                     "[tool error] no MCP manager available to execute `{}`",
                     call.function.name
-                ),
+                )),
             }
         }
     }
@@ -320,27 +294,13 @@ impl ChatCLI {
     /// assistant message is appended to history, single-turn system hints
     /// are stripped, and the session is checkpointed.
     pub(super) async fn agent_turn(&mut self, turn_start: usize) -> Result<()> {
-        // Auto-compact: when the prompt token estimate crosses
-        // `compact_threshold_pct` of the active model's context window,
-        // summarize older turns before sending. Best-effort; failures
-        // are logged but never abort the turn — we'd rather attempt the
-        // request than refuse silently.
-        self.maybe_auto_compact().await;
-
+        let turn_started = std::time::Instant::now();
         // Reset the cooperative TUI cancel flag at the start of each turn so a
         // stale Ctrl-C from a prior turn can't abort this one. No-op for the
         // non-TUI path (the flag is only ever set by the TUI render task).
         self.cancel
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let cancel = std::sync::Arc::clone(&self.cancel);
-
-        // Hard stop: refuse to send when the estimated prompt would
-        // still exceed the model's context window. Keeps the user's
-        // last turn in history so they can /compact, /pin less, or
-        // switch model and retry from the same state.
-        if self.check_token_budget(turn_start)? {
-            return Ok(());
-        }
 
         // Build the tool list once per turn. Older / non-tool-capable models
         // ignore it silently, so this is safe to always send.
@@ -369,6 +329,7 @@ impl ChatCLI {
         // Reset to 0 on any successful tool call; when it reaches
         // MAX_CONSECUTIVE_TOOL_ERRORS the model is treated as stuck.
         let mut consecutive_tool_errors: u32 = 0;
+        let mut completed = false;
 
         if let Some(sink) = self.event_sink.as_ref() {
             sink.emit(
@@ -402,9 +363,39 @@ impl ChatCLI {
         };
         let subprocess_deadline = subprocess_time_cap.map(|cap| tokio::time::Instant::now() + cap);
         for step in 0..max_agent_steps {
+            // Tool results can substantially grow history, so both
+            // compaction and the hard request budget are checked before every
+            // provider call rather than only at the start of the user turn.
+            let compact_stats = match self.maybe_auto_compact(tools.as_deref()).await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    turn_stats.add_unreported_request();
+                    self.record_turn_stats(&mut turn_stats, turn_started);
+                    return Err(error);
+                }
+            };
+            turn_stats.add(&compact_stats);
+            match self.check_token_budget(turn_start, tools.as_deref()) {
+                Ok(true) => {
+                    if !turn_stats.is_empty() {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if !turn_stats.is_empty() {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
+                    }
+                    return Err(error);
+                }
+            }
             if let Some(deadline) = subprocess_deadline {
                 if let Some(cap) = subprocess_time_cap {
                     if tokio::time::Instant::now() >= deadline {
+                        if !turn_stats.is_empty() {
+                            self.record_turn_stats(&mut turn_stats, turn_started);
+                        }
                         return Err(self.subprocess_time_cap_error(
                             cap,
                             step,
@@ -496,6 +487,8 @@ impl ChatCLI {
             let got_token = self.ui.got_token();
 
             if hit_time_cap {
+                turn_stats.add_unreported_request();
+                self.record_turn_stats(&mut turn_stats, turn_started);
                 if got_token && headless_mode && !json_enabled {
                     println!();
                 }
@@ -514,6 +507,8 @@ impl ChatCLI {
             // steps in this turn (if any) survive: use `/rewind` to undo
             // them.
             let Some(stream_result) = outcome else {
+                turn_stats.add_unreported_request();
+                self.record_turn_stats(&mut turn_stats, turn_started);
                 if got_token && !self.tui_active {
                     // Move past any partial output.
                     println!();
@@ -545,7 +540,14 @@ impl ChatCLI {
                 }
                 return Ok(());
             };
-            let (msg, stats) = stream_result?;
+            let (msg, stats) = match stream_result {
+                Ok(result) => result,
+                Err(error) => {
+                    turn_stats.add_unreported_request();
+                    self.record_turn_stats(&mut turn_stats, turn_started);
+                    return Err(error);
+                }
+            };
             turn_stats.add(&stats);
 
             if got_token {
@@ -614,7 +616,8 @@ impl ChatCLI {
                     }
                     any_output = true;
                 }
-                let window = crate::llm::context_window_for_model(self.executor.get_model());
+                let window = self.effective_context_window();
+                turn_stats.wall_clock_ms = Some(turn_started.elapsed().as_millis() as u64);
                 let done = if self.subprocess_subagent_mode {
                     subprocess_done_event(&turn_stats, window, step + 1)
                 } else {
@@ -661,6 +664,7 @@ impl ChatCLI {
                         "cubi: model returned no content; try rephrasing or switching model."
                     );
                 }
+                completed = true;
                 break;
             }
 
@@ -767,7 +771,7 @@ impl ChatCLI {
                 // used for the trailing ✓/✗ status row's elapsed time.
                 self.ui.tool_started(&call.function.name);
                 let tool_started_at = std::time::Instant::now();
-                let result_text = {
+                let tool_outcome = {
                     // Tool spinner: gives users a visible heartbeat
                     // (with elapsed seconds) while a slow tool runs.
                     // Suppressed in JSON mode so machine-parsed event
@@ -807,7 +811,8 @@ impl ChatCLI {
                     sp.finish().await;
                     r
                 };
-                let Some(result_text) = result_text else {
+                turn_stats.add(&std::mem::take(&mut self.pending_turn_stats));
+                let Some(tool_outcome) = tool_outcome else {
                     // Close the framed tool block opened by `tool_started`
                     // above with a failure status (no-op for LineSink/NullSink,
                     // so non-TUI output stays byte-identical). Without this the
@@ -830,6 +835,7 @@ impl ChatCLI {
                     }
                     self.cancel_tool_calls(turn_start, &calls, idx);
                     if hit_time_cap {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
                         return Err(self.subprocess_time_cap_error(
                             cap,
@@ -839,34 +845,34 @@ impl ChatCLI {
                         ));
                     }
                     if headless_mode {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         return Err(exit_code::err(
                             ExitCode::Cancelled,
                             "cubi: cancelled (Ctrl-C)",
                         ));
                     }
+                    self.record_turn_stats(&mut turn_stats, turn_started);
                     return Ok(());
                 };
+                let is_error = tool_outcome.is_failure();
+                let result_text = tool_outcome.text;
 
                 if let Some((tracer, id, started)) = trace_ctx {
-                    let is_err = result_text.starts_with("[tool error]")
-                        || result_text.starts_with("[tool denied]");
                     tracer.log_complete(
                         &call.function.name,
                         &id,
-                        !is_err,
+                        !is_error,
                         started.elapsed().as_millis(),
                         result_text.chars().count(),
                     );
                 }
 
                 if let Some(sink) = self.event_sink.as_ref() {
-                    let is_err = result_text.starts_with("[tool error]")
-                        || result_text.starts_with("[tool denied]");
                     sink.emit(
                         "tool_call_complete",
                         serde_json::json!({
                             "tool": call.function.name,
-                            "ok": !is_err,
+                            "ok": !is_error,
                             "result_chars": result_text.chars().count(),
                         }),
                     );
@@ -876,27 +882,19 @@ impl ChatCLI {
                 // (potentially large) text in the payload sidecar so
                 // the JSONL line stays a single line.
                 {
-                    let is_err = result_text.starts_with("[tool error]")
-                        || result_text.starts_with("[tool denied]");
                     self.emit_receipt(
                         crate::receipts::ReceiptEvent::ToolResult {
                             name: call.function.name.clone(),
-                            ok: !is_err,
+                            ok: !is_error,
                         },
                         &serde_json::json!({
                             "name": call.function.name,
-                            "ok": !is_err,
+                            "ok": !is_error,
                             "result": result_text,
                             "call_id": call.id,
                         }),
                     );
                 }
-
-                // Fire PostToolUse hook.
-                let is_error = result_text.starts_with("[tool error]")
-                    || result_text.starts_with("[tool denied]");
-                self.hooks
-                    .fire_post_tool_use(&call.function.name, &result_text, is_error);
 
                 // Tool errors are a normal part of an agentic loop: the model
                 // is expected to read the error and retry (fix a path, re-read
@@ -907,7 +905,7 @@ impl ChatCLI {
                 // errors in a row with no successful call in between (genuinely
                 // stuck), so scripts get a non-zero exit instead of burning the
                 // full step budget.
-                if result_text.starts_with("[tool error]") {
+                if is_error {
                     consecutive_tool_errors += 1;
                     if headless_mode && consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
                         // Record the final error in history so an inspected or
@@ -917,6 +915,7 @@ impl ChatCLI {
                             result_text.clone(),
                             call.id.clone(),
                         ));
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         return Err(exit_code::err(
                             ExitCode::Tool,
                             format!(
@@ -950,12 +949,10 @@ impl ChatCLI {
                 // Close the framed tool block in the TUI (no-op for LineSink).
                 // `ok` mirrors the error detection used above; the output is
                 // capped so a huge tool result doesn't bloat the event/channel.
-                let tool_ok = !result_text.starts_with("[tool error]")
-                    && !result_text.starts_with("[tool denied]");
                 let tool_output: String = result_text.chars().take(2000).collect();
                 self.ui.tool_finished(
                     &call.function.name,
-                    tool_ok,
+                    !is_error,
                     &tool_output,
                     tool_started_at.elapsed().as_millis() as u64,
                 );
@@ -982,33 +979,30 @@ impl ChatCLI {
                     "agent loop hit step cap ({max_agent_steps}) with pending tool calls; \
                      stopping before a final assistant reply"
                 );
-                eprintln!("{} {}", "Warn:".bright_yellow(), message);
-                if self.subprocess_subagent_mode && json_enabled {
-                    let window = crate::llm::context_window_for_model(self.executor.get_model());
-                    for event in subprocess_step_cap_events(
-                        &format!("subagent {message}"),
-                        max_agent_steps,
-                        &turn_stats,
-                        window,
-                    ) {
-                        Self::emit_json_event(event);
-                    }
-                }
+                self.emit_status(format!("{} {}", "Warn:".bright_yellow(), message));
             }
+        }
+
+        if !completed {
+            self.record_turn_stats(&mut turn_stats, turn_started);
+            return Err(exit_code::err(
+                ExitCode::Incomplete,
+                format!(
+                    "cubi: agent loop exhausted {} steps before producing a final reply",
+                    max_agent_steps
+                ),
+            ));
         }
 
         // Per-turn footer (opt-in via `/stats-footer on`). Skipped when the
         // provider returned nothing useful or when `--quiet` is set.
         if self.stats_footer_enabled && !self.quiet_mode && !turn_stats.is_empty() {
-            let window = crate::llm::context_window_for_model(self.executor.get_model());
+            let window = self.effective_context_window();
             self.ui.usage_footer(&turn_stats, window);
         }
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
-        self.session_stats.add(&turn_stats);
-        // Retain a copy of the per-turn stats so `/usage` and the optional
-        // usage footer can render without re-querying the provider.
-        self.usage_history.push(turn_stats.clone());
+        self.record_turn_stats(&mut turn_stats, turn_started);
         // Optional one-line usage footer (suppressed in headless/JSON and
         // when `--quiet` is set).
         if self.usage_footer_enabled
@@ -1032,11 +1026,7 @@ impl ChatCLI {
             sink.emit(
                 "turn_end",
                 serde_json::json!({
-                    "usage": {
-                        "prompt_tokens": turn_stats.prompt_tokens,
-                        "completion_tokens": turn_stats.completion_tokens,
-                        "elapsed_ms": turn_stats.elapsed_ms,
-                    },
+                    "usage": turn_stats,
                     "model": self.executor.get_model(),
                 }),
             );
@@ -1211,12 +1201,24 @@ impl ChatCLI {
             event_sink: self.event_sink.clone(),
         };
         let result = if use_tools {
-            crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
-                .await?
+            let access = super::tool_dispatch::ToolAccess {
+                hooks: self.hooks.clone(),
+                policy: self.policy.clone(),
+                permissions: Arc::clone(&self.permissions),
+            };
+            crate::consensus::run_with_tools(
+                req,
+                &self.executor,
+                &sink,
+                &mut self.mcp_manager,
+                access,
+                self.approved_tools.clone(),
+            )
+            .await?
         } else {
             crate::consensus::run(req, &self.executor, &sink).await?
         };
-        self.session_stats.add(&result.aggregate_stats());
+        self.pending_turn_stats.add(&result.aggregate_stats());
         self.emit_status(format!(
             "  {} consensus winner: {} — {}",
             "↳".bright_magenta(),
@@ -1256,34 +1258,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subprocess_step_cap_events_include_final_error_done_and_steps() {
-        let stats = ChatStats {
-            prompt_tokens: 3,
-            completion_tokens: 4,
-            elapsed_ms: 5,
-        };
-
-        let events = subprocess_step_cap_events("subagent hit cap", 2, &stats, Some(100));
-
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0]["type"], "final");
-        assert_eq!(events[0]["value"], "subagent hit cap");
-        assert_eq!(events[0]["steps_used"], 2);
-        assert_eq!(events[1]["type"], "error");
-        assert_eq!(events[1]["message"], "subagent hit cap");
-        assert_eq!(events[1]["steps_used"], 2);
-        assert_eq!(events[2]["type"], "done");
-        assert_eq!(events[2]["stats"]["prompt_tokens"], 3);
-        assert_eq!(events[2]["stats"]["completion_tokens"], 4);
-        assert_eq!(events[2]["steps_used"], 2);
-    }
-
-    #[test]
     fn subprocess_done_event_includes_exact_success_steps() {
         let stats = ChatStats {
             prompt_tokens: 6,
             completion_tokens: 7,
             elapsed_ms: 8,
+            ..ChatStats::default()
         };
 
         let event = subprocess_done_event(&stats, Some(200), 1);

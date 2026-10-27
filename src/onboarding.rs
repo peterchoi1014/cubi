@@ -182,9 +182,14 @@ impl AppConfig {
     /// default (un-onboarded) config rather than erroring — a missing
     /// file just means "first run on this machine".
     pub fn load() -> Self {
-        let Some(path) = Self::storage_path() else {
+        Self::load_from_home(crate::sessions::home_dir().as_deref())
+    }
+
+    pub(crate) fn load_from_home(home: Option<&std::path::Path>) -> Self {
+        let Some(home) = home else {
             return Self::default();
         };
+        let path = home.join(".cubi").join("config.json");
         let mut cfg: Self = match fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => Self::default(),
@@ -211,17 +216,13 @@ impl AppConfig {
 ///   2. `config.default_model` from `~/.cubi/config.json`.
 ///   3. The baked-in `fallback` constant from `main`.
 pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
-    if let Ok(env) = std::env::var("CUBI_MODEL") {
-        if !env.is_empty() {
-            return env;
-        }
-    }
-    if let Some(model) = &config.default_model {
-        if !model.is_empty() {
-            return model.clone();
-        }
-    }
-    fallback.to_string()
+    crate::config::with(|runtime| {
+        crate::config::RuntimeConfig::resolve_model(
+            runtime.model_override.as_deref(),
+            config,
+            fallback,
+        )
+    })
 }
 
 /// Heuristic check: returns `true` when `model` matches a known family
@@ -234,22 +235,7 @@ pub fn resolve_model(config: &AppConfig, fallback: &str) -> String {
 /// through as "probably fine" so we don't nag users running tool-capable
 /// models we just haven't seen yet.
 pub fn is_known_non_tool_capable(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    // Strip any `:tag` suffix so we match on the family name.
-    let family = m.split(':').next().unwrap_or(&m);
-    // Tiny llama3.2 variants (1b, 3b-without-tools-tuning) are the main
-    // offender that triggered this check.
-    if family == "llama3.2" {
-        if let Some(tag) = m.split(':').nth(1) {
-            // The 1b tag is known-bad; 3b is borderline but works for
-            // simple cases — only flag 1b to avoid false positives.
-            return tag.starts_with("1b");
-        }
-    }
-    matches!(
-        family,
-        "tinyllama" | "smollm" | "smollm2" | "gemma" | "gemma2" | "gemma3" | "phi" | "phi3"
-    ) || family.starts_with("orca-mini")
+    crate::model_profile::lookup(model).is_some_and(|profile| !profile.tool_calling)
 }
 
 /// Runs the first-run wizard if appropriate, mutating `config` and the
@@ -268,10 +254,7 @@ pub async fn run_if_needed(
     if config.onboarded {
         return Ok(());
     }
-    if std::env::var("CUBI_NO_ONBOARD")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
+    if crate::config::with(|config| config.no_onboard) {
         // Still mark as onboarded so we don't repeatedly check the env var.
         config.onboarded = true;
         let _ = config.save();
