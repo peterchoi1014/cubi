@@ -4407,19 +4407,45 @@ impl ChatCLI {
     async fn compact(&mut self, cancel: Option<Arc<AtomicBool>>) -> Result<CompactionResult> {
         const KEEP_RECENT_TURNS: usize = 3;
         const SUMMARY_TOKEN_BUDGET: usize = 400;
+        const SUMMARY_SYSTEM_PROMPT: &str = "You are a summarizer. Produce a concise bullet-point summary of the \
+             following conversation. Preserve key decisions, facts, and outcomes. \
+             Do NOT include conversational filler. Output only the summary.";
 
-        let Some(plan) = compaction::plan_compaction(&self.history, KEEP_RECENT_TURNS) else {
-            let non_system_count = self
-                .history
-                .iter()
-                .filter(|message| message.role != "system")
-                .count();
-            self.emit_status(format!(
-                "{} Conversation is too short to compact ({} non-system messages).",
-                "ℹ".bright_blue(),
-                non_system_count
-            ));
-            return Ok(CompactionResult::default());
+        let budget = context_budget::effective_budget(
+            self.executor.get_model(),
+            self.executor.provider_name(),
+        );
+        let mut keep_recent_turns = KEEP_RECENT_TURNS;
+        let (plan, summary_prompt) = loop {
+            let Some(plan) = compaction::plan_compaction(&self.history, keep_recent_turns) else {
+                if keep_recent_turns == KEEP_RECENT_TURNS {
+                    let non_system_count = self
+                        .history
+                        .iter()
+                        .filter(|message| message.role != "system")
+                        .count();
+                    self.emit_status(format!(
+                        "{} Conversation is too short to compact ({} non-system messages).",
+                        "ℹ".bright_blue(),
+                        non_system_count
+                    ));
+                    return Ok(CompactionResult::default());
+                }
+                anyhow::bail!(
+                    "cubi: cannot compact a complete conversation turn within the prompt limit"
+                );
+            };
+            let summary_prompt = vec![
+                Message::text("system", SUMMARY_SYSTEM_PROMPT),
+                Message::text("user", plan.transcript.clone()),
+            ];
+            if budget.is_none_or(|budget| {
+                context_budget::estimate_request_tokens(&summary_prompt, None)
+                    <= budget.prompt_limit
+            }) {
+                break (plan, summary_prompt);
+            }
+            keep_recent_turns += 1;
         };
 
         self.emit_status(format!(
@@ -4427,27 +4453,6 @@ impl ChatCLI {
             "⚙".bright_blue(),
             plan.summarized_count
         ));
-
-        let mut summary_prompt = vec![
-            Message::text(
-                "system",
-                "You are a summarizer. Produce a concise bullet-point summary of the \
-                 following conversation. Preserve key decisions, facts, and outcomes. \
-                 Do NOT include conversational filler. Output only the summary.",
-            ),
-            Message::text("user", plan.transcript.clone()),
-        ];
-        if let Some(budget) = context_budget::effective_budget(
-            self.executor.get_model(),
-            self.executor.provider_name(),
-        ) {
-            context_budget::truncate_message_to_fit(
-                &mut summary_prompt,
-                None,
-                1,
-                budget.prompt_limit,
-            );
-        }
 
         let summary_result = if let Some(cancel) = cancel.as_ref() {
             tokio::select! {
@@ -8567,7 +8572,7 @@ mod tests {
             unsafe {
                 std::env::set_var("OPENAI_BASE_URL", &fixture.base_url);
                 std::env::set_var("OPENAI_API_KEY", "test-key");
-                std::env::set_var("CUBI_CONTEXT_WINDOW", "1024");
+                std::env::set_var("CUBI_CONTEXT_WINDOW", "2048");
                 std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES");
                 std::env::remove_var("CUBI_FAKE_LLM");
                 std::env::remove_var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE");
@@ -8580,14 +8585,17 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 FileJournal::default(),
             );
-            for index in 0..4 {
+            let turn_markers = (0..6)
+                .map(|index| format!("UNIQUE-TURN-{index}"))
+                .collect::<Vec<_>>();
+            for marker in &turn_markers {
                 cli.history.push(Message::text(
                     "user",
-                    format!("user {index} {}", "u".repeat(8_000)),
+                    format!("{marker} user {}", "u".repeat(1_500)),
                 ));
                 cli.history.push(Message::text(
                     "assistant",
-                    format!("assistant {index} {}", "a".repeat(8_000)),
+                    format!("{marker} assistant {}", "a".repeat(1_500)),
                 ));
             }
 
@@ -8616,6 +8624,17 @@ mod tests {
                 context_budget::estimate_request_tokens(&messages, None) <= budget.prompt_limit,
                 "summarization request exceeded prompt limit"
             );
+            let summarizer_input = &messages[1].content;
+            for marker in &turn_markers[..3] {
+                assert!(
+                    summarizer_input.contains(marker)
+                        || cli
+                            .history
+                            .iter()
+                            .any(|message| message.content.contains(marker)),
+                    "{marker} was neither represented in the summarizer input nor retained"
+                );
+            }
         });
     }
 
