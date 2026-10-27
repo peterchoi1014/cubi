@@ -58,6 +58,16 @@ fn subprocess_done_event(
 }
 
 impl ChatCLI {
+    pub(super) fn approval_mode(&self) -> super::tool_dispatch::ApprovalMode {
+        if self.headless_mode {
+            super::tool_dispatch::ApprovalMode::Headless
+        } else if self.tui_active {
+            super::tool_dispatch::ApprovalMode::Tui
+        } else {
+            super::tool_dispatch::ApprovalMode::Classic
+        }
+    }
+
     pub(crate) fn build_turn_tool_specs(&self) -> Option<Vec<crate::ollama::ToolSpec>> {
         let tools = self
             .mcp_manager
@@ -117,7 +127,11 @@ impl ChatCLI {
         }
     }
 
-    pub(super) fn prompt_tool_approval(&mut self, tool_name: &str) -> bool {
+    pub(super) async fn prompt_tool_approval(
+        &mut self,
+        call: &ToolCall,
+        origin: &str,
+    ) -> super::tool_dispatch::Approval {
         let cwd = std::env::current_dir().ok();
         let trusted = cwd
             .as_deref()
@@ -128,46 +142,13 @@ impl ChatCLI {
                     .contains(path)
             })
             .unwrap_or(false);
-        if trusted || self.approved_tools.contains(tool_name) {
-            return true;
+        if trusted {
+            return super::tool_dispatch::Approval::AllowOnce;
         }
-        if self.headless_mode {
-            self.emit_status(format!(
-                "⚠ Tool `{}` wants to run; denying in headless mode.",
-                tool_name
-            ));
-            return false;
-        }
-        // In the full-screen TUI, an interactive stdin prompt would fight the
-        // render task (a second reader on the terminal) and corrupt the alt
-        // screen. Auto-deny using the same non-interactive path as headless;
-        // the notice is surfaced through the sink so it lands in the transcript.
-        if self.tui_active {
-            self.emit_status(format!(
-                "⚠ Tool `{}` wants to run; auto-denied in TUI mode (approval prompt unavailable).",
-                tool_name
-            ));
-            return false;
-        }
-
-        use std::io::{self, Write};
-        print!(
-            "⚠ Tool `{}` wants to run. Allow? [y/N/a(lways)] ",
-            tool_name
-        );
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            return false;
-        }
-        match input.trim().to_ascii_lowercase().as_str() {
-            "y" => true,
-            "a" => {
-                self.approved_tools.insert(tool_name.to_string());
-                true
-            }
-            _ => false,
-        }
+        let mode = self.approval_mode();
+        self.approval_session
+            .request(call, origin, mode, self.ui.as_mut(), &self.cancel)
+            .await
     }
 
     async fn execute_tool_call(&mut self, call: &ToolCall) -> super::tool_dispatch::ToolOutcome {
@@ -210,6 +191,14 @@ impl ChatCLI {
                     goal.chars().take(120).collect::<String>().bright_white()
                 );
                 self.emit_status(start_msg);
+                let mode = self.approval_mode();
+                let mut approval = super::tool_dispatch::ParentApproval::new(
+                    &mut self.approval_session,
+                    self.ui.as_mut(),
+                    &self.permissions,
+                    &self.cancel,
+                    mode,
+                );
                 match agent_loop::run_subagent(
                     &self.executor,
                     &mut self.mcp_manager,
@@ -218,7 +207,8 @@ impl ChatCLI {
                         policy: self.policy.clone(),
                         permissions: Arc::clone(&self.permissions),
                     },
-                    self.approved_tools.clone(),
+                    &mut approval,
+                    "agent_run",
                     &goal,
                     max_steps,
                 )
@@ -1216,13 +1206,21 @@ impl ChatCLI {
                 policy: self.policy.clone(),
                 permissions: Arc::clone(&self.permissions),
             };
+            let mode = self.approval_mode();
+            let mut approval = super::tool_dispatch::ParentApproval::new(
+                &mut self.approval_session,
+                self.ui.as_mut(),
+                &self.permissions,
+                &self.cancel,
+                mode,
+            );
             crate::consensus::run_with_tools(
                 req,
                 &self.executor,
                 &sink,
                 &mut self.mcp_manager,
                 access,
-                self.approved_tools.clone(),
+                &mut approval,
             )
             .await?
         } else {

@@ -45,19 +45,26 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     let theme = state.theme();
 
     let composer_rows = composer_height(state.composer());
-    let picker_rows = picker_height(state);
+    let approval_rows = if state.approval_pending() { 5 } else { 0 };
+    let picker_rows = if state.approval_pending() {
+        0
+    } else {
+        picker_height(state)
+    };
     // Reserve a middle region for the picker popup when it is open. When
     // closed `picker_rows == 0`, so the zero-height region renders nothing and
     // the layout is byte-for-byte the previous transcript/composer split.
     let chunks = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(approval_rows),
         Constraint::Length(picker_rows),
         Constraint::Length(composer_rows),
     ])
     .split(area);
     let transcript_area = chunks[0];
-    let picker_area = chunks[1];
-    let composer_area = chunks[2];
+    let approval_area = chunks[1];
+    let picker_area = chunks[2];
+    let composer_area = chunks[3];
 
     // --- Transcript -------------------------------------------------------
     let mut lines: Vec<Line> = Vec::new();
@@ -180,6 +187,9 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     if picker_rows > 0 {
         draw_picker(frame, picker_area, state, &theme);
     }
+    if approval_rows > 0 {
+        draw_approval(frame, approval_area, state, &theme);
+    }
 
     // --- Composer (bordered, info at the four corners) --------------------
     let status = state.status();
@@ -229,7 +239,34 @@ pub(super) fn draw(frame: &mut Frame, state: &AppState) {
     // Clamp inside the composer's inner area to avoid drawing off-region.
     let cursor_x = cursor_x.min(inner.x.saturating_add(inner.width.saturating_sub(1)));
     let cursor_y = cursor_y.min(inner.y.saturating_add(inner.height.saturating_sub(1)));
-    frame.set_cursor_position((cursor_x, cursor_y));
+    if !state.approval_pending() {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn draw_approval(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState, theme: &Theme) {
+    let Some(prompt) = state.pending_approval() else {
+        return;
+    };
+    let title = format!(" tool approval · {} ", prompt.origin);
+    let lines = vec![
+        Line::styled(
+            format!("{} — {}", prompt.tool, prompt.summary),
+            Style::default()
+                .fg(theme.tool_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "[y] allow once   [a] allow tool for session   [n/Esc] deny",
+            Style::default().fg(theme.status),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title_top(Line::from(title).left_aligned()))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The composer's height in rows: one row per logical line, at least 1, capped

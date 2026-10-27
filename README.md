@@ -52,7 +52,9 @@ local server), a streaming native-tool-calling agent loop, and MCP support.
   [`docs/mcp/registry.md`](docs/mcp/registry.md)
 - 🛡️ **Trust + plan mode + admin policy** — every write/exec path is gated by
   per-directory trust; `/plan` switches to a read-only mode; admins can ship a
-  policy file with a tool deny-list
+  policy file with a tool deny-list. In untrusted directories, interactive
+  sessions approve each tool call with a short argument summary; `a` grants
+  that tool for the rest of the session
 - 🧠 **Project memory + sessions** — auto-injected `CUBI.md` per project,
   cross-session persistent notes, auto-checkpointed sessions with
   `/resume`/`/fork`/`/rewind`/`/compact`
@@ -154,6 +156,11 @@ input box and a live status line, and includes:
   `/skills`, `/mcp`, `/consensus`, `/review`, etc. render inline (no drop to a
   separate screen); long model commands stream live and are `Ctrl-C`-cancelable
 - shell escape: prefix input with `!` to run a shell command (e.g. `!git status`)
+- per-call tool approval in untrusted directories: a framed modal shows the
+  tool, a short command/path summary, and its origin; press `y` to allow once,
+  `a` to allow that tool for the session, or `n`/`Esc` to deny. `Ctrl-C`
+  denies the pending call and cancels the turn. The composer stays locked
+  while the modal is open
 
 Navigation: the **mouse wheel**, `PageUp`/`PageDown` scroll the transcript;
 keyboard **`Up`/`Down` recall your input history** (and move the picker
@@ -167,6 +174,9 @@ Prefer the classic line-based readline REPL? Pass `--classic` (or set
 `CUBI_CLASSIC=1`). The TUI is also skipped automatically for non-TTY, piped,
 headless, `-p`, and `--json` runs, so scripts and pipelines are unaffected.
 (`--tui` / `CUBI_TUI` remain accepted but are now the default and a no-op.)
+The classic REPL uses the same `y` / `a` / deny approval choices in its stdin
+prompt. Headless runs cannot prompt and deny calls that are not already covered
+by project trust or a session grant.
 
 ## 📖 Usage
 

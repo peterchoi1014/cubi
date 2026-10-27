@@ -64,6 +64,29 @@ pub enum RenderEvent {
         output: String,
         elapsed_ms: u64,
     },
+    /// Main asks the render task to show an interactive per-call approval
+    /// prompt. The decision returns over the dedicated approval reply channel,
+    /// never through stdin or the normal user-action channel.
+    ApprovalRequest {
+        id: u64,
+        tool: String,
+        summary: String,
+        origin: String,
+    },
+    /// Main stopped waiting for this request because the turn was cancelled.
+    /// The render task clears a still-matching modal and records a denial.
+    ApprovalCancelled { id: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalReply {
+    Shown {
+        id: u64,
+    },
+    Decision {
+        id: u64,
+        decision: crate::cli::tool_dispatch::Approval,
+    },
 }
 
 /// Output-mode flags the sink needs to reproduce current behavior. These can

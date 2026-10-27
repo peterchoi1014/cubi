@@ -65,7 +65,7 @@
 //! child so the top-level tool builder omits `agent_run` and `consensus_run`
 //! too. Both paths also reject explicit nested meta-tool calls defensively.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -355,16 +355,9 @@ pub async fn run_with_tools(
     sink: &dyn ConsensusEventSink,
     mcp: &mut Option<McpManager>,
     access: crate::cli::tool_dispatch::ToolAccess,
-    approved_tools: HashSet<String>,
+    approval: &mut dyn crate::cli::tool_dispatch::ApprovalHost,
 ) -> Result<ConsensusResult> {
-    run_inner(
-        req,
-        executor,
-        sink,
-        Some(mcp),
-        Some((access, approved_tools)),
-    )
-    .await
+    run_inner(req, executor, sink, Some(mcp), Some((access, approval))).await
 }
 
 async fn run_inner(
@@ -372,7 +365,10 @@ async fn run_inner(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
     mcp: Option<&mut Option<McpManager>>,
-    tool_access: Option<(crate::cli::tool_dispatch::ToolAccess, HashSet<String>)>,
+    tool_access: Option<(
+        crate::cli::tool_dispatch::ToolAccess,
+        &mut dyn crate::cli::tool_dispatch::ApprovalHost,
+    )>,
 ) -> Result<ConsensusResult> {
     run_inner_with_isolated_runner(req, executor, sink, mcp, tool_access, None).await
 }
@@ -382,7 +378,10 @@ async fn run_inner_with_isolated_runner(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
     mcp: Option<&mut Option<McpManager>>,
-    tool_access: Option<(crate::cli::tool_dispatch::ToolAccess, HashSet<String>)>,
+    tool_access: Option<(
+        crate::cli::tool_dispatch::ToolAccess,
+        &mut dyn crate::cli::tool_dispatch::ApprovalHost,
+    )>,
     isolated_runner: Option<IsolatedSubagentRunner>,
 ) -> Result<ConsensusResult> {
     req.max_steps_per_subagent = normalize_max_steps_per_subagent(req.max_steps_per_subagent);
@@ -433,10 +432,10 @@ async fn run_inner_with_isolated_runner(
         let Some(mcp) = mcp else {
             anyhow::bail!("tool-enabled consensus requires an MCP manager; call run_with_tools");
         };
-        let Some((access, approved_tools)) = tool_access else {
+        let Some((access, approval)) = tool_access else {
             anyhow::bail!("tool-enabled consensus requires the parent authorization context");
         };
-        run_tool_subagents(&req, executor, mcp, access, approved_tools).await
+        run_tool_subagents(&req, executor, mcp, access, approval).await
     } else {
         run_llm_subagents(&req, executor).await
     };
@@ -592,16 +591,20 @@ async fn run_tool_subagents(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
     access: crate::cli::tool_dispatch::ToolAccess,
-    approved_tools: HashSet<String>,
+    approval: &mut dyn crate::cli::tool_dispatch::ApprovalHost,
 ) -> Vec<SubagentOutput> {
     let mut subagent_outputs = Vec::with_capacity(req.models.len());
     for model in &req.models {
         let started = Instant::now();
+        let origin = format!("consensus {}", model);
         let res = crate::agent_loop::run_subagent_with_model(
             executor,
             mcp,
             access.clone(),
-            approved_tools.clone(),
+            crate::agent_loop::SubagentApproval {
+                host: approval,
+                origin: &origin,
+            },
             Some(model.as_str()),
             &req.goal,
             req.max_steps_per_subagent,
@@ -1453,6 +1456,20 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::pin::Pin;
+
+    struct AlwaysApprove;
+
+    impl crate::cli::tool_dispatch::ApprovalHost for AlwaysApprove {
+        fn request_approval<'a>(
+            &'a mut self,
+            _call: &'a crate::ollama::ToolCall,
+            _origin: &'a str,
+        ) -> Pin<Box<dyn std::future::Future<Output = crate::cli::tool_dispatch::Approval> + 'a>>
+        {
+            Box::pin(async { crate::cli::tool_dispatch::Approval::AllowOnce })
+        }
+    }
 
     fn unsafe_unset_all() {
         // SAFETY: tests are serialized by the outer mutex `lock()`
@@ -2277,13 +2294,14 @@ fn main() {
         };
         let direct = run(req.clone(), &executor(), &NullSink).await.unwrap();
         let mut no_mcp = None;
+        let mut approval = AlwaysApprove;
         let via_tools_entrypoint = run_with_tools(
             req,
             &executor(),
             &NullSink,
             &mut no_mcp,
             tool_access(),
-            HashSet::new(),
+            &mut approval,
         )
         .await
         .unwrap();
@@ -2336,13 +2354,14 @@ fn main() {
             isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
+        let mut approval = AlwaysApprove;
         let err = run_with_tools(
             req,
             &executor(),
             &NullSink,
             &mut no_mcp,
             tool_access(),
-            HashSet::new(),
+            &mut approval,
         )
         .await
         .unwrap_err()
@@ -2373,14 +2392,9 @@ fn main() {
             isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
-        let outputs = run_tool_subagents(
-            &req,
-            &executor(),
-            &mut no_mcp,
-            tool_access(),
-            HashSet::new(),
-        )
-        .await;
+        let mut approval = AlwaysApprove;
+        let outputs =
+            run_tool_subagents(&req, &executor(), &mut no_mcp, tool_access(), &mut approval).await;
 
         assert_eq!(
             outputs.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),

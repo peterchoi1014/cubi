@@ -598,6 +598,41 @@ fn headless_aborts_after_consecutive_tool_errors() {
         .code(11);
 }
 
+#[test]
+fn headless_untrusted_tool_call_is_denied_without_execution() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let target = project.path().join("must-not-exist.txt");
+    let tool_call = serde_json::json!({
+        "function": {
+            "name": "write_file",
+            "arguments": {
+                "path": target,
+                "content": "denied"
+            }
+        }
+    })
+    .to_string();
+
+    cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env("CUBI_FAKE_LLM_TOOL_CALL", tool_call)
+        .args(["--no-stream", "-p", "write the file"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("done"))
+        .stderr(predicate::str::contains(
+            "Tool `write_file` wants to run; denying in headless mode.",
+        ));
+
+    assert!(
+        !target.exists(),
+        "denied tool call must not create the file"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn headless_step_exhaustion_is_incomplete_with_one_terminal_json_event() {

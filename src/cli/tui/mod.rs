@@ -16,6 +16,8 @@
 //!   * `action_tx: UnboundedSender<UserAction>` (render → main): how the idle
 //!     main loop receives the user's submitted line — this replaces
 //!     `rl.readline()` in TUI mode.
+//!   * `approval_tx: UnboundedSender<ApprovalReply>` (render → main): per-call
+//!     tool approval decisions. Requests arrive as `RenderEvent`s.
 //!   * `cancel: Arc<AtomicBool>`: set by the render task on Ctrl-C, observed by
 //!     `agent_turn`'s extra cancel branch (raw mode disables ISIG, so
 //!     `tokio::signal::ctrl_c()` never fires under the TUI).
@@ -34,7 +36,7 @@ mod widgets;
 
 use crate::cli::AgentCommand;
 use crate::cli::ChatCLI;
-use crate::cli::ui_sink::RenderEvent;
+use crate::cli::ui_sink::{ApprovalReply, RenderEvent};
 use crate::commands::{self, Cmd};
 use anyhow::{Context, Result};
 use app::AppState;
@@ -78,6 +80,13 @@ enum RenderControl {
     },
 }
 
+struct RenderChannels {
+    render_rx: UnboundedReceiver<RenderEvent>,
+    action_tx: UnboundedSender<UserAction>,
+    approval_tx: UnboundedSender<ApprovalReply>,
+    control_rx: UnboundedReceiver<RenderControl>,
+}
+
 /// The dedicated render task. Sole owner of the `Terminal`, the [`AppState`],
 /// and the crossterm [`EventStream`]. Runs until the user quits (Ctrl-D) or
 /// either channel end closes.
@@ -90,10 +99,8 @@ enum RenderControl {
 async fn render_task<B, S, F>(
     mut terminal: ratatui::Terminal<B>,
     mut state: AppState,
-    mut render_rx: UnboundedReceiver<RenderEvent>,
-    action_tx: UnboundedSender<UserAction>,
+    channels: RenderChannels,
     cancel: Arc<AtomicBool>,
-    mut control_rx: UnboundedReceiver<RenderControl>,
     mut make_events: F,
 ) -> Result<(), B::Error>
 where
@@ -101,6 +108,12 @@ where
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
     F: FnMut() -> S,
 {
+    let RenderChannels {
+        mut render_rx,
+        action_tx,
+        approval_tx,
+        mut control_rx,
+    } = channels;
     // `events` is an `Option` so a suspend can genuinely drop the stream
     // (releasing crossterm's background stdin reader) and rebuild it on resume.
     // It is `Some` whenever the select loop runs; while parked the task is
@@ -181,7 +194,14 @@ where
             maybe_ev = render_rx.recv() => {
                 match maybe_ev {
                     Some(ev) => {
+                        let approval_id = match &ev {
+                            RenderEvent::ApprovalRequest { id, .. } => Some(*id),
+                            _ => None,
+                        };
                         state.apply(ev);
+                        if let Some(id) = approval_id {
+                            let _ = approval_tx.send(ApprovalReply::Shown { id });
+                        }
                         redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
                     }
                     // Sender dropped (main restored its sink on shutdown).
@@ -205,6 +225,27 @@ where
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
+                        if state.approval_pending() {
+                            if let Some(approval_key) = event::map_approval_key(key) {
+                                let (decision, cancel_turn) = match approval_key {
+                                    event::ApprovalKey::Decision(decision) => (decision, false),
+                                    event::ApprovalKey::DenyAndCancel => {
+                                        (crate::cli::tool_dispatch::Approval::Deny, true)
+                                    }
+                                };
+                                if let Some(id) = state.resolve_approval(decision) {
+                                    let _ = approval_tx.send(ApprovalReply::Decision {
+                                        id,
+                                        decision,
+                                    });
+                                }
+                                if cancel_turn {
+                                    cancel.store(true, Ordering::SeqCst);
+                                }
+                                redraw(&mut terminal, &mut state, &mut thinking_since, &mut spinner_frame, false)?;
+                            }
+                            continue;
+                        }
                         match event::map_key(key) {
                             event::Action::Edit(e) => {
                                 state.edit(e);
@@ -221,6 +262,11 @@ where
                                 {
                                     let _ = state.take_composer();
                                     state.push_history(&cmd);
+                                    if is_quit_line(&cmd) {
+                                        cancel.store(true, Ordering::SeqCst);
+                                        let _ = action_tx.send(UserAction::Quit);
+                                        break;
+                                    }
                                     // Slash commands are not echoed (they run
                                     // suspended on the real terminal).
                                     let _ = action_tx.send(UserAction::SubmitLine(cmd));
@@ -231,6 +277,13 @@ where
                                 state.push_history(&line);
                                 let trimmed = line.trim();
                                 if !trimmed.is_empty() {
+                                    // `/quit` must not wait behind a running turn:
+                                    // cancel it and leave now, like Ctrl-D.
+                                    if is_quit_line(trimmed) {
+                                        cancel.store(true, Ordering::SeqCst);
+                                        let _ = action_tx.send(UserAction::Quit);
+                                        break;
+                                    }
                                     // Echo non-slash input as a `You` role block
                                     // directly into the transcript (the render
                                     // task owns `state`), so the live turn
@@ -256,6 +309,9 @@ where
                                 cancel.store(true, Ordering::SeqCst);
                             }
                             event::Action::Quit => {
+                                // Cancel any in-flight turn so the main task drops
+                                // the model request instead of waiting for the reply.
+                                cancel.store(true, Ordering::SeqCst);
                                 let _ = action_tx.send(UserAction::Quit);
                                 break;
                             }
@@ -358,6 +414,14 @@ where
 /// achieves the same back-buffer reset + full clear (`ClearType::All`) with no
 /// stdin read. Best-effort: a failure here is swallowed so a transient hiccup
 /// on resume can never kill the render task; the next frame recovers.
+/// `/quit` or its `/exit` alias, as parsed by the shared command table.
+fn is_quit_line(line: &str) -> bool {
+    matches!(
+        crate::commands::parse(line.trim()),
+        Some((crate::commands::Cmd::Quit, _))
+    )
+}
+
 fn force_full_repaint<B>(terminal: &mut ratatui::Terminal<B>)
 where
     B: ratatui::backend::Backend,
@@ -475,6 +539,7 @@ impl ChatCLI {
         // Wire the channels + the shared cancel flag.
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
         // Control channel (main → render) for the slash-command suspend/resume
         // handshake, kept separate from `render_tx` so a suspend is never
         // queued behind pending render output.
@@ -484,6 +549,8 @@ impl ChatCLI {
         // A second handle on the render channel so the main task can push a
         // fresh status snapshot after each turn without reaching into the sink.
         let status_tx = render_tx.clone();
+        self.approval_session
+            .attach_tui(render_tx.clone(), approval_rx);
 
         // Seed the initial view with the normal startup output (which the
         // alternate screen would otherwise wipe) BEFORE the live status
@@ -538,15 +605,18 @@ impl ChatCLI {
         let render_handle = tokio::spawn(render_task(
             terminal,
             state,
-            render_rx,
-            action_tx,
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
             Arc::clone(&cancel),
-            control_rx,
             EventStream::new,
         ));
 
         // Swap the sink for the whole session and mark the TUI active so tool
-        // approval auto-denies and raw stdout prints are suppressed.
+        // approval uses the render-task modal and raw stdout prints are suppressed.
         let prev_ui = std::mem::replace(&mut self.ui, Box::new(TuiSink::new(render_tx)));
         self.tui_active = true;
 
@@ -567,6 +637,7 @@ impl ChatCLI {
         // onto the normal screen.
         self.ui = prev_ui;
         self.tui_active = false;
+        self.approval_session.detach_tui();
         render_handle.abort();
         let _ = render_handle.await;
         guard.restore();
@@ -1119,6 +1190,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
         let (_control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -1128,10 +1200,13 @@ mod render_loop_tests {
         let handle = tokio::spawn(render_task(
             terminal,
             state,
-            render_rx,
-            action_tx.clone(),
+            RenderChannels {
+                render_rx,
+                action_tx: action_tx.clone(),
+                approval_tx,
+                control_rx,
+            },
             Arc::clone(&cancel),
-            control_rx,
             futures_util::stream::pending::<std::io::Result<Event>>,
         ));
 
@@ -1171,6 +1246,159 @@ mod render_loop_tests {
         assert!(joined.is_ok(), "render task should exit cleanly");
     }
 
+    #[tokio::test]
+    async fn render_task_round_trips_allow_once_approval() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
+        let (_control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+        let mut event_rx = Some(event_rx);
+
+        let handle = tokio::spawn(render_task(
+            terminal,
+            AppState::new(),
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
+            cancel,
+            move || {
+                let mut rx = event_rx.take().expect("event stream built once");
+                futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+            },
+        ));
+
+        render_tx
+            .send(RenderEvent::ApprovalRequest {
+                id: 42,
+                tool: "bash".to_string(),
+                summary: "command: cargo test".to_string(),
+                origin: "agent_run".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            approval_rx.recv().await,
+            Some(ApprovalReply::Shown { id: 42 })
+        );
+
+        event_tx
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            ))))
+            .unwrap();
+        assert_eq!(
+            approval_rx.recv().await,
+            Some(ApprovalReply::Decision {
+                id: 42,
+                decision: crate::cli::tool_dispatch::Approval::AllowOnce,
+            })
+        );
+
+        drop(render_tx);
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    async fn quit_test_harness() -> (
+        mpsc::UnboundedSender<std::io::Result<Event>>,
+        mpsc::UnboundedReceiver<UserAction>,
+        Arc<AtomicBool>,
+        mpsc::UnboundedSender<RenderEvent>,
+        tokio::task::JoinHandle<std::result::Result<(), std::convert::Infallible>>,
+        mpsc::UnboundedSender<RenderControl>,
+    ) {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+        let mut event_rx = Some(event_rx);
+        let handle = tokio::spawn(render_task(
+            terminal,
+            AppState::new(),
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
+            Arc::clone(&cancel),
+            move || {
+                let mut rx = event_rx.take().expect("event stream built once");
+                futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+            },
+        ));
+        (event_tx, action_rx, cancel, render_tx, handle, control_tx)
+    }
+
+    /// Quitting while a turn is generating must cancel that turn so the main
+    /// task drops the model request instead of waiting for the full reply.
+    #[tokio::test]
+    async fn ctrl_d_cancels_the_running_turn_and_quits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (event_tx, mut action_rx, cancel, _render_tx, handle, _control_tx) =
+            quit_test_harness().await;
+
+        event_tx
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))))
+            .unwrap();
+
+        assert_eq!(action_rx.recv().await, Some(UserAction::Quit));
+        assert!(cancel.load(Ordering::SeqCst), "Ctrl-D must cancel the turn");
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn quit_command_cancels_the_running_turn_and_quits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (event_tx, mut action_rx, cancel, _render_tx, handle, _control_tx) =
+            quit_test_harness().await;
+
+        for ch in "/quit".chars() {
+            event_tx
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                ))))
+                .unwrap();
+        }
+        event_tx
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))))
+            .unwrap();
+
+        assert_eq!(action_rx.recv().await, Some(UserAction::Quit));
+        assert!(cancel.load(Ordering::SeqCst), "/quit must cancel the turn");
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    #[test]
+    fn quit_line_matches_quit_and_exit_only() {
+        assert!(is_quit_line("/quit"));
+        assert!(is_quit_line("  /exit  "));
+        assert!(!is_quit_line("/quiet"));
+        assert!(!is_quit_line("quit"));
+    }
+
     /// The main loop relies on the render task ending cleanly when its render
     /// channel closes. Assert that invariant (no panic, `Ok`).
     #[tokio::test]
@@ -1179,6 +1407,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
         let (_control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
         let state = AppState::new();
@@ -1186,10 +1415,13 @@ mod render_loop_tests {
         let handle = tokio::spawn(render_task(
             terminal,
             state,
-            render_rx,
-            action_tx,
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
             cancel,
-            control_rx,
             futures_util::stream::pending::<std::io::Result<Event>>,
         ));
         drop(render_tx);
@@ -1214,6 +1446,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut state = AppState::new();
@@ -1225,10 +1458,13 @@ mod render_loop_tests {
         let handle = tokio::spawn(render_task(
             terminal,
             state,
-            render_rx,
-            action_tx,
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
             Arc::clone(&cancel),
-            control_rx,
             move || {
                 builds_factory.fetch_add(1, Ordering::SeqCst);
                 futures_util::stream::pending::<std::io::Result<Event>>()
@@ -1367,6 +1603,7 @@ mod render_loop_tests {
         let terminal = ratatui::Terminal::new(backend).unwrap();
         let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
         let (action_tx, _action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut state = AppState::new();
@@ -1375,10 +1612,13 @@ mod render_loop_tests {
         let handle = tokio::spawn(render_task(
             terminal,
             state,
-            render_rx,
-            action_tx,
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
             Arc::clone(&cancel),
-            control_rx,
             futures_util::stream::pending::<std::io::Result<Event>>,
         ));
 

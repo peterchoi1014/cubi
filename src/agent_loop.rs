@@ -21,11 +21,12 @@
 
 use crate::config::ToolProfile;
 use serde_json::json;
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::cli::tool_dispatch::{ToolAccess, ToolCallHost, ToolOutcome, dispatch_tool};
+use crate::cli::tool_dispatch::{
+    ApprovalHost, ToolAccess, ToolCallHost, ToolOutcome, dispatch_tool,
+};
 use crate::executor::AIExecutor;
 use crate::mcp_client::Tool;
 use crate::mcp_manager::McpManager;
@@ -232,6 +233,11 @@ pub struct SubagentRunResult {
     pub tool_calls: usize,
 }
 
+pub struct SubagentApproval<'a> {
+    pub host: &'a mut dyn ApprovalHost,
+    pub origin: &'a str,
+}
+
 #[derive(Debug)]
 pub struct SubagentRunError {
     pub source: anyhow::Error,
@@ -254,20 +260,16 @@ impl std::error::Error for SubagentRunError {
 
 struct SubagentToolHost<'a> {
     mcp: &'a mut Option<McpManager>,
-    access: &'a ToolAccess,
-    approved_tools: &'a HashSet<String>,
+    approval: &'a mut dyn ApprovalHost,
+    origin: &'a str,
 }
 
 impl ToolCallHost for SubagentToolHost<'_> {
-    fn approve_tool(&mut self, tool_name: &str) -> bool {
-        let trusted = std::env::current_dir().ok().is_some_and(|cwd| {
-            self.access
-                .permissions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&cwd)
-        });
-        trusted || self.approved_tools.contains(tool_name)
+    fn approve_tool<'a>(
+        &'a mut self,
+        call: &'a ToolCall,
+    ) -> Pin<Box<dyn Future<Output = crate::cli::tool_dispatch::Approval> + 'a>> {
+        self.approval.request_approval(call, self.origin)
     }
 
     fn execute_authorized<'a>(
@@ -318,15 +320,20 @@ pub async fn run_subagent(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
     access: ToolAccess,
-    approved_tools: HashSet<String>,
+    approval: &mut dyn ApprovalHost,
+    origin: &str,
     goal: &str,
     requested_max_steps: usize,
 ) -> std::result::Result<SubagentRunResult, SubagentRunError> {
+    let approval = SubagentApproval {
+        host: approval,
+        origin,
+    };
     run_subagent_with_model(
         executor,
         mcp,
         access,
-        approved_tools,
+        approval,
         None,
         goal,
         requested_max_steps,
@@ -340,7 +347,7 @@ pub async fn run_subagent_with_model(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
     access: ToolAccess,
-    approved_tools: HashSet<String>,
+    approval: SubagentApproval<'_>,
     model: Option<&str>,
     goal: &str,
     requested_max_steps: usize,
@@ -359,8 +366,8 @@ pub async fn run_subagent_with_model(
     let mut tool_calls = 0usize;
     let mut tool_host = SubagentToolHost {
         mcp,
-        access: &access,
-        approved_tools: &approved_tools,
+        approval: approval.host,
+        origin: approval.origin,
     };
 
     for step in 0..max_steps {
@@ -474,9 +481,40 @@ pub async fn run_subagent_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::tool_dispatch::Approval;
     use crate::mcp_client::{Content, Tool, ToolCallResult};
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
+
+    struct AlwaysApprove;
+
+    impl ApprovalHost for AlwaysApprove {
+        fn request_approval<'a>(
+            &'a mut self,
+            _call: &'a ToolCall,
+            _origin: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Approval> + 'a>> {
+            Box::pin(async { Approval::AllowOnce })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingApproval {
+        origins: Vec<String>,
+    }
+
+    impl ApprovalHost for RecordingApproval {
+        fn request_approval<'a>(
+            &'a mut self,
+            _call: &'a ToolCall,
+            origin: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Approval> + 'a>> {
+            Box::pin(async move {
+                self.origins.push(origin.to_string());
+                Approval::Deny
+            })
+        }
+    }
 
     fn fake_tool(name: &str) -> Tool {
         Tool {
@@ -536,11 +574,11 @@ mod tests {
             permissions: Arc::new(Mutex::new(crate::permissions::Permissions::default())),
         };
         let mut no_mcp = None;
-        let approved_tools = HashSet::from(["read_file".to_string()]);
+        let mut approval = AlwaysApprove;
         let mut host = SubagentToolHost {
             mcp: &mut no_mcp,
-            access: &access,
-            approved_tools: &approved_tools,
+            approval: &mut approval,
+            origin: "agent_run",
         };
         let call = ToolCall {
             id: Some("call-read".to_string()),
@@ -559,6 +597,38 @@ mod tests {
         );
         assert!(outcome.text.contains("admin policy"));
         assert!(!outcome.text.contains("no MCP manager"));
+    }
+
+    #[tokio::test]
+    async fn subagent_approval_reaches_parent_with_origin() {
+        let access = ToolAccess {
+            hooks: crate::hooks::HookRegistry::empty(),
+            policy: crate::policy::Policy::default(),
+            permissions: Arc::new(Mutex::new(crate::permissions::Permissions::default())),
+        };
+        let mut no_mcp = None;
+        let mut approval = RecordingApproval::default();
+        let mut host = SubagentToolHost {
+            mcp: &mut no_mcp,
+            approval: &mut approval,
+            origin: "consensus qwen3:8b",
+        };
+        let call = ToolCall {
+            id: Some("call-read".to_string()),
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "fixture.txt"}),
+            },
+        };
+
+        let outcome = dispatch_tool(&access, &mut host, &call).await;
+
+        assert_eq!(
+            outcome.kind,
+            crate::cli::tool_dispatch::ToolOutcomeKind::Denied
+        );
+        assert_eq!(approval.origins, vec!["consensus qwen3:8b"]);
     }
 
     #[test]
@@ -736,11 +806,13 @@ mod tests {
                 permissions,
             };
 
+            let mut approval = AlwaysApprove;
             let result = run_subagent(
                 &executor,
                 &mut mcp,
                 access,
-                HashSet::from(["read_file".to_string()]),
+                &mut approval,
+                "agent_run",
                 "Read the requested file and report its contents.",
                 2,
             )

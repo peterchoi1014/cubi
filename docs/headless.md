@@ -199,6 +199,10 @@ than trying to copy uncommitted or untracked state into every worktree.
 The parent also sets `CUBI_HOME` for each child so Cubi state
 (`.cubi/config.json`, trust store, sessions, MCP config, etc.) is rooted in
 the child temp home rather than the real user profile.
+These isolated subprocesses remain non-interactive: they cannot forward an
+approval request to the parent TUI. Their temporary worktree root is seeded as
+trusted for the requested run; any tool call outside that trusted scope is
+denied by the child's normal headless approval path rather than prompting.
 Use `max_steps` and `isolated_time_cap_secs` on the meta-tool
 (or `/consensus ... --isolate --max-steps <n>
 --isolated-time-cap-secs <seconds> ...`) to set each subagent's step budget
