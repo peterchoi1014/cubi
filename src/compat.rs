@@ -150,6 +150,18 @@ pub(crate) mod test_env {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize every test that changes the process working directory or
+    /// relies on it staying put (for example by using cwd-relative paths).
+    /// The working directory is process-wide, so all such tests across
+    /// modules must share this one lock. Take it before any other test lock.
+    pub(crate) fn cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+        CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) struct EnvRestore {
         old: Vec<(&'static str, Option<OsString>)>,
     }
