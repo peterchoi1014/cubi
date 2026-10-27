@@ -56,8 +56,7 @@ impl Policy {
     }
 
     fn resolve_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("CUBI_POLICY_FILE") {
-            let path = PathBuf::from(p);
+        if let Some(path) = crate::config::with(|config| config.paths.policy_file.clone()) {
             if path.exists() {
                 return Some(path);
             }

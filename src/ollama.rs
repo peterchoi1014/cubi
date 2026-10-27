@@ -164,31 +164,15 @@ fn chat_options_for_model(model: &str) -> Result<Option<ChatOptions>> {
 }
 
 fn current_num_ctx_override() -> Option<usize> {
-    std::env::var("CUBI_NUM_CTX")
-        .ok()
-        .and_then(|raw| parse_positive_usize(&raw))
-}
-
-fn parse_positive_usize(raw: &str) -> Option<usize> {
-    let value = raw.trim().parse::<usize>().ok()?;
-    (value > 0).then_some(value)
+    crate::config::with(|config| config.generation.num_ctx)
 }
 
 fn current_think() -> Option<bool> {
-    std::env::var("CUBI_THINK").ok().and_then(|raw| {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "on" => Some(true),
-            "off" => Some(false),
-            _ => None,
-        }
-    })
+    crate::config::with(|config| config.generation.think)
 }
 
 fn current_keep_alive() -> Option<String> {
-    std::env::var("CUBI_KEEP_ALIVE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
+    crate::config::with(|config| config.generation.keep_alive.clone())
 }
 
 fn resolve_num_ctx(model: &str, env_override: Option<usize>) -> Option<usize> {

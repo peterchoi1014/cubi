@@ -128,15 +128,7 @@ pub(super) fn is_compacted_summary(message: &Message) -> bool {
 }
 
 pub(super) fn memory_extraction_enabled() -> bool {
-    memory_extraction_enabled_value(
-        std::env::var("CUBI_COMPACT_EXTRACT_MEMORIES")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn memory_extraction_enabled_value(value: Option<&str>) -> bool {
-    value == Some("1")
+    crate::config::with(|config| config.compact_extract_memories)
 }
 
 #[cfg(test)]
@@ -236,13 +228,5 @@ mod tests {
     fn bounded_summary_truncates_by_token_budget() {
         let bounded = bound_summary(&"x".repeat(8_000), 100);
         assert!(crate::llm::estimate_tokens(&bounded) <= 101);
-    }
-
-    #[test]
-    fn memory_extraction_requires_exact_opt_in() {
-        assert!(!memory_extraction_enabled_value(None));
-        assert!(!memory_extraction_enabled_value(Some("0")));
-        assert!(!memory_extraction_enabled_value(Some("true")));
-        assert!(memory_extraction_enabled_value(Some("1")));
     }
 }

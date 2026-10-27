@@ -9,6 +9,7 @@ mod commands;
 mod compat;
 mod completer;
 mod completions;
+mod config;
 mod consensus;
 mod doctor;
 mod event_sink;
@@ -104,9 +105,11 @@ async fn validate_startup_model(executor: &AIExecutor, model: &str) -> Result<St
     Ok(StartupModelCheck { models, found })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing();
+fn main() -> Result<()> {
+    let environment = config::Environment::capture();
+    init_tracing(environment.value("CUBI_LOG"));
+    let mut model_override = None;
+    let mut debug = false;
 
     // Lightweight argv handling. We don't pull in clap because the chat
     // loop has no flags of its own; this just makes `cubi --version`,
@@ -498,7 +501,7 @@ async fn main() -> Result<()> {
             }
             "--no-banner" => cli_flags.no_banner = true,
             "--debug" => {
-                user_error::set_debug_flag(true);
+                debug = true;
             }
             "--trace-tools" => {
                 i += 1;
@@ -676,11 +679,10 @@ async fn main() -> Result<()> {
                         std::process::exit(2);
                     }
                 };
-                // Apply frontmatter overrides: model via env so
-                // resolve_model picks it up; system via cli_flags.
+                // Frontmatter is a CLI-level override, above environment and
+                // persisted configuration, without changing the process env.
                 if let Some(model) = &script.model {
-                    // SAFETY: argv parsing is single-threaded.
-                    unsafe { std::env::set_var("CUBI_MODEL", model) };
+                    model_override = Some(model.clone());
                 }
                 if let Some(sys) = &script.system {
                     cli_flags.system_prompt = Some(sys.clone());
@@ -1069,53 +1071,44 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
-    if std::env::var("CUBI_NO_BANNER")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        cli_flags.no_banner = true;
+    let chat_session = matches!(
+        primary,
+        PrimaryCommand::Interactive | PrimaryCommand::Resume(_)
+    );
+    if chat_session {
+        compat::migrate_config_dir(environment.home_dir().as_deref());
     }
-    if !cli_flags.quiet
-        && std::env::var("CUBI_QUIET")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.quiet = true;
-        cli_flags.no_banner = true;
-    }
-    if !cli_flags.tui
-        && std::env::var("CUBI_TUI")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.tui = true;
-    }
-    if !cli_flags.classic
-        && std::env::var("CUBI_CLASSIC")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    {
-        cli_flags.classic = true;
-    }
-    if cli_flags.quiet {
-        // Suppress the global "thinking…" / tool-call spinner via the
-        // existing env knob so we don't have to thread a flag through
-        // every spinner call site.
-        // SAFETY: this runs during early argv processing in `main`,
-        // before any task is spawned that reads CUBI_NO_SPINNER or
-        // otherwise concurrently touches the process environment.
-        // Tokio's runtime worker threads exist by this point (since
-        // we're inside `#[tokio::main]`), but they're idle until we
-        // hand them work below, so there are no concurrent env
-        // readers racing with this set_var.
-        unsafe { std::env::set_var("CUBI_NO_SPINNER", "1") };
-    }
-    if std::env::var("CUBI_EXPLAIN_TOOLS")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        cli_flags.explain_tools = true;
-    }
+    let mut config = AppConfig::load_from_home(environment.home_dir().as_deref());
+    let runtime_config = config::install(config::RuntimeConfig::resolve(
+        &environment,
+        config.clone(),
+        &config::StartupOverrides {
+            model: model_override,
+            trace_tools: trace_tools_path.clone(),
+            events: events_path.clone(),
+            receipts: receipts_path,
+            quiet: cli_flags.quiet,
+            no_banner: cli_flags.no_banner,
+            tui: cli_flags.tui,
+            classic: cli_flags.classic,
+            explain_tools: cli_flags.explain_tools,
+            debug,
+            chat_session,
+        },
+    ))?;
+    runtime_config.read(|config| {
+        cli_flags.quiet = config.ui.quiet;
+        cli_flags.no_banner = config.ui.no_banner;
+        cli_flags.tui = config.ui.tui;
+        cli_flags.classic = config.ui.classic;
+        cli_flags.explain_tools = config.ui.explain_tools;
+    });
+
+    // Configuration is fully resolved before any runtime worker can read it.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
 
     if doctor_fix && !matches!(primary, PrimaryCommand::Doctor) {
         eprintln!("cubi: --fix is only valid with the `doctor` subcommand.");
@@ -1345,18 +1338,9 @@ async fn main() -> Result<()> {
     // needed here — headless / one-shot / JSON already route away from the TUI.
     let use_tui = !cli_flags.classic && !headless && !cli_flags.json;
 
-    // Rebrand back-compat: promote legacy AI_CHAT_CLI_*/AICHAT_* env vars
-    // to their new CUBI_* names and rename ~/.ai-chat-cli/ → ~/.cubi/
-    // exactly once. Both no-op if there's nothing to migrate.
-    compat::promote_legacy_env();
-    compat::migrate_config_dir();
-
     // Initialize permissions early — the onboarding wizard may want to
     // mutate it when the user trusts the cwd.
     let permissions = Arc::new(Mutex::new(Permissions::load()));
-
-    // Persistent user config (model preference, onboarding flag, ...).
-    let mut config = AppConfig::load();
 
     // Apply forward-only config migrations and persist if anything
     // changed (e.g. first time this binary saw the file).
@@ -1373,26 +1357,6 @@ async fn main() -> Result<()> {
     // Initialise telemetry early so onboarding events can be recorded.
     telemetry::init(config.telemetry);
 
-    // Apply persisted UI prefs from config (theme/output-style/color/vim)
-    // into the env-var slots that the rest of the CLI already reads.
-    if let Some(t) = &config.theme {
-        // SAFETY: single-threaded during startup.
-        unsafe { std::env::set_var("CUBI_THEME", t) };
-    }
-    if let Some(s) = &config.output_style {
-        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", s) };
-    }
-    if let Some(c) = &config.color {
-        unsafe { std::env::set_var("CUBI_COLOR", c) };
-        match c.as_str() {
-            "off" => colored::control::set_override(false),
-            "on" => colored::control::set_override(true),
-            _ => {}
-        }
-    }
-    if let Some(v) = &config.vim_mode {
-        unsafe { std::env::set_var("CUBI_VIM_MODE", v) };
-    }
     style::init_color_control();
 
     // First-run wizard. No-ops if already onboarded, in non-interactive
@@ -1408,7 +1372,8 @@ async fn main() -> Result<()> {
 
     // Resolve the model from env > config > baked-in fallback. This
     // removes the previous hard-coded lock-in.
-    let model_owned = onboarding::resolve_model(&config, DEFAULT_MODEL);
+    runtime_config.update(|runtime| runtime.apply_onboarding(config.clone()));
+    let model_owned = runtime_config.read(|runtime| runtime.model.clone());
     let model: &str = &model_owned;
 
     // Seed the TUI transcript with the normal startup output that the
@@ -1439,10 +1404,11 @@ async fn main() -> Result<()> {
             format!("{} Using fake test provider", "✓".bright_green()),
         );
     } else if executor.provider_name() == "openai" {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let base_url = runtime_config.read(|config| {
+            config.provider.openai_base_url.clone()
+                .or_else(|| config.provider.base_url.clone())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+        });
         status_line(
             headless,
             format!(
@@ -1666,14 +1632,9 @@ async fn main() -> Result<()> {
     // tamper-evident JSONL audit log. Side-channel: failures degrade
     // to a warning so a misconfigured path can't kill an otherwise
     // healthy session.
-    let receipts_target = receipts_path
-        .clone()
-        .or_else(|| {
-            std::env::var("CUBI_RECEIPTS")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
-        .or_else(|| config.receipts.clone().filter(|v| !v.is_empty()));
+    let receipts_target = runtime_config.read(|config| {
+        config.paths.receipts.as_ref().map(|path| path.to_string_lossy().into_owned())
+    });
     if let Some(target) = receipts_target {
         let signing_key = match receipts::load_default_signing_key() {
             Ok(k) => k,
@@ -1766,6 +1727,7 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+        })
 }
 
 #[derive(Debug)]
@@ -1997,7 +1959,7 @@ async fn run_plugin(name: &str, args: &[String], json: bool) -> i32 {
             return 2;
         }
     }
-    let mut cmd = std::process::Command::new(&handler);
+    let mut cmd = crate::config::command(&handler);
     for a in args {
         cmd.arg(a);
     }
@@ -2378,7 +2340,7 @@ fn print_help() {
 }
 
 fn print_config() -> Result<()> {
-    let config = AppConfig::load();
+    let config = config::with(|config| config.app.clone());
     let mut value = serde_json::to_value(&config)?;
     redact_secrets(&mut value);
     if let Some(obj) = value.as_object_mut() {
@@ -2550,14 +2512,14 @@ fn prune_sessions(age_secs: u64, dry_run: bool) -> Result<()> {
 /// (e.g. `CUBI_LOG=cubi=debug`). When unset, no subscriber is installed
 /// so the binary stays quiet by default. Output is always stderr —
 /// never stdout — to avoid polluting machine-readable JSON output.
-fn init_tracing() {
-    let Ok(filter) = std::env::var("CUBI_LOG") else {
+fn init_tracing(filter: Option<&str>) {
+    let Some(filter) = filter else {
         return;
     };
     if filter.is_empty() {
         return;
     }
-    let env_filter = match tracing_subscriber::EnvFilter::try_new(&filter) {
+    let env_filter = match tracing_subscriber::EnvFilter::try_new(filter) {
         Ok(f) => f,
         Err(err) => {
             eprintln!("cubi: ignoring invalid CUBI_LOG={filter:?}: {err}");

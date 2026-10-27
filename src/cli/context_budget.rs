@@ -10,8 +10,8 @@ pub(super) struct ContextBudget {
 }
 
 pub(super) fn effective_budget(model: &str, provider: &str) -> Option<ContextBudget> {
-    let ollama_override = positive_env("CUBI_NUM_CTX");
-    let openai_override = positive_env("CUBI_CONTEXT_WINDOW");
+    let (ollama_override, openai_override) =
+        crate::config::with(|config| (config.generation.num_ctx, config.generation.context_window));
     effective_budget_with_overrides(model, provider, ollama_override, openai_override)
 }
 
@@ -39,13 +39,6 @@ fn effective_budget_with_overrides(
         completion_reserve,
         prompt_limit: window.saturating_sub(completion_reserve),
     })
-}
-
-fn positive_env(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
 }
 
 pub(super) fn estimate_request_tokens(messages: &[Message], tools: Option<&[ToolSpec]>) -> usize {

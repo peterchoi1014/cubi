@@ -569,28 +569,7 @@ pub enum DeleteSessionResult {
 /// subprocesses redirect all Cubi state to a temporary directory without
 /// touching the developer's real profile.
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    if let Some(path) = absolute_env_path(CUBI_HOME_ENV) {
-        return Some(path);
-    }
-    #[cfg(not(windows))]
-    if let Some(path) = absolute_env_path("HOME") {
-        return Some(path);
-    }
-    #[cfg(windows)]
-    if let Some(path) = absolute_env_path("USERPROFILE") {
-        // Windows must ignore HOME here to match historical dirs::home_dir() behavior.
-        return Some(path);
-    }
-    dirs::home_dir()
-}
-
-fn absolute_env_path(name: &str) -> Option<PathBuf> {
-    let value = std::env::var_os(name)?;
-    if value.is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(value);
-    if path.is_absolute() { Some(path) } else { None }
+    crate::config::with(|config| config.paths.home.clone())
 }
 
 pub fn cubi_dir() -> Option<PathBuf> {

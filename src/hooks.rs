@@ -351,7 +351,7 @@ impl HookRegistry {
         env: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<i32> {
-        let mut child_command = tokio::process::Command::new("sh");
+        let mut child_command = crate::config::async_command("sh");
         child_command
             .arg("-c")
             .arg(command)

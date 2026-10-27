@@ -11,6 +11,7 @@ use crate::git_cmds;
 use crate::hooks::{HookDef, HookEvent, HookRegistry, HooksConfig};
 use crate::mcp_manager::McpManager;
 use crate::memdir::Memdir;
+#[cfg(test)]
 use crate::oauth;
 use crate::ollama::{ChatStats, Message, ToolCall};
 use crate::onboarding::AppConfig;
@@ -23,7 +24,6 @@ use crate::sessions::{DeleteSessionResult, FindSessionResult, SessionFile, Sessi
 use crate::settings_sync;
 use crate::skills::{self, Skill};
 use crate::style::CubiStyle;
-use crate::themes;
 use crate::todos::TodoList;
 use anyhow::{Context, Result};
 use rustyline::Editor;
@@ -57,6 +57,7 @@ mod edit_cmd;
 mod multiline;
 mod render;
 mod repl;
+mod settings;
 mod spinner;
 mod status;
 pub(crate) mod tool_dispatch;
@@ -82,6 +83,7 @@ use render::welcome_banner_rows;
 use repl::repl_history_path;
 
 pub struct ChatCLI {
+    config: crate::config::SharedConfig,
     executor: AIExecutor,
     history: Vec<Message>,
     mcp_manager: Option<McpManager>,
@@ -327,6 +329,7 @@ impl ChatCLI {
         journal: FileJournal,
         flags: CliFlags,
     ) -> Self {
+        let config = executor.runtime_config();
         let mut cli = Self {
             executor,
             history: Vec::new(),
@@ -358,7 +361,7 @@ impl ChatCLI {
             json_enabled: flags.json,
             mcp_counts: flags.mcp_counts,
             no_banner: flags.no_banner,
-            app_config: AppConfig::load(),
+            app_config: config.read(|config| config.app.clone()),
             pinned: Vec::new(),
             tool_tracer: None,
             usage_history: Vec::new(),
@@ -371,7 +374,7 @@ impl ChatCLI {
             receipts: None,
             explain_tools_enabled: flags.explain_tools,
             history_cursor: 0,
-            history_page_size: resolve_history_page_size(),
+            history_page_size: config.read(|config| config.ui.history_page_size),
             ui: Box::new(ui_sink::LineSink::new(ui_sink::SinkFlags {
                 headless: false,
                 json: false,
@@ -380,6 +383,7 @@ impl ChatCLI {
             cancel: Arc::new(AtomicBool::new(false)),
             tui_active: false,
             startup_transcript: Vec::new(),
+            config,
         };
 
         if let Some(system_prompt) = flags.system_prompt {
@@ -400,8 +404,7 @@ impl ChatCLI {
         // Steer reply formatting via the configured output style. We push
         // a system message rather than mutating per-prompt so the
         // preset rides along with every assistant turn for the session.
-        let style = std::env::var("CUBI_OUTPUT_STYLE")
-            .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string());
+        let style = cli.config.read(|config| config.ui.output_style.clone());
         cli.history.push(Message::text(
             "system",
             format!("SYSTEM: {}", output_styles::system_prompt_for(&style)),
@@ -2252,7 +2255,7 @@ impl ChatCLI {
         }
 
         // 3. `git` on PATH.
-        match std::process::Command::new("git").arg("--version").output() {
+        match crate::config::command("git").arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let v = String::from_utf8_lossy(&out.stdout);
                 println!(
@@ -3362,7 +3365,7 @@ impl ChatCLI {
             return;
         }
         let (program, flag) = shell_program();
-        match std::process::Command::new(program)
+        match crate::config::command(program)
             .arg(flag)
             .arg(command)
             .status()
@@ -4974,7 +4977,7 @@ impl ChatCLI {
     /// `/pr_comments` — shells out to `gh pr view --comments` if installed.
     fn run_pr_comments(&self, args: &str) {
         let arg_pr = args.trim();
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = crate::config::command("gh");
         cmd.arg("pr").arg("view").arg("--comments");
         if !arg_pr.is_empty() {
             cmd.arg(arg_pr);
@@ -5039,7 +5042,7 @@ impl ChatCLI {
     /// `/autofix-pr` — fetch PR comments and ask the model to propose fixes.
     async fn run_autofix_pr(&mut self, args: &str) {
         let arg_pr = args.trim();
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = crate::config::command("gh");
         cmd.arg("pr").arg("view").arg("--comments");
         if !arg_pr.is_empty() {
             cmd.arg(arg_pr);
@@ -5364,168 +5367,6 @@ impl ChatCLI {
         }
     }
 
-    /// `/passes` and `/effort` — show or set the agent-loop pass budget. We
-    /// stash it in the `EffortConfig` config field. The agent loop reads
-    /// `AGENT_PASSES_OVERRIDE` env var if set; we set that here so the
-    /// change takes effect mid-session without rebuilding the loop.
-    fn handle_effort(&self, cmd: Cmd, args: &str) {
-        let arg = args.trim();
-        if arg.is_empty() {
-            let current = std::env::var("AGENT_PASSES_OVERRIDE")
-                .unwrap_or_else(|_| format!("{}", agent_loop::MAX_AGENT_STEPS));
-            println!(
-                "{} max passes: {} (default {})",
-                "ℹ".bright_blue(),
-                current.bright_cyan(),
-                agent_loop::MAX_AGENT_STEPS
-            );
-            return;
-        }
-        let n = if matches!(cmd, Cmd::Effort) {
-            match arg.to_ascii_lowercase().as_str() {
-                "low" => 4,
-                "medium" | "med" => 8,
-                "high" => 12,
-                other => {
-                    if let Ok(n) = other.parse::<u32>() {
-                        n
-                    } else {
-                        eprintln!(
-                            "{} Use low|medium|high or a number 1..=12",
-                            "Error:".bright_red()
-                        );
-                        return;
-                    }
-                }
-            }
-        } else {
-            match arg.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => {
-                    eprintln!("{} /passes expects a number 1..=12", "Error:".bright_red());
-                    return;
-                }
-            }
-        };
-        if !(1..=12).contains(&n) {
-            eprintln!("{} must be 1..=12", "Error:".bright_red());
-            return;
-        }
-        unsafe { std::env::set_var("AGENT_PASSES_OVERRIDE", n.to_string()) };
-        println!("{} max passes set to {}", "✓".bright_green(), n);
-    }
-
-    /// Loads the on-disk AppConfig, applies `mutate`, persists. Errors
-    /// are surfaced but never fatal — handlers fall back to "in-memory
-    /// only" (still affects the env vars for the current process) so a
-    /// read-only $HOME doesn't break the slash commands.
-    fn update_config(&self, mutate: impl FnOnce(&mut AppConfig)) -> Result<()> {
-        let mut cfg = AppConfig::load();
-        mutate(&mut cfg);
-        cfg.save()
-    }
-
-    fn handle_theme(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        if arg.is_empty() {
-            println!(
-                "{} theme: {} (set with /theme [{}])",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_THEME")
-                    .unwrap_or_else(|_| "auto".to_string())
-                    .bright_cyan(),
-                themes::VALID_THEMES.join("|")
-            );
-            return;
-        }
-        if !themes::is_valid_theme(&arg) {
-            eprintln!(
-                "{} Unknown theme '{}'. Expected {}.",
-                "Error:".bright_red(),
-                arg,
-                themes::VALID_THEMES.join("|")
-            );
-            return;
-        }
-        // SAFETY: handled on the readline thread, no race.
-        unsafe { std::env::set_var("CUBI_THEME", &arg) };
-        if let Err(e) = self.update_config(|c| c.theme = Some(arg.clone())) {
-            eprintln!(
-                "{} theme set in this session but not persisted: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        println!("{} theme set to {}", "✓".bright_green(), arg);
-    }
-
-    fn handle_color(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} colored output is {} (toggle with /color on|off)",
-                "ℹ".bright_blue(),
-                if colored::control::SHOULD_COLORIZE.should_colorize() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            "on" => {
-                crate::style::set_color_override(true);
-                if let Err(e) = self.update_config(|c| c.color = Some("on".to_string())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!("{} colored output ON", "✓".bright_green());
-            }
-            "off" => {
-                crate::style::set_color_override(false);
-                if let Err(e) = self.update_config(|c| c.color = Some("off".to_string())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!("colored output OFF");
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
-    fn handle_output_style(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        if arg.is_empty() {
-            println!(
-                "{} output style: {} (set with /output-style [{}])",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_OUTPUT_STYLE")
-                    .unwrap_or_else(|_| output_styles::DEFAULT_STYLE.to_string())
-                    .bright_cyan(),
-                output_styles::VALID_STYLES.join("|")
-            );
-            return;
-        }
-        if !output_styles::is_valid_style(&arg) {
-            eprintln!(
-                "{} Unknown style '{}'. Expected {}.",
-                "Error:".bright_red(),
-                arg,
-                output_styles::VALID_STYLES.join("|")
-            );
-            return;
-        }
-        unsafe { std::env::set_var("CUBI_OUTPUT_STYLE", &arg) };
-        if let Err(e) = self.update_config(|c| c.output_style = Some(arg.clone())) {
-            eprintln!(
-                "{} style set in this session but not persisted: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        println!("{} output style set to {}", "✓".bright_green(), arg);
-    }
-
     fn show_statusline(&self) {
         let plan = if self.plan_mode.load(Ordering::SeqCst) {
             "plan"
@@ -5633,182 +5474,6 @@ impl ChatCLI {
             println!("  {} {}", k.bright_cyan(), v);
         }
         println!();
-    }
-
-    fn handle_vim(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} vim mode: {} (toggle with /vim on|off; takes effect next session)",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_VIM_MODE")
-                    .unwrap_or_else(|_| "off".to_string())
-                    .bright_cyan()
-            ),
-            "on" | "off" => {
-                unsafe { std::env::set_var("CUBI_VIM_MODE", &arg) };
-                if let Err(e) = self.update_config(|c| c.vim_mode = Some(arg.clone())) {
-                    eprintln!("{} not persisted: {}", "Warn:".bright_yellow(), e);
-                }
-                println!(
-                    "{} vim mode {} (restart the CLI to apply)",
-                    "✓".bright_green(),
-                    arg
-                );
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
-    fn handle_login(&self, args: &str) {
-        let parsed = match oauth::parse_login_args(args) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{} {}", "Error:".bright_red(), e);
-                println!(
-                    "{} Usage: /login <provider> <access-token> [--refresh-token <token>] [--expires-in <seconds>]",
-                    "Info:".bright_yellow()
-                );
-                return;
-            }
-        };
-        let mut store = oauth::OAuthStore::load();
-        store.upsert_login(&parsed);
-        if let Err(e) = store.save() {
-            eprintln!(
-                "{} failed to persist OAuth token: {}",
-                "Error:".bright_red(),
-                e
-            );
-            return;
-        }
-        let env_var = oauth::provider_env_var(&parsed.provider);
-        unsafe { std::env::set_var(&env_var, &parsed.access_token) };
-        println!(
-            "{} OAuth token saved for '{}' and loaded into {}",
-            "✓".bright_green(),
-            parsed.provider.bright_cyan(),
-            env_var.bright_cyan()
-        );
-    }
-
-    fn handle_logout(&self, args: &str) {
-        let provider = if args.trim().is_empty() {
-            "ollama"
-        } else {
-            args.trim()
-        };
-        let mut store = oauth::OAuthStore::load();
-        let removed = store.remove_provider(provider);
-        if let Err(e) = store.save() {
-            eprintln!(
-                "{} failed to persist OAuth store: {}",
-                "Warn:".bright_yellow(),
-                e
-            );
-        }
-        let var = oauth::provider_env_var(provider);
-        unsafe { std::env::remove_var(&var) };
-        println!(
-            "{} cleared {} from this process{}",
-            "✓".bright_green(),
-            var.bright_cyan(),
-            if removed {
-                " and removed persisted OAuth token"
-            } else {
-                ""
-            }
-        );
-    }
-
-    fn show_oauth_refresh(&self, args: &str) {
-        let provider_filter = args.trim().to_ascii_lowercase();
-        let store = oauth::OAuthStore::load();
-        if store.providers.is_empty() {
-            println!(
-                "{} No OAuth tokens are stored yet. Use /login <provider> <access-token> first.",
-                "ℹ".bright_blue()
-            );
-            return;
-        }
-
-        let mut refreshed = 0usize;
-        for (provider, token) in &store.providers {
-            if !provider_filter.is_empty() && provider != &provider_filter {
-                continue;
-            }
-            let env_var = oauth::provider_env_var(provider);
-            if token.is_expired() {
-                println!(
-                    "{} {} token is expired; not loading {}",
-                    "⚠".bright_yellow(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan()
-                );
-                continue;
-            }
-            unsafe { std::env::set_var(&env_var, &token.access_token) };
-            refreshed += 1;
-            match token.expires_at_unix {
-                Some(ts) => println!(
-                    "{} refreshed {} into {} (expires at unix={})",
-                    "✓".bright_green(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan(),
-                    ts.to_string().bright_black()
-                ),
-                None => println!(
-                    "{} refreshed {} into {} (no expiry set)",
-                    "✓".bright_green(),
-                    provider.bright_cyan(),
-                    env_var.bright_cyan()
-                ),
-            }
-        }
-        if refreshed == 0 {
-            if !provider_filter.is_empty() {
-                println!(
-                    "{} No non-expired token found for provider '{}'.",
-                    "ℹ".bright_blue(),
-                    provider_filter.bright_cyan()
-                );
-            } else {
-                println!(
-                    "{}",
-                    "ℹ No non-expired OAuth tokens to refresh.".bright_blue()
-                );
-            }
-        }
-    }
-
-    fn handle_privacy_settings(&self, args: &str) {
-        let arg = args.trim();
-        if arg.is_empty() {
-            let telemetry = std::env::var("CUBI_TELEMETRY").unwrap_or_else(|_| "off".to_string());
-            println!(
-                "\n{}\n  telemetry: {} (no remote analytics implemented yet)\n  \
-                 local data: ~/.cubi/ (sessions, memdir, schedule, messages, triggers)\n  \
-                 set with: /privacy-settings telemetry on|off\n",
-                "Privacy:".bright_yellow().bold(),
-                telemetry.bright_cyan()
-            );
-            return;
-        }
-        let parts: Vec<&str> = arg.split_whitespace().collect();
-        match parts.as_slice() {
-            ["telemetry", v] if matches!(*v, "on" | "off") => {
-                unsafe { std::env::set_var("CUBI_TELEMETRY", *v) };
-                println!("{} telemetry set to {}", "✓".bright_green(), v);
-            }
-            _ => eprintln!(
-                "{} Usage: /privacy-settings telemetry on|off",
-                "Error:".bright_red()
-            ),
-        }
     }
 
     /// Renders the `/mcp` status as a String so the classic REPL and the TUI
@@ -6428,32 +6093,6 @@ impl ChatCLI {
         println!();
     }
 
-    fn handle_debug_tool_call(&self, args: &str) {
-        let arg = args.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" => println!(
-                "{} debug-tool-call: {} (toggle with /debug-tool-call on|off)",
-                "ℹ".bright_blue(),
-                std::env::var("CUBI_DEBUG_TOOL_CALL")
-                    .unwrap_or_else(|_| "off".to_string())
-                    .bright_cyan()
-            ),
-            "on" => {
-                unsafe { std::env::set_var("CUBI_DEBUG_TOOL_CALL", "on") };
-                println!("{} debug-tool-call ON", "✓".bright_green());
-            }
-            "off" => {
-                unsafe { std::env::remove_var("CUBI_DEBUG_TOOL_CALL") };
-                println!("debug-tool-call OFF");
-            }
-            other => eprintln!(
-                "{} Unknown value '{}'. Expected on|off.",
-                "Error:".bright_red(),
-                other
-            ),
-        }
-    }
-
     fn show_upgrade(&self) {
         println!(
             "\n{}\n  cd ~/code/cubi && git pull && cargo install --path . --locked\n  \
@@ -6486,17 +6125,6 @@ impl ChatCLI {
             "{} No Slack integration is bundled. You can drive cubi from \
              a Slack bot by piping prompts through `--batch` mode.",
             "ℹ".bright_blue()
-        );
-    }
-
-    fn reset_limits(&self) {
-        // The Ollama client tracks retries per-call (no persistent state), so
-        // "resetting" is informational. Clear the env-var override if set so
-        // backoff returns to defaults.
-        unsafe { std::env::remove_var("CUBI_RATE_LIMIT_BACKOFF_MS") };
-        println!(
-            "{} Rate-limit / retry state cleared (Ollama retries are per-call).",
-            "✓".bright_green()
         );
     }
 
@@ -6547,7 +6175,7 @@ impl ChatCLI {
             ("xclip", &["-selection", "clipboard"])
         };
 
-        let mut child = match std::process::Command::new(program)
+        let mut child = match crate::config::command(program)
             .args(extra)
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -7147,12 +6775,9 @@ fn pad_col(s: &str, width: usize) -> String {
 
 /// Reads `CUBI_HISTORY_PAGE` (clamped to a sane range) to size the
 /// `/history` pager. Falls back to 10 when unset or unparsable.
+#[cfg(test)]
 pub(crate) fn resolve_history_page_size() -> usize {
-    std::env::var("CUBI_HISTORY_PAGE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| (1..=500).contains(n))
-        .unwrap_or(10)
+    crate::config::with(|config| config.ui.history_page_size)
 }
 
 #[derive(Debug, Default)]
@@ -7509,7 +7134,7 @@ async fn shell_capture(command: &str) -> (bool, String, u64) {
     }
     let (program, flag) = shell_program();
     let started = std::time::Instant::now();
-    let result = tokio::process::Command::new(program)
+    let result = crate::config::async_command(program)
         .arg(flag)
         .arg(command)
         .output()
@@ -7541,7 +7166,7 @@ async fn shell_capture(command: &str) -> (bool, String, u64) {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn user(s: &str) -> Message {
         Message::text("user", s)
@@ -7706,14 +7331,12 @@ mod tests {
     #[test]
     fn resolve_history_page_size_uses_default_when_unset() {
         let _guard = env_lock().lock().expect("env lock not poisoned");
-        let prev = std::env::var("CUBI_HISTORY_PAGE").ok();
-        // SAFETY: serialized via the env lock above.
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&["CUBI_HISTORY_PAGE"]);
+        // SAFETY: both environment locks are held through fixture restoration.
         unsafe { std::env::remove_var("CUBI_HISTORY_PAGE") };
         let size = resolve_history_page_size();
         assert_eq!(size, 10);
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("CUBI_HISTORY_PAGE", v) };
-        }
     }
 
     // ---- /compact preview planner ----
@@ -8136,21 +7759,37 @@ mod tests {
         )
     }
 
-    fn temp_oauth_path(suffix: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!("cubi-{suffix}-{nanos}.json"))
-            .display()
-            .to_string()
+    #[test]
+    fn debug_tool_call_changes_without_mutating_process_environment() {
+        let _guard = env_lock().lock().expect("lock should not be poisoned");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&["CUBI_DEBUG_TOOL_CALL"]);
+        let previous = std::env::var_os("CUBI_DEBUG_TOOL_CALL");
+        let cli = new_test_cli();
+
+        cli.handle_debug_tool_call(if previous.is_some() { "off" } else { "on" });
+        let after = std::env::var_os("CUBI_DEBUG_TOOL_CALL");
+        assert_eq!(
+            cli.config.read(|config| config.debug_tool_call.clone()),
+            previous.is_none().then(|| "on".to_string())
+        );
+
+        assert_eq!(after, previous);
     }
 
     #[test]
     fn login_and_logout_persist_and_remove_provider_tokens() {
         let _guard = env_lock().lock().expect("lock should not be poisoned");
-        let oauth_path = temp_oauth_path("oauth");
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _restore = crate::compat::test_env::EnvRestore::capture(&[
+            "CUBI_OAUTH_FILE",
+            "CUBI_GITHUB_API_KEY",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        let oauth_path = home.path().join("oauth.json");
+        // SAFETY: all environment-test locks remain held through restoration.
         unsafe {
             std::env::set_var("CUBI_OAUTH_FILE", &oauth_path);
             std::env::remove_var("CUBI_GITHUB_API_KEY");
@@ -8166,20 +7805,20 @@ mod tests {
         assert_eq!(token.access_token, "token123");
         assert_eq!(token.refresh_token.as_deref(), Some("refresh123"));
         assert_eq!(
-            std::env::var("CUBI_GITHUB_API_KEY").ok().as_deref(),
-            Some("token123")
+            cli.config
+                .read(|config| config.provider.keys.get("CUBI_GITHUB_API_KEY").cloned()),
+            Some(std::ffi::OsString::from("token123"))
         );
+        assert!(std::env::var("CUBI_GITHUB_API_KEY").is_err());
 
         cli.handle_logout("github");
         let after_logout = oauth::OAuthStore::load();
         assert!(after_logout.get_provider("github").is_none());
+        assert!(
+            cli.config
+                .read(|config| !config.provider.keys.contains_key("CUBI_GITHUB_API_KEY"))
+        );
         assert!(std::env::var("CUBI_GITHUB_API_KEY").is_err());
-
-        let _ = std::fs::remove_file(&oauth_path);
-        unsafe {
-            std::env::remove_var("CUBI_OAUTH_FILE");
-            std::env::remove_var("CUBI_GITHUB_API_KEY");
-        }
     }
 
     #[test]

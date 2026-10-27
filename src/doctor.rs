@@ -243,8 +243,7 @@ fn maybe_write_stub_config(path: &std::path::Path) -> StubWriteResult {
             return StubWriteResult::Err(e);
         }
     }
-    let model = std::env::var("CUBI_MODEL")
-        .ok()
+    let model = crate::config::with(|config| config.model_override.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
     let stub = format!(
@@ -377,7 +376,7 @@ fn completions_check_in_home(
 }
 
 fn detect_shell() -> Option<String> {
-    if let Ok(s) = std::env::var("CUBI_SHELL") {
+    if let Some(s) = crate::config::with(|config| config.shell.clone()) {
         if !s.is_empty() {
             return Some(s);
         }
@@ -400,15 +399,14 @@ fn rc_snippet_for(shell: &str, dir: &std::path::Path) -> String {
 }
 
 async fn check_model_host() -> CheckResult {
-    let config = AppConfig::load();
+    let config = crate::config::with(|config| config.app.clone());
     let model = crate::onboarding::resolve_model(&config, crate::DEFAULT_MODEL);
 
     // Resolve provider + URL the same way `executor`/`main` do.
-    let openai_base = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .or_else(|| std::env::var("CUBI_BASE_URL").ok());
-    let has_openai_key = std::env::var("OPENAI_API_KEY")
-        .ok()
+    let provider_config = crate::config::with(|config| config.provider.clone());
+    let openai_base = provider_config.openai_base_url.or(provider_config.base_url);
+    let has_openai_key = provider_config
+        .openai_api_key
         .filter(|v| !v.is_empty())
         .is_some();
 
@@ -416,8 +414,8 @@ async fn check_model_host() -> CheckResult {
         let base = openai_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         ("openai", format!("{}/models", base.trim_end_matches('/')))
     } else {
-        let base = std::env::var("OLLAMA_BASE_URL")
-            .ok()
+        let base = provider_config
+            .ollama_base_url
             .unwrap_or_else(|| "http://localhost:11434".to_string());
         ("ollama", format!("{}/api/tags", base.trim_end_matches('/')))
     };

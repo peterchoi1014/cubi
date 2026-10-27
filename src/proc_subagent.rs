@@ -164,13 +164,16 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
     time_cap: Duration,
     max_steps: usize,
 ) -> Result<ProcSubagentResult> {
+    let config = crate::config::shared().snapshot();
     let home_dir = tempfile::Builder::new()
         .prefix("cubi-subagent-home-")
         .tempdir()
         .context("create isolated home tempdir")?;
     let permissions = current_tool_permission_snapshot();
     seed_trust(home_dir.path(), trusted_root, &permissions).context("seed trusted root")?;
-    seed_config(home_dir.path(), model).context("seed non-interactive cubi config")?;
+    config
+        .write_child_config(home_dir.path(), model)
+        .context("seed non-interactive cubi config")?;
     let max_steps_arg = max_steps.max(1).to_string();
     let time_cap_arg = duration_millis_arg(time_cap);
     let parent_time_cap = time_cap.saturating_add(CHILD_COOPERATIVE_TIMEOUT_GRACE);
@@ -204,6 +207,7 @@ pub(crate) async fn run_isolated_subagent_with_binary_and_trust_root(
         home_dir.path(),
         workdir,
         parent_time_cap,
+        &config,
     )
     .await?;
 
@@ -287,9 +291,11 @@ async fn run_binary_isolated(
     home: &Path,
     workdir: &Path,
     time_cap: Duration,
+    config: &crate::config::RuntimeConfig,
 ) -> Result<RawRunResult> {
     let seeded_policy_file = seed_policy(home).context("seed active cubi policy")?;
     let mut cmd = tokio::process::Command::new(binary);
+    config.apply_to_child(cmd.as_std_mut());
     cmd.args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
@@ -626,21 +632,6 @@ fn seed_trust(
     Ok(())
 }
 
-fn seed_config(home: &Path, model: &str) -> Result<()> {
-    let cubi_dir = home.join(".cubi");
-    std::fs::create_dir_all(&cubi_dir).with_context(|| format!("create {}", cubi_dir.display()))?;
-    let config = serde_json::json!({
-        "default_model": model,
-        "onboarded": true,
-        "config_version": 1,
-    });
-    let config_path = cubi_dir.join("config.json");
-    let serialized = serde_json::to_string_pretty(&config).context("serialize config.json")?;
-    std::fs::write(&config_path, serialized)
-        .with_context(|| format!("write {}", config_path.display()))?;
-    Ok(())
-}
-
 fn seed_policy(home: &Path) -> Result<Option<PathBuf>> {
     let Some(active_policy) = crate::policy::Policy::active_path() else {
         return Ok(None);
@@ -672,6 +663,10 @@ mod tests {
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &Path) -> Self {
+            Self::set_value(key, value.as_os_str())
+        }
+
+        fn set_value(key: &'static str, value: &OsStr) -> Self {
             let guard = Self {
                 key,
                 old: std::env::var_os(key),
@@ -947,7 +942,7 @@ mod tests {
     fn seed_config_marks_home_onboarded_with_model() {
         let home = tempfile::tempdir().unwrap();
 
-        seed_config(home.path(), "model-x").unwrap();
+        crate::config::with(|config| config.write_child_config(home.path(), "model-x")).unwrap();
 
         let raw = std::fs::read_to_string(home.path().join(".cubi").join("config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1132,6 +1127,7 @@ mod tests {
             home.path(),
             workdir.path(),
             Duration::from_millis(100),
+            &crate::config::shared().snapshot(),
         )
         .await
         .unwrap();
@@ -1172,6 +1168,7 @@ mod tests {
             home.path(),
             workdir.path(),
             Duration::from_secs(10),
+            &crate::config::shared().snapshot(),
         )
         .await
         .unwrap();
@@ -1255,6 +1252,7 @@ mod tests {
             isolated_home.path(),
             workdir.path(),
             Duration::from_secs(10),
+            &crate::config::shared().snapshot(),
         )
         .await
         .unwrap();
@@ -1310,6 +1308,7 @@ mod tests {
             isolated_home.path(),
             workdir.path(),
             Duration::from_secs(10),
+            &crate::config::shared().snapshot(),
         )
         .await
         .unwrap();
@@ -1341,6 +1340,7 @@ mod tests {
             home.path(),
             workdir.path(),
             Duration::from_secs(10),
+            &crate::config::shared().snapshot(),
         )
         .await
         .unwrap();
@@ -1353,6 +1353,97 @@ mod tests {
         };
         assert_eq!(exit_code, Some(0), "stdout length {}", stdout.len());
         assert!(stdout.contains("large-stdout-helper-end"));
+    }
+
+    #[test]
+    fn isolated_child_receives_runtime_values_without_ambient_configuration_leaks() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::compat::test_env::env_guard();
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        let _ambient_ctx = EnvVarGuard::set_value("CUBI_NUM_CTX", OsStr::new("1024"));
+        let _log = EnvVarGuard::set_value("CUBI_LOG", OsStr::new("cubi=debug"));
+        let _ambient_key = EnvVarGuard::set_value("CUBI_GITHUB_API_KEY", OsStr::new("old-key"));
+        let _legacy = EnvVarGuard::set_value("AICHAT_GITHUB_API_KEY", OsStr::new("legacy-key"));
+        let _unknown =
+            EnvVarGuard::set_value("CUBI_UNREGISTERED_SETTING", OsStr::new("must-not-leak"));
+        let config = crate::config::shared();
+        config.update(|config| {
+            config.generation.num_ctx = Some(8192);
+            config.generation.max_tokens = Some(37);
+            config.generation.think = Some(false);
+            config.generation.max_retries = 5;
+            config
+                .provider
+                .keys
+                .insert("CUBI_GITHUB_API_KEY".into(), "runtime-key".into());
+            config.debug_tool_call = Some("on".to_string());
+            config.app.auto_compact = false;
+            config.app.tool_timeout_secs = Some(7);
+            config.paths.events = Some("parent.events".into());
+            config.paths.receipts = Some("parent.receipts".into());
+            config.paths.trace_tools = Some("parent.trace".into());
+        });
+        let config = config.snapshot();
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        config
+            .write_child_config(home.path(), "runtime-model")
+            .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let args = helper_args("proc_subagent::tests::runtime_config_child_helper");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(run_binary_isolated(
+                &exe,
+                &args,
+                &[("CUBI_PROC_SUBAGENT_CONFIG_HELPER", "1")],
+                home.path(),
+                workdir.path(),
+                Duration::from_secs(10),
+                &config,
+            ))
+            .unwrap();
+        let RawRunResult::Completed {
+            stdout, exit_code, ..
+        } = result
+        else {
+            panic!("configuration helper timed out");
+        };
+        assert_eq!(exit_code, Some(0), "stdout:\n{}", stdout);
+        assert!(stdout.contains("CONFIG_CHILD_OK"), "stdout:\n{}", stdout);
+        assert_eq!(std::env::var("CUBI_NUM_CTX").unwrap(), "1024");
+        assert_eq!(std::env::var("CUBI_GITHUB_API_KEY").unwrap(), "old-key");
+    }
+
+    #[test]
+    #[ignore]
+    fn runtime_config_child_helper() {
+        if std::env::var_os("CUBI_PROC_SUBAGENT_CONFIG_HELPER").is_none() {
+            return;
+        }
+        assert_eq!(std::env::var("CUBI_NUM_CTX").unwrap(), "8192");
+        assert_eq!(std::env::var("CUBI_LOG").unwrap(), "cubi=debug");
+        assert_eq!(std::env::var("CUBI_MAX_TOKENS").unwrap(), "37");
+        assert_eq!(std::env::var("CUBI_THINK").unwrap(), "off");
+        assert_eq!(std::env::var("CUBI_LLM_MAX_RETRIES").unwrap(), "5");
+        assert_eq!(std::env::var("CUBI_GITHUB_API_KEY").unwrap(), "runtime-key");
+        assert_eq!(std::env::var("CUBI_DEBUG_TOOL_CALL").unwrap(), "on");
+        for name in [
+            "AICHAT_GITHUB_API_KEY",
+            "CUBI_UNREGISTERED_SETTING",
+            "CUBI_EVENTS",
+            "CUBI_RECEIPTS",
+            "CUBI_TRACE_TOOLS",
+        ] {
+            assert!(std::env::var_os(name).is_none(), "{} leaked", name);
+        }
+        let app = crate::onboarding::AppConfig::load();
+        assert!(!app.auto_compact);
+        assert_eq!(app.tool_timeout_secs, Some(7));
+        println!("CONFIG_CHILD_OK");
     }
 
     fn helper_args(test_name: &'static str) -> [&'static str; 5] {

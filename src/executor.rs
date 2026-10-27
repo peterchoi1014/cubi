@@ -5,6 +5,7 @@ use anyhow::Result;
 pub struct AIExecutor {
     backend: LlmBackend,
     model: String,
+    config: crate::config::SharedConfig,
 }
 
 impl AIExecutor {
@@ -16,6 +17,7 @@ impl AIExecutor {
         Self {
             backend: create_provider(),
             model,
+            config: crate::config::shared(),
         }
     }
 
@@ -25,7 +27,15 @@ impl AIExecutor {
     /// binary's parallel runners).
     #[cfg(test)]
     pub fn with_backend(backend: LlmBackend, model: String) -> Self {
-        Self { backend, model }
+        Self {
+            backend,
+            model,
+            config: crate::config::shared(),
+        }
+    }
+
+    pub(crate) fn runtime_config(&self) -> crate::config::SharedConfig {
+        self.config.clone()
     }
 
     pub async fn chat(&self, messages: Vec<Message>) -> Result<String> {
@@ -111,6 +121,7 @@ impl AIExecutor {
         if !models.is_empty() && !models.iter().any(|m| m.starts_with(&model) || m == &model) {
             anyhow::bail!("Model '{}' not found. Available: {:?}", model, models);
         }
+        self.config.update(|config| config.model = model.clone());
         self.model = model;
         Ok(())
     }

@@ -45,19 +45,11 @@ pub(crate) fn build_http_client() -> reqwest::Client {
 }
 
 fn current_http_read_timeout() -> Duration {
-    std::env::var("CUBI_HTTP_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_HTTP_READ_TIMEOUT)
+    crate::config::with(|config| config.generation.http_timeout)
 }
 
 pub(crate) fn current_max_tokens() -> Option<u64> {
-    std::env::var("CUBI_MAX_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|tokens| *tokens > 0)
+    crate::config::with(|config| config.generation.max_tokens)
 }
 
 // ─── Provider enum (object-safe dispatch without async_trait) ────────────────
@@ -331,20 +323,21 @@ impl OpenAiClient {
         }
     }
 
-    /// Creates a client from environment variables.
+    /// Creates a client from the resolved startup configuration.
     pub fn from_env() -> Option<Self> {
-        let openai_base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
+        let provider = crate::config::with(|config| config.provider.clone());
+        let openai_base_url = provider
+            .openai_base_url
             .filter(|url| !url.trim().is_empty());
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("CUBI_API_KEY").ok())
+        let api_key = provider
+            .openai_api_key
+            .or(provider.api_key)
             .filter(|key| !key.trim().is_empty());
         if api_key.is_none() && !openai_base_url.as_deref().is_some_and(is_loopback_url) {
             return None;
         }
         let base_url = openai_base_url
-            .or_else(|| std::env::var("CUBI_BASE_URL").ok())
+            .or(provider.base_url)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         Some(Self::new(
             base_url.trim_end_matches('/').to_string(),
@@ -987,7 +980,7 @@ impl OpenAiClient {
 }
 
 fn fake_content() -> String {
-    std::env::var("CUBI_FAKE_LLM_RESPONSE").unwrap_or_else(|_| "hi".to_string())
+    crate::config::with(|config| config.fake.response.clone())
 }
 
 /// Per-model response lookup for the `Fake` backend. Resolution order:
@@ -996,37 +989,34 @@ fn fake_content() -> String {
 ///      tests to script different "model" outputs in the same process.
 ///   2. Fallback to [`fake_content`] (single global response).
 pub(crate) fn fake_content_for(model: &str) -> String {
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_MODEL_RESPONSES") {
-        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
-            if let Some(v) = map.get(model) {
-                return v.clone();
-            }
-        }
-    }
-    fake_content()
+    crate::config::with(|config| {
+        config
+            .fake
+            .model_responses
+            .get(model)
+            .unwrap_or(&config.fake.response)
+            .clone()
+    })
 }
 
 fn fake_message_for(model: &str, messages: &[Message]) -> Message {
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_TOOL_CALL") {
+    let fake = crate::config::with(|config| config.fake.clone());
+    if let Some(call) = fake.tool_call {
         // Normally the scripted tool call is emitted once (until a tool
         // result appears in history) so tests can drive a single
         // model→tool→model round-trip. Setting
         // `CUBI_FAKE_LLM_TOOL_CALL_REPEAT=1` removes that gate so the fake
         // backend re-issues the call on every step — used to exercise the
         // headless consecutive-tool-error safety valve.
-        let repeat = std::env::var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let repeat = fake.tool_call_repeat;
         if repeat || !messages.iter().any(|message| message.role == "tool") {
-            if let Ok(call) = serde_json::from_str::<ToolCall>(&raw) {
-                return Message {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![call]),
-                    tool_name: None,
-                    tool_call_id: None,
-                };
-            }
+            return Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Some(vec![call]),
+                tool_name: None,
+                tool_call_id: None,
+            };
         }
     }
     Message::text("assistant", fake_content_for(model))
@@ -1040,10 +1030,8 @@ pub(crate) fn fake_check_fail(model: &str) -> Result<()> {
     if model.is_empty() {
         return Ok(());
     }
-    if let Ok(raw) = std::env::var("CUBI_FAKE_LLM_FAIL_MODELS") {
-        if raw.split(',').any(|m| m.trim() == model) {
-            anyhow::bail!("fake backend: scripted failure for model `{model}`");
-        }
+    if crate::config::with(|config| config.fake.fail_models.iter().any(|m| m == model)) {
+        anyhow::bail!("fake backend: scripted failure for model `{model}`");
     }
     Ok(())
 }
@@ -1123,26 +1111,20 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 fn current_max_retries() -> u32 {
-    if let Ok(v) = std::env::var("CUBI_LLM_MAX_RETRIES") {
-        if let Ok(n) = v.parse::<u32>() {
-            return n;
-        }
-    }
-    let cfg = crate::onboarding::AppConfig::load();
-    cfg.llm_max_retries
+    crate::config::with(|config| config.generation.max_retries)
 }
 
 /// Creates the appropriate LLM provider based on environment configuration.
 pub fn create_provider() -> LlmBackend {
-    if std::env::var("CUBI_FAKE_LLM").is_ok() {
+    if crate::config::with(|config| config.fake.enabled) {
         return LlmBackend::Fake;
     }
     if let Some(client) = OpenAiClient::from_env() {
         return LlmBackend::OpenAi(client);
     }
 
-    let ollama = match std::env::var("CUBI_BASE_URL") {
-        Ok(url) if !url.is_empty() => OllamaClient::with_base_url(url),
+    let ollama = match crate::config::with(|config| config.provider.base_url.clone()) {
+        Some(url) if !url.is_empty() => OllamaClient::with_base_url(url),
         _ => OllamaClient::new(),
     };
     LlmBackend::Ollama(ollama)
@@ -1179,12 +1161,8 @@ pub fn estimate_conversation_tokens(messages: &[Message]) -> usize {
 /// budget-error path be exercised without depending on a particular
 /// model's real window size.
 pub fn context_window_for_model(model: &str) -> Option<usize> {
-    if let Ok(raw) = std::env::var("CUBI_MAX_PROMPT_TOKENS_OVERRIDE") {
-        if let Ok(n) = raw.parse::<usize>() {
-            if n > 0 {
-                return Some(n);
-            }
-        }
+    if let Some(n) = crate::config::with(|config| config.generation.prompt_tokens_override) {
+        return Some(n);
     }
     crate::model_profile::lookup(model).and_then(|profile| profile.nominal_context_window)
 }

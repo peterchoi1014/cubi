@@ -13,7 +13,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
-use std::process::Command;
 
 fn settings_root() -> Result<PathBuf> {
     crate::sessions::cubi_dir().context("Could not resolve home directory")
@@ -22,7 +21,7 @@ fn settings_root() -> Result<PathBuf> {
 fn run_git(args: &[&str]) -> Result<String> {
     let root = settings_root()?;
     std::fs::create_dir_all(&root)?;
-    let out = Command::new("git")
+    let out = crate::config::command("git")
         .arg("-C")
         .arg(&root)
         .args(args)

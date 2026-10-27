@@ -7,13 +7,14 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead as _, BufReader as StdBufReader};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command as TokioCommand};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
@@ -21,8 +22,8 @@ use crate::file_rollback::FileJournal;
 use crate::permissions::Permissions;
 use crate::repomap::{RepoMap, RepoMapOptions};
 
-const READ_FILE_DEFAULT_MAX_LINES: usize = 400;
-const READ_FILE_DEFAULT_MAX_BYTES: usize = 50 * 1024;
+pub(crate) const READ_FILE_DEFAULT_MAX_LINES: usize = 400;
+pub(crate) const READ_FILE_DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
 /// Resolve the unbounded-read output caps, allowing per-environment tuning
 /// via `CUBI_READ_FILE_MAX_LINES` / `CUBI_READ_FILE_MAX_BYTES`. A positive
@@ -30,17 +31,7 @@ const READ_FILE_DEFAULT_MAX_BYTES: usize = 50 * 1024;
 /// zero, or unparseable falls back to the default. Larger-context models
 /// can raise these; small-context models can lower them.
 fn read_file_caps() -> (usize, usize) {
-    let resolve = |var: &str, default: usize| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(default)
-    };
-    (
-        resolve("CUBI_READ_FILE_MAX_LINES", READ_FILE_DEFAULT_MAX_LINES),
-        resolve("CUBI_READ_FILE_MAX_BYTES", READ_FILE_DEFAULT_MAX_BYTES),
-    )
+    crate::config::with(|config| (config.read_file_max_lines, config.read_file_max_bytes))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,7 +592,7 @@ impl BuiltinToolRegistry {
         }
 
         let execution = async {
-            let output = TokioCommand::new("sh")
+            let output = crate::config::async_command("sh")
                 .arg("-c")
                 .arg(command)
                 .kill_on_drop(true)
@@ -791,7 +782,7 @@ impl BuiltinToolRegistry {
         let recursive = args["recursive"].as_bool().unwrap_or(false);
         let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
 
-        let mut command = Command::new("grep");
+        let mut command = crate::config::command("grep");
         if ignore_case {
             command.arg("-i");
         }
@@ -994,7 +985,7 @@ impl BuiltinToolRegistry {
 
         match action {
             "list" => {
-                let out = Command::new("git")
+                let out = crate::config::command("git")
                     .current_dir(&git_cwd)
                     .args(["worktree", "list", "--porcelain"])
                     .output()
@@ -1017,7 +1008,7 @@ impl BuiltinToolRegistry {
                 let path = args["path"]
                     .as_str()
                     .context("Missing 'path' parameter for `add`")?;
-                let mut cmd = Command::new("git");
+                let mut cmd = crate::config::command("git");
                 cmd.current_dir(&git_cwd);
                 cmd.args(["worktree", "add", path]);
                 if let Some(branch) = args["branch"].as_str() {
@@ -1063,7 +1054,7 @@ impl BuiltinToolRegistry {
                 let path = args["path"]
                     .as_str()
                     .context("Missing 'path' parameter for `remove`")?;
-                let out = Command::new("git")
+                let out = crate::config::command("git")
                     .current_dir(&git_cwd)
                     .args(["worktree", "remove", path])
                     .output()
@@ -1298,7 +1289,7 @@ impl BuiltinToolRegistry {
         // already depend on the crate.
         let sentinel = format!("__CUBI_REPL_DONE_{}__", uuid::Uuid::new_v4().simple());
 
-        let mut child = TokioCommand::new("bash")
+        let mut child = crate::config::async_command("bash")
             .arg("--noprofile")
             .arg("--norc")
             // Intentionally NOT `-i`: interactive mode pulls in job control
@@ -1823,7 +1814,7 @@ impl BuiltinToolRegistry {
         let flag = flag.to_string();
         let program = program.to_string();
         let execution = async move {
-            let child = TokioCommand::new(&program)
+            let child = crate::config::async_command(&program)
                 .arg(&flag)
                 .arg(&command)
                 .stdout(Stdio::piped())
@@ -2262,7 +2253,7 @@ impl BuiltinToolRegistry {
         // unified below.
         #[cfg(target_os = "macos")]
         let mut cmd = {
-            let mut c = Command::new("caffeinate");
+            let mut c = crate::config::command("caffeinate");
             // -d display, -i system idle, -m disk, -s system sleep, -u user
             c.args(["-dimsu", "-t", &capped.to_string()]);
             c
@@ -2271,7 +2262,7 @@ impl BuiltinToolRegistry {
         let mut cmd = {
             // systemd-inhibit holds the lock for the lifetime of its
             // child command. We use `sleep` as the held command.
-            let mut c = Command::new("systemd-inhibit");
+            let mut c = crate::config::command("systemd-inhibit");
             c.args([
                 "--what=idle:sleep",
                 "--who=cubi",
@@ -2294,7 +2285,7 @@ impl BuiltinToolRegistry {
                  [W.PWR]::SetThreadExecutionState(0x80000000) | Out-Null",
                 secs = capped
             );
-            let mut c = Command::new("powershell");
+            let mut c = crate::config::command("powershell");
             c.args(["-NoProfile", "-Command", &script]);
             c
         };
@@ -2794,7 +2785,7 @@ fn send_os_notification(title: &str, message: &str) -> Result<String> {
             escape_applescript(message),
             escape_applescript(title)
         );
-        let status = Command::new("osascript")
+        let status = crate::config::command("osascript")
             .arg("-e")
             .arg(&script)
             .stdout(Stdio::null())
@@ -2806,7 +2797,7 @@ fn send_os_notification(title: &str, message: &str) -> Result<String> {
             Err(e) => Ok(format!("osascript unavailable: {e}")),
         }
     } else if cfg!(target_os = "linux") {
-        let status = Command::new("notify-send")
+        let status = crate::config::command("notify-send")
             .arg(title)
             .arg(message)
             .stdout(Stdio::null())
@@ -2830,7 +2821,7 @@ fn send_os_notification(title: &str, message: &str) -> Result<String> {
             title.replace('\'', "''"),
             message.replace('\'', "''")
         );
-        let status = Command::new("powershell")
+        let status = crate::config::command("powershell")
             .arg("-NoProfile")
             .arg("-Command")
             .arg(&ps)

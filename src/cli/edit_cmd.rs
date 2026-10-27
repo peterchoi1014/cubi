@@ -32,19 +32,7 @@ pub(crate) enum EditOutcome {
 /// 3. `$EDITOR`
 /// 4. Platform fallback: `vi` on unix, `notepad.exe` on windows.
 pub(crate) fn resolve_editor() -> String {
-    for key in ["CUBI_EDITOR", "VISUAL", "EDITOR"] {
-        if let Ok(v) = std::env::var(key) {
-            let t = v.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
-    }
-    if cfg!(windows) {
-        "notepad.exe".to_string()
-    } else {
-        "vi".to_string()
-    }
+    crate::config::with(|config| config.editor.clone())
 }
 
 /// Core helper: seed a tempfile, hand it to `invoke`, then classify the
@@ -92,7 +80,7 @@ pub(crate) fn spawn_editor_blocking(editor: &str, path: &Path) -> io::Result<()>
             "editor command is empty",
         ));
     };
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = crate::config::command(bin);
     for a in parts {
         cmd.arg(a);
     }

@@ -33,7 +33,7 @@ impl Spinner {
     /// Also a no-op when `CUBI_NO_SPINNER` is set (used by `--quiet`).
     /// Without a current Tokio runtime, returns an inactive handle.
     pub fn start(label: impl Into<String>) -> Self {
-        let suppress_env = std::env::var("CUBI_NO_SPINNER").is_ok();
+        let suppress_env = crate::config::with(|config| config.ui.no_spinner);
         let active = !suppress_env && std::io::stderr().is_terminal();
         Self::start_inner(label, active)
     }

@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Locality {
@@ -64,52 +64,7 @@ pub fn lookup(model_id: &str) -> Option<ModelProfile> {
 }
 
 pub fn sampling_for_model(model_id: &str) -> Result<Sampling> {
-    let mut sampling = lookup(model_id)
-        .map(|profile| profile.default_sampling)
-        .unwrap_or_default();
-
-    if let Some(raw) = env_value("CUBI_TEMPERATURE")? {
-        let value = raw
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| anyhow::anyhow!("CUBI_TEMPERATURE must be a non-negative number"))?;
-        if !value.is_finite() || value < 0.0 {
-            bail!("CUBI_TEMPERATURE must be a finite, non-negative number");
-        }
-        sampling.temperature = Some(value);
-    }
-    if let Some(raw) = env_value("CUBI_TOP_P")? {
-        let value = raw
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| anyhow::anyhow!("CUBI_TOP_P must be a number in (0, 1]"))?;
-        if !(value.is_finite() && 0.0 < value && value <= 1.0) {
-            bail!("CUBI_TOP_P must be a finite number in (0, 1]");
-        }
-        sampling.top_p = Some(value);
-    }
-    if let Some(raw) = env_value("CUBI_TOP_K")? {
-        let value = raw
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("CUBI_TOP_K must be a positive integer"))?;
-        if value == 0 {
-            bail!("CUBI_TOP_K must be a positive integer");
-        }
-        sampling.top_k = Some(value);
-    }
-
-    Ok(sampling)
-}
-
-fn env_value(name: &str) -> Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            bail!("{} must contain valid UTF-8", name)
-        }
-    }
+    crate::config::with(|config| config.generation.sampling_for_model(model_id))
 }
 
 fn context_window(id: &str) -> Option<usize> {

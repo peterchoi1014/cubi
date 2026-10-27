@@ -12,7 +12,6 @@
 //! call site.
 
 use anyhow::{Context, Result};
-use std::process::Command;
 
 /// Outcome of a `git` invocation. We keep both streams so the caller can
 /// decide whether to show stderr context even on success (git often
@@ -25,7 +24,7 @@ pub struct GitOutput {
 }
 
 fn run_git(args: &[&str]) -> Result<GitOutput> {
-    let output = Command::new("git")
+    let output = crate::config::command("git")
         .args(args)
         .output()
         .context("Failed to execute `git`. Is git installed and on PATH?")?;

@@ -19,12 +19,12 @@
 //! single iteration of streaming chat — no behavioral regression for users
 //! who haven't pulled a tool-capable model yet.
 
+use crate::config::ToolProfile;
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
 
 use crate::cli::tool_dispatch::{ToolAccess, ToolCallHost, ToolOutcome, dispatch_tool};
 use crate::executor::AIExecutor;
@@ -81,22 +81,6 @@ const CODING_TOOL_NAMES: [&str; 8] = [
     "write_file",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolProfile {
-    Full,
-    Coding,
-}
-
-impl ToolProfile {
-    fn selected() -> Self {
-        static SELECTED: OnceLock<ToolProfile> = OnceLock::new();
-        *SELECTED.get_or_init(|| match std::env::var(TOOL_PROFILE_ENV) {
-            Ok(value) if value.eq_ignore_ascii_case("coding") => Self::Coding,
-            _ => Self::Full,
-        })
-    }
-}
-
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
 /// it focused on the single goal and discourage it from chatting back.
@@ -120,7 +104,7 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
     }
     let specs = build_tool_specs_for_profile(
         mcp_tools,
-        ToolProfile::selected(),
+        crate::config::with(|config| config.tool_profile),
         !meta_tools_disabled_by_env(),
     );
     (!specs.is_empty()).then_some(specs)
@@ -160,7 +144,7 @@ fn build_tool_specs_for_profile(
 }
 
 pub fn meta_tools_disabled_by_env() -> bool {
-    std::env::var_os(DISABLE_META_TOOLS_ENV).is_some()
+    crate::config::with(|config| config.disable_meta_tools)
 }
 
 /// `ToolSpec` for the [`AGENT_TOOL_NAME`] meta-tool. Kept in this module so

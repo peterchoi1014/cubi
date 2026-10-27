@@ -1,3 +1,4 @@
+use crate::config::UiConfig;
 use colored::{ColoredString, Colorize};
 use std::fmt::Display;
 use std::io::IsTerminal;
@@ -12,10 +13,7 @@ pub fn should_color() -> bool {
     if let Some(enabled) = color_override() {
         return enabled;
     }
-    should_color_with(
-        |key| std::env::var_os(key).and_then(|v| v.into_string().ok()),
-        std::io::stdout().is_terminal(),
-    )
+    crate::config::with(|config| should_color_with(&config.ui, std::io::stdout().is_terminal()))
 }
 
 pub fn init_color_control() {
@@ -34,22 +32,19 @@ pub fn set_color_override(enabled: bool) {
     colored::control::set_override(enabled);
 }
 
-fn should_color_with<F>(env: F, stdout_is_tty: bool) -> bool
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if env_flag_enabled(env("CLICOLOR_FORCE")) {
+fn should_color_with(ui: &UiConfig, stdout_is_tty: bool) -> bool {
+    if ui.force_color {
         return true;
     }
-    if env("NO_COLOR").is_some() {
+    if ui.no_color {
         return false;
     }
-    match env("CUBI_COLOR").as_deref() {
+    match ui.color.as_deref() {
         Some("on") => return true,
         Some("off") => return false,
         _ => {}
     }
-    if matches!(env("CLICOLOR").as_deref(), Some("0")) {
+    if ui.clicolor_off {
         return false;
     }
     stdout_is_tty
@@ -61,10 +56,6 @@ fn color_override() -> Option<bool> {
         COLOR_OVERRIDE_ON => Some(true),
         _ => None,
     }
-}
-
-fn env_flag_enabled(value: Option<String>) -> bool {
-    value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 pub trait CubiStyle: Display {
@@ -114,39 +105,54 @@ impl<T> CubiStyle for T where T: Display {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::config::{Environment, RuntimeConfig, StartupOverrides};
+    use crate::onboarding::AppConfig;
 
-    fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        let map: HashMap<&'a str, &'a str> = vars.iter().copied().collect();
-        move |key| map.get(key).map(|v| (*v).to_string())
+    fn env(vars: &[(&str, &str)]) -> UiConfig {
+        let env = Environment::from_values(
+            vars.iter()
+                .map(|(key, value)| ((*key).into(), (*value).into())),
+        );
+        RuntimeConfig::resolve(&env, AppConfig::default(), &StartupOverrides::default()).ui
     }
 
     #[test]
     fn color_defaults_to_tty_detection() {
-        assert!(should_color_with(env(&[]), true));
-        assert!(!should_color_with(env(&[]), false));
+        assert!(should_color_with(&env(&[]), true));
+        assert!(!should_color_with(&env(&[]), false));
     }
 
     #[test]
     fn no_color_disables_color() {
-        assert!(!should_color_with(env(&[("NO_COLOR", "1")]), true));
+        assert!(!should_color_with(&env(&[("NO_COLOR", "1")]), true));
     }
 
     #[test]
     fn no_color_empty_still_disables_color() {
-        assert!(!should_color_with(env(&[("NO_COLOR", "")]), true));
+        assert!(!should_color_with(&env(&[("NO_COLOR", "")]), true));
     }
 
     #[test]
     fn clicolor_force_overrides_no_color_and_tty() {
         assert!(should_color_with(
-            env(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]),
+            &env(&[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]),
             false
         ));
     }
 
     #[test]
     fn clicolor_zero_disables_auto_color() {
-        assert!(!should_color_with(env(&[("CLICOLOR", "0")]), true));
+        assert!(!should_color_with(&env(&[("CLICOLOR", "0")]), true));
+    }
+
+    #[test]
+    fn cubi_color_overrides_tty_but_not_no_color() {
+        for (vars, tty, expected) in [
+            (vec![("CUBI_COLOR", "on"), ("CLICOLOR", "0")], false, true),
+            (vec![("CUBI_COLOR", "off")], true, false),
+            (vec![("CUBI_COLOR", "on"), ("NO_COLOR", "")], true, false),
+        ] {
+            assert_eq!(should_color_with(&env(&vars), tty), expected);
+        }
     }
 }

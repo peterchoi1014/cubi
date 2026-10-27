@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const DIAGNOSTIC_TAIL_BYTES: usize = 4 * 1024;
-const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 120;
 
 /// Parsed `task.toml` describing one bench task.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -216,12 +215,7 @@ fn diagnostic(value: String) -> Option<String> {
 }
 
 fn verifier_timeout() -> Duration {
-    let seconds = std::env::var("CUBI_BENCH_VERIFY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECONDS);
-    Duration::from_secs(seconds)
+    crate::config::with(|config| config.bench_verify_timeout)
 }
 
 pub(crate) fn infrastructure_exit(exit_code: Option<i32>) -> bool {
@@ -531,7 +525,7 @@ pub async fn run(args: BenchArgs) -> Result<i32> {
     let model = args
         .model
         .clone()
-        .or_else(|| std::env::var("CUBI_MODEL").ok())
+        .or_else(|| crate::config::with(|config| config.model_override.clone()))
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
 
     let tasks_root = args
@@ -735,7 +729,8 @@ async fn run_one_task(
     let _step_cap = step_cap_override.unwrap_or(task.step_cap); // reserved: cubi has no public --max-steps flag yet
 
     let start = Instant::now();
-    let mut cmd = tokio::process::Command::new(cubi_bin);
+    crate::config::with(|config| config.write_child_config(home_dir.path(), model))?;
+    let mut cmd = crate::config::async_command(cubi_bin);
     cmd.arg("-p")
         .arg(&task.prompt)
         .arg("--json")
@@ -837,7 +832,7 @@ async fn run_one_task(
 
     // Run verify.sh from inside the workdir. `verify.sh` is documented
     // as POSIX sh, so invoke `sh` rather than `bash`.
-    let mut verify_cmd = tokio::process::Command::new("sh");
+    let mut verify_cmd = crate::config::async_command("sh");
     verify_cmd
         .arg(&verify_script)
         .current_dir(workdir.path())

@@ -24,8 +24,8 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 /// how the rest of the CLI treats startup-time settings.
 pub fn init(config_enabled: bool) {
     let env_on = matches!(
-        std::env::var("CUBI_TELEMETRY").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        crate::config::with(|config| config.telemetry.clone()).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
     );
     let _ = ENABLED.set(config_enabled || env_on);
 }

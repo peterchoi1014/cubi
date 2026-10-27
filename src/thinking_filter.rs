@@ -57,9 +57,7 @@ pub fn strip_thinking_blocks(s: &str) -> String {
 }
 
 fn keep_thinking() -> bool {
-    std::env::var("CUBI_KEEP_THINKING")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::config::with(|config| config.keep_thinking)
 }
 
 /// Streaming stripper. Construct one per stream, call [`feed`] for each

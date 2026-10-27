@@ -32,13 +32,13 @@ impl EventSink {
     /// flag, then the `CUBI_EVENTS` env var. Returns `None` when neither
     /// is set or both are empty.
     pub fn from_args(flag_path: Option<&str>) -> Option<Self> {
-        let raw = flag_path
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("CUBI_EVENTS").ok())?;
-        if raw.is_empty() {
+        let path = flag_path
+            .map(PathBuf::from)
+            .or_else(|| crate::config::with(|config| config.paths.events.clone()))?;
+        if path.as_os_str().is_empty() {
             return None;
         }
-        Some(Self::new(PathBuf::from(raw)))
+        Some(Self::new(path))
     }
 
     pub fn new(path: PathBuf) -> Self {
