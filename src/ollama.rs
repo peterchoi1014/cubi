@@ -37,7 +37,14 @@ pub struct ChatRequest {
     pub think: Option<bool>,
     /// Native model residency control. Omitted unless `CUBI_KEEP_ALIVE` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub keep_alive: Option<String>,
+    pub keep_alive: Option<KeepAlive>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum KeepAlive {
+    Seconds(i64),
+    Duration(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,8 +178,17 @@ fn current_think() -> Option<bool> {
     crate::config::with(|config| config.generation.think)
 }
 
-fn current_keep_alive() -> Option<String> {
-    crate::config::with(|config| config.generation.keep_alive.clone())
+fn current_keep_alive() -> Option<KeepAlive> {
+    crate::config::with(|config| {
+        config
+            .generation
+            .keep_alive
+            .clone()
+            .map(|value| match value.parse::<i64>() {
+                Ok(seconds) => KeepAlive::Seconds(seconds),
+                Err(_) => KeepAlive::Duration(value),
+            })
+    })
 }
 
 fn resolve_num_ctx(model: &str, env_override: Option<usize>) -> Option<usize> {
@@ -1255,6 +1271,53 @@ mod tests {
         assert_eq!(body["options"]["num_predict"], 123);
         assert_eq!(body["think"], false);
         assert_eq!(body["keep_alive"], "10m");
+    }
+
+    #[tokio::test]
+    async fn request_serializes_keep_alive_by_value_kind_in_both_modes() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let cases = [
+            ("-1", serde_json::json!(-1)),
+            ("0", serde_json::json!(0)),
+            ("5m", serde_json::json!("5m")),
+        ];
+
+        for stream in [false, true] {
+            for (configured, expected) in &cases {
+                let _env = EnvGuard::set(&[
+                    ("CUBI_KEEP_ALIVE", Some(configured)),
+                    ("CUBI_NUM_CTX", None),
+                ]);
+                let response = serde_json::json!({
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": true
+                });
+                let response = if stream {
+                    format!("{}\n", response).into_bytes()
+                } else {
+                    response.to_string().into_bytes()
+                };
+                let (base_url, server) = serve_chunked(vec![response]).await;
+                let client = OllamaClient::with_base_url(base_url);
+
+                if stream {
+                    client
+                        .chat_stream("unknown-model", vec![], None, |_| {})
+                        .await
+                        .unwrap();
+                } else {
+                    client
+                        .chat_with_tools("unknown-model", vec![], None)
+                        .await
+                        .unwrap();
+                }
+                let request = server.await.unwrap();
+                let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+                assert_eq!(body["stream"], stream);
+                assert_eq!(body["keep_alive"], *expected);
+            }
+        }
     }
 
     #[tokio::test]
