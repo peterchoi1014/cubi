@@ -9,9 +9,12 @@ const DEFAULT_OLLAMA_NUM_CTX_CAP: usize = 32_768;
 /// Normalize assistant content before handing it back to the host.
 /// Some Ollama versions expose a separate `thinking` field that already
 /// strips `<think>...</think>` server-side; in that case this is a no-op.
-fn normalize_assistant_message(mut m: Message) -> Message {
+pub(crate) fn normalize_assistant_message(
+    mut m: Message,
+    advertised_tools: Option<&[ToolSpec]>,
+) -> Message {
     m.content = strip_thinking_blocks(&m.content);
-    synthesize_tool_call_from_content(&mut m);
+    synthesize_advertised_tool_call_from_content(&mut m, advertised_tools);
     m
 }
 
@@ -29,11 +32,20 @@ pub struct ChatRequest {
     /// Runtime options for Ollama's `/api/chat` endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<ChatOptions>,
+    /// Native reasoning control. Omitted unless `CUBI_THINK` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Native model residency control. Omitted unless `CUBI_KEEP_ALIVE` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatOptions {
-    pub num_ctx: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<u64>,
 }
 
 /// Native tool definition forwarded to Ollama. Mirrors the OpenAI-compatible
@@ -109,7 +121,7 @@ impl Message {
 }
 
 /// A single tool invocation the model wants the host to perform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Ollama doesn't always set an id; tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,7 +131,7 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
     /// Ollama returns arguments as a JSON object; older clients sometimes
@@ -128,7 +140,12 @@ pub struct ToolCallFunction {
 }
 
 fn chat_options_for_model(model: &str) -> Option<ChatOptions> {
-    resolve_num_ctx(model, current_num_ctx_override()).map(|num_ctx| ChatOptions { num_ctx })
+    let num_ctx = resolve_num_ctx(model, current_num_ctx_override());
+    let num_predict = crate::llm::current_max_tokens();
+    (num_ctx.is_some() || num_predict.is_some()).then_some(ChatOptions {
+        num_ctx,
+        num_predict,
+    })
 }
 
 fn current_num_ctx_override() -> Option<usize> {
@@ -142,6 +159,23 @@ fn parse_positive_usize(raw: &str) -> Option<usize> {
     (value > 0).then_some(value)
 }
 
+fn current_think() -> Option<bool> {
+    std::env::var("CUBI_THINK").ok().and_then(|raw| {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn current_keep_alive() -> Option<String> {
+    std::env::var("CUBI_KEEP_ALIVE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
 fn resolve_num_ctx(model: &str, env_override: Option<usize>) -> Option<usize> {
     let env_override = env_override.filter(|value| *value > 0);
     let cap = env_override.unwrap_or(DEFAULT_OLLAMA_NUM_CTX_CAP);
@@ -151,6 +185,7 @@ fn resolve_num_ctx(model: &str, env_override: Option<usize>) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 fn synthesize_tool_call_from_content(message: &mut Message) -> bool {
     if message.role != "assistant"
         || message
@@ -164,6 +199,36 @@ fn synthesize_tool_call_from_content(message: &mut Message) -> bool {
     let Some(tool_call) = parse_tool_call_content(&message.content) else {
         return false;
     };
+
+    message.content.clear();
+    message.tool_calls = Some(vec![tool_call]);
+    true
+}
+
+fn synthesize_advertised_tool_call_from_content(
+    message: &mut Message,
+    advertised_tools: Option<&[ToolSpec]>,
+) -> bool {
+    if message.role != "assistant"
+        || message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        return false;
+    }
+
+    let Some(tool_call) = parse_tool_call_content(&message.content) else {
+        return false;
+    };
+    let is_advertised = advertised_tools.is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.function.name == tool_call.function.name)
+    });
+    if !is_advertised {
+        return false;
+    }
 
     message.content.clear();
     message.tool_calls = Some(vec![tool_call]);
@@ -248,6 +313,8 @@ pub struct ChatResponse {
     // Note: 'done' field exists in API but we don't need it for non-streaming
     #[allow(dead_code)]
     pub done: bool,
+    #[serde(default)]
+    pub done_reason: Option<String>,
     /// Number of tokens in the prompt (Ollama only sends this on the final
     /// chunk, or on the single non-streaming response).
     #[serde(default)]
@@ -269,6 +336,8 @@ pub struct ChatResponse {
 pub struct ChatStreamChunk {
     pub message: Message,
     pub done: bool,
+    #[serde(default)]
+    pub done_reason: Option<String>,
     /// Token counts. Present only on the final chunk; intermediate chunks
     /// have these as `None`.
     #[serde(default)]
@@ -346,7 +415,7 @@ impl OllamaClient {
     pub fn new() -> Self {
         Self {
             base_url: "http://localhost:11434".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::llm::build_http_client(),
         }
     }
 
@@ -354,7 +423,7 @@ impl OllamaClient {
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             base_url,
-            client: reqwest::Client::new(),
+            client: crate::llm::build_http_client(),
         }
     }
 
@@ -386,6 +455,8 @@ impl OllamaClient {
                 stream: false,
                 tools: tools.clone(),
                 options: chat_options_for_model(model),
+                think: current_think(),
+                keep_alive: current_keep_alive(),
             };
             async move {
                 tracing::debug!(target: "cubi::llm::ollama", model = %model, "ollama chat request");
@@ -408,6 +479,12 @@ impl OllamaClient {
                     .json()
                     .await
                     .context("Failed to parse Ollama response")?;
+                if chat_response.done_reason.as_deref() == Some("length") {
+                    anyhow::bail!(
+                        "Ollama response was truncated by the output-token limit; partial content: {}",
+                        chat_response.message.content
+                    );
+                }
 
                 let stats = ChatStats {
                     prompt_tokens: chat_response.prompt_eval_count.unwrap_or(0),
@@ -418,7 +495,10 @@ impl OllamaClient {
                         .unwrap_or(0),
                 };
 
-                Ok((normalize_assistant_message(chat_response.message), stats))
+                Ok((
+                    normalize_assistant_message(chat_response.message, request.tools.as_deref()),
+                    stats,
+                ))
             }
         })
         .await
@@ -452,6 +532,8 @@ impl OllamaClient {
                 stream: true,
                 tools: tools.clone(),
                 options: chat_options_for_model(model),
+                think: current_think(),
+                keep_alive: current_keep_alive(),
             };
             async move {
                 let response = self
@@ -476,10 +558,12 @@ impl OllamaClient {
         // parse one JSON object per non-empty line. `reqwest`'s
         // `bytes_stream` does not guarantee per-line framing, so we buffer.
         let mut stream = response.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut content = String::new();
         let mut final_msg: Option<Message> = None;
+        let mut tool_calls = Vec::new();
         let mut stats = ChatStats::default();
+        let mut done_reason: Option<String> = None;
         // Strips Qwen3-style <think>…</think> reasoning blocks from
         // both the tokens we forward to the UI and the accumulated
         // content we record in history.
@@ -487,27 +571,40 @@ impl OllamaClient {
 
         // Local closure so the trailing-buffer case after the read loop can
         // reuse the same parse-and-dispatch logic without duplication.
-        let mut handle_line = |line: &str,
+        let mut handle_line = |line: &[u8],
                                content: &mut String,
                                final_msg: &mut Option<Message>,
+                               tool_calls: &mut Vec<ToolCall>,
                                stats: &mut ChatStats,
-                               stripper: &mut ThinkStripper| {
+                               done_reason: &mut Option<String>,
+                               stripper: &mut ThinkStripper|
+         -> Result<()> {
+            let line = std::str::from_utf8(line).context("Ollama stream returned invalid UTF-8")?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                return;
+                return Ok(());
             }
             let parsed: ChatStreamChunk = match serde_json::from_str(trimmed) {
                 Ok(c) => c,
-                Err(_) => return, // tolerate a malformed mid-stream line
+                Err(_) => return Ok(()), // tolerate a malformed mid-stream line
             };
-            if !parsed.message.content.is_empty() {
-                let clean = stripper.feed(&parsed.message.content);
+            let mut message = parsed.message;
+            if !message.content.is_empty() {
+                let clean = stripper.feed(&message.content);
                 if !clean.is_empty() {
                     on_token(&clean);
                     content.push_str(&clean);
                 }
             }
+            if let Some(calls) = message.tool_calls.take() {
+                for call in calls {
+                    if !tool_calls.contains(&call) {
+                        tool_calls.push(call);
+                    }
+                }
+            }
             if parsed.done {
+                *done_reason = parsed.done_reason;
                 // Capture provider stats from the terminal chunk.
                 stats.prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
                 stats.completion_tokens = parsed.eval_count.unwrap_or(0);
@@ -517,27 +614,30 @@ impl OllamaClient {
                     on_token(&tail);
                     content.push_str(&tail);
                 }
-                let mut m = parsed.message;
                 // Replace fragmentary content with the accumulated text so
                 // callers don't have to reconstruct it.
-                m.content = content.clone();
-                *final_msg = Some(m);
+                message.content = content.clone();
+                message.tool_calls = (!tool_calls.is_empty()).then(|| std::mem::take(tool_calls));
+                *final_msg = Some(message);
             }
+            Ok(())
         };
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("Stream read failed")?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].to_string();
-                buf.drain(..=nl);
+            buf.extend_from_slice(&bytes);
+            while let Some(nl) = buf.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = buf.drain(..=nl).collect();
+                line.pop();
                 handle_line(
                     &line,
                     &mut content,
                     &mut final_msg,
+                    &mut tool_calls,
                     &mut stats,
+                    &mut done_reason,
                     &mut stripper,
-                );
+                )?;
             }
         }
 
@@ -545,21 +645,30 @@ impl OllamaClient {
         // server sent the final `done:true` object without `\n`, it would
         // otherwise sit in `buf` forever and we'd report "ended without
         // done chunk". Flush whatever's left.
-        if !buf.trim().is_empty() {
+        if !buf.iter().all(|byte| byte.is_ascii_whitespace()) {
             let remaining = std::mem::take(&mut buf);
             handle_line(
                 &remaining,
                 &mut content,
                 &mut final_msg,
+                &mut tool_calls,
                 &mut stats,
+                &mut done_reason,
                 &mut stripper,
-            );
+            )?;
         }
 
         let msg = normalize_assistant_message(
             final_msg
                 .ok_or_else(|| anyhow::anyhow!("Ollama stream ended without a `done` chunk"))?,
+            tools.as_deref(),
         );
+        if done_reason.as_deref() == Some("length") {
+            anyhow::bail!(
+                "Ollama response was truncated by the output-token limit; partial content: {}",
+                msg.content
+            );
+        }
         Ok((msg, stats))
     }
 
@@ -589,6 +698,279 @@ impl OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn set(values: &[(&'static str, Option<&str>)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    // SAFETY: env-mutating tests are serialized by `crate::llm::ENV_LOCK`.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                    (*name, previous)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                // SAFETY: the guard is dropped while its test still holds the env lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn serve_chunked(parts: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut header_end = None;
+            let mut content_length = 0;
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if header_end.is_none()
+                    && let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let end = index + 4;
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    header_end = Some(end);
+                }
+                if header_end.is_some_and(|end| request.len() >= end + content_length) {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for part in parts {
+                socket
+                    .write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&part).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+
+            let body_start = header_end.unwrap();
+            String::from_utf8(request[body_start..body_start + content_length].to_vec()).unwrap()
+        });
+        (format!("http://{}", address), handle)
+    }
+
+    fn bash_tool_call() -> serde_json::Value {
+        serde_json::json!({
+            "function": {
+                "name": "bash",
+                "arguments": {"command": "pwd"}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_tool_call_from_non_final_chunk() {
+        let early = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [bash_tool_call()]
+            },
+            "done": false
+        });
+        let final_chunk = serde_json::json!({
+            "message": {"role": "assistant", "content": ""},
+            "done": true
+        });
+        let body = format!("{}\n{}\n", early, final_chunk).into_bytes();
+        let (base_url, server) = serve_chunked(vec![body]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("early tool call preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments["command"], "pwd");
+    }
+
+    #[tokio::test]
+    async fn stream_deduplicates_tool_call_repeated_on_final_chunk() {
+        let call = bash_tool_call();
+        let early = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call.clone()]
+            },
+            "done": false
+        });
+        let final_chunk = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call]
+            },
+            "done": true
+        });
+        let body = format!("{}\n{}\n", early, final_chunk).into_bytes();
+        let (base_url, server) = serve_chunked(vec![body]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(message.tool_calls.expect("tool call preserved").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_multibyte_utf8_split_across_writes() {
+        let line = serde_json::json!({
+            "message": {"role": "assistant", "content": "café"},
+            "done": true
+        })
+        .to_string();
+        let bytes = format!("{}\n", line).into_bytes();
+        let split = bytes
+            .windows("é".len())
+            .position(|window| window == "é".as_bytes())
+            .unwrap()
+            + 1;
+        let parts = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+        let (base_url, server) = serve_chunked(parts).await;
+        let mut streamed = String::new();
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |token| streamed.push_str(token))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(streamed, "café");
+        assert_eq!(message.content, "café");
+    }
+
+    #[tokio::test]
+    async fn stream_reports_length_limited_response_as_truncated() {
+        let body = serde_json::json!({
+            "message": {"role": "assistant", "content": "partial"},
+            "done": true,
+            "done_reason": "length"
+        });
+        let (base_url, server) = serve_chunked(vec![format!("{}\n", body).into_bytes()]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let error = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("truncated"));
+        assert!(error.to_string().contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn request_includes_generation_controls_only_when_configured() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_MAX_TOKENS", Some("123")),
+            ("CUBI_THINK", Some("off")),
+            ("CUBI_KEEP_ALIVE", Some("10m")),
+            ("CUBI_NUM_CTX", None),
+        ]);
+        let response = serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        client
+            .chat_with_tools("unknown-model", vec![], None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        assert_eq!(body["options"]["num_predict"], 123);
+        assert_eq!(body["think"], false);
+        assert_eq!(body["keep_alive"], "10m");
+    }
+
+    #[tokio::test]
+    async fn request_omits_generation_controls_when_unset() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_MAX_TOKENS", None),
+            ("CUBI_THINK", None),
+            ("CUBI_KEEP_ALIVE", None),
+            ("CUBI_NUM_CTX", None),
+        ]);
+        let response = serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        client
+            .chat_with_tools("unknown-model", vec![], None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request).unwrap();
+
+        assert!(body.get("options").is_none());
+        assert!(body.get("think").is_none());
+        assert!(body.get("keep_alive").is_none());
+    }
 
     #[test]
     fn message_text_constructor_omits_tool_fields() {
@@ -705,7 +1087,12 @@ mod tests {
             messages: vec![],
             stream: false,
             tools: None,
-            options: Some(ChatOptions { num_ctx: 4_096 }),
+            options: Some(ChatOptions {
+                num_ctx: Some(4_096),
+                num_predict: None,
+            }),
+            think: None,
+            keep_alive: None,
         };
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["options"]["num_ctx"], 4_096);

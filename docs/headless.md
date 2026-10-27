@@ -59,6 +59,17 @@ knobs let interactive users disable the same affordances individually:
   cubi derives `num_ctx` from the model's known window, clamped to a safe
   default; a positive override raises that ceiling (still bounded by the
   model's real window).
+- `CUBI_MAX_TOKENS=…` — set a positive output-token cap. Cubi sends it as
+  Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider
+  response that stops at this limit is reported as truncated rather than as a
+  successful completion.
+- `CUBI_THINK=on|off` — set Ollama's native `think` request field. The field is
+  omitted when this variable is unset.
+- `CUBI_KEEP_ALIVE=…` — pass an Ollama `keep_alive` value such as `10m` or
+  `-1`. The field is omitted when this variable is unset.
+- `CUBI_HTTP_TIMEOUT_SECS=…` — set the positive per-read/stream-idle HTTP
+  timeout in seconds (default 300). HTTP connections also have a fixed
+  10-second connect timeout; Cubi does not impose a total generation timeout.
 - `CUBI_READ_FILE_MAX_LINES=…` / `CUBI_READ_FILE_MAX_BYTES=…` — tune the
   shared model-facing tool-output budget (defaults 400 lines / 50 KiB).
   `read_file` applies it to both full and ranged reads and returns continuation
@@ -68,6 +79,24 @@ knobs let interactive users disable the same affordances individually:
   session: `read_file`, `grep`, `search_glob`, `edit_file`, `write_file`,
   `bash`, `list_files`, and `repo_map`, plus the agent meta-tools when enabled.
   The full catalog remains the default.
+
+## Provider environment
+
+`CUBI_BASE_URL` selects a custom native Ollama endpoint. OpenAI-compatible
+servers are selected with `OPENAI_BASE_URL`; remote endpoints also require
+`OPENAI_API_KEY` (or `CUBI_API_KEY`). A loopback `OPENAI_BASE_URL` using
+`localhost`, `127.0.0.0/8`, or `::1` does not require a dummy API key.
+
+```sh
+# Native Ollama on another local port
+CUBI_BASE_URL=http://127.0.0.1:11435 cubi -p "hello"
+
+# llama-server / MLX / LM Studio on loopback, with no dummy key
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 cubi -p "hello"
+
+# Remote OpenAI-compatible service
+OPENAI_BASE_URL=https://example.invalid/v1 OPENAI_API_KEY=... cubi -p "hello"
+```
 
 Examples:
 

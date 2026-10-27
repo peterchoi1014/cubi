@@ -91,6 +91,18 @@ use std::sync::{Arc, Mutex};
 // The qwen3.5:4b fallback is still advertised below for smaller machines.
 const DEFAULT_MODEL: &str = "qwen3.5:9b";
 
+struct StartupModelCheck {
+    models: Vec<String>,
+    found: bool,
+}
+
+async fn validate_startup_model(executor: &AIExecutor, model: &str) -> Result<StartupModelCheck> {
+    let models = executor.list_models().await?;
+    let found = (executor.provider_name() == "openai" && models.is_empty())
+        || models.iter().any(|available| available.starts_with(model));
+    Ok(StartupModelCheck { models, found })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -1448,8 +1460,8 @@ async fn main() -> Result<()> {
             ),
         );
     } else {
-        match ollama_client.list_models().await {
-            Ok(models) => {
+        match validate_startup_model(&executor, model).await {
+            Ok(check) => {
                 status_line(
                     headless,
                     format!(
@@ -1459,12 +1471,12 @@ async fn main() -> Result<()> {
                     ),
                 );
 
-                if !models.iter().any(|m| m.starts_with(model)) {
+                if !check.found {
                     eprintln!(
                         "{} Model '{}' not found. Available models: {:?}",
                         "Warning:".bright_yellow(),
                         model,
-                        models
+                        check.models
                     );
                     eprintln!(
                         "\nInstall the model with: {}",
@@ -2714,5 +2726,53 @@ mod redact_tests {
         assert_eq!(v["user_password"], "<redacted>");
         assert_eq!(v["nested"]["inner_key"], "<redacted>");
         assert_eq!(v["nested"]["ok"], "fine");
+    }
+}
+
+#[cfg(test)]
+mod startup_model_tests {
+    use super::validate_startup_model;
+    use crate::executor::AIExecutor;
+    use crate::llm::LlmBackend;
+    use crate::ollama::OllamaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn startup_model_check_uses_configured_executor_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8(request[..count].to_vec()).unwrap();
+            let body = r#"{"models":[{"name":"fixture-model:latest"}]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let backend =
+            LlmBackend::Ollama(OllamaClient::with_base_url(format!("http://{}", address)));
+        let executor = AIExecutor::with_backend(backend, "fixture-model".to_string());
+
+        let check = validate_startup_model(&executor, "fixture-model")
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(check.found);
+        assert_eq!(check.models, vec!["fixture-model:latest"]);
+        assert!(request.starts_with("GET /api/tags HTTP/1.1"));
     }
 }

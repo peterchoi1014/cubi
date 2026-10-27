@@ -98,6 +98,27 @@ with `!` (e.g. `!ls -la`). `Ctrl+C` interrupts; `/quit` exits.
 For full installation, model selection, and non-Ollama backend setup, see
 **[INSTALL.md](INSTALL.md)**.
 
+## Provider environment
+
+Use `CUBI_BASE_URL` for a custom native Ollama endpoint. Use
+`OPENAI_BASE_URL` for llama-server, MLX, LM Studio, or another
+OpenAI-compatible endpoint. Remote OpenAI-compatible services require
+`OPENAI_API_KEY` (or `CUBI_API_KEY`); loopback URLs on `localhost`,
+`127.0.0.0/8`, or `::1` work without a dummy key.
+
+Generation and transport controls are shared across interactive and headless
+runs:
+
+- `CUBI_MAX_TOKENS` sets Ollama `options.num_predict` or OpenAI `max_tokens`.
+- `CUBI_THINK=on|off` controls Ollama's native `think` field.
+- `CUBI_KEEP_ALIVE` passes Ollama's model-residency value through unchanged.
+- `CUBI_HTTP_TIMEOUT_SECS` sets the stream-idle/read timeout (default 300
+  seconds); connections use a fixed 10-second timeout and generations have no
+  total-request deadline.
+
+Unset optional controls are omitted from provider request bodies. A response
+stopped by the output-token limit is reported as truncated.
+
 ## 🖥️ Interactive UI (TUI)
 
 Running `cubi` with no prompt now opens a **full-screen terminal UI by default**.
