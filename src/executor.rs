@@ -156,3 +156,96 @@ impl AIExecutor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn set(values: &[(&'static str, Option<&str>)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    // SAFETY: env-mutating tests are serialized by `crate::llm::ENV_LOCK`.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                    (*name, previous)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                // SAFETY: the guard is dropped while its test still holds the env lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_request_rejects_output_cap_that_fills_context_window() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_NUM_CTX", Some("8192")),
+            ("CUBI_CONTEXT_WINDOW", None),
+            ("CUBI_MAX_TOKENS", Some("8192")),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let executor = AIExecutor::with_backend(
+            LlmBackend::Ollama(crate::ollama::OllamaClient::with_base_url(
+                "http://127.0.0.1:1".to_string(),
+            )),
+            "unknown-model".to_string(),
+        );
+
+        let error = executor
+            .chat_with_tools(vec![Message::text("user", "x")], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("refusing model request"));
+        assert!(error.to_string().contains("8192 reserved for completion"));
+    }
+
+    #[tokio::test]
+    async fn openai_request_rejects_output_cap_that_fills_context_window() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(&[
+            ("CUBI_NUM_CTX", None),
+            ("CUBI_CONTEXT_WINDOW", Some("8192")),
+            ("CUBI_MAX_TOKENS", Some("8192")),
+            ("CUBI_LLM_MAX_RETRIES", Some("0")),
+        ]);
+        let executor = AIExecutor::with_backend(
+            LlmBackend::OpenAi(crate::llm::OpenAiClient::new(
+                "http://127.0.0.1:1/v1".to_string(),
+                String::new(),
+            )),
+            "unknown-model".to_string(),
+        );
+
+        let error = executor
+            .chat_with_tools(vec![Message::text("user", "x")], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("refusing model request"));
+        assert!(error.to_string().contains("8192 reserved for completion"));
+    }
+}

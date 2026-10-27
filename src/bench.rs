@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const DIAGNOSTIC_TAIL_BYTES: usize = 4 * 1024;
+const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Parsed `task.toml` describing one bench task.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -134,69 +137,160 @@ pub(crate) fn configure_isolated_child_env(command: &mut tokio::process::Command
 }
 
 pub(crate) async fn capture_child(
-    mut child: tokio::process::Child,
+    command: &mut tokio::process::Command,
     timeout: Duration,
 ) -> std::io::Result<CapturedProcess> {
-    let stdout_task = child
-        .stdout
-        .take()
-        .map(|stdout| tokio::spawn(read_tail(stdout)));
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|stderr| tokio::spawn(read_tail(stderr)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id().ok_or_else(|| {
+        std::io::Error::other("captured child exited before its PID was available")
+    })?;
+    let stdout_task = child.stdout.take().map(spawn_tail_reader);
+    let stderr_task = child.stderr.take().map(spawn_tail_reader);
 
     let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(error)) => {
-            let _ = child.start_kill();
+            let _ = terminate_captured_process_tree(&mut child, pid).await;
+            abort_tail_reader(stdout_task).await;
+            abort_tail_reader(stderr_task).await;
             return Err(error);
         }
         Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            if let Err(error) = terminate_captured_process_tree(&mut child, pid).await {
+                abort_tail_reader(stdout_task).await;
+                abort_tail_reader(stderr_task).await;
+                return Err(error);
+            }
             (None, true)
         }
     };
+    let (stdout_tail, stderr_tail) = tokio::join!(
+        collect_tail(stdout_task, DIAGNOSTIC_DRAIN_TIMEOUT),
+        collect_tail(stderr_task, DIAGNOSTIC_DRAIN_TIMEOUT)
+    );
 
     Ok(CapturedProcess {
         exit_code,
         timed_out,
-        stdout_tail: join_tail(stdout_task).await?,
-        stderr_tail: join_tail(stderr_task).await?,
+        stdout_tail: stdout_tail?,
+        stderr_tail: stderr_tail?,
     })
 }
 
-async fn read_tail<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+struct TailReader {
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    tail: Arc<Mutex<Vec<u8>>>,
+}
+
+fn spawn_tail_reader<R>(reader: R) -> TailReader
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let tail = Arc::new(Mutex::new(Vec::with_capacity(DIAGNOSTIC_TAIL_BYTES)));
+    let task_tail = Arc::clone(&tail);
+    let task = tokio::spawn(read_tail(reader, task_tail));
+    TailReader { task, tail }
+}
+
+async fn read_tail<R>(mut reader: R, tail: Arc<Mutex<Vec<u8>>>) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut tail = Vec::with_capacity(DIAGNOSTIC_TAIL_BYTES);
     let mut chunk = [0_u8; 1024];
     loop {
         let count = reader.read(&mut chunk).await?;
         if count == 0 {
             break;
         }
+        let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         tail.extend_from_slice(&chunk[..count]);
         if tail.len() > DIAGNOSTIC_TAIL_BYTES {
             let excess = tail.len() - DIAGNOSTIC_TAIL_BYTES;
             tail.drain(..excess);
         }
     }
-    Ok(tail)
+    Ok(())
 }
 
-async fn join_tail(
-    task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
-) -> std::io::Result<String> {
-    let Some(task) = task else {
+async fn collect_tail(reader: Option<TailReader>, grace: Duration) -> std::io::Result<String> {
+    let Some(mut reader) = reader else {
         return Ok(String::new());
     };
-    let bytes = task
-        .await
-        .map_err(|error| std::io::Error::other(format!("diagnostic reader failed: {error}")))??;
+    match tokio::time::timeout(grace, &mut reader.task).await {
+        Ok(joined) => joined.map_err(|error| {
+            std::io::Error::other(format!("diagnostic reader failed: {error}"))
+        })??,
+        Err(_) => {
+            reader.task.abort();
+            let _ = reader.task.await;
+        }
+    }
+    let bytes = reader
+        .tail
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Ok(bound_diagnostic(&String::from_utf8_lossy(&bytes)))
+}
+
+async fn abort_tail_reader(reader: Option<TailReader>) {
+    if let Some(reader) = reader {
+        reader.task.abort();
+        let _ = reader.task.await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_captured_process_tree(
+    child: &mut tokio::process::Child,
+    pid: u32,
+) -> std::io::Result<()> {
+    let process_group = i32::try_from(pid)
+        .map_err(|_| std::io::Error::other("captured child PID does not fit a Unix process ID"))?;
+    // SAFETY: `kill` receives the negated PID of the child configured above as a process-group
+    // leader. SIGKILL does not dereference Rust memory, and ESRCH is handled as an exit race.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| std::io::Error::other("timed out waiting for killed process group"))??;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_captured_process_tree(
+    child: &mut tokio::process::Child,
+    pid: u32,
+) -> std::io::Result<()> {
+    let mut taskkill = crate::config::async_command("taskkill");
+    taskkill
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, taskkill.status())
+        .await
+        .map_err(|_| std::io::Error::other("timed out running taskkill for process tree"))??;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "taskkill failed with status {}",
+            status
+        )));
+    }
+    tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| std::io::Error::other("timed out waiting for killed process tree"))??;
+    Ok(())
 }
 
 fn bound_diagnostic(value: &str) -> String {
@@ -750,13 +844,9 @@ async fn run_one_task(
     configure_isolated_child_env(&mut cmd, home_dir.path());
     let _ = quiet_stdout; // reserved: a future verbose mode may stream cubi output through.
 
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("spawn cubi for task {}", task.id))?;
-
     let time_cap_seconds = scaled_time_cap(task.time_cap_seconds, time_cap_multiplier);
     let timeout = Duration::from_secs(time_cap_seconds);
-    let agent = match capture_child(child, timeout).await {
+    let agent = match capture_child(&mut cmd, timeout).await {
         Ok(output) => output,
         Err(error) => {
             let (steps_used, tokens_in, tokens_out) = parse_events_metrics(&events_path);
@@ -841,10 +931,7 @@ async fn run_one_task(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     configure_isolated_child_env(&mut verify_cmd, home_dir.path());
-    let verify_child = verify_cmd
-        .spawn()
-        .with_context(|| format!("spawn verify.sh for task {}", task.id))?;
-    let verify_out = capture_child(verify_child, verifier_timeout())
+    let verify_out = capture_child(&mut verify_cmd, verifier_timeout())
         .await
         .with_context(|| format!("run verify.sh for task {}", task.id))?;
     if verify_out.timed_out {
@@ -972,6 +1059,181 @@ fn parse_events_metrics(path: &Path) -> (Option<u32>, Option<u64>, Option<u64>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_child_timeout_kills_descendant_holding_pipes() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "bench::tests::capture_child_timeout_outer_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CUBI_CAPTURE_CHILD_OUTER_HELPER", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_outer_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = status_tx.send(child.wait());
+        });
+
+        match status_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(status) => assert!(status.unwrap().success()),
+            Err(error) => {
+                terminate_outer_process_tree(child_pid);
+                let _ = status_rx.recv_timeout(Duration::from_secs(5));
+                panic!("capture_child test process exceeded outer deadline: {error}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn capture_child_timeout_outer_helper() {
+        if std::env::var_os("CUBI_CAPTURE_CHILD_OUTER_HELPER").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = runtime
+            .block_on(async {
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "bench::tests::capture_child_timeout_verifier_helper",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("CUBI_CAPTURE_CHILD_VERIFIER_HELPER", "1")
+                    .env("CUBI_CAPTURE_CHILD_PID_FILE", &pid_file)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                capture_child(&mut command, Duration::from_millis(500)).await
+            })
+            .unwrap();
+
+        assert!(result.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let descendant_pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_process_is_gone(descendant_pid);
+    }
+
+    #[test]
+    #[ignore]
+    fn capture_child_timeout_verifier_helper() {
+        if std::env::var_os("CUBI_CAPTURE_CHILD_VERIFIER_HELPER").is_none() {
+            return;
+        }
+        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap());
+        descendant
+            .args([
+                "bench::tests::capture_child_timeout_descendant_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CUBI_CAPTURE_CHILD_DESCENDANT_HELPER", "1");
+        let mut descendant = descendant.spawn().unwrap();
+        std::fs::write(
+            std::env::var_os("CUBI_CAPTURE_CHILD_PID_FILE").unwrap(),
+            descendant.id().to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        descendant.wait().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn capture_child_timeout_descendant_helper() {
+        if std::env::var_os("CUBI_CAPTURE_CHILD_DESCENDANT_HELPER").is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    fn configure_outer_process_group(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    fn configure_outer_process_group(_command: &mut std::process::Command) {}
+
+    #[cfg(unix)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let pid = i32::try_from(pid).unwrap();
+        // SAFETY: `kill` is called with the negated PID of the live outer test process, which
+        // was configured as a process-group leader. SIGKILL does not dereference Rust memory.
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        assert_eq!(result, 0, "failed to kill outer test process group");
+    }
+
+    #[cfg(windows)]
+    fn terminate_outer_process_tree(pid: u32) {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to kill outer test process tree");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_is_gone(pid: u32) {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "descendant process {} is still running (ps stat {:?})",
+            pid,
+            stat
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_process_is_gone(pid: u32) {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("No tasks are running")
+                || stdout.contains("INFO: No tasks are running")
+                || !stdout.contains(&pid.to_string()),
+            "descendant process {pid} is still running: {stdout}"
+        );
+    }
 
     #[test]
     fn isolated_child_env_uses_a_per_home_cargo_target_dir() {

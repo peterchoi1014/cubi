@@ -20,18 +20,7 @@ impl RuntimeConfig {
     /// Command::env changes only the child's environment, never the process.
     pub(crate) fn apply_to_child(&self, command: &mut std::process::Command) {
         for (name, _) in std::env::vars_os() {
-            if name.to_str().is_some_and(|name| {
-                name.starts_with("CUBI_")
-                    || name.starts_with("AICHAT_")
-                    || name.starts_with("AI_CHAT_CLI_")
-                    || matches!(
-                        name,
-                        "OPENAI_API_KEY"
-                            | "OPENAI_BASE_URL"
-                            | "OLLAMA_BASE_URL"
-                            | "AGENT_PASSES_OVERRIDE"
-                    )
-            }) {
+            if is_managed_key_with_case(&name, cfg!(windows)) {
                 command.env_remove(name);
             }
         }
@@ -215,5 +204,31 @@ impl RuntimeConfig {
         let path = directory.join("config.json");
         std::fs::write(&path, serde_json::to_string_pretty(&app)?)
             .with_context(|| format!("write {}", path.display()))
+    }
+}
+
+fn is_managed_key_with_case(name: &OsStr, case_insensitive: bool) -> bool {
+    let normalized = super::env_key::normalize_with_case(name, case_insensitive);
+    normalized.to_str().is_some_and(|name| {
+        name.starts_with("CUBI_")
+            || name.starts_with("AICHAT_")
+            || name.starts_with("AI_CHAT_CLI_")
+            || matches!(
+                name,
+                "OPENAI_API_KEY" | "OPENAI_BASE_URL" | "OLLAMA_BASE_URL" | "AGENT_PASSES_OVERRIDE"
+            )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_child_keys_select_platform_case_semantics() {
+        assert!(!is_managed_key_with_case(OsStr::new("cubi_model"), false));
+        assert!(is_managed_key_with_case(OsStr::new("cubi_model"), true));
+        assert!(is_managed_key_with_case(OsStr::new("openai_api_key"), true));
+        assert!(!is_managed_key_with_case(OsStr::new("unrelated"), true));
     }
 }

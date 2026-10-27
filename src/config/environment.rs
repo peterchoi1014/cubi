@@ -5,7 +5,10 @@ use std::str::FromStr;
 
 /// Transient input to startup resolution, not a runtime configuration store.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Environment(BTreeMap<OsString, OsString>);
+pub(crate) struct Environment {
+    values: BTreeMap<OsString, OsString>,
+    case_insensitive: bool,
+}
 
 impl Environment {
     pub(crate) fn capture() -> Self {
@@ -15,11 +18,32 @@ impl Environment {
     pub(crate) fn from_values(values: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         let mut values = values.into_iter().collect();
         crate::compat::promote_legacy_env(&mut values);
-        Self(values)
+        Self {
+            values,
+            case_insensitive: cfg!(windows),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values_with_case(
+        values: impl IntoIterator<Item = (OsString, OsString)>,
+        case_insensitive: bool,
+    ) -> Self {
+        let mut values = values.into_iter().collect();
+        crate::compat::promote_legacy_env_with_case(&mut values, case_insensitive);
+        Self {
+            values,
+            case_insensitive,
+        }
     }
 
     pub(crate) fn os_value(&self, name: &str) -> Option<&OsStr> {
-        self.0.get(OsStr::new(name)).map(OsString::as_os_str)
+        self.values
+            .iter()
+            .find(|(key, _)| {
+                super::env_key::matches_with_case(key, OsStr::new(name), self.case_insensitive)
+            })
+            .map(|(_, value)| value.as_os_str())
     }
 
     pub(crate) fn value(&self, name: &str) -> Option<&str> {
@@ -51,12 +75,13 @@ impl Environment {
     }
 
     pub(crate) fn provider_keys(&self) -> BTreeMap<String, OsString> {
-        self.0
+        self.values
             .iter()
             .filter_map(|(name, value)| {
-                let name = name.to_str()?;
-                let provider = name.strip_prefix("CUBI_")?.strip_suffix("_API_KEY")?;
-                (!provider.is_empty()).then(|| (name.to_string(), value.clone()))
+                let normalized = super::env_key::normalize_with_case(name, self.case_insensitive);
+                let normalized = normalized.to_str()?;
+                let provider = normalized.strip_prefix("CUBI_")?.strip_suffix("_API_KEY")?;
+                (!provider.is_empty()).then(|| (name.to_string_lossy().into_owned(), value.clone()))
             })
             .collect()
     }

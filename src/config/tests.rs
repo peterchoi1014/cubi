@@ -8,6 +8,49 @@ fn environment(values: &[(&str, &str)]) -> Environment {
     )
 }
 
+fn environment_with_case(values: &[(&str, &str)], case_insensitive: bool) -> Environment {
+    Environment::from_values_with_case(
+        values
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into())),
+        case_insensitive,
+    )
+}
+
+#[test]
+fn environment_key_lookup_selects_platform_case_semantics() {
+    let sensitive = environment_with_case(&[("cubi_model", "lower")], false);
+    let insensitive = environment_with_case(&[("cubi_model", "lower")], true);
+
+    assert_eq!(sensitive.value("CUBI_MODEL"), None);
+    assert_eq!(insensitive.value("CUBI_MODEL"), Some("lower"));
+}
+
+#[test]
+fn provider_keys_preserve_original_case_with_windows_semantics() {
+    let env = environment_with_case(&[("cubi_openai_api_key", "secret")], true);
+
+    assert_eq!(
+        env.provider_keys().get("cubi_openai_api_key"),
+        Some(&OsString::from("secret"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn captured_windows_environment_accepts_mixed_case_names() {
+    let _lock = crate::compat::test_env::env_guard();
+    let _restore = crate::compat::test_env::EnvRestore::capture(&["cubi_model"]);
+    // SAFETY: the shared environment lock is held through capture and restoration.
+    unsafe {
+        std::env::set_var("cubi_model", "mixed-case-model");
+    }
+
+    let env = Environment::capture();
+
+    assert_eq!(env.value("CUBI_MODEL"), Some("mixed-case-model"));
+}
+
 #[test]
 fn model_precedence_is_flag_then_env_then_persisted_then_default() {
     let app = AppConfig {

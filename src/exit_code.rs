@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::ollama::ChatStats;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 #[allow(dead_code)]
@@ -33,6 +35,31 @@ impl ExitCode {
 pub struct AppExit {
     pub code: ExitCode,
     pub message: String,
+    pub terminal_usage: Option<TerminalUsage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalUsage {
+    pub stats: ChatStats,
+    pub steps_used: usize,
+}
+
+#[derive(Debug)]
+pub struct ErrorWithUsage {
+    pub source: anyhow::Error,
+    pub terminal_usage: TerminalUsage,
+}
+
+impl fmt::Display for ErrorWithUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for ErrorWithUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 impl AppExit {
@@ -40,7 +67,13 @@ impl AppExit {
         Self {
             code,
             message: message.into(),
+            terminal_usage: None,
         }
+    }
+
+    pub fn with_terminal_usage(mut self, stats: ChatStats, steps_used: usize) -> Self {
+        self.terminal_usage = Some(TerminalUsage { stats, steps_used });
+        self
     }
 }
 
@@ -54,6 +87,26 @@ impl std::error::Error for AppExit {}
 
 pub fn err(code: ExitCode, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(AppExit::new(code, message))
+}
+
+pub fn err_with_usage(
+    code: ExitCode,
+    message: impl Into<String>,
+    stats: ChatStats,
+    steps_used: usize,
+) -> anyhow::Error {
+    anyhow::Error::new(AppExit::new(code, message).with_terminal_usage(stats, steps_used))
+}
+
+pub fn preserve_error_usage(
+    source: anyhow::Error,
+    stats: ChatStats,
+    steps_used: usize,
+) -> anyhow::Error {
+    anyhow::Error::new(ErrorWithUsage {
+        source,
+        terminal_usage: TerminalUsage { stats, steps_used },
+    })
 }
 
 pub fn exit(code: ExitCode) -> ! {

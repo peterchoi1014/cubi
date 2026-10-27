@@ -484,13 +484,12 @@ fn is_loopback_url(raw: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw) else {
         return false;
     };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 impl OpenAiClient {
@@ -1053,6 +1052,7 @@ fn fake_stats() -> ChatStats {
         prompt_tokens: 1,
         completion_tokens: 1,
         elapsed_ms: 1,
+        cached_prompt_tokens: Some(5),
         request_count: 1,
         last_prompt_tokens: Some(1),
         ..ChatStats::default()
@@ -1732,6 +1732,28 @@ mod tests {
 
         assert_eq!(message.content, "ok");
         assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn keyless_openai_selects_every_loopback_host_form() {
+        let _lock = ENV_LOCK.lock().await;
+
+        for base_url in [
+            "http://[::1]:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+        ] {
+            let _env = EnvGuard::set(&[
+                ("OPENAI_BASE_URL", Some(base_url)),
+                ("OPENAI_API_KEY", None),
+                ("CUBI_API_KEY", None),
+            ]);
+
+            let client =
+                OpenAiClient::from_env().expect("loopback endpoint selects OpenAI provider");
+
+            assert_eq!(client.base_url(), base_url);
+        }
     }
 
     #[test]

@@ -77,11 +77,14 @@ impl ChatCLI {
         cap: Duration,
         steps_used: usize,
         stats: &ChatStats,
-        json_enabled: bool,
     ) -> anyhow::Error {
         let message = format!("subagent time cap reached after {}", format_time_cap(cap));
-        let _ = (steps_used, stats, json_enabled);
-        exit_code::err(ExitCode::Tool, format!("cubi: {message}"))
+        exit_code::err_with_usage(
+            ExitCode::Tool,
+            format!("cubi: {message}"),
+            stats.clone(),
+            steps_used,
+        )
     }
 
     fn record_turn_stats(&mut self, stats: &mut ChatStats, started: std::time::Instant) {
@@ -227,7 +230,10 @@ impl ChatCLI {
                         self.emit_status(done_msg);
                         ToolOutcome::success(report.output)
                     }
-                    Err(e) => ToolOutcome::error(format!("[tool error] subagent failed: {e}")),
+                    Err(e) => {
+                        self.pending_turn_stats.add(&e.stats);
+                        ToolOutcome::error(format!("[tool error] subagent failed: {e}"))
+                    }
                 }
             }
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME
@@ -371,7 +377,11 @@ impl ChatCLI {
                 Err(error) => {
                     turn_stats.add_unreported_request();
                     self.record_turn_stats(&mut turn_stats, turn_started);
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step,
+                    ));
                 }
             };
             turn_stats.add(&compact_stats);
@@ -387,7 +397,11 @@ impl ChatCLI {
                     if !turn_stats.is_empty() {
                         self.record_turn_stats(&mut turn_stats, turn_started);
                     }
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step,
+                    ));
                 }
             }
             if let Some(deadline) = subprocess_deadline {
@@ -396,12 +410,7 @@ impl ChatCLI {
                         if !turn_stats.is_empty() {
                             self.record_turn_stats(&mut turn_stats, turn_started);
                         }
-                        return Err(self.subprocess_time_cap_error(
-                            cap,
-                            step,
-                            &turn_stats,
-                            json_enabled,
-                        ));
+                        return Err(self.subprocess_time_cap_error(cap, step, &turn_stats));
                     }
                 }
             }
@@ -493,12 +502,7 @@ impl ChatCLI {
                     println!();
                 }
                 let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
-                return Err(self.subprocess_time_cap_error(
-                    cap,
-                    step + 1,
-                    &turn_stats,
-                    json_enabled,
-                ));
+                return Err(self.subprocess_time_cap_error(cap, step + 1, &turn_stats));
             }
 
             // None == user pressed Ctrl-C mid-call. Truncate the history
@@ -533,9 +537,11 @@ impl ChatCLI {
                 self.journal.discard_last_turn_if_empty();
                 self.history.truncate(turn_start);
                 if headless_mode {
-                    return Err(exit_code::err(
+                    return Err(exit_code::err_with_usage(
                         ExitCode::Cancelled,
                         "cubi: cancelled (Ctrl-C)",
+                        turn_stats.clone(),
+                        step + 1,
                     ));
                 }
                 return Ok(());
@@ -543,9 +549,12 @@ impl ChatCLI {
             let (msg, stats) = match stream_result {
                 Ok(result) => result,
                 Err(error) => {
-                    turn_stats.add_unreported_request();
                     self.record_turn_stats(&mut turn_stats, turn_started);
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step + 1,
+                    ));
                 }
             };
             turn_stats.add(&stats);
@@ -837,18 +846,15 @@ impl ChatCLI {
                     if hit_time_cap {
                         self.record_turn_stats(&mut turn_stats, turn_started);
                         let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
-                        return Err(self.subprocess_time_cap_error(
-                            cap,
-                            step + 1,
-                            &turn_stats,
-                            json_enabled,
-                        ));
+                        return Err(self.subprocess_time_cap_error(cap, step + 1, &turn_stats));
                     }
                     if headless_mode {
                         self.record_turn_stats(&mut turn_stats, turn_started);
-                        return Err(exit_code::err(
+                        return Err(exit_code::err_with_usage(
                             ExitCode::Cancelled,
                             "cubi: cancelled (Ctrl-C)",
+                            turn_stats.clone(),
+                            step + 1,
                         ));
                     }
                     self.record_turn_stats(&mut turn_stats, turn_started);
@@ -916,13 +922,15 @@ impl ChatCLI {
                             call.id.clone(),
                         ));
                         self.record_turn_stats(&mut turn_stats, turn_started);
-                        return Err(exit_code::err(
+                        return Err(exit_code::err_with_usage(
                             ExitCode::Tool,
                             format!(
                                 "cubi: aborting after {} consecutive tool errors; \
                                  last: tool '{}' failed: {}",
                                 consecutive_tool_errors, call.function.name, result_text
                             ),
+                            turn_stats.clone(),
+                            step + 1,
                         ));
                     }
                 } else {
@@ -985,12 +993,14 @@ impl ChatCLI {
 
         if !completed {
             self.record_turn_stats(&mut turn_stats, turn_started);
-            return Err(exit_code::err(
+            return Err(exit_code::err_with_usage(
                 ExitCode::Incomplete,
                 format!(
                     "cubi: agent loop exhausted {} steps before producing a final reply",
                     max_agent_steps
                 ),
+                turn_stats.clone(),
+                max_agent_steps,
             ));
         }
 

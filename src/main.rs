@@ -1688,10 +1688,17 @@ fn main() -> Result<()> {
 
     if let Err(err) = run_result {
         let debug = user_error::debug_mode();
+        let (err, accrued_usage) = match err.downcast::<exit_code::ErrorWithUsage>() {
+            Ok(error) => (error.source, Some(error.terminal_usage)),
+            Err(error) => (error, None),
+        };
         // Already a classified UserError? Use it directly.
         if err.downcast_ref::<user_error::UserError>().is_some() {
             match err.downcast::<user_error::UserError>() {
-                Ok(ue) => {
+                Ok(mut ue) => {
+                    if ue.terminal_usage.is_none() {
+                        ue.terminal_usage = accrued_usage;
+                    }
                     let code = ue.exit_code;
                     user_error::report_user_error(&ue, json_output && headless, debug);
                     exit_code::exit(code);
@@ -1713,6 +1720,7 @@ fn main() -> Result<()> {
                 },
             );
             ue.exit_code = code;
+            ue.terminal_usage = exit.terminal_usage.clone().or(accrued_usage);
             ue.cause = Some(err);
             user_error::report_user_error(&ue, json_output && headless, debug);
             exit_code::exit(code);
@@ -1725,6 +1733,7 @@ fn main() -> Result<()> {
         };
         let mut ue = ue;
         ue.exit_code = fallback_code;
+        ue.terminal_usage = accrued_usage;
         user_error::report_user_error(&ue, json_output && headless, debug);
         exit_code::exit(fallback_code);
     }

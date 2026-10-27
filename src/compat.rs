@@ -47,11 +47,18 @@ const ENV_RENAMES: &[(&str, &str)] = &[
 
 /// Promote aliases in the captured startup input, never in the process env.
 pub fn promote_legacy_env(values: &mut BTreeMap<OsString, OsString>) {
+    promote_legacy_env_with_case(values, cfg!(windows));
+}
+
+pub(crate) fn promote_legacy_env_with_case(
+    values: &mut BTreeMap<OsString, OsString>,
+    case_insensitive: bool,
+) {
     for (new, old) in ENV_RENAMES {
-        if values.contains_key(std::ffi::OsStr::new(new)) {
+        if contains_key_with_case(values, new, case_insensitive) {
             continue;
         }
-        if let Some(v) = values.get(std::ffi::OsStr::new(old)).cloned() {
+        if let Some(v) = value_with_case(values, old, case_insensitive).cloned() {
             values.insert(OsString::from(new), v);
         }
     }
@@ -61,7 +68,8 @@ pub fn promote_legacy_env(values: &mut BTreeMap<OsString, OsString>) {
     let keys: Vec<(String, std::ffi::OsString)> = values
         .iter()
         .filter_map(|(k, v)| {
-            let key = k.to_str()?;
+            let key = crate::config::env_key::normalize_with_case(k, case_insensitive);
+            let key = key.to_str()?;
             if let Some(rest) = key.strip_prefix("AICHAT_") {
                 if rest.ends_with("_API_KEY") {
                     return Some((format!("CUBI_{rest}"), v.clone()));
@@ -71,8 +79,29 @@ pub fn promote_legacy_env(values: &mut BTreeMap<OsString, OsString>) {
         })
         .collect();
     for (new, v) in keys {
-        values.entry(OsString::from(new)).or_insert(v);
+        if !contains_key_with_case(values, &new, case_insensitive) {
+            values.insert(OsString::from(new), v);
+        }
     }
+}
+
+fn contains_key_with_case(
+    values: &BTreeMap<OsString, OsString>,
+    name: &str,
+    case_insensitive: bool,
+) -> bool {
+    value_with_case(values, name, case_insensitive).is_some()
+}
+
+fn value_with_case<'a>(
+    values: &'a BTreeMap<OsString, OsString>,
+    name: &str,
+    case_insensitive: bool,
+) -> Option<&'a OsString> {
+    values.iter().find_map(|(key, value)| {
+        crate::config::env_key::matches_with_case(key, std::ffi::OsStr::new(name), case_insensitive)
+            .then_some(value)
+    })
 }
 
 /// Rename `~/.ai-chat-cli/` → `~/.cubi/` exactly once, when the new
@@ -242,6 +271,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_aliases_select_platform_case_semantics() {
+        let values = BTreeMap::from([(
+            OsString::from("ai_chat_cli_model"),
+            OsString::from("legacy-value"),
+        )]);
+        let mut sensitive = values.clone();
+        let mut insensitive = values;
+
+        promote_legacy_env_with_case(&mut sensitive, false);
+        promote_legacy_env_with_case(&mut insensitive, true);
+
+        assert!(!sensitive.contains_key(std::ffi::OsStr::new("CUBI_MODEL")));
+        assert_eq!(
+            insensitive.get(std::ffi::OsStr::new("CUBI_MODEL")),
+            Some(&OsString::from("legacy-value"))
+        );
+    }
+
+    #[test]
+    fn mixed_case_canonical_name_blocks_legacy_promotion_on_windows() {
+        let mut values = BTreeMap::from([
+            (
+                OsString::from("Cubi_Model"),
+                OsString::from("canonical-value"),
+            ),
+            (
+                OsString::from("AI_CHAT_CLI_MODEL"),
+                OsString::from("legacy-value"),
+            ),
+        ]);
+
+        promote_legacy_env_with_case(&mut values, true);
+
+        assert!(!values.contains_key(std::ffi::OsStr::new("CUBI_MODEL")));
+        assert_eq!(
+            values.get(std::ffi::OsStr::new("Cubi_Model")),
+            Some(&OsString::from("canonical-value"))
+        );
     }
 
     #[test]
