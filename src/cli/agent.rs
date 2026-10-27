@@ -220,7 +220,10 @@ impl ChatCLI {
                         self.emit_status(done_msg);
                         ToolOutcome::success(report.output)
                     }
-                    Err(e) => ToolOutcome::error(format!("[tool error] subagent failed: {e}")),
+                    Err(e) => {
+                        self.pending_turn_stats.add(&e.stats);
+                        ToolOutcome::error(format!("[tool error] subagent failed: {e}"))
+                    }
                 }
             }
         } else if call.function.name == crate::agent_loop::CONSENSUS_TOOL_NAME
@@ -364,7 +367,11 @@ impl ChatCLI {
                 Err(error) => {
                     turn_stats.add_unreported_request();
                     self.record_turn_stats(&mut turn_stats, turn_started);
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step,
+                    ));
                 }
             };
             turn_stats.add(&compact_stats);
@@ -380,7 +387,11 @@ impl ChatCLI {
                     if !turn_stats.is_empty() {
                         self.record_turn_stats(&mut turn_stats, turn_started);
                     }
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step,
+                    ));
                 }
             }
             if let Some(deadline) = subprocess_deadline {
@@ -528,9 +539,12 @@ impl ChatCLI {
             let (msg, stats) = match stream_result {
                 Ok(result) => result,
                 Err(error) => {
-                    turn_stats.add_unreported_request();
                     self.record_turn_stats(&mut turn_stats, turn_started);
-                    return Err(error);
+                    return Err(exit_code::preserve_error_usage(
+                        error,
+                        turn_stats.clone(),
+                        step + 1,
+                    ));
                 }
             };
             turn_stats.add(&stats);

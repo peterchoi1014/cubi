@@ -44,6 +44,24 @@ pub struct TerminalUsage {
     pub steps_used: usize,
 }
 
+#[derive(Debug)]
+pub struct ErrorWithUsage {
+    pub source: anyhow::Error,
+    pub terminal_usage: TerminalUsage,
+}
+
+impl fmt::Display for ErrorWithUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for ErrorWithUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 impl AppExit {
     pub fn new(code: ExitCode, message: impl Into<String>) -> Self {
         Self {
@@ -78,6 +96,17 @@ pub fn err_with_usage(
     steps_used: usize,
 ) -> anyhow::Error {
     anyhow::Error::new(AppExit::new(code, message).with_terminal_usage(stats, steps_used))
+}
+
+pub fn preserve_error_usage(
+    source: anyhow::Error,
+    stats: ChatStats,
+    steps_used: usize,
+) -> anyhow::Error {
+    anyhow::Error::new(ErrorWithUsage {
+        source,
+        terminal_usage: TerminalUsage { stats, steps_used },
+    })
 }
 
 pub fn exit(code: ExitCode) -> ! {

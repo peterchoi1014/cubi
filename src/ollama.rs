@@ -385,13 +385,25 @@ struct StreamToolCall {
 }
 
 impl StreamToolCall {
-    fn has_same_identity(&self, other: &Self) -> bool {
-        if self.index.is_some()
-            || self.call.id.is_some()
-            || other.index.is_some()
-            || other.call.id.is_some()
-        {
-            self.index == other.index && self.call.id == other.call.id
+    fn has_explicit_identity(&self) -> bool {
+        self.index.is_some() || self.call.id.is_some()
+    }
+
+    fn has_same_explicit_identity(&self, other: &Self) -> bool {
+        self.index
+            .zip(other.index)
+            .is_some_and(|(left, right)| left == right)
+            || self
+                .call
+                .id
+                .as_ref()
+                .zip(other.call.id.as_ref())
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    fn is_same_occurrence(&self, other: &Self) -> bool {
+        if self.has_explicit_identity() || other.has_explicit_identity() {
+            self.has_same_explicit_identity(other)
         } else {
             self.call == other.call
         }
@@ -731,15 +743,29 @@ impl OllamaClient {
                 }
             }
             if let Some(calls) = message.tool_calls.take() {
-                for (position, call) in calls.into_iter().enumerate() {
-                    let call = StreamToolCall {
+                let calls = calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, call)| StreamToolCall {
                         index: tool_call_indices.get(position).copied().flatten(),
                         call,
-                    };
-                    if !tool_calls
+                    })
+                    .collect::<Vec<_>>();
+                let is_terminal_replay = parsed.done
+                    && calls.len() == tool_calls.len()
+                    && calls
                         .iter()
-                        .any(|existing| existing.has_same_identity(&call))
-                    {
+                        .zip(tool_calls.iter())
+                        .all(|(call, existing)| call.is_same_occurrence(existing));
+                if !is_terminal_replay {
+                    for call in calls {
+                        if call.has_explicit_identity()
+                            && tool_calls
+                                .iter()
+                                .any(|existing| existing.has_same_explicit_identity(&call))
+                        {
+                            continue;
+                        }
                         tool_calls.push(call);
                     }
                 }
@@ -1143,6 +1169,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_preserves_unindexed_equal_tool_calls_in_single_frame() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [bash_tool_call(), bash_tool_call()]
+            },
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![format!("{}\n", response).into_bytes()]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("tool calls preserved");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
+    }
+
+    #[tokio::test]
+    async fn stream_reconciles_terminal_replay_of_unindexed_equal_tool_calls() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let calls = [bash_tool_call(), bash_tool_call()];
+        let early = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": calls
+            },
+            "done": false
+        });
+        let final_chunk = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": calls
+            },
+            "done": true
+        });
+        let body = format!("{}\n{}\n", early, final_chunk).into_bytes();
+        let (base_url, server) = serve_chunked(vec![body]).await;
+
+        let client = OllamaClient::with_base_url(base_url);
+        let (message, _) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("tool calls preserved");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
+    }
+
+    #[tokio::test]
     async fn stream_rejects_malformed_frame_after_tool_call() {
         let _lock = crate::llm::ENV_LOCK.lock().await;
         let early = serde_json::json!({
@@ -1178,6 +1264,31 @@ mod tests {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [indexed_bash_tool_call(0), indexed_bash_tool_call(1)]
+            },
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let (message, _) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let calls = message.tool_calls.expect("tool calls preserved");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, calls[1].function.arguments);
+    }
+
+    #[tokio::test]
+    async fn buffered_response_preserves_unindexed_equal_tool_calls() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
+        let response = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [bash_tool_call(), bash_tool_call()]
             },
             "done": true
         });

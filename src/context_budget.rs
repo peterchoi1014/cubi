@@ -1,5 +1,6 @@
 use crate::ollama::{Message, ToolSpec};
 use anyhow::Result;
+use std::fmt;
 
 const DEFAULT_OLLAMA_NUM_CTX_CAP: usize = 32_768;
 
@@ -9,6 +10,26 @@ pub(crate) struct ContextBudget {
     pub(crate) completion_reserve: usize,
     pub(crate) prompt_limit: usize,
 }
+
+#[derive(Debug)]
+pub(crate) struct RequestPreflightError {
+    needed: usize,
+    prompt_limit: usize,
+    completion_reserve: usize,
+}
+
+impl fmt::Display for RequestPreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cubi: refusing model request before send: would exceed context window \
+             ({} tokens estimated, prompt limit is {}; {} reserved for completion)",
+            self.needed, self.prompt_limit, self.completion_reserve
+        )
+    }
+}
+
+impl std::error::Error for RequestPreflightError {}
 
 pub(crate) fn effective_budget(model: &str, provider: &str) -> Option<ContextBudget> {
     let (ollama_override, openai_override, output_cap) = crate::config::with(|config| {
@@ -89,13 +110,11 @@ pub(crate) fn ensure_request_fits(
     if needed <= budget.prompt_limit {
         return Ok(());
     }
-    anyhow::bail!(
-        "cubi: refusing model request before send: would exceed context window \
-         ({} tokens estimated, prompt limit is {}; {} reserved for completion)",
+    Err(anyhow::Error::new(RequestPreflightError {
         needed,
-        budget.prompt_limit,
-        budget.completion_reserve
-    )
+        prompt_limit: budget.prompt_limit,
+        completion_reserve: budget.completion_reserve,
+    }))
 }
 
 pub(crate) fn truncate_message_to_fit(

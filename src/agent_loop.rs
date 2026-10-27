@@ -20,7 +20,6 @@
 //! who haven't pulled a tool-capable model yet.
 
 use crate::config::ToolProfile;
-use anyhow::Result;
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
@@ -239,6 +238,26 @@ pub struct SubagentApproval<'a> {
     pub origin: &'a str,
 }
 
+#[derive(Debug)]
+pub struct SubagentRunError {
+    pub source: anyhow::Error,
+    pub stats: ChatStats,
+    pub steps_used: usize,
+    pub tool_calls: usize,
+}
+
+impl std::fmt::Display for SubagentRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for SubagentRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 struct SubagentToolHost<'a> {
     mcp: &'a mut Option<McpManager>,
     approval: &'a mut dyn ApprovalHost,
@@ -305,7 +324,7 @@ pub async fn run_subagent(
     origin: &str,
     goal: &str,
     requested_max_steps: usize,
-) -> Result<SubagentRunResult> {
+) -> std::result::Result<SubagentRunResult, SubagentRunError> {
     let approval = SubagentApproval {
         host: approval,
         origin,
@@ -332,7 +351,7 @@ pub async fn run_subagent_with_model(
     model: Option<&str>,
     goal: &str,
     requested_max_steps: usize,
-) -> Result<SubagentRunResult> {
+) -> std::result::Result<SubagentRunResult, SubagentRunError> {
     // Hard-cap the caller's budget so the parent can't be tricked into
     // burning unbounded budget via a large `max_steps`.
     let max_steps = requested_max_steps.clamp(1, SUBAGENT_MAX_STEPS);
@@ -352,16 +371,33 @@ pub async fn run_subagent_with_model(
     };
 
     for step in 0..max_steps {
-        let (msg, stats) = match model {
+        let request = match model {
             Some(model) => {
                 executor
                     .chat_with_model_and_tools(model, history.clone(), tools.clone())
-                    .await?
+                    .await
             }
             None => {
                 executor
                     .chat_with_tools(history.clone(), tools.clone())
-                    .await?
+                    .await
+            }
+        };
+        let (msg, stats) = match request {
+            Ok(result) => result,
+            Err(source) => {
+                let request_was_sent = source
+                    .downcast_ref::<crate::context_budget::RequestPreflightError>()
+                    .is_none();
+                if request_was_sent {
+                    total_stats.add_unreported_request();
+                }
+                return Err(SubagentRunError {
+                    source,
+                    stats: total_stats,
+                    steps_used: step + usize::from(request_was_sent),
+                    tool_calls,
+                });
             }
         };
         total_stats.add(&stats);
