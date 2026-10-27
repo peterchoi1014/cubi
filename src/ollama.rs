@@ -909,6 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_preserves_tool_call_from_non_final_chunk() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let early = serde_json::json!({
             "message": {
                 "role": "assistant",
@@ -939,6 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_stats_preserve_native_timings_when_reported() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let response = serde_json::json!({
             "message": {"role": "assistant", "content": "ok"},
             "done": true,
@@ -970,6 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_stats_leave_unreported_native_timings_unknown() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let response = serde_json::json!({
             "message": {"role": "assistant", "content": "ok"},
             "done": true
@@ -991,6 +994,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_stats_measure_time_to_first_token_client_side() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let body = serde_json::json!({
             "message": {"role": "assistant", "content": "ok"},
             "done": true
@@ -1009,6 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_deduplicates_tool_call_repeated_on_final_chunk() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let call = bash_tool_call();
         let early = serde_json::json!({
             "message": {
@@ -1041,6 +1046,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_preserves_multibyte_utf8_split_across_writes() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let line = serde_json::json!({
             "message": {"role": "assistant", "content": "café"},
             "done": true
@@ -1069,6 +1075,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_reports_length_limited_response_as_truncated() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let body = serde_json::json!({
             "message": {"role": "assistant", "content": "partial"},
             "done": true,

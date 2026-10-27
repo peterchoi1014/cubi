@@ -1312,6 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_usage_preserves_cached_prompt_tokens_when_reported() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let response = serde_json::json!({
             "choices": [{
                 "message": {"content": "ok"},
@@ -1342,6 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_usage_leaves_cached_prompt_tokens_unknown_when_absent() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let response = serde_json::json!({
             "choices": [{
                 "message": {"content": "ok"},
@@ -1367,6 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_rejects_premature_eof_without_terminal_event() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let chunk = serde_json::json!({
             "choices": [{"delta": {"content": "partial"}, "finish_reason": null}]
         });
@@ -1386,6 +1389,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_preserves_multibyte_utf8_split_across_writes() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let chunk = serde_json::json!({
             "choices": [{"delta": {"content": "café"}, "finish_reason": "stop"}]
         });
@@ -1412,6 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_non_streaming_normalizes_advertised_bare_json_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
         let response = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": content}}],
@@ -1439,6 +1444,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_non_streaming_leaves_unadvertised_bare_json_as_text() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
         let response = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": content}}]
@@ -1463,6 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_normalizes_advertised_bare_json_tool_call() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let content = r#"{"name":"read_file","arguments":{"path":"src/main.rs"}}"#;
         let chunk = serde_json::json!({
             "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
@@ -1493,6 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_preserves_malformed_tool_arguments_in_parse_error() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let malformed = r#"{"path":"src/main.rs""#;
         let response = serde_json::json!({
             "choices": [{
@@ -1527,6 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_reports_length_finish_as_truncated() {
+        let _lock = crate::llm::ENV_LOCK.lock().await;
         let chunk = serde_json::json!({
             "choices": [{"delta": {"content": "partial"}, "finish_reason": "length"}]
         });

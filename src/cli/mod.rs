@@ -8626,6 +8626,9 @@ mod tests {
     #[test]
     fn compact_does_not_extract_memories_without_opt_in() {
         let _guard = env_lock().lock().expect("env lock not poisoned");
+        // The fake-LLM env vars are also mutated by consensus tests; share
+        // their lock so a parallel test cannot swap the scripted reply.
+        let _fake_llm_guard = crate::llm::ENV_LOCK.blocking_lock();
         let previous_fake = std::env::var("CUBI_FAKE_LLM").ok();
         let previous_response = std::env::var("CUBI_FAKE_LLM_RESPONSE").ok();
         let previous_extract = std::env::var("CUBI_COMPACT_EXTRACT_MEMORIES").ok();
@@ -8698,6 +8701,9 @@ mod tests {
     #[test]
     fn large_tool_result_triggers_compaction_before_follow_up_request() {
         let _guard = env_lock().lock().expect("env lock not poisoned");
+        // The fake-LLM env vars are also mutated by consensus tests; share
+        // their lock so a parallel test cannot swap the scripted reply.
+        let _fake_llm_guard = crate::llm::ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let large_file = temp.path().join("large.txt");
         fs::write(&large_file, "x".repeat(8_000)).unwrap();

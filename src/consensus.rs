@@ -1509,10 +1509,9 @@ mod tests {
     // touch the fake-backend scripting knobs. tokio::sync::Mutex so
     // the guard is await-safe (clippy: await_holding_lock).
     async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        use tokio::sync::Mutex;
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(())).lock().await
+        // Shared with the llm/ollama/cli tests that also mutate the
+        // CUBI_FAKE_LLM* vars, so they cannot race each other.
+        crate::llm::ENV_LOCK.lock().await
     }
 
     static TEST_ISOLATED_ACTIVE_SUBAGENTS: std::sync::atomic::AtomicUsize =
