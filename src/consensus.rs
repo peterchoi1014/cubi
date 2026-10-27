@@ -65,7 +65,7 @@
 //! child so the top-level tool builder omits `agent_run` and `consensus_run`
 //! too. Both paths also reject explicit nested meta-tool calls defensively.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -332,7 +332,7 @@ pub async fn run(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
 ) -> Result<ConsensusResult> {
-    run_inner(req, executor, sink, None).await
+    run_inner(req, executor, sink, None, None).await
 }
 
 /// Drives a consensus run that may opt in to tool-enabled subagents.
@@ -349,8 +349,17 @@ pub async fn run_with_tools(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
     mcp: &mut Option<McpManager>,
+    access: crate::cli::tool_dispatch::ToolAccess,
+    approved_tools: HashSet<String>,
 ) -> Result<ConsensusResult> {
-    run_inner(req, executor, sink, Some(mcp)).await
+    run_inner(
+        req,
+        executor,
+        sink,
+        Some(mcp),
+        Some((access, approved_tools)),
+    )
+    .await
 }
 
 async fn run_inner(
@@ -358,8 +367,9 @@ async fn run_inner(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
     mcp: Option<&mut Option<McpManager>>,
+    tool_access: Option<(crate::cli::tool_dispatch::ToolAccess, HashSet<String>)>,
 ) -> Result<ConsensusResult> {
-    run_inner_with_isolated_runner(req, executor, sink, mcp, None).await
+    run_inner_with_isolated_runner(req, executor, sink, mcp, tool_access, None).await
 }
 
 async fn run_inner_with_isolated_runner(
@@ -367,6 +377,7 @@ async fn run_inner_with_isolated_runner(
     executor: &AIExecutor,
     sink: &dyn ConsensusEventSink,
     mcp: Option<&mut Option<McpManager>>,
+    tool_access: Option<(crate::cli::tool_dispatch::ToolAccess, HashSet<String>)>,
     isolated_runner: Option<IsolatedSubagentRunner>,
 ) -> Result<ConsensusResult> {
     req.max_steps_per_subagent = normalize_max_steps_per_subagent(req.max_steps_per_subagent);
@@ -417,7 +428,10 @@ async fn run_inner_with_isolated_runner(
         let Some(mcp) = mcp else {
             anyhow::bail!("tool-enabled consensus requires an MCP manager; call run_with_tools");
         };
-        run_tool_subagents(&req, executor, mcp).await
+        let Some((access, approved_tools)) = tool_access else {
+            anyhow::bail!("tool-enabled consensus requires the parent authorization context");
+        };
+        run_tool_subagents(&req, executor, mcp, access, approved_tools).await
     } else {
         run_llm_subagents(&req, executor).await
     };
@@ -560,6 +574,8 @@ async fn run_tool_subagents(
     req: &ConsensusRequest,
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
+    access: crate::cli::tool_dispatch::ToolAccess,
+    approved_tools: HashSet<String>,
 ) -> Vec<SubagentOutput> {
     let mut subagent_outputs = Vec::with_capacity(req.models.len());
     for model in &req.models {
@@ -567,6 +583,8 @@ async fn run_tool_subagents(
         let res = crate::agent_loop::run_subagent_with_model(
             executor,
             mcp,
+            access.clone(),
+            approved_tools.clone(),
             Some(model.as_str()),
             &req.goal,
             req.max_steps_per_subagent,
@@ -1435,6 +1453,16 @@ mod tests {
         AIExecutor::with_backend(crate::llm::LlmBackend::Fake, "default-model".to_string())
     }
 
+    fn tool_access() -> crate::cli::tool_dispatch::ToolAccess {
+        crate::cli::tool_dispatch::ToolAccess {
+            hooks: crate::hooks::HookRegistry::empty(),
+            policy: crate::policy::Policy::default(),
+            permissions: Arc::new(std::sync::Mutex::new(
+                crate::permissions::Permissions::default(),
+            )),
+        }
+    }
+
     // Env-var manipulation is process-global; serialize tests that
     // touch the fake-backend scripting knobs. tokio::sync::Mutex so
     // the guard is await-safe (clippy: await_holding_lock).
@@ -1535,6 +1563,7 @@ mod tests {
             &executor(),
             &NullSink,
             Some(&mut no_mcp),
+            None,
             Some(fake_isolated_runner()),
         )
         .await
@@ -2180,9 +2209,16 @@ fn main() {
         };
         let direct = run(req.clone(), &executor(), &NullSink).await.unwrap();
         let mut no_mcp = None;
-        let via_tools_entrypoint = run_with_tools(req, &executor(), &NullSink, &mut no_mcp)
-            .await
-            .unwrap();
+        let via_tools_entrypoint = run_with_tools(
+            req,
+            &executor(),
+            &NullSink,
+            &mut no_mcp,
+            tool_access(),
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(via_tools_entrypoint.winner_model, direct.winner_model);
         assert_eq!(via_tools_entrypoint.winner_output, direct.winner_output);
@@ -2232,10 +2268,17 @@ fn main() {
             isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
-        let err = run_with_tools(req, &executor(), &NullSink, &mut no_mcp)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = run_with_tools(
+            req,
+            &executor(),
+            &NullSink,
+            &mut no_mcp,
+            tool_access(),
+            HashSet::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("active MCP manager"), "got: {err}");
     }
 
@@ -2262,7 +2305,14 @@ fn main() {
             isolated_time_cap_secs: 0,
         };
         let mut no_mcp = None;
-        let outputs = run_tool_subagents(&req, &executor(), &mut no_mcp).await;
+        let outputs = run_tool_subagents(
+            &req,
+            &executor(),
+            &mut no_mcp,
+            tool_access(),
+            HashSet::new(),
+        )
+        .await;
 
         assert_eq!(
             outputs.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),
@@ -2671,6 +2721,7 @@ fn main() {
             &executor(),
             &NullSink,
             Some(&mut no_mcp),
+            None,
             Some(runner),
         )
         .await

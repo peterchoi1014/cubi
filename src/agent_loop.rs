@@ -21,12 +21,16 @@
 
 use anyhow::Result;
 use serde_json::json;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
 
+use crate::cli::tool_dispatch::{ToolAccess, ToolCallHost, ToolOutcome, dispatch_tool};
 use crate::executor::AIExecutor;
 use crate::mcp_client::Tool;
 use crate::mcp_manager::McpManager;
-use crate::ollama::{ChatStats, Message, ToolFunction, ToolSpec};
+use crate::ollama::{ChatStats, Message, ToolCall, ToolFunction, ToolSpec};
 
 /// Maximum number of "model → tool → model" iterations per user turn before
 /// the loop bails out with a diagnostic. Generous enough for realistic
@@ -245,6 +249,60 @@ pub struct SubagentRunResult {
     pub tool_calls: usize,
 }
 
+struct SubagentToolHost<'a> {
+    mcp: &'a mut Option<McpManager>,
+    access: &'a ToolAccess,
+    approved_tools: &'a HashSet<String>,
+}
+
+impl ToolCallHost for SubagentToolHost<'_> {
+    fn approve_tool(&mut self, tool_name: &str) -> bool {
+        let trusted = std::env::current_dir().ok().is_some_and(|cwd| {
+            self.access
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&cwd)
+        });
+        trusted || self.approved_tools.contains(tool_name)
+    }
+
+    fn execute_authorized<'a>(
+        &'a mut self,
+        call: &'a ToolCall,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + 'a>> {
+        Box::pin(async move {
+            if call.function.name == AGENT_TOOL_NAME {
+                return ToolOutcome::error("[tool error] nested `agent_run` is not allowed");
+            }
+            if call.function.name == CONSENSUS_TOOL_NAME {
+                return ToolOutcome::error("[tool error] nested `consensus_run` is not allowed");
+            }
+            let Some(mcp) = self.mcp.as_mut() else {
+                return ToolOutcome::error(format!(
+                    "[tool error] no MCP manager available to execute `{}`",
+                    call.function.name
+                ));
+            };
+            match mcp
+                .call_tool(&call.function.name, call.function.arguments.clone())
+                .await
+            {
+                Ok(result) => {
+                    let is_error = result.is_error == Some(true);
+                    let text = render_tool_result(&result);
+                    if is_error {
+                        ToolOutcome::error(text)
+                    } else {
+                        ToolOutcome::success(text)
+                    }
+                }
+                Err(error) => ToolOutcome::error(format!("[tool error] {error}")),
+            }
+        })
+    }
+}
+
 /// Runs a subagent loop with a fresh context. Returns the subagent's final
 /// assistant message text. Used by the top-level agent loop in response to
 /// an `agent_run` tool call from the parent model.
@@ -256,14 +314,22 @@ pub struct SubagentRunResult {
 pub async fn run_subagent(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
+    access: ToolAccess,
+    approved_tools: HashSet<String>,
     goal: &str,
     requested_max_steps: usize,
 ) -> Result<String> {
-    Ok(
-        run_subagent_with_model(executor, mcp, None, goal, requested_max_steps)
-            .await?
-            .output,
+    Ok(run_subagent_with_model(
+        executor,
+        mcp,
+        access,
+        approved_tools,
+        None,
+        goal,
+        requested_max_steps,
     )
+    .await?
+    .output)
 }
 
 /// Runs the same subagent loop as [`run_subagent`] but optionally overrides
@@ -271,6 +337,8 @@ pub async fn run_subagent(
 pub async fn run_subagent_with_model(
     executor: &AIExecutor,
     mcp: &mut Option<McpManager>,
+    access: ToolAccess,
+    approved_tools: HashSet<String>,
     model: Option<&str>,
     goal: &str,
     requested_max_steps: usize,
@@ -287,6 +355,11 @@ pub async fn run_subagent_with_model(
     ];
     let mut total_stats = ChatStats::default();
     let mut tool_calls = 0usize;
+    let mut tool_host = SubagentToolHost {
+        mcp,
+        access: &access,
+        approved_tools: &approved_tools,
+    };
 
     for step in 0..max_steps {
         let (msg, stats) = match model {
@@ -341,24 +414,7 @@ pub async fn run_subagent_with_model(
             // emit the name anyway. Reject explicitly so it shows up as
             // a tool error and the model gives up rather than us
             // silently doing nothing.
-            let result_text = if call.function.name == AGENT_TOOL_NAME {
-                "[tool error] nested `agent_run` is not allowed".to_string()
-            } else if call.function.name == CONSENSUS_TOOL_NAME {
-                "[tool error] nested `consensus_run` is not allowed".to_string()
-            } else if let Some(m) = mcp.as_mut() {
-                match m
-                    .call_tool(&call.function.name, call.function.arguments.clone())
-                    .await
-                {
-                    Ok(r) => render_tool_result(&r),
-                    Err(e) => format!("[tool error] {e}"),
-                }
-            } else {
-                format!(
-                    "[tool error] no MCP manager available to execute `{}`",
-                    call.function.name
-                )
-            };
+            let result_text = dispatch_tool(&access, &mut tool_host, &call).await.text;
             history.push(Message::tool_result(
                 &call.function.name,
                 result_text,
@@ -400,6 +456,8 @@ pub async fn run_subagent_with_model(
 mod tests {
     use super::*;
     use crate::mcp_client::{Content, Tool, ToolCallResult};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
 
     fn fake_tool(name: &str) -> Tool {
         Tool {
@@ -446,6 +504,42 @@ mod tests {
             is_error: Some(true),
         };
         assert!(render_tool_result(&r).contains("[tool reported error"));
+    }
+
+    #[tokio::test]
+    async fn subagent_dispatch_inherits_parent_policy_denial() {
+        let access = ToolAccess {
+            hooks: crate::hooks::HookRegistry::empty(),
+            policy: crate::policy::Policy {
+                denied_tools: BTreeSet::from(["read_file".to_string()]),
+                note: None,
+            },
+            permissions: Arc::new(Mutex::new(crate::permissions::Permissions::default())),
+        };
+        let mut no_mcp = None;
+        let approved_tools = HashSet::from(["read_file".to_string()]);
+        let mut host = SubagentToolHost {
+            mcp: &mut no_mcp,
+            access: &access,
+            approved_tools: &approved_tools,
+        };
+        let call = ToolCall {
+            id: Some("call-read".to_string()),
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "secret.txt"}),
+            },
+        };
+
+        let outcome = dispatch_tool(&access, &mut host, &call).await;
+
+        assert_eq!(
+            outcome.kind,
+            crate::cli::tool_dispatch::ToolOutcomeKind::Denied
+        );
+        assert!(outcome.text.contains("admin policy"));
+        assert!(!outcome.text.contains("no MCP manager"));
     }
 
     #[test]

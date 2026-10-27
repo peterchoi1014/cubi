@@ -59,7 +59,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
+
+const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hook lifecycle event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,22 +131,30 @@ pub struct HooksConfig {
 #[derive(Debug, Clone)]
 pub struct HookRegistry {
     hooks: Vec<HookDef>,
+    skipped_untrusted_project: bool,
 }
 
 impl HookRegistry {
     /// Loads hooks from project-local and global config files.
     /// Project-local hooks are prepended (run first).
-    pub fn load() -> Self {
+    pub fn load(permissions: &crate::permissions::Permissions) -> Self {
         let mut hooks = Vec::new();
 
         // Project-local: .cubi/hooks.json in cwd
         // If a local config exists, it overrides the global config entirely.
         let mut found_local = false;
+        let mut skipped_untrusted_project = false;
         if let Ok(cwd) = std::env::current_dir() {
             let local_path = cwd.join(".cubi").join("hooks.json");
-            if let Some(cfg) = Self::load_file(&local_path) {
-                hooks.extend(cfg.hooks);
-                found_local = true;
+            if local_path.exists() {
+                if permissions.contains(&cwd) {
+                    if let Some(cfg) = Self::load_file(&local_path) {
+                        hooks.extend(cfg.hooks);
+                        found_local = true;
+                    }
+                } else {
+                    skipped_untrusted_project = true;
+                }
             }
         }
 
@@ -157,19 +167,32 @@ impl HookRegistry {
             }
         }
 
-        Self { hooks }
+        Self {
+            hooks,
+            skipped_untrusted_project,
+        }
     }
 
     /// Creates a registry with specific hooks (for testing).
     #[cfg(test)]
     pub fn with_hooks(hooks: Vec<HookDef>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            skipped_untrusted_project: false,
+        }
     }
 
     /// Creates an empty registry.
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            hooks: Vec::new(),
+            skipped_untrusted_project: false,
+        }
+    }
+
+    pub fn skipped_untrusted_project(&self) -> bool {
+        self.skipped_untrusted_project
     }
 
     /// Returns `true` if any hooks are registered.
@@ -192,7 +215,11 @@ impl HookRegistry {
     /// Fires PreToolUse hooks for the given tool. Returns `Allow` if all
     /// hooks pass (exit 0) or no hooks match. Returns `Deny` if any hook
     /// exits with code 1.
-    pub fn fire_pre_tool_use(&self, tool_name: &str, args: &serde_json::Value) -> HookDecision {
+    pub async fn fire_pre_tool_use(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> HookDecision {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -208,7 +235,7 @@ impl HookRegistry {
                 serde_json::to_string(args).unwrap_or_default(),
             );
 
-            match Self::run_hook_command(&hook.command, &env) {
+            match Self::run_hook_command(&hook.command, &env).await {
                 Ok(1) => {
                     return HookDecision::Deny(format!(
                         "PreToolUse hook denied `{}`: {}",
@@ -226,7 +253,7 @@ impl HookRegistry {
     }
 
     /// Fires PostToolUse hooks for the given tool.
-    pub fn fire_post_tool_use(&self, tool_name: &str, result: &str, is_error: bool) {
+    pub async fn fire_post_tool_use(&self, tool_name: &str, result: &str, is_error: bool) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -240,14 +267,14 @@ impl HookRegistry {
             env.insert("HOOK_TOOL_RESULT".to_string(), result.to_string());
             env.insert("HOOK_TOOL_ERROR".to_string(), is_error.to_string());
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!("Warning: PostToolUse hook failed: {} ({})", hook.command, e);
             }
         }
     }
 
     /// Fires SessionStart hooks.
-    pub fn fire_session_start(&self, model: &str) {
+    pub async fn fire_session_start(&self, model: &str) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -262,7 +289,7 @@ impl HookRegistry {
                 env.insert("HOOK_CWD".to_string(), cwd.display().to_string());
             }
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!(
                     "Warning: SessionStart hook failed: {} ({})",
                     hook.command, e
@@ -272,7 +299,7 @@ impl HookRegistry {
     }
 
     /// Fires Stop hooks.
-    pub fn fire_stop(&self) {
+    pub async fn fire_stop(&self) {
         let matching: Vec<&HookDef> = self
             .hooks
             .iter()
@@ -283,7 +310,7 @@ impl HookRegistry {
             let mut env = HashMap::new();
             env.insert("HOOK_EVENT".to_string(), "Stop".to_string());
 
-            if let Err(e) = Self::run_hook_command(&hook.command, &env) {
+            if let Err(e) = Self::run_hook_command(&hook.command, &env).await {
                 eprintln!("Warning: Stop hook failed: {} ({})", hook.command, e);
             }
         }
@@ -315,12 +342,24 @@ impl HookRegistry {
 
     /// Executes a hook command with the given environment variables.
     /// Returns the exit code.
-    fn run_hook_command(command: &str, env: &HashMap<String, String>) -> Result<i32> {
-        let output = Command::new("sh")
+    async fn run_hook_command(command: &str, env: &HashMap<String, String>) -> Result<i32> {
+        Self::run_hook_command_with_timeout(command, env, HOOK_TIMEOUT).await
+    }
+
+    async fn run_hook_command_with_timeout(
+        command: &str,
+        env: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<i32> {
+        let mut child_command = tokio::process::Command::new("sh");
+        child_command
             .arg("-c")
             .arg(command)
             .envs(env)
-            .output()?;
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, child_command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("hook timed out after {} ms", timeout.as_millis()))??;
         Ok(output.status.code().unwrap_or(2))
     }
 }
@@ -427,76 +466,78 @@ mod tests {
         assert!(HookRegistry::matches_tool(&hook, "anything"));
     }
 
-    #[test]
-    fn fire_pre_tool_use_allows_when_no_hooks() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_allows_when_no_hooks() {
         let reg = HookRegistry::empty();
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_pre_tool_use_allows_on_exit_0() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_allows_on_exit_0() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: None,
             command: "true".to_string(), // exit 0
         }]);
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_pre_tool_use_denies_on_exit_1() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_denies_on_exit_1() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: None,
             command: "exit 1".to_string(),
         }]);
-        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({}));
+        let decision = reg.fire_pre_tool_use("bash", &serde_json::json!({})).await;
         assert!(matches!(decision, HookDecision::Deny(_)));
     }
 
-    #[test]
-    fn fire_pre_tool_use_skips_non_matching_tools() {
+    #[tokio::test]
+    async fn fire_pre_tool_use_skips_non_matching_tools() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PreToolUse,
             match_tool: Some("bash".to_string()),
             command: "exit 1".to_string(),
         }]);
         // Should allow because the hook only matches "bash", not "write_file"
-        let decision = reg.fire_pre_tool_use("write_file", &serde_json::json!({}));
+        let decision = reg
+            .fire_pre_tool_use("write_file", &serde_json::json!({}))
+            .await;
         assert_eq!(decision, HookDecision::Allow);
     }
 
-    #[test]
-    fn fire_session_start_runs_without_error() {
+    #[tokio::test]
+    async fn fire_session_start_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::SessionStart,
             match_tool: None,
             command: "true".to_string(),
         }]);
         // Should not panic.
-        reg.fire_session_start("llama3.2:1b");
+        reg.fire_session_start("llama3.2:1b").await;
     }
 
-    #[test]
-    fn fire_stop_runs_without_error() {
+    #[tokio::test]
+    async fn fire_stop_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::Stop,
             match_tool: None,
             command: "true".to_string(),
         }]);
-        reg.fire_stop();
+        reg.fire_stop().await;
     }
 
-    #[test]
-    fn fire_post_tool_use_runs_without_error() {
+    #[tokio::test]
+    async fn fire_post_tool_use_runs_without_error() {
         let reg = HookRegistry::with_hooks(vec![HookDef {
             event: HookEvent::PostToolUse,
             match_tool: None,
             command: "true".to_string(),
         }]);
-        reg.fire_post_tool_use("bash", "output", false);
+        reg.fire_post_tool_use("bash", "output", false).await;
     }
 
     #[test]
@@ -535,5 +576,19 @@ mod tests {
         assert_eq!(HookEvent::PostToolUse.as_str(), "PostToolUse");
         assert_eq!(HookEvent::SessionStart.as_str(), "SessionStart");
         assert_eq!(HookEvent::Stop.as_str(), "Stop");
+    }
+
+    #[tokio::test]
+    async fn stalled_hook_is_terminated_at_timeout() {
+        let started = std::time::Instant::now();
+        let result = HookRegistry::run_hook_command_with_timeout(
+            "while :; do :; done",
+            &HashMap::new(),
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

@@ -24,7 +24,7 @@ Flags meant to influence the run (e.g. `--system`, `--model`) must
 appear *before* `exec`; everything after `exec` is treated as prompt
 text.
 
-Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `130` cancelled.
+Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `14` incomplete (the agent stopped before a final reply), `130` cancelled.
 
 ## Error events
 
@@ -70,6 +70,13 @@ knobs let interactive users disable the same affordances individually:
 - `CUBI_HTTP_TIMEOUT_SECS=…` — set the positive per-read/stream-idle HTTP
   timeout in seconds (default 300). HTTP connections also have a fixed
   10-second connect timeout; Cubi does not impose a total generation timeout.
+- `CUBI_CONTEXT_WINDOW=…` — set the served context window for an
+  OpenAI-compatible backend. Cubi clamps it to the model's known nominal
+  window, reserves completion headroom, and applies the resulting prompt
+  budget before every model request.
+- `CUBI_COMPACT_EXTRACT_MEMORIES=1` — opt in to the additional
+  post-compaction model call that extracts persistent memories. It is off by
+  default so compaction adds only the summarization call.
 - `CUBI_READ_FILE_MAX_LINES=…` / `CUBI_READ_FILE_MAX_BYTES=…` — tune the
   shared model-facing tool-output budget (defaults 400 lines / 50 KiB).
   `read_file` applies it to both full and ranged reads and returns continuation

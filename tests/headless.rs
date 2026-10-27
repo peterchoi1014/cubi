@@ -317,6 +317,81 @@ fn headless_json_outputs_line_delimited_events() {
 
 #[cfg(unix)]
 #[test]
+fn untrusted_project_session_hook_is_skipped() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let marker = project.path().join("hook-ran");
+    let hooks_dir = project.path().join(".cubi");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(
+        hooks_dir.join("hooks.json"),
+        serde_json::json!({
+            "hooks": [{
+                "event": "SessionStart",
+                "command": format!("touch '{}'", marker.display())
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .args(["--no-stream", "-p", "hello"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "project hooks skipped because the current directory is untrusted",
+        ));
+
+    assert!(!marker.exists(), "untrusted project hook must not execute");
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_project_session_hook_runs() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let marker = project.path().join("hook-ran");
+    let hooks_dir = project.path().join(".cubi");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(
+        hooks_dir.join("hooks.json"),
+        serde_json::json!({
+            "hooks": [{
+                "event": "SessionStart",
+                "command": format!("touch '{}'", marker.display())
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({
+            "trusted_roots": [project.path().canonicalize().unwrap()]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .args(["--no-stream", "-p", "hello"])
+        .assert()
+        .success();
+
+    assert!(marker.exists(), "trusted project hook should execute");
+}
+
+#[cfg(unix)]
+#[test]
 fn headless_json_reports_tool_timeout_and_recovers() {
     let home = tempdir().unwrap();
     let cubi_dir = home.path().join(".cubi");
@@ -382,6 +457,100 @@ fn headless_aborts_after_consecutive_tool_errors() {
         .assert()
         .failure()
         .code(11);
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_step_exhaustion_is_incomplete_with_one_terminal_json_event() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({
+            "trusted_roots": [project.path().canonicalize().unwrap()]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "unused")
+        .env("CUBI_FAKE_LLM_TOOL_CALL_REPEAT", "1")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"list_files","arguments":{"path":"."}}}"#,
+        )
+        .args(["--json", "--no-stream", "-p", "keep listing"])
+        .assert()
+        .failure()
+        .code(14)
+        .get_output()
+        .stdout
+        .clone();
+
+    let events: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let terminal_count = events
+        .iter()
+        .filter(|event| matches!(event["type"].as_str(), Some("done" | "error")))
+        .count();
+    assert_eq!(terminal_count, 1);
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(events.last().unwrap()["exit_code"], 14);
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_policy_denials_hit_failure_bound_with_one_terminal_event() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    let policy_path = home.path().join("policy.json");
+    fs::write(
+        &policy_path,
+        serde_json::json!({"denied_tools": ["list_files"]}).to_string(),
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_POLICY_FILE", &policy_path)
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "unused")
+        .env("CUBI_FAKE_LLM_TOOL_CALL_REPEAT", "1")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"function":{"name":"list_files","arguments":{"path":"."}}}"#,
+        )
+        .args(["--json", "--no-stream", "-p", "keep trying"])
+        .assert()
+        .failure()
+        .code(11)
+        .get_output()
+        .stdout
+        .clone();
+
+    let events: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event["type"].as_str(), Some("done" | "error")))
+            .count(),
+        1
+    );
+    assert_eq!(events.last().unwrap()["exit_code"], 11);
 }
 
 #[test]

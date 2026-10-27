@@ -51,12 +51,15 @@ const PROJECT_MEMORY_PREFIX: &str = "SYSTEM: Project memory loaded from";
 const PINNED_SYSTEM_TAG: &str = "SYSTEM[pinned]:";
 
 mod agent;
+mod compaction;
+mod context_budget;
 mod edit_cmd;
 mod multiline;
 mod render;
 mod repl;
 mod spinner;
 mod status;
+pub(crate) mod tool_dispatch;
 mod tui;
 mod ui_sink;
 
@@ -274,6 +277,11 @@ impl Default for CliFlags {
 }
 
 impl ChatCLI {
+    pub(super) fn effective_context_window(&self) -> Option<usize> {
+        context_budget::effective_budget(self.executor.get_model(), self.executor.provider_name())
+            .map(|budget| budget.window)
+    }
+
     fn emit_status(&mut self, msg: impl std::fmt::Display) {
         if self.json_enabled && self.headless_mode {
             return;
@@ -322,7 +330,12 @@ impl ChatCLI {
             todos: TodoList::load_for_current_dir(),
             memdir: Memdir::load(),
             user_commands: file_mentions::load_user_commands(),
-            hooks: HookRegistry::load(),
+            hooks: {
+                let guard = permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                HookRegistry::load(&guard)
+            },
             skills: skills::load_skills(),
             approved_tools: HashSet::new(),
             plan_mode,
@@ -366,6 +379,11 @@ impl ChatCLI {
 
         if let Some(system_prompt) = flags.system_prompt {
             cli.history.push(Message::text("system", system_prompt));
+        }
+        if cli.hooks.skipped_untrusted_project() {
+            eprintln!(
+                "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them."
+            );
         }
 
         // Auto-inject project memory (CUBI.md) into context, if present.
@@ -483,7 +501,9 @@ impl ChatCLI {
         if self.json_enabled {
             self.markdown_enabled = false;
         }
-        self.hooks.fire_session_start(self.executor.get_model());
+        self.hooks
+            .fire_session_start(self.executor.get_model())
+            .await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionStart {
                 model: self.executor.get_model().to_string(),
@@ -500,7 +520,7 @@ impl ChatCLI {
         self.history.push(Message::text("user", expanded));
         self.journal.start_turn();
         let result = self.agent_turn(turn_start).await;
-        self.hooks.fire_stop();
+        self.hooks.fire_stop().await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionEnd,
             &serde_json::json!({"mode": "headless"}),
@@ -1105,7 +1125,7 @@ impl ChatCLI {
                 if arg.eq_ignore_ascii_case("preview") {
                     self.compact_preview();
                 } else if arg.is_empty() {
-                    if let Err(e) = self.compact().await {
+                    if let Err(e) = self.compact(None).await {
                         eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
                     }
                 } else {
@@ -2703,7 +2723,18 @@ impl ChatCLI {
             });
             match crate::hooks::save_global(&hooks) {
                 Ok(()) => {
-                    self.hooks = HookRegistry::load();
+                    self.hooks = {
+                        let guard = self
+                            .permissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        HookRegistry::load(&guard)
+                    };
+                    if self.hooks.skipped_untrusted_project() {
+                        self.emit_status(
+                            "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them.",
+                        );
+                    }
                     println!("{} Hook added.", "✓".bright_green());
                 }
                 Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
@@ -2723,7 +2754,18 @@ impl ChatCLI {
             hooks.remove(index - 1);
             match crate::hooks::save_global(&hooks) {
                 Ok(()) => {
-                    self.hooks = HookRegistry::load();
+                    self.hooks = {
+                        let guard = self
+                            .permissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        HookRegistry::load(&guard)
+                    };
+                    if self.hooks.skipped_untrusted_project() {
+                        self.emit_status(
+                            "cubi: project hooks skipped because the current directory is untrusted; run /trust to enable them.",
+                        );
+                    }
                     println!("{} Hook removed.", "✓".bright_green());
                 }
                 Err(e) => eprintln!("{} Failed to save hooks: {}", "Error:".bright_red(), e),
@@ -4259,7 +4301,7 @@ impl ChatCLI {
     /// explicit estimates (we don't know the exact summary length until
     /// the LLM produces it).
     fn compact_preview(&self) {
-        const KEEP_RECENT: usize = 6;
+        const KEEP_RECENT: usize = 3;
         // Hard upper bound for the synthesized summary message. Used so
         // the preview can report a meaningful "post-compact upper bound"
         // even though the real summary length depends on the LLM.
@@ -4269,7 +4311,7 @@ impl ChatCLI {
 
         if plan.summarize_count == 0 {
             println!(
-                "{} Nothing to compact ({} non-system messages, keeps last {}).",
+                "{} Nothing to compact ({} non-system messages, keeps last {} turns).",
                 "ℹ".bright_blue(),
                 plan.non_system_count,
                 KEEP_RECENT
@@ -4283,7 +4325,7 @@ impl ChatCLI {
             "—".bright_black()
         );
         println!(
-            "  {} would summarize {} non-system message{} ({} kept verbatim, plus system+pinned).",
+            "  {} would summarize {} non-system message{} ({} kept verbatim in complete turns, plus system+pinned).",
             "▸".bright_cyan(),
             plan.summarize_count,
             if plan.summarize_count == 1 { "" } else { "s" },
@@ -4329,64 +4371,29 @@ impl ChatCLI {
     /// (0 when nothing was compacted), or an error when the summarizer
     /// call failed. The count lets `agent_turn` emit a `compacted` JSON
     /// event with an accurate `summarized_messages` field.
-    async fn compact(&mut self) -> Result<usize> {
-        // We keep the last N non-system messages intact and summarize
-        // everything before that.
-        const KEEP_RECENT: usize = 6; // ~3 exchanges
+    async fn compact(&mut self, cancel: Option<Arc<AtomicBool>>) -> Result<usize> {
+        const KEEP_RECENT_TURNS: usize = 3;
+        const SUMMARY_TOKEN_BUDGET: usize = 400;
 
-        let non_system_indices: Vec<usize> = self
-            .history
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role != "system")
-            .map(|(i, _)| i)
-            .collect();
-
-        if non_system_indices.len() <= KEEP_RECENT {
-            println!(
+        let Some(plan) = compaction::plan_compaction(&self.history, KEEP_RECENT_TURNS) else {
+            let non_system_count = self
+                .history
+                .iter()
+                .filter(|message| message.role != "system")
+                .count();
+            self.emit_status(format!(
                 "{} Conversation is too short to compact ({} non-system messages).",
                 "ℹ".bright_blue(),
-                non_system_indices.len()
-            );
+                non_system_count
+            ));
             return Ok(0);
-        }
+        };
 
-        // Split: messages to summarize vs. messages to keep.
-        let cutoff_idx = non_system_indices[non_system_indices.len() - KEEP_RECENT];
-        let to_summarize: Vec<&Message> = self.history[..cutoff_idx]
-            .iter()
-            .filter(|m| m.role != "system")
-            .collect();
-
-        if to_summarize.is_empty() {
-            println!("{} Nothing to compact.", "ℹ".bright_blue());
-            return Ok(0);
-        }
-
-        // Build a condensed transcript for the summarizer.
-        let mut transcript = String::new();
-        for msg in &to_summarize {
-            let role_label = match msg.role.as_str() {
-                "user" => "User",
-                "assistant" => "Assistant",
-                "tool" => "Tool",
-                _ => &msg.role,
-            };
-            // Truncate very long messages for the summarizer (char-safe).
-            let content = if msg.content.chars().count() > 500 {
-                let truncated: String = msg.content.chars().take(500).collect();
-                format!("{}…", truncated)
-            } else {
-                msg.content.clone()
-            };
-            transcript.push_str(&format!("{}: {}\n", role_label, content));
-        }
-
-        println!(
+        self.emit_status(format!(
             "{} Compacting {} messages into a summary…",
             "⚙".bright_blue(),
-            to_summarize.len()
-        );
+            plan.summarized_count
+        ));
 
         let summary_prompt = vec![
             Message::text(
@@ -4395,55 +4402,62 @@ impl ChatCLI {
                  following conversation. Preserve key decisions, facts, and outcomes. \
                  Do NOT include conversational filler. Output only the summary.",
             ),
-            Message::text("user", transcript),
+            Message::text("user", plan.transcript.clone()),
         ];
 
-        match self.executor.chat(summary_prompt).await {
+        let summary_result = if let Some(cancel) = cancel.as_ref() {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => Err(exit_code::err(
+                    ExitCode::Cancelled,
+                    "cubi: compaction cancelled (Ctrl-C)",
+                )),
+                _ = agent::wait_for_cancel(cancel) => Err(exit_code::err(
+                    ExitCode::Cancelled,
+                    "cubi: compaction cancelled (Ctrl-C)",
+                )),
+                result = self.executor.chat(summary_prompt) => result,
+            }
+        } else {
+            self.executor.chat(summary_prompt).await
+        };
+
+        match summary_result {
             Ok(summary) => {
-                let summarized_count = to_summarize.len();
-                // Rebuild history: keep all messages at their original positions,
-                // but replace old non-system messages before cutoff with a single
-                // summary. Messages at/after cutoff are preserved as-is.
-                let mut new_history: Vec<Message> = Vec::new();
+                let summarized_count = plan.summarized_count;
+                let summary = compaction::bound_summary(&summary, SUMMARY_TOKEN_BUDGET);
+                self.history = plan.rebuild(&summary);
 
-                // Keep system messages that appeared before the cutoff
-                // (this includes PINNED_SYSTEM_TAG entries, which must
-                // survive compaction so the user's pinned context isn't
-                // silently dropped along with the summarized turns).
-                for msg in &self.history[..cutoff_idx] {
-                    if msg.role == "system" {
-                        new_history.push(msg.clone());
-                    }
-                }
-
-                // Insert the compacted summary.
-                new_history.push(Message::text(
-                    "system",
-                    format!(
-                        "SYSTEM: Compacted summary of earlier conversation:\n\n{}",
-                        summary
-                    ),
-                ));
-
-                // Append all messages from cutoff onward (recent messages kept intact).
-                new_history.extend(self.history[cutoff_idx..].iter().cloned());
-
-                self.history = new_history;
-
-                println!(
+                self.emit_status(format!(
                     "{} Compacted. History now has {} messages.",
                     "✓".bright_green(),
                     self.history.len()
-                );
+                ));
 
-                let extract_prompt = vec![
-                    Message::text(
-                        "system",
-                        "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
-                    ),
-                    Message::text("user", &summary),
-                ];
-                if let Ok(extracted) = self.executor.chat(extract_prompt).await {
+                if compaction::memory_extraction_enabled() {
+                    let extract_prompt = vec![
+                        Message::text(
+                            "system",
+                            "Extract 3-5 concise factual bullets from the following conversation summary that would be useful to remember in future sessions. Each bullet starts with '- '. Output ONLY the bullets, nothing else.",
+                        ),
+                        Message::text("user", &summary),
+                    ];
+                    let extracted = if let Some(cancel) = cancel.as_ref() {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::signal::ctrl_c() => Err(exit_code::err(
+                                ExitCode::Cancelled,
+                                "cubi: memory extraction cancelled (Ctrl-C)",
+                            )),
+                            _ = agent::wait_for_cancel(cancel) => Err(exit_code::err(
+                                ExitCode::Cancelled,
+                                "cubi: memory extraction cancelled (Ctrl-C)",
+                            )),
+                            result = self.executor.chat(extract_prompt) => result,
+                        }
+                    } else {
+                        self.executor.chat(extract_prompt).await
+                    }?;
                     if extracted.contains("- ") {
                         let bullets: Vec<_> = extracted
                             .lines()
@@ -4458,11 +4472,11 @@ impl ChatCLI {
                             }
                             self.persist_memdir();
                             self.inject_memdir();
-                            println!(
+                            self.emit_status(format!(
                                 "{} Extracted {} memories to memdir.",
                                 "ℹ".bright_blue(),
                                 bullets.len()
-                            );
+                            ));
                         }
                     }
                 }
@@ -4483,23 +4497,34 @@ impl ChatCLI {
     /// or the model's window is unknown (in which case we can't make
     /// an informed decision and let the request through — the provider
     /// will return its own error).
-    pub(super) fn check_token_budget(&self, _turn_start: usize) -> Result<bool> {
+    pub(super) fn check_token_budget(
+        &self,
+        _turn_start: usize,
+        tools: Option<&[crate::ollama::ToolSpec]>,
+    ) -> Result<bool> {
         let model = self.executor.get_model().to_string();
-        let Some(window) = crate::llm::context_window_for_model(&model) else {
+        let Some(budget) = context_budget::effective_budget(&model, self.executor.provider_name())
+        else {
             return Ok(false);
         };
-        let needed = crate::llm::estimate_conversation_tokens(&self.history);
-        if needed <= window {
+        let needed = context_budget::estimate_request_tokens(&self.history, tools);
+        if needed <= budget.prompt_limit {
             return Ok(false);
         }
         let json_enabled = self.json_enabled && self.headless_mode;
         if json_enabled {
-            Self::emit_json_event(crate::json_events::budget_error(needed, window, &model));
+            Self::emit_json_event(crate::json_events::budget_error(
+                needed,
+                budget.window,
+                budget.prompt_limit,
+                budget.completion_reserve,
+                &model,
+            ));
             return Err(exit_code::err(
                 ExitCode::Budget,
                 format!(
-                    "cubi: would exceed context window ({} tokens estimated, model window is {})",
-                    needed, window
+                    "cubi: would exceed context window ({} tokens estimated, prompt limit is {}; {} reserved for completion)",
+                    needed, budget.prompt_limit, budget.completion_reserve
                 ),
             ));
         }
@@ -4509,7 +4534,7 @@ impl ChatCLI {
                 format!(
                     "cubi: refusing — prompt ({} est. tokens) exceeds {} window of {} tokens. \
                      Run /compact or shorten the prompt and retry.",
-                    needed, model, window
+                    needed, model, budget.prompt_limit
                 ),
             ));
         }
@@ -4517,7 +4542,7 @@ impl ChatCLI {
             "{} prompt would exceed the model's context window ({} estimated tokens > {} window for {}).",
             "[budget]".bright_red(),
             needed,
-            window,
+            budget.prompt_limit,
             model.bright_cyan()
         );
         eprintln!(
@@ -4595,26 +4620,30 @@ impl ChatCLI {
     /// tokens cross `compact_threshold_pct`, invoke [`compact`] before
     /// the next LLM call. No-op when the model's window is unknown
     /// (we'd be guessing) or when `auto_compact` is disabled.
-    pub(super) async fn maybe_auto_compact(&mut self) {
+    pub(super) async fn maybe_auto_compact(
+        &mut self,
+        tools: Option<&[crate::ollama::ToolSpec]>,
+    ) -> Result<()> {
         if !self.app_config.auto_compact {
-            return;
+            return Ok(());
         }
         let model = self.executor.get_model().to_string();
-        let Some(window) = crate::llm::context_window_for_model(&model) else {
-            return;
+        let Some(budget) = context_budget::effective_budget(&model, self.executor.provider_name())
+        else {
+            return Ok(());
         };
         let threshold =
             crate::onboarding::clamp_compact_threshold(self.app_config.compact_threshold_pct)
                 as usize;
-        let estimated = crate::llm::estimate_conversation_tokens(&self.history);
+        let estimated = context_budget::estimate_request_tokens(&self.history, tools);
         // window * threshold / 100 — order chosen to keep precision and
         // stay inside usize on tiny windows.
-        let cutoff = window.saturating_mul(threshold) / 100;
+        let cutoff = budget.prompt_limit.saturating_mul(threshold) / 100;
         if estimated < cutoff {
-            return;
+            return Ok(());
         }
         let json_enabled = self.json_enabled && self.headless_mode;
-        match self.compact().await {
+        match self.compact(Some(Arc::clone(&self.cancel))).await {
             Ok(0) => {
                 tracing::debug!(
                     target: "cubi::cli",
@@ -4631,9 +4660,17 @@ impl ChatCLI {
                         n
                     );
                 }
-                Self::emit_json_event_if(json_enabled, crate::json_events::compacted(n, window));
+                Self::emit_json_event_if(
+                    json_enabled,
+                    crate::json_events::compacted(n, budget.window),
+                );
             }
             Err(e) => {
+                if e.downcast_ref::<exit_code::AppExit>()
+                    .is_some_and(|exit| exit.code == ExitCode::Cancelled)
+                {
+                    return Err(e);
+                }
                 tracing::warn!(
                     target: "cubi::cli",
                     error = %e,
@@ -4641,6 +4678,7 @@ impl ChatCLI {
                 );
             }
         }
+        Ok(())
     }
 
     /// Records a clarifying question from the user. Until the model can
@@ -6146,8 +6184,20 @@ impl ChatCLI {
         // a user abort.
         let run_fut = async {
             if use_tools {
-                crate::consensus::run_with_tools(req, &self.executor, &sink, &mut self.mcp_manager)
-                    .await
+                let access = tool_dispatch::ToolAccess {
+                    hooks: self.hooks.clone(),
+                    policy: self.policy.clone(),
+                    permissions: Arc::clone(&self.permissions),
+                };
+                crate::consensus::run_with_tools(
+                    req,
+                    &self.executor,
+                    &sink,
+                    &mut self.mcp_manager,
+                    access,
+                    self.approved_tools.clone(),
+                )
+                .await
             } else {
                 crate::consensus::run(req, &self.executor, &sink).await
             }
@@ -7166,16 +7216,10 @@ pub(crate) fn compact_preview_plan(
     keep_recent: usize,
     summary_budget: usize,
 ) -> CompactPreview {
-    let non_system_indices: Vec<usize> = history
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role != "system")
-        .map(|(i, _)| i)
-        .collect();
-    let non_system_count = non_system_indices.len();
+    let non_system_count = history.iter().filter(|m| m.role != "system").count();
     let current_tokens = crate::llm::estimate_conversation_tokens(history);
 
-    if non_system_count <= keep_recent {
+    let Some(plan) = compaction::plan_compaction(history, keep_recent) else {
         return CompactPreview {
             non_system_count,
             summarize_count: 0,
@@ -7185,23 +7229,10 @@ pub(crate) fn compact_preview_plan(
             upper_bound_tokens: current_tokens,
             estimated_savings: 0,
         };
-    }
-
-    let cutoff_idx = non_system_indices[non_system_count - keep_recent];
-    let summarize_count = history[..cutoff_idx]
-        .iter()
-        .filter(|m| m.role != "system")
-        .count();
-    let retained: Vec<&crate::ollama::Message> = history
-        .iter()
-        .enumerate()
-        .filter(|(i, m)| m.role == "system" || *i >= cutoff_idx)
-        .map(|(_, m)| m)
-        .collect();
-    let retained_tokens: usize = retained
-        .iter()
-        .map(|m| 4 + crate::llm::estimate_tokens(&m.content))
-        .sum();
+    };
+    let summarize_count = plan.summarized_count;
+    let keep_recent_count = plan.retained_count;
+    let retained_tokens = plan.retained_tokens();
     // Reserve role overhead for the synthesized summary system message
     // plus the configured budget so the upper bound mirrors what
     // `estimate_conversation_tokens` would report post-compact.
@@ -7210,7 +7241,7 @@ pub(crate) fn compact_preview_plan(
     CompactPreview {
         non_system_count,
         summarize_count,
-        keep_recent_count: keep_recent,
+        keep_recent_count,
         current_tokens,
         retained_tokens,
         upper_bound_tokens,
@@ -7630,10 +7661,10 @@ mod tests {
             )));
         }
         let plan = compact_preview_plan(&h, 6, 400);
-        // 20 non-system; keep last 6, summarize 14.
+        // 10 complete turns; keep last 6 turns, summarize 4 turns.
         assert_eq!(plan.non_system_count, 20);
-        assert_eq!(plan.summarize_count, 14);
-        assert_eq!(plan.keep_recent_count, 6);
+        assert_eq!(plan.summarize_count, 8);
+        assert_eq!(plan.keep_recent_count, 12);
         assert!(plan.current_tokens > plan.retained_tokens);
         // Upper bound is retained + role overhead + summary budget.
         assert_eq!(plan.upper_bound_tokens, plan.retained_tokens + 4 + 400);
@@ -8488,39 +8519,205 @@ mod tests {
 
     #[test]
     fn pinned_system_messages_survive_compact_rebuild() {
-        // Simulates the rebuild step from `compact()` directly: pinned
-        // system messages must be retained verbatim and reappear before
-        // the summary in the new history.
         let mut cli = new_test_cli();
         cli.pin("keep me through compaction");
-        // Stuff some user/assistant turns to be summarized.
         for i in 0..10 {
             cli.history.push(Message::text("user", format!("u{}", i)));
             cli.history
                 .push(Message::text("assistant", format!("a{}", i)));
         }
-        // Replicate the rebuild rule: every system message in the
-        // pre-cutoff slice survives. With KEEP_RECENT = 6, cutoff_idx
-        // is at index of the 6th-from-last non-system message.
-        let non_system_indices: Vec<usize> = cli
-            .history
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role != "system")
-            .map(|(i, _)| i)
-            .collect();
-        let cutoff_idx = non_system_indices[non_system_indices.len() - 6];
-        let preserved: Vec<&Message> = cli.history[..cutoff_idx]
-            .iter()
-            .filter(|m| m.role == "system")
-            .collect();
+        let rebuilt = compaction::plan_compaction(&cli.history, 3)
+            .expect("history should compact")
+            .rebuild("summary");
+
         assert!(
-            preserved
+            rebuilt
                 .iter()
                 .any(|m| m.content.starts_with(PINNED_SYSTEM_TAG)
                     && m.content.contains("keep me through compaction")),
             "pinned system message must be preserved across compact rebuild"
         );
+    }
+
+    #[test]
+    fn compact_does_not_extract_memories_without_opt_in() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        let previous_fake = std::env::var("CUBI_FAKE_LLM").ok();
+        let previous_response = std::env::var("CUBI_FAKE_LLM_RESPONSE").ok();
+        let previous_extract = std::env::var("CUBI_COMPACT_EXTRACT_MEMORIES").ok();
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            std::env::set_var("CUBI_FAKE_LLM", "1");
+            std::env::set_var("CUBI_FAKE_LLM_RESPONSE", "- must not persist");
+            std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES");
+        }
+        let mut cli = new_test_cli();
+        let temp = tempfile::tempdir().unwrap();
+        cli.memdir = Memdir::with_path(temp.path().join("memories.json"));
+        for i in 0..4 {
+            cli.history.push(Message::text("user", format!("u{i}")));
+            cli.history
+                .push(Message::text("assistant", format!("a{i}")));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let summarized = runtime.block_on(cli.compact(None)).unwrap();
+
+        assert!(summarized > 0);
+        assert!(cli.memdir.is_empty());
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            match previous_fake {
+                Some(value) => std::env::set_var("CUBI_FAKE_LLM", value),
+                None => std::env::remove_var("CUBI_FAKE_LLM"),
+            }
+            match previous_response {
+                Some(value) => std::env::set_var("CUBI_FAKE_LLM_RESPONSE", value),
+                None => std::env::remove_var("CUBI_FAKE_LLM_RESPONSE"),
+            }
+            match previous_extract {
+                Some(value) => std::env::set_var("CUBI_COMPACT_EXTRACT_MEMORIES", value),
+                None => std::env::remove_var("CUBI_COMPACT_EXTRACT_MEMORIES"),
+            }
+        }
+    }
+
+    #[test]
+    fn compact_honors_turn_cancellation_before_model_call() {
+        let mut cli = new_test_cli();
+        for i in 0..4 {
+            cli.history.push(Message::text("user", format!("u{i}")));
+            cli.history
+                .push(Message::text("assistant", format!("a{i}")));
+        }
+        let cancel = Arc::new(AtomicBool::new(true));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(cli.compact(Some(cancel)))
+            .expect_err("pre-set turn cancellation should abort compaction");
+
+        assert_eq!(
+            error
+                .downcast_ref::<exit_code::AppExit>()
+                .map(|exit| exit.code),
+            Some(ExitCode::Cancelled)
+        );
+    }
+
+    #[test]
+    fn large_tool_result_triggers_compaction_before_follow_up_request() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        let temp = tempfile::tempdir().unwrap();
+        let large_file = temp.path().join("large.txt");
+        fs::write(&large_file, "x".repeat(8_000)).unwrap();
+        let previous: Vec<(&str, Option<String>)> = [
+            "CUBI_FAKE_LLM",
+            "CUBI_FAKE_LLM_RESPONSE",
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            "CUBI_FAKE_LLM_TOOL_CALL_REPEAT",
+            "CUBI_CONTEXT_WINDOW",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var(name).ok()))
+        .collect();
+        let tool_call = serde_json::json!({
+            "function": {
+                "name": "read_file",
+                "arguments": {"path": large_file}
+            }
+        })
+        .to_string();
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            std::env::set_var("CUBI_FAKE_LLM", "1");
+            std::env::set_var("CUBI_FAKE_LLM_RESPONSE", "final");
+            std::env::set_var("CUBI_FAKE_LLM_TOOL_CALL", tool_call);
+            std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT");
+            std::env::set_var("CUBI_CONTEXT_WINDOW", "8000");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut permissions = Permissions::default();
+        permissions.trust_dir(&cwd).unwrap();
+        let permissions = Arc::new(Mutex::new(permissions));
+        let plan_mode = Arc::new(AtomicBool::new(false));
+        let manager = runtime
+            .block_on(McpManager::new(
+                Arc::clone(&permissions),
+                Arc::clone(&plan_mode),
+            ))
+            .unwrap();
+        let executor = AIExecutor::new_from_env("qwen3:8b".to_string());
+        let mut cli = ChatCLI::new(
+            executor,
+            Some(manager),
+            permissions,
+            plan_mode,
+            FileJournal::default(),
+        );
+        cli.headless_mode = true;
+        cli.stream_enabled = false;
+        cli.app_config = AppConfig::default();
+        for i in 0..5 {
+            cli.history.push(Message::text(
+                "user",
+                format!("older user turn {i} {}", "u".repeat(80)),
+            ));
+            cli.history.push(Message::text(
+                "assistant",
+                format!("older assistant turn {i} {}", "a".repeat(80)),
+            ));
+        }
+        let turn_start = cli.history.len();
+        cli.history
+            .push(Message::text("user", "read the large file"));
+        cli.journal.start_turn();
+        let tools = cli.build_turn_tool_specs();
+        let budget = context_budget::effective_budget(
+            cli.executor.get_model(),
+            cli.executor.provider_name(),
+        )
+        .unwrap();
+        let initial_estimate =
+            context_budget::estimate_request_tokens(&cli.history, tools.as_deref());
+        assert!(
+            initial_estimate
+                < budget.prompt_limit * usize::from(cli.app_config.compact_threshold_pct) / 100,
+            "fixture must start below the auto-compaction threshold"
+        );
+
+        runtime.block_on(cli.agent_turn(turn_start)).unwrap();
+
+        assert_eq!(
+            cli.history
+                .iter()
+                .filter(|message| compaction::is_compacted_summary(message))
+                .count(),
+            1,
+            "the post-tool request should compact older turns"
+        );
+        assert_eq!(cli.history.last().unwrap().content, "final");
+        runtime.block_on(cli.shutdown());
+        // SAFETY: process environment mutation is serialized by env_lock.
+        unsafe {
+            for (name, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[test]

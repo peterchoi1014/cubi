@@ -1884,6 +1884,7 @@ fn kind_for_legacy_exit(code: ExitCode) -> user_error::ErrorKind {
         ExitCode::Tool => user_error::ErrorKind::Tool,
         ExitCode::Budget => user_error::ErrorKind::Budget,
         ExitCode::Network => user_error::ErrorKind::ConnectRefused,
+        ExitCode::Incomplete => user_error::ErrorKind::Other,
         ExitCode::Cancelled => user_error::ErrorKind::Cancelled,
     }
 }
@@ -2365,7 +2366,7 @@ fn print_help() {
                                         TUI (interactive sessions only). Also\n  \
                                         honors CUBI_CLASSIC=1. (--tui / CUBI_TUI\n  \
                                         are now the default and a no-op.)\n\n\
-         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 130 cancelled\n\n\
+         Headless exit codes:\n  0 ok · 2 usage/config · 10 model/API error · 11 tool error · 12 context budget · 13 network · 14 incomplete · 130 cancelled\n\n\
          Notes:\n  -p/--prompt requires inline text and does not read stdin. Without -p,\n  \
          piped stdin becomes the one-shot prompt. One-shot mode buffers by default;\n  \
          pass --stream to stream tokens.\n  \

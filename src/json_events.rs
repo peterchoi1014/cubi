@@ -146,11 +146,19 @@ pub fn emit_compacted(enabled: bool, summarized_messages: usize, window: usize) 
     v
 }
 
-pub fn budget_error(needed: usize, window: usize, model: &str) -> Value {
+pub fn budget_error(
+    needed: usize,
+    window: usize,
+    prompt_limit: usize,
+    completion_reserve: usize,
+    model: &str,
+) -> Value {
     json!({
         "type": "budget_error",
         "needed": needed,
         "window": window,
+        "prompt_limit": prompt_limit,
+        "completion_reserve": completion_reserve,
         "model": model,
     })
 }

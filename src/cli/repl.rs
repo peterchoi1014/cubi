@@ -41,7 +41,9 @@ impl ChatCLI {
         }
 
         // Fire SessionStart hooks.
-        self.hooks.fire_session_start(self.executor.get_model());
+        self.hooks
+            .fire_session_start(self.executor.get_model())
+            .await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionStart {
                 model: self.executor.get_model().to_string(),
@@ -283,7 +285,7 @@ impl ChatCLI {
         }
 
         // Fire Stop hooks.
-        self.hooks.fire_stop();
+        self.hooks.fire_stop().await;
         self.emit_receipt(
             crate::receipts::ReceiptEvent::SessionEnd,
             &serde_json::json!({"mode": "interactive"}),
