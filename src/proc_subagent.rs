@@ -973,6 +973,8 @@ mod tests {
 
     #[test]
     fn seed_policy_copies_relative_active_policy_to_absolute_isolated_path() {
+        // Uses cwd-relative paths under target/, so hold the crate-wide cwd lock.
+        let _cwd_guard = crate::compat::test_env::cwd_guard();
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _cubi_home_guard = EnvVarGuard::remove(crate::sessions::CUBI_HOME_ENV);
         let nanos = std::time::SystemTime::now()
@@ -1197,6 +1199,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_binary_isolated_seeds_active_policy_file_while_isolating_home() {
+        // Uses cwd-relative paths under target/, so hold the crate-wide cwd lock.
+        let _cwd_guard = crate::compat::test_env::cwd_guard();
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _cubi_home_guard = EnvVarGuard::remove(crate::sessions::CUBI_HOME_ENV);
         let parent_home = tempfile::tempdir().unwrap();
@@ -1275,6 +1279,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_binary_isolated_drops_unseeded_policy_env_from_child() {
+        // Uses cwd-relative paths under target/, so hold the crate-wide cwd lock.
+        let _cwd_guard = crate::compat::test_env::cwd_guard();
         let _env_lock = ENV_LOCK.lock().unwrap();
         let _cubi_home_guard = EnvVarGuard::remove(crate::sessions::CUBI_HOME_ENV);
         let nanos = std::time::SystemTime::now()
