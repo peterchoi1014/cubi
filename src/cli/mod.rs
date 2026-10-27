@@ -131,6 +131,10 @@ pub struct ChatCLI {
     /// Cumulative provider-reported usage for *this run* (does not persist
     /// across `/resume`). Surfaced by `/stats`.
     session_stats: ChatStats,
+    /// Model usage produced inside meta-tools while the parent tool call is
+    /// executing. The agent loop drains this into the active turn before the
+    /// next provider request.
+    pending_turn_stats: ChatStats,
     /// Suppresses REPL-only decoration so one-shot output remains pipeable.
     headless_mode: bool,
     /// Emits line-delimited JSON events in headless mode.
@@ -349,6 +353,7 @@ impl ChatCLI {
             markdown_enabled: flags.markdown,
             stats_footer_enabled: flags.stats_footer,
             session_stats: ChatStats::default(),
+            pending_turn_stats: ChatStats::default(),
             headless_mode: false,
             json_enabled: flags.json,
             mcp_counts: flags.mcp_counts,
@@ -1125,8 +1130,16 @@ impl ChatCLI {
                 if arg.eq_ignore_ascii_case("preview") {
                     self.compact_preview();
                 } else if arg.is_empty() {
-                    if let Err(e) = self.compact(None).await {
-                        eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                    match self.compact(None).await {
+                        Ok(result) => {
+                            if !result.stats.is_empty() {
+                                self.session_stats.add(&result.stats);
+                                self.usage_history.push(result.stats);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{} Compaction failed: {}", "Error:".bright_red(), e);
+                        }
                     }
                 } else {
                     println!(
@@ -1996,6 +2009,18 @@ impl ChatCLI {
                     "  {}: {} ms (this run)",
                     "model time".bright_cyan(),
                     self.session_stats.elapsed_ms
+                );
+            }
+            println!(
+                "  {}: {} (this run)",
+                "model requests".bright_cyan(),
+                self.session_stats.request_count
+            );
+            if let Some(wall_ms) = self.session_stats.wall_clock_ms {
+                println!(
+                    "  {}: {} ms (completed turns)",
+                    "turn wall time".bright_cyan(),
+                    wall_ms
                 );
             }
         }
@@ -4371,7 +4396,7 @@ impl ChatCLI {
     /// (0 when nothing was compacted), or an error when the summarizer
     /// call failed. The count lets `agent_turn` emit a `compacted` JSON
     /// event with an accurate `summarized_messages` field.
-    async fn compact(&mut self, cancel: Option<Arc<AtomicBool>>) -> Result<usize> {
+    async fn compact(&mut self, cancel: Option<Arc<AtomicBool>>) -> Result<CompactionResult> {
         const KEEP_RECENT_TURNS: usize = 3;
         const SUMMARY_TOKEN_BUDGET: usize = 400;
 
@@ -4386,7 +4411,7 @@ impl ChatCLI {
                 "ℹ".bright_blue(),
                 non_system_count
             ));
-            return Ok(0);
+            return Ok(CompactionResult::default());
         };
 
         self.emit_status(format!(
@@ -4416,15 +4441,16 @@ impl ChatCLI {
                     ExitCode::Cancelled,
                     "cubi: compaction cancelled (Ctrl-C)",
                 )),
-                result = self.executor.chat(summary_prompt) => result,
+                result = self.executor.chat_with_tools(summary_prompt, None) => result,
             }
         } else {
-            self.executor.chat(summary_prompt).await
+            self.executor.chat_with_tools(summary_prompt, None).await
         };
 
         match summary_result {
-            Ok(summary) => {
+            Ok((summary_message, mut stats)) => {
                 let summarized_count = plan.summarized_count;
+                let summary = summary_message.content;
                 let summary = compaction::bound_summary(&summary, SUMMARY_TOKEN_BUDGET);
                 self.history = plan.rebuild(&summary);
 
@@ -4453,11 +4479,14 @@ impl ChatCLI {
                                 ExitCode::Cancelled,
                                 "cubi: memory extraction cancelled (Ctrl-C)",
                             )),
-                            result = self.executor.chat(extract_prompt) => result,
+                            result = self.executor.chat_with_tools(extract_prompt, None) => result,
                         }
                     } else {
-                        self.executor.chat(extract_prompt).await
+                        self.executor.chat_with_tools(extract_prompt, None).await
                     }?;
+                    let (extracted_message, extract_stats) = extracted;
+                    stats.add(&extract_stats);
+                    let extracted = extracted_message.content;
                     if extracted.contains("- ") {
                         let bullets: Vec<_> = extracted
                             .lines()
@@ -4481,7 +4510,10 @@ impl ChatCLI {
                     }
                 }
                 self.checkpoint_session();
-                Ok(summarized_count)
+                Ok(CompactionResult {
+                    summarized_count,
+                    stats,
+                })
             }
             Err(e) => Err(e),
         }
@@ -4623,14 +4655,14 @@ impl ChatCLI {
     pub(super) async fn maybe_auto_compact(
         &mut self,
         tools: Option<&[crate::ollama::ToolSpec]>,
-    ) -> Result<()> {
+    ) -> Result<ChatStats> {
         if !self.app_config.auto_compact {
-            return Ok(());
+            return Ok(ChatStats::default());
         }
         let model = self.executor.get_model().to_string();
         let Some(budget) = context_budget::effective_budget(&model, self.executor.provider_name())
         else {
-            return Ok(());
+            return Ok(ChatStats::default());
         };
         let threshold =
             crate::onboarding::clamp_compact_threshold(self.app_config.compact_threshold_pct)
@@ -4640,30 +4672,32 @@ impl ChatCLI {
         // stay inside usize on tiny windows.
         let cutoff = budget.prompt_limit.saturating_mul(threshold) / 100;
         if estimated < cutoff {
-            return Ok(());
+            return Ok(ChatStats::default());
         }
         let json_enabled = self.json_enabled && self.headless_mode;
         match self.compact(Some(Arc::clone(&self.cancel))).await {
-            Ok(0) => {
+            Ok(result) if result.summarized_count == 0 => {
                 tracing::debug!(
                     target: "cubi::cli",
                     estimated,
                     cutoff,
                     "auto-compact skipped: nothing to summarize",
                 );
+                Ok(result.stats)
             }
-            Ok(n) => {
+            Ok(result) => {
                 if !json_enabled {
                     println!(
                         "{} auto-compacted {} earlier turn(s) into a summary",
                         "⚙".bright_blue(),
-                        n
+                        result.summarized_count
                     );
                 }
                 Self::emit_json_event_if(
                     json_enabled,
-                    crate::json_events::compacted(n, budget.window),
+                    crate::json_events::compacted(result.summarized_count, budget.window),
                 );
+                Ok(result.stats)
             }
             Err(e) => {
                 if e.downcast_ref::<exit_code::AppExit>()
@@ -4676,9 +4710,11 @@ impl ChatCLI {
                     error = %e,
                     "auto-compact failed; continuing with full history",
                 );
+                let mut stats = ChatStats::default();
+                stats.add_unreported_request();
+                Ok(stats)
             }
         }
-        Ok(())
     }
 
     /// Records a clarifying question from the user. Until the model can
@@ -5544,10 +5580,15 @@ impl ChatCLI {
     /// Immutable snapshot of the fields the status line can display, built
     /// from live `ChatCLI` state. Rendering lives in `status::StatusState`.
     fn status_snapshot(&self) -> crate::cli::status::StatusState {
+        let context_used = self
+            .session_stats
+            .last_prompt_tokens
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .or_else(|| Some(crate::llm::estimate_conversation_tokens(&self.history)));
         crate::cli::status::StatusState {
             model: self.executor.get_model().to_string(),
-            context_used: Some(crate::llm::estimate_conversation_tokens(&self.history)),
-            context_window: crate::llm::context_window_for_model(self.executor.get_model()),
+            context_used,
+            context_window: self.effective_context_window(),
             cwd: std::env::current_dir().unwrap_or_default(),
             prompt_tokens: self.session_stats.prompt_tokens,
             completion_tokens: self.session_stats.completion_tokens,
@@ -6115,11 +6156,21 @@ impl ChatCLI {
     }
 
     fn show_cost(&self) {
-        let tokens = self.history.iter().map(|m| m.content.len()).sum::<usize>() / 4;
+        let total_tokens = self
+            .session_stats
+            .prompt_tokens
+            .saturating_add(self.session_stats.completion_tokens);
+        let cost = crate::pricing::format_cost(
+            crate::pricing::lookup(self.executor.get_model()),
+            self.session_stats.prompt_tokens,
+            self.session_stats.completion_tokens,
+        );
         println!(
-            "\n{}\n  estimated tokens: ~{}\n  estimated cost:   $0.00 (local Ollama)\n",
+            "\n{}\n  provider tokens: {}\n  model requests:  {}\n  cost:            {}\n",
             "Cost:".bright_yellow().bold(),
-            tokens
+            total_tokens,
+            self.session_stats.request_count,
+            cost
         );
     }
 
@@ -6987,6 +7038,7 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
             prompt_tokens: sub.prompt_tokens,
             completion_tokens: sub.completion_tokens,
             elapsed_ms: sub.elapsed_ms,
+            ..crate::ollama::ChatStats::default()
         };
         let payload = crate::json_events::consensus_subagent_result(
             &sub.model,
@@ -7103,6 +7155,12 @@ pub(crate) fn resolve_history_page_size() -> usize {
         .unwrap_or(10)
 }
 
+#[derive(Debug, Default)]
+struct CompactionResult {
+    summarized_count: usize,
+    stats: ChatStats,
+}
+
 /// Builds a one-line dim usage-footer string. Pure formatter so callers
 /// can `println!` it (TTY) or unit-test the output.
 pub(crate) fn format_usage_footer_line(
@@ -7112,14 +7170,18 @@ pub(crate) fn format_usage_footer_line(
 ) -> String {
     let total = turn.prompt_tokens + turn.completion_tokens;
     let cum = cumulative.prompt_tokens + cumulative.completion_tokens;
-    format!(
-        "usage: prompt={p} completion={c} total={t} • session {cum} • {cost}",
+    let mut line = format!(
+        "usage: prompt={p} completion={c} total={t} requests={requests}",
         p = turn.prompt_tokens,
         c = turn.completion_tokens,
         t = total,
-        cum = cum,
-        cost = cost_label,
-    )
+        requests = turn.request_count,
+    );
+    if let Some(wall_ms) = turn.wall_clock_ms {
+        line.push_str(&format!(" wall={}ms", wall_ms));
+    }
+    line.push_str(&format!(" • session {} • {}", cum, cost_label));
+    line
 }
 
 /// One row in the `/usage` table.
@@ -7128,6 +7190,8 @@ pub(crate) struct UsageRow {
     pub label: String,
     pub prompt: u64,
     pub completion: u64,
+    pub requests: u64,
+    pub wall_ms: Option<u64>,
     pub cost: String,
 }
 
@@ -7140,20 +7204,30 @@ pub(crate) fn build_usage_rows(
     let mut rows = Vec::with_capacity(per_turn.len() + 1);
     let mut cum_p: u64 = 0;
     let mut cum_c: u64 = 0;
+    let mut cum_requests: u64 = 0;
+    let mut cum_wall_ms: Option<u64> = None;
     for (idx, s) in per_turn.iter().enumerate() {
         rows.push(UsageRow {
             label: format!("turn {}", idx + 1),
             prompt: s.prompt_tokens,
             completion: s.completion_tokens,
+            requests: s.request_count,
+            wall_ms: s.wall_clock_ms,
             cost: crate::pricing::format_cost(pricing, s.prompt_tokens, s.completion_tokens),
         });
         cum_p += s.prompt_tokens;
         cum_c += s.completion_tokens;
+        cum_requests = cum_requests.saturating_add(s.request_count);
+        if let Some(wall_ms) = s.wall_clock_ms {
+            cum_wall_ms = Some(cum_wall_ms.unwrap_or(0).saturating_add(wall_ms));
+        }
     }
     rows.push(UsageRow {
         label: "session".to_string(),
         prompt: cum_p,
         completion: cum_c,
+        requests: cum_requests,
+        wall_ms: cum_wall_ms,
         cost: crate::pricing::format_cost(pricing, cum_p, cum_c),
     });
     rows
@@ -7163,16 +7237,22 @@ pub(crate) fn build_usage_rows(
 pub(crate) fn format_usage_table(rows: &[UsageRow]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<10} {:>8} {:>10} {:>8} {}\n",
-        "turn", "prompt", "completion", "total", "cost"
+        "{:<10} {:>8} {:>10} {:>8} {:>8} {:>9} {}\n",
+        "turn", "prompt", "completion", "total", "requests", "wall ms", "cost"
     ));
     for r in rows {
+        let wall_ms = r
+            .wall_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".to_string());
         out.push_str(&format!(
-            "{:<10} {:>8} {:>10} {:>8} {}\n",
+            "{:<10} {:>8} {:>10} {:>8} {:>8} {:>9} {}\n",
             r.label,
             r.prompt,
             r.completion,
             r.prompt + r.completion,
+            r.requests,
+            wall_ms,
             r.cost,
         ));
     }
@@ -7517,11 +7597,13 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             elapsed_ms: 200,
+            ..crate::ollama::ChatStats::default()
         };
         let cum = crate::ollama::ChatStats {
             prompt_tokens: 300,
             completion_tokens: 150,
             elapsed_ms: 600,
+            ..crate::ollama::ChatStats::default()
         };
         let line = format_usage_footer_line(&turn, &cum, "$0.01");
         assert!(line.contains("prompt=100"));
@@ -7538,11 +7620,13 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 elapsed_ms: 1,
+                ..crate::ollama::ChatStats::default()
             },
             crate::ollama::ChatStats {
                 prompt_tokens: 30,
                 completion_tokens: 40,
                 elapsed_ms: 1,
+                ..crate::ollama::ChatStats::default()
             },
         ];
         let rows = build_usage_rows(&per_turn, None);
@@ -8566,7 +8650,7 @@ mod tests {
 
         let summarized = runtime.block_on(cli.compact(None)).unwrap();
 
-        assert!(summarized > 0);
+        assert!(summarized.summarized_count > 0);
         assert!(cli.memdir.is_empty());
         // SAFETY: process environment mutation is serialized by env_lock.
         unsafe {
@@ -8658,7 +8742,7 @@ mod tests {
                 Arc::clone(&plan_mode),
             ))
             .unwrap();
-        let executor = AIExecutor::new_from_env("qwen3:8b".to_string());
+        let executor = AIExecutor::new_from_env("compaction-fixture-model".to_string());
         let mut cli = ChatCLI::new(
             executor,
             Some(manager),

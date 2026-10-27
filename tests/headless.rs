@@ -313,6 +313,52 @@ fn headless_json_outputs_line_delimited_events() {
     assert_eq!(events[0]["value"], "hello");
     assert_eq!(events[1]["type"], "done");
     assert!(events[1]["stats"].is_object());
+    assert_eq!(events[1]["stats"]["request_count"], 1);
+    assert_eq!(events[1]["stats"]["last_prompt_tokens"], 1);
+    assert!(events[1]["stats"]["wall_clock_ms"].is_number());
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_done_stats_include_agent_run_child_requests() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let cubi_dir = home.path().join(".cubi");
+    fs::create_dir_all(&cubi_dir).unwrap();
+    fs::write(
+        cubi_dir.join("trusted_dirs.json"),
+        serde_json::json!({
+            "trusted_roots": [project.path().canonicalize().unwrap()]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = cubi(home.path())
+        .current_dir(project.path())
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env(
+            "CUBI_FAKE_LLM_TOOL_CALL",
+            r#"{"id":"call_agent","type":"function","function":{"name":"agent_run",
+                "arguments":{"goal":"return a short report","max_steps":2}}}"#,
+        )
+        .args(["--json", "--no-stream", "-p", "delegate once"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let done: serde_json::Value = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["type"] == "done")
+        .expect("terminal done event");
+    assert_eq!(done["stats"]["request_count"], 4);
+    assert_eq!(done["stats"]["prompt_tokens"], 4);
+    assert_eq!(done["stats"]["completion_tokens"], 4);
 }
 
 #[cfg(unix)]

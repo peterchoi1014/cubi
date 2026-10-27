@@ -137,6 +137,8 @@ pub struct InstanceResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass_to_pass_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_stderr_tail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -660,6 +662,7 @@ async fn run_one_instance(
         fail_to_pass_total: None,
         pass_to_pass_passed: None,
         pass_to_pass_total: None,
+        agent_stderr_tail: None,
         error: Some(msg),
     };
 
@@ -733,37 +736,39 @@ async fn run_one_instance(
         .arg("--events")
         .arg(&events_path)
         .env("CUBI_MODEL", model)
-        .env("HOME", home_dir.path())
-        .env("USERPROFILE", home_dir.path())
         .env("CUBI_NO_BANNER", "1")
         .env("CUBI_NO_ONBOARD", "1")
         .current_dir(&repo_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::bench::configure_isolated_child_env(&mut cmd, home_dir.path());
 
-    let cubi_exit_code: Option<i32> = match cmd.spawn() {
-        Ok(mut child) => {
+    let agent_output = match cmd.spawn() {
+        Ok(child) => {
             let timeout = Duration::from_secs(args.time_cap_seconds);
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(exit)) => exit.code(),
-                Ok(Err(e)) => {
-                    let _ = child.kill().await;
+            match crate::bench::capture_child(child, timeout).await {
+                Ok(output) if !output.timed_out => output,
+                Ok(output) => {
+                    return (
+                        empty_pred(String::new()),
+                        InstanceResult {
+                            agent_stderr_tail: (!output.stderr_tail.is_empty())
+                                .then_some(output.stderr_tail),
+                            ..err_result(
+                                format!("exceeded time cap {}s", args.time_cap_seconds),
+                                start.elapsed().as_secs_f64(),
+                                None,
+                            )
+                        },
+                    );
+                }
+                Err(e) => {
                     return (
                         empty_pred(String::new()),
                         err_result(
                             format!("cubi wait error: {e}"),
-                            start.elapsed().as_secs_f64(),
-                            None,
-                        ),
-                    );
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    return (
-                        empty_pred(String::new()),
-                        err_result(
-                            format!("exceeded time cap {}s", args.time_cap_seconds),
                             start.elapsed().as_secs_f64(),
                             None,
                         ),
@@ -782,6 +787,25 @@ async fn run_one_instance(
             );
         }
     };
+    let cubi_exit_code = agent_output.exit_code;
+    let agent_stderr_tail =
+        (!agent_output.stderr_tail.is_empty()).then_some(agent_output.stderr_tail);
+    if crate::bench::infrastructure_exit(cubi_exit_code) {
+        return (
+            empty_pred(String::new()),
+            InstanceResult {
+                agent_stderr_tail,
+                ..err_result(
+                    format!(
+                        "agent infrastructure failure (exit code {:?})",
+                        cubi_exit_code
+                    ),
+                    start.elapsed().as_secs_f64(),
+                    cubi_exit_code,
+                )
+            },
+        );
+    }
 
     // Capture the agent's edit BEFORE any test patch is applied.
     let patch = match capture_diff(&repo_dir).await {
@@ -810,6 +834,7 @@ async fn run_one_instance(
         fail_to_pass_total: None,
         pass_to_pass_passed: None,
         pass_to_pass_total: None,
+        agent_stderr_tail,
         error: None,
     };
 
@@ -1119,6 +1144,7 @@ SKIPPED [1] tests/test_foo.py:12: needs network
             fail_to_pass_total: None,
             pass_to_pass_passed: None,
             pass_to_pass_total: None,
+            agent_stderr_tail: None,
             error: None,
         };
         let results = vec![

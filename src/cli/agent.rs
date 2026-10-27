@@ -84,6 +84,12 @@ impl ChatCLI {
         exit_code::err(ExitCode::Tool, format!("cubi: {message}"))
     }
 
+    fn record_turn_stats(&mut self, stats: &mut ChatStats, started: std::time::Instant) {
+        stats.wall_clock_ms = Some(started.elapsed().as_millis() as u64);
+        self.session_stats.add(stats);
+        self.usage_history.push(stats.clone());
+    }
+
     fn meta_tool_blocked_in_subagent_mode(&self, tool_name: &str) -> Option<String> {
         if !self.subprocess_subagent_mode {
             return None;
@@ -216,9 +222,10 @@ impl ChatCLI {
                 .await
                 {
                     Ok(report) => {
+                        self.pending_turn_stats.add(&report.stats);
                         let done_msg = format!("  {} subagent done", "↳".bright_magenta());
                         self.emit_status(done_msg);
-                        ToolOutcome::success(report)
+                        ToolOutcome::success(report.output)
                     }
                     Err(e) => ToolOutcome::error(format!("[tool error] subagent failed: {e}")),
                 }
@@ -287,6 +294,7 @@ impl ChatCLI {
     /// assistant message is appended to history, single-turn system hints
     /// are stripped, and the session is checkpointed.
     pub(super) async fn agent_turn(&mut self, turn_start: usize) -> Result<()> {
+        let turn_started = std::time::Instant::now();
         // Reset the cooperative TUI cancel flag at the start of each turn so a
         // stale Ctrl-C from a prior turn can't abort this one. No-op for the
         // non-TUI path (the flag is only ever set by the TUI render task).
@@ -358,13 +366,36 @@ impl ChatCLI {
             // Tool results can substantially grow history, so both
             // compaction and the hard request budget are checked before every
             // provider call rather than only at the start of the user turn.
-            self.maybe_auto_compact(tools.as_deref()).await?;
-            if self.check_token_budget(turn_start, tools.as_deref())? {
-                return Ok(());
+            let compact_stats = match self.maybe_auto_compact(tools.as_deref()).await {
+                Ok(stats) => stats,
+                Err(error) => {
+                    turn_stats.add_unreported_request();
+                    self.record_turn_stats(&mut turn_stats, turn_started);
+                    return Err(error);
+                }
+            };
+            turn_stats.add(&compact_stats);
+            match self.check_token_budget(turn_start, tools.as_deref()) {
+                Ok(true) => {
+                    if !turn_stats.is_empty() {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if !turn_stats.is_empty() {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
+                    }
+                    return Err(error);
+                }
             }
             if let Some(deadline) = subprocess_deadline {
                 if let Some(cap) = subprocess_time_cap {
                     if tokio::time::Instant::now() >= deadline {
+                        if !turn_stats.is_empty() {
+                            self.record_turn_stats(&mut turn_stats, turn_started);
+                        }
                         return Err(self.subprocess_time_cap_error(
                             cap,
                             step,
@@ -456,6 +487,8 @@ impl ChatCLI {
             let got_token = self.ui.got_token();
 
             if hit_time_cap {
+                turn_stats.add_unreported_request();
+                self.record_turn_stats(&mut turn_stats, turn_started);
                 if got_token && headless_mode && !json_enabled {
                     println!();
                 }
@@ -474,6 +507,8 @@ impl ChatCLI {
             // steps in this turn (if any) survive: use `/rewind` to undo
             // them.
             let Some(stream_result) = outcome else {
+                turn_stats.add_unreported_request();
+                self.record_turn_stats(&mut turn_stats, turn_started);
                 if got_token && !self.tui_active {
                     // Move past any partial output.
                     println!();
@@ -505,7 +540,14 @@ impl ChatCLI {
                 }
                 return Ok(());
             };
-            let (msg, stats) = stream_result?;
+            let (msg, stats) = match stream_result {
+                Ok(result) => result,
+                Err(error) => {
+                    turn_stats.add_unreported_request();
+                    self.record_turn_stats(&mut turn_stats, turn_started);
+                    return Err(error);
+                }
+            };
             turn_stats.add(&stats);
 
             if got_token {
@@ -575,6 +617,7 @@ impl ChatCLI {
                     any_output = true;
                 }
                 let window = self.effective_context_window();
+                turn_stats.wall_clock_ms = Some(turn_started.elapsed().as_millis() as u64);
                 let done = if self.subprocess_subagent_mode {
                     subprocess_done_event(&turn_stats, window, step + 1)
                 } else {
@@ -768,6 +811,7 @@ impl ChatCLI {
                     sp.finish().await;
                     r
                 };
+                turn_stats.add(&std::mem::take(&mut self.pending_turn_stats));
                 let Some(tool_outcome) = tool_outcome else {
                     // Close the framed tool block opened by `tool_started`
                     // above with a failure status (no-op for LineSink/NullSink,
@@ -791,6 +835,7 @@ impl ChatCLI {
                     }
                     self.cancel_tool_calls(turn_start, &calls, idx);
                     if hit_time_cap {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         let cap = subprocess_time_cap.unwrap_or(Duration::from_millis(0));
                         return Err(self.subprocess_time_cap_error(
                             cap,
@@ -800,11 +845,13 @@ impl ChatCLI {
                         ));
                     }
                     if headless_mode {
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         return Err(exit_code::err(
                             ExitCode::Cancelled,
                             "cubi: cancelled (Ctrl-C)",
                         ));
                     }
+                    self.record_turn_stats(&mut turn_stats, turn_started);
                     return Ok(());
                 };
                 let is_error = tool_outcome.is_failure();
@@ -868,6 +915,7 @@ impl ChatCLI {
                             result_text.clone(),
                             call.id.clone(),
                         ));
+                        self.record_turn_stats(&mut turn_stats, turn_started);
                         return Err(exit_code::err(
                             ExitCode::Tool,
                             format!(
@@ -936,8 +984,7 @@ impl ChatCLI {
         }
 
         if !completed {
-            self.session_stats.add(&turn_stats);
-            self.usage_history.push(turn_stats);
+            self.record_turn_stats(&mut turn_stats, turn_started);
             return Err(exit_code::err(
                 ExitCode::Incomplete,
                 format!(
@@ -955,10 +1002,7 @@ impl ChatCLI {
         }
         // Roll the per-turn usage into the run-total. Done last so an early
         // cancel return (above) doesn't poison the counter.
-        self.session_stats.add(&turn_stats);
-        // Retain a copy of the per-turn stats so `/usage` and the optional
-        // usage footer can render without re-querying the provider.
-        self.usage_history.push(turn_stats.clone());
+        self.record_turn_stats(&mut turn_stats, turn_started);
         // Optional one-line usage footer (suppressed in headless/JSON and
         // when `--quiet` is set).
         if self.usage_footer_enabled
@@ -982,11 +1026,7 @@ impl ChatCLI {
             sink.emit(
                 "turn_end",
                 serde_json::json!({
-                    "usage": {
-                        "prompt_tokens": turn_stats.prompt_tokens,
-                        "completion_tokens": turn_stats.completion_tokens,
-                        "elapsed_ms": turn_stats.elapsed_ms,
-                    },
+                    "usage": turn_stats,
                     "model": self.executor.get_model(),
                 }),
             );
@@ -1178,7 +1218,7 @@ impl ChatCLI {
         } else {
             crate::consensus::run(req, &self.executor, &sink).await?
         };
-        self.session_stats.add(&result.aggregate_stats());
+        self.pending_turn_stats.add(&result.aggregate_stats());
         self.emit_status(format!(
             "  {} consensus winner: {} — {}",
             "↳".bright_magenta(),
@@ -1223,6 +1263,7 @@ mod tests {
             prompt_tokens: 6,
             completion_tokens: 7,
             elapsed_ms: 8,
+            ..ChatStats::default()
         };
 
         let event = subprocess_done_event(&stats, Some(200), 1);

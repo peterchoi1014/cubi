@@ -192,6 +192,14 @@ struct OaiUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OaiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OaiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,6 +647,14 @@ impl OpenAiClient {
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cached_prompt_tokens: oai_resp
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens),
+            request_count: 1,
+            last_prompt_tokens: oai_resp.usage.as_ref().map(|usage| usage.prompt_tokens),
+            ..ChatStats::default()
         };
         Ok((
             crate::ollama::normalize_assistant_message(
@@ -778,6 +794,7 @@ impl OpenAiClient {
         let mut usage: Option<OaiUsage> = None;
         let mut terminal_event_seen = false;
         let mut finish_reason: Option<String> = None;
+        let mut time_to_first_token_ms = None;
         // Strips Qwen3-style <think>…</think> reasoning blocks from
         // streamed tokens before forwarding to the UI and recording.
         let mut stripper = crate::thinking_filter::ThinkStripper::new();
@@ -788,6 +805,7 @@ impl OpenAiClient {
                                usage: &mut Option<OaiUsage>,
                                terminal_event_seen: &mut bool,
                                finish_reason: &mut Option<String>,
+                               time_to_first_token_ms: &mut Option<u64>,
                                stripper: &mut crate::thinking_filter::ThinkStripper|
          -> Result<()> {
             let line = std::str::from_utf8(line).context("OpenAI stream returned invalid UTF-8")?;
@@ -815,6 +833,8 @@ impl OpenAiClient {
                     if !text.is_empty() {
                         let clean = stripper.feed(text);
                         if !clean.is_empty() {
+                            time_to_first_token_ms
+                                .get_or_insert_with(|| started.elapsed().as_millis() as u64);
                             on_token(&clean);
                             content.push_str(&clean);
                         }
@@ -857,6 +877,7 @@ impl OpenAiClient {
                     &mut usage,
                     &mut terminal_event_seen,
                     &mut finish_reason,
+                    &mut time_to_first_token_ms,
                     &mut stripper,
                 )?;
             }
@@ -870,6 +891,7 @@ impl OpenAiClient {
                 &mut usage,
                 &mut terminal_event_seen,
                 &mut finish_reason,
+                &mut time_to_first_token_ms,
                 &mut stripper,
             )?;
         }
@@ -913,6 +935,14 @@ impl OpenAiClient {
             prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
             completion_tokens: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            time_to_first_token_ms,
+            cached_prompt_tokens: usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens),
+            request_count: 1,
+            last_prompt_tokens: usage.as_ref().map(|usage| usage.prompt_tokens),
+            ..ChatStats::default()
         };
 
         Ok((
@@ -1023,6 +1053,9 @@ fn fake_stats() -> ChatStats {
         prompt_tokens: 1,
         completion_tokens: 1,
         elapsed_ms: 1,
+        request_count: 1,
+        last_prompt_tokens: Some(1),
+        ..ChatStats::default()
     }
 }
 
@@ -1275,6 +1308,61 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn openai_usage_preserves_cached_prompt_tokens_when_reported() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 13}
+            }
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, String::new());
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.prompt_tokens, 21);
+        assert_eq!(stats.completion_tokens, 8);
+        assert_eq!(stats.cached_prompt_tokens, Some(13));
+        assert_eq!(stats.last_prompt_tokens, Some(21));
+        assert_eq!(stats.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn openai_usage_leaves_cached_prompt_tokens_unknown_when_absent() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 8
+            }
+        });
+        let (base_url, server) =
+            serve_chunked("application/json", vec![response.to_string().into_bytes()]).await;
+        let client = OpenAiClient::new(base_url, String::new());
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.cached_prompt_tokens, None);
     }
 
     #[tokio::test]

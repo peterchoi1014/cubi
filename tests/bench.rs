@@ -66,6 +66,7 @@ fn bench_rejects_unknown_flag() {
 #[cfg(not(windows))]
 #[test]
 fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
+    let leaked_cubi_home = tempfile::tempdir().unwrap();
     Command::cargo_bin("cubi")
         .unwrap()
         .args([
@@ -76,6 +77,7 @@ fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
             "fake-model",
             "--json",
         ])
+        .env("CUBI_HOME", leaked_cubi_home.path())
         .env("CUBI_FAKE_LLM", "1")
         .env(
             "CUBI_FAKE_LLM_TOOL_CALL",
@@ -86,6 +88,95 @@ fn bench_scores_a_pass_when_the_agent_fixes_the_task() {
         .success()
         .stdout(contains("\"status\": \"pass\""))
         .stdout(contains("\"score_pct\": 100.0"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bench_reports_verifier_timeout_as_infrastructure_error() {
+    let tasks = tempfile::tempdir().unwrap();
+    let task = tasks.path().join("timeout-task");
+    std::fs::create_dir_all(task.join("repo")).unwrap();
+    std::fs::write(
+        task.join("task.toml"),
+        r#"id = "timeout-task"
+difficulty = "easy"
+description = "timeout fixture"
+prompt = "finish"
+time_cap_seconds = 10
+step_cap = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(task.join("verify.sh"), "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+
+    Command::cargo_bin("cubi")
+        .unwrap()
+        .args(["bench", "--task", "timeout-task", "--tasks-root"])
+        .arg(tasks.path())
+        .args(["--model", "fake-model", "--json"])
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .env("CUBI_BENCH_VERIFY_TIMEOUT_SECS", "1")
+        .assert()
+        .code(2)
+        .stdout(contains("\"status\": \"error\""))
+        .stdout(contains("verifier timed out"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bench_bounds_captured_verifier_diagnostics() {
+    let tasks = tempfile::tempdir().unwrap();
+    let task = tasks.path().join("diagnostic-task");
+    std::fs::create_dir_all(task.join("repo")).unwrap();
+    std::fs::write(
+        task.join("task.toml"),
+        r#"id = "diagnostic-task"
+difficulty = "easy"
+description = "diagnostic fixture"
+prompt = "finish"
+time_cap_seconds = 10
+step_cap = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        task.join("verify.sh"),
+        "#!/bin/sh\n\
+         awk 'BEGIN { for (i = 0; i < 5000; i++) printf \"o\"; print \"OUT_END\" }'\n\
+         awk 'BEGIN { for (i = 0; i < 5000; i++) printf \"e\"; print \"ERR_END\" }' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("cubi")
+        .unwrap()
+        .args(["bench", "--task", "diagnostic-task", "--tasks-root"])
+        .arg(tasks.path())
+        .args(["--model", "fake-model", "--json"])
+        .env("CUBI_FAKE_LLM", "1")
+        .env("CUBI_FAKE_LLM_RESPONSE", "done")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let result = &summary["per_task"][0];
+    let stdout = result["verifier_stdout_tail"].as_str().unwrap();
+    let stderr = result["verifier_stderr_tail"].as_str().unwrap();
+    assert!(
+        stdout.len() <= 4096,
+        "stdout tail was {} bytes",
+        stdout.len()
+    );
+    assert!(
+        stderr.len() <= 4096,
+        "stderr tail was {} bytes",
+        stderr.len()
+    );
+    assert!(stdout.ends_with("OUT_END\n"));
+    assert!(stderr.ends_with("ERR_END\n"));
 }
 
 /// Negative control for the test above: an agent that only *reads* the file

@@ -1148,6 +1148,7 @@ mod render_loop_tests {
                     prompt_tokens: 1,
                     completion_tokens: 2,
                     elapsed_ms: 3,
+                    ..ChatStats::default()
                 },
                 window: Some(8000),
             })

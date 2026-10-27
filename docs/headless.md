@@ -26,6 +26,17 @@ text.
 
 Exit codes: `0` ok, `2` usage/config, `10` model/API, `11` tool failure, `12` context-window budget exceeded, `13` network (connect refused / DNS / TLS), `14` incomplete (the agent stopped before a final reply), `130` cancelled.
 
+The terminal `done` event carries a turn aggregate in `stats`. Existing
+`prompt_tokens`, `completion_tokens`, and `elapsed_ms` fields retain their
+meaning. Additive fields include `request_count`, `wall_clock_ms`,
+`last_prompt_tokens`, client-measured `time_to_first_token_ms`, Ollama-native
+`load_duration_ms`, `prompt_eval_duration_ms`, and `eval_duration_ms`, plus
+OpenAI-compatible `cached_prompt_tokens`. Provider-specific values are `null`
+when the provider did not report them. The aggregate includes tool-loop
+follow-ups, automatic compaction calls, and in-process `agent_run` children.
+Top-level `utilization_pct` uses `last_prompt_tokens` against the effective
+window rather than cumulative prompt tokens.
+
 ## Error events
 
 The `error` JSON event carries a `message` plus optional `kind`, `exit_code`,
@@ -151,8 +162,10 @@ Event types currently emitted:
 - `mcp_status_change` — `{type, ts, before, after}` where each side is
   `{ok, failed, not_loaded}`. Emitted when the agent loop detects an
   MCP server transition during a turn.
-- `turn_end` — `{type, ts, usage, model}`. `usage` carries
-  `{prompt_tokens, completion_tokens, elapsed_ms}`.
+- `turn_end` — `{type, ts, usage, model}`. `usage` carries the same complete
+  turn aggregate described for terminal `done` events, including request
+  count, wall-clock time, optional provider timings, and last-request prompt
+  occupancy.
 - `consensus_start` — `{type, ts, goal, models, strategy,
   max_steps_per_subagent}`. Emitted
   before any subagent dispatches when the `consensus_run` meta-tool

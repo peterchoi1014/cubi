@@ -318,8 +318,8 @@ pub async fn run_subagent(
     approved_tools: HashSet<String>,
     goal: &str,
     requested_max_steps: usize,
-) -> Result<String> {
-    Ok(run_subagent_with_model(
+) -> Result<SubagentRunResult> {
+    run_subagent_with_model(
         executor,
         mcp,
         access,
@@ -328,8 +328,7 @@ pub async fn run_subagent(
         goal,
         requested_max_steps,
     )
-    .await?
-    .output)
+    .await
 }
 
 /// Runs the same subagent loop as [`run_subagent`] but optionally overrides

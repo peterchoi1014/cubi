@@ -341,6 +341,15 @@ pub struct ChatResponse {
     /// prompt eval, and generation.
     #[serde(default)]
     pub total_duration: Option<u64>,
+    /// Time spent loading the model, in nanoseconds.
+    #[serde(default)]
+    pub load_duration: Option<u64>,
+    /// Time spent evaluating the prompt, in nanoseconds.
+    #[serde(default)]
+    pub prompt_eval_duration: Option<u64>,
+    /// Time spent generating the completion, in nanoseconds.
+    #[serde(default)]
+    pub eval_duration: Option<u64>,
 }
 
 /// One streaming chunk from `/api/chat` when `stream: true`. Each NDJSON
@@ -362,16 +371,31 @@ pub struct ChatStreamChunk {
     /// End-to-end duration in nanoseconds. Final chunk only.
     #[serde(default)]
     pub total_duration: Option<u64>,
+    #[serde(default)]
+    pub load_duration: Option<u64>,
+    #[serde(default)]
+    pub prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    pub eval_duration: Option<u64>,
 }
 
 /// Per-call inference statistics. Populated from whatever the provider
-/// returned (Ollama: `eval_count`/`prompt_eval_count`; OpenAI: `usage`). All
-/// fields default to zero so they can be summed without optionality noise.
+/// returned (Ollama: native counts/durations; OpenAI: `usage`). Existing
+/// token and elapsed fields remain additive counters. Provider-specific
+/// values stay `None` when they were not reported.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub elapsed_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
+    pub load_duration_ms: Option<u64>,
+    pub prompt_eval_duration_ms: Option<u64>,
+    pub eval_duration_ms: Option<u64>,
+    pub cached_prompt_tokens: Option<u64>,
+    pub request_count: u64,
+    pub wall_clock_ms: Option<u64>,
+    pub last_prompt_tokens: Option<u64>,
 }
 
 impl ChatStats {
@@ -382,16 +406,58 @@ impl ChatStats {
 
     /// Accumulates `other` into `self`. Used for session-level totals.
     pub fn add(&mut self, other: &Self) {
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.elapsed_ms += other.elapsed_ms;
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
+        add_optional(
+            &mut self.time_to_first_token_ms,
+            other.time_to_first_token_ms,
+        );
+        add_optional(&mut self.load_duration_ms, other.load_duration_ms);
+        add_optional(
+            &mut self.prompt_eval_duration_ms,
+            other.prompt_eval_duration_ms,
+        );
+        add_optional(&mut self.eval_duration_ms, other.eval_duration_ms);
+        add_optional(&mut self.cached_prompt_tokens, other.cached_prompt_tokens);
+        self.request_count = self.request_count.saturating_add(other.request_count);
+        add_optional(&mut self.wall_clock_ms, other.wall_clock_ms);
+        if other.last_prompt_tokens.is_some() {
+            self.last_prompt_tokens = other.last_prompt_tokens;
+        }
+    }
+
+    /// Records a request that ended before provider statistics were available.
+    pub fn add_unreported_request(&mut self) {
+        self.request_count = self.request_count.saturating_add(1);
     }
 
     /// True when no field was populated. Used to decide whether to print a
     /// footer (skip if the provider returned nothing useful).
     pub fn is_empty(&self) -> bool {
-        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.elapsed_ms == 0
+        self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.elapsed_ms == 0
+            && self.time_to_first_token_ms.is_none()
+            && self.load_duration_ms.is_none()
+            && self.prompt_eval_duration_ms.is_none()
+            && self.eval_duration_ms.is_none()
+            && self.cached_prompt_tokens.is_none()
+            && self.request_count == 0
+            && self.wall_clock_ms.is_none()
     }
+}
+
+fn add_optional(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
+fn nanos_to_millis(value: Option<u64>) -> Option<u64> {
+    value.map(|nanoseconds| nanoseconds / 1_000_000)
 }
 
 pub struct OllamaClient {
@@ -505,10 +571,15 @@ impl OllamaClient {
                 let stats = ChatStats {
                     prompt_tokens: chat_response.prompt_eval_count.unwrap_or(0),
                     completion_tokens: chat_response.eval_count.unwrap_or(0),
-                    elapsed_ms: chat_response
-                        .total_duration
-                        .map(|ns| ns / 1_000_000)
-                        .unwrap_or(0),
+                    elapsed_ms: nanos_to_millis(chat_response.total_duration).unwrap_or(0),
+                    load_duration_ms: nanos_to_millis(chat_response.load_duration),
+                    prompt_eval_duration_ms: nanos_to_millis(
+                        chat_response.prompt_eval_duration,
+                    ),
+                    eval_duration_ms: nanos_to_millis(chat_response.eval_duration),
+                    request_count: 1,
+                    last_prompt_tokens: chat_response.prompt_eval_count,
+                    ..ChatStats::default()
                 };
 
                 Ok((
@@ -550,6 +621,7 @@ impl OllamaClient {
             think: current_think(),
             keep_alive: current_keep_alive(),
         };
+        let started = std::time::Instant::now();
         let response = with_retry(3, || {
             let request = request.clone();
             async move {
@@ -580,6 +652,7 @@ impl OllamaClient {
         let mut final_msg: Option<Message> = None;
         let mut tool_calls = Vec::new();
         let mut stats = ChatStats::default();
+        let mut time_to_first_token_ms = None;
         let mut done_reason: Option<String> = None;
         // Strips Qwen3-style <think>…</think> reasoning blocks from
         // both the tokens we forward to the UI and the accumulated
@@ -593,6 +666,7 @@ impl OllamaClient {
                                final_msg: &mut Option<Message>,
                                tool_calls: &mut Vec<ToolCall>,
                                stats: &mut ChatStats,
+                               time_to_first_token_ms: &mut Option<u64>,
                                done_reason: &mut Option<String>,
                                stripper: &mut ThinkStripper|
          -> Result<()> {
@@ -609,6 +683,8 @@ impl OllamaClient {
             if !message.content.is_empty() {
                 let clean = stripper.feed(&message.content);
                 if !clean.is_empty() {
+                    time_to_first_token_ms
+                        .get_or_insert_with(|| started.elapsed().as_millis() as u64);
                     on_token(&clean);
                     content.push_str(&clean);
                 }
@@ -625,7 +701,12 @@ impl OllamaClient {
                 // Capture provider stats from the terminal chunk.
                 stats.prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
                 stats.completion_tokens = parsed.eval_count.unwrap_or(0);
-                stats.elapsed_ms = parsed.total_duration.map(|ns| ns / 1_000_000).unwrap_or(0);
+                stats.elapsed_ms = nanos_to_millis(parsed.total_duration).unwrap_or(0);
+                stats.load_duration_ms = nanos_to_millis(parsed.load_duration);
+                stats.prompt_eval_duration_ms = nanos_to_millis(parsed.prompt_eval_duration);
+                stats.eval_duration_ms = nanos_to_millis(parsed.eval_duration);
+                stats.request_count = 1;
+                stats.last_prompt_tokens = parsed.prompt_eval_count;
                 let tail = stripper.flush();
                 if !tail.is_empty() {
                     on_token(&tail);
@@ -652,6 +733,7 @@ impl OllamaClient {
                     &mut final_msg,
                     &mut tool_calls,
                     &mut stats,
+                    &mut time_to_first_token_ms,
                     &mut done_reason,
                     &mut stripper,
                 )?;
@@ -670,6 +752,7 @@ impl OllamaClient {
                 &mut final_msg,
                 &mut tool_calls,
                 &mut stats,
+                &mut time_to_first_token_ms,
                 &mut done_reason,
                 &mut stripper,
             )?;
@@ -686,6 +769,7 @@ impl OllamaClient {
                 msg.content
             );
         }
+        stats.time_to_first_token_ms = time_to_first_token_ms;
         Ok((msg, stats))
     }
 
@@ -851,6 +935,76 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments["command"], "pwd");
+    }
+
+    #[tokio::test]
+    async fn response_stats_preserve_native_timings_when_reported() {
+        let response = serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done": true,
+            "prompt_eval_count": 12,
+            "eval_count": 5,
+            "total_duration": 9_000_000,
+            "load_duration": 1_000_000,
+            "prompt_eval_duration": 2_000_000,
+            "eval_duration": 3_000_000
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.prompt_tokens, 12);
+        assert_eq!(stats.completion_tokens, 5);
+        assert_eq!(stats.elapsed_ms, 9);
+        assert_eq!(stats.load_duration_ms, Some(1));
+        assert_eq!(stats.prompt_eval_duration_ms, Some(2));
+        assert_eq!(stats.eval_duration_ms, Some(3));
+        assert_eq!(stats.request_count, 1);
+        assert_eq!(stats.last_prompt_tokens, Some(12));
+    }
+
+    #[tokio::test]
+    async fn response_stats_leave_unreported_native_timings_unknown() {
+        let response = serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![response.to_string().into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let (_, stats) = client
+            .chat_with_tools("test-model", vec![], None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.load_duration_ms, None);
+        assert_eq!(stats.prompt_eval_duration_ms, None);
+        assert_eq!(stats.eval_duration_ms, None);
+        assert_eq!(stats.last_prompt_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn streaming_stats_measure_time_to_first_token_client_side() {
+        let body = serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "done": true
+        });
+        let (base_url, server) = serve_chunked(vec![format!("{}\n", body).into_bytes()]).await;
+        let client = OllamaClient::with_base_url(base_url);
+
+        let (_, stats) = client
+            .chat_stream("test-model", vec![], None, |_| {})
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert!(stats.time_to_first_token_ms.is_some());
     }
 
     #[tokio::test]

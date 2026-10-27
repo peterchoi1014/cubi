@@ -349,13 +349,19 @@ pub(super) fn print_stats_footer(stats: &ChatStats, window: Option<usize>) {
             parts.push(format!("{:.1} tok/s", tps));
         }
     }
+    if stats.request_count > 0 {
+        parts.push(format!("{} request(s)", stats.request_count));
+    }
+    if let Some(wall_ms) = stats.wall_clock_ms {
+        parts.push(format!("{} ms wall", wall_ms));
+    }
     if parts.is_empty() {
         return;
     }
     let mut line = parts.join(" · ");
     if let Some(w) = window {
-        if stats.prompt_tokens > 0 && w > 0 {
-            let pct = utilization_pct(stats.prompt_tokens, w);
+        if let Some(prompt_tokens) = stats.last_prompt_tokens.filter(|_| w > 0) {
+            let pct = utilization_pct(prompt_tokens, w);
             line.push_str(&format!(" ({}% of {}-token window)", pct, w));
         }
     }
