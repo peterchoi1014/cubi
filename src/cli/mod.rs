@@ -2992,7 +2992,7 @@ impl ChatCLI {
         }
     }
 
-    fn handle_trust(&self, args: &str) {
+    fn handle_trust(&mut self, args: &str) {
         let cwd = match std::env::current_dir() {
             Ok(c) => c,
             Err(e) => {
@@ -3000,13 +3000,17 @@ impl ChatCLI {
                 return;
             }
         };
+        self.handle_trust_at(args, &cwd);
+    }
+
+    fn handle_trust_at(&mut self, args: &str, cwd: &Path) {
         let mut perms = self
             .permissions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = match args.trim() {
-            "" | "add" => perms.trust_dir(&cwd).map(|added| (added, true)),
-            "revoke" | "remove" | "rm" => perms.revoke_dir(&cwd).map(|removed| (removed, false)),
+            "" | "add" => perms.trust_dir(cwd).map(|added| (added, true)),
+            "revoke" | "remove" | "rm" => perms.revoke_dir(cwd).map(|removed| (removed, false)),
             other => {
                 eprintln!(
                     "{} Unknown argument '{}'. Usage: /trust [revoke]",
@@ -3046,6 +3050,7 @@ impl ChatCLI {
                         cwd.display().to_string().bright_cyan()
                     );
                 }
+                self.hooks = HookRegistry::load_for_dir(&perms, cwd);
             }
             Err(e) => eprintln!("{} {}", "Error:".bright_red(), e),
         }
@@ -7779,6 +7784,186 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             FileJournal::default(),
         )
+    }
+
+    #[cfg(unix)]
+    struct TrustHookTestHost {
+        executions: usize,
+    }
+
+    #[cfg(unix)]
+    impl tool_dispatch::ToolCallHost for TrustHookTestHost {
+        fn approve_tool(&mut self, _tool_name: &str) -> bool {
+            true
+        }
+
+        fn execute_authorized<'a>(
+            &'a mut self,
+            _call: &'a crate::ollama::ToolCall,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = tool_dispatch::ToolOutcome> + 'a>>
+        {
+            Box::pin(async move {
+                self.executions += 1;
+                tool_dispatch::ToolOutcome::success("ok")
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_trust_hook(path: &Path, marker: &Path, label: &str) {
+        std::fs::create_dir_all(path.parent().expect("hook config parent")).unwrap();
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "hooks": [{
+                    "event": "PreToolUse",
+                    "match_tool": "read_file",
+                    "command": format!("printf '{}\\n' >> '{}'", label, marker.display())
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn exercise_parent_and_subagent_dispatch(
+        cli: &mut ChatCLI,
+        project: &Path,
+        marker: &Path,
+        expected_label: &str,
+    ) {
+        let call = crate::ollama::ToolCall {
+            id: Some("trust-hook-parent".to_string()),
+            call_type: None,
+            function: crate::ollama::ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": project.join("fixture.txt")}),
+            },
+        };
+        let access = tool_dispatch::ToolAccess {
+            hooks: cli.hooks.clone(),
+            policy: Policy::default(),
+            permissions: Arc::clone(&cli.permissions),
+        };
+        let mut host = TrustHookTestHost { executions: 0 };
+
+        let parent_outcome = tool_dispatch::dispatch_tool(&access, &mut host, &call).await;
+        assert!(!parent_outcome.is_failure());
+        assert_eq!(host.executions, 1);
+
+        let subagent = agent_loop::run_subagent(
+            &cli.executor,
+            &mut cli.mcp_manager,
+            access,
+            HashSet::from(["read_file".to_string()]),
+            "read the fixture",
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(subagent.steps_used, 2);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            format!("{expected_label}\n{expected_label}\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_changes_reload_hooks_for_parent_and_subagent_dispatch() {
+        let _guard = env_lock().lock().expect("env lock not poisoned");
+        let _llm_guard = crate::llm::ENV_LOCK.blocking_lock();
+        crate::compat::test_env::with_cubi_home(|cubi_home, _other_home| {
+            let _restore = crate::compat::test_env::EnvRestore::capture(&[
+                "CUBI_FAKE_LLM",
+                "CUBI_FAKE_LLM_RESPONSE",
+                "CUBI_FAKE_LLM_TOOL_CALL",
+                "CUBI_FAKE_LLM_TOOL_CALL_REPEAT",
+            ]);
+            let project = tempfile::tempdir().unwrap();
+            let local_marker = project.path().join("local-hooks.log");
+            let global_marker = project.path().join("global-hooks.log");
+            write_trust_hook(
+                &project.path().join(".cubi").join("hooks.json"),
+                &local_marker,
+                "local",
+            );
+            write_trust_hook(
+                &cubi_home.join(".cubi").join("hooks.json"),
+                &global_marker,
+                "global",
+            );
+            std::fs::write(project.path().join("fixture.txt"), "fixture").unwrap();
+            let fake_call = serde_json::json!({
+                "function": {
+                    "name": "read_file",
+                    "arguments": {"path": project.path().join("fixture.txt")}
+                }
+            });
+            // SAFETY: both environment locks are held through fixture restoration.
+            unsafe {
+                std::env::set_var("CUBI_FAKE_LLM", "1");
+                std::env::set_var("CUBI_FAKE_LLM_RESPONSE", "done");
+                std::env::set_var("CUBI_FAKE_LLM_TOOL_CALL", fake_call.to_string());
+                std::env::remove_var("CUBI_FAKE_LLM_TOOL_CALL_REPEAT");
+            }
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let permissions = Arc::new(Mutex::new(Permissions::default()));
+                let plan_mode = Arc::new(AtomicBool::new(false));
+                let manager = McpManager::new(Arc::clone(&permissions), Arc::clone(&plan_mode))
+                    .await
+                    .unwrap();
+                let executor = AIExecutor::new_from_env("test-model".to_string());
+                let mut cli = ChatCLI::new(
+                    executor,
+                    Some(manager),
+                    Arc::clone(&permissions),
+                    plan_mode,
+                    FileJournal::default(),
+                );
+                cli.hooks = HookRegistry::load_for_dir(
+                    &permissions.lock().unwrap_or_else(|p| p.into_inner()),
+                    project.path(),
+                );
+                assert!(
+                    cli.hooks.skipped_untrusted_project(),
+                    "fixture must start with the global fallback loaded"
+                );
+
+                cli.handle_trust_at("add", project.path());
+                exercise_parent_and_subagent_dispatch(
+                    &mut cli,
+                    project.path(),
+                    &local_marker,
+                    "local",
+                )
+                .await;
+                assert!(
+                    !global_marker.exists(),
+                    "the stale global fallback must not handle post-trust dispatch"
+                );
+
+                cli.handle_trust_at("revoke", project.path());
+                exercise_parent_and_subagent_dispatch(
+                    &mut cli,
+                    project.path(),
+                    &global_marker,
+                    "global",
+                )
+                .await;
+                assert_eq!(
+                    std::fs::read_to_string(&local_marker).unwrap(),
+                    "local\nlocal\n",
+                    "revoked project hooks must not handle later dispatch",
+                );
+            });
+        });
     }
 
     #[test]

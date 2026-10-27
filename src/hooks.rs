@@ -140,16 +140,28 @@ impl HookRegistry {
     /// Loads hooks from project-local and global config files.
     /// Project-local hooks are prepended (run first).
     pub fn load(permissions: &crate::permissions::Permissions) -> Self {
+        let cwd = std::env::current_dir().ok();
+        Self::load_for_optional_dir(permissions, cwd.as_deref())
+    }
+
+    pub(crate) fn load_for_dir(permissions: &crate::permissions::Permissions, cwd: &Path) -> Self {
+        Self::load_for_optional_dir(permissions, Some(cwd))
+    }
+
+    fn load_for_optional_dir(
+        permissions: &crate::permissions::Permissions,
+        cwd: Option<&Path>,
+    ) -> Self {
         let mut hooks = Vec::new();
 
         // Project-local: .cubi/hooks.json in cwd
         // If a local config exists, it overrides the global config entirely.
         let mut found_local = false;
         let mut skipped_untrusted_project = false;
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = cwd {
             let local_path = cwd.join(".cubi").join("hooks.json");
             if local_path.exists() {
-                if permissions.contains(&cwd) {
+                if permissions.contains(cwd) {
                     if let Some(cfg) = Self::load_file(&local_path) {
                         hooks.extend(cfg.hooks);
                         found_local = true;
