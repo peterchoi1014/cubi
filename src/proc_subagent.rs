@@ -27,14 +27,14 @@ pub struct ProcSubagentResult {
     pub timed_out: bool,
     /// Number of `tool_call` events observed in the subprocess JSONL stream.
     pub tool_calls: usize,
-    /// Token usage parsed from the subprocess's final `"done"` event.
-    /// Zero when the subprocess never emitted `done`.
+    /// Token usage parsed from the subprocess's terminal `"done"` or `"error"` event.
+    /// Zero when the subprocess emitted neither.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     /// Number of agent-loop steps reported by the subprocess JSON stream.
-    /// Modern children emit an exact top-level `steps_used` on `done`; legacy
-    /// streams fall back to one `tool_call` event per intermediate step plus a
-    /// final step for the report.
+    /// Modern children emit an exact top-level `steps_used` on the terminal
+    /// event; legacy streams fall back to one `tool_call` event per intermediate
+    /// step plus a final step for the report.
     pub steps_used: usize,
     /// Stderr is intentionally discarded for isolated subprocesses, so this
     /// remains empty for subprocess-backed subagents.
@@ -466,10 +466,23 @@ fn parse_subagent_stream(stdout: &str) -> ParsedSubagentStream {
             continue;
         };
         saw_json_event = true;
+        let event_type = v.get("type").and_then(Value::as_str);
         if let Some(steps) = token_stat(&v, &["steps_used"]) {
             explicit_steps_used = Some(usize::try_from(steps).unwrap_or(usize::MAX));
         }
-        match v.get("type").and_then(Value::as_str) {
+        if matches!(event_type, Some("done" | "error")) {
+            if let Some(value) =
+                token_stat(&v, &["prompt_tokens", "input_tokens", "prompt_eval_count"])
+            {
+                prompt_tokens = value;
+            }
+            if let Some(value) =
+                token_stat(&v, &["completion_tokens", "output_tokens", "eval_count"])
+            {
+                completion_tokens = value;
+            }
+        }
+        match event_type {
             Some("token") => {
                 if let Some(token) = event_text(&v) {
                     out.push_str(token);
@@ -490,16 +503,6 @@ fn parse_subagent_stream(stdout: &str) -> ParsedSubagentStream {
                     if let Some(text) = event_text(&v) {
                         out.push_str(text);
                     }
-                }
-                if let Some(value) =
-                    token_stat(&v, &["prompt_tokens", "input_tokens", "prompt_eval_count"])
-                {
-                    prompt_tokens = value;
-                }
-                if let Some(value) =
-                    token_stat(&v, &["completion_tokens", "output_tokens", "eval_count"])
-                {
-                    completion_tokens = value;
                 }
             }
             Some("error") => {
@@ -864,13 +867,11 @@ mod tests {
     fn parse_subagent_stream_records_structured_errors_and_explicit_steps() {
         let stdout = r#"{"type":"tool_call","name":"bash","arguments":{}}"#.to_string()
             + "\n"
-            + r#"{"type":"error","message":"step cap reached","steps_used":1}"#
+            + r#"{"type":"error","message":"step cap reached","steps_used":1,"stats":{"prompt_tokens":5,"completion_tokens":6}}"#
             + "\n"
             + r#"{"type":"budget_error","needed":99,"window":42,"model":"tiny"}"#
             + "\n"
-            + r#"{"type":"final","value":"partial diagnostic","steps_used":1}"#
-            + "\n"
-            + r#"{"type":"done","stats":{"prompt_tokens":5,"completion_tokens":6}}"#;
+            + r#"{"type":"final","value":"partial diagnostic","steps_used":1}"#;
 
         let parsed = parse_subagent_stream(&stdout);
 
@@ -1607,8 +1608,7 @@ mod tests {
         let script = "#!/bin/sh\n\
              printf 'child stderr diagnostic\\n' >&2\n\
              printf '{\"type\":\"tool_call\",\"name\":\"bash\",\"arguments\":{}}\\n'\n\
-             printf '{\"type\":\"error\",\"message\":\"structured failure\",\"steps_used\":1}\\n'\n\
-             printf '{\"type\":\"done\",\"stats\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\\n'\n\
+             printf '{\"type\":\"error\",\"message\":\"structured failure\",\"steps_used\":1,\"stats\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\\n'\n\
              exit 7\n";
         std::fs::write(&path, script).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();

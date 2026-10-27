@@ -548,8 +548,13 @@ fn headless_step_exhaustion_is_incomplete_with_one_terminal_json_event() {
         .filter(|event| matches!(event["type"].as_str(), Some("done" | "error")))
         .count();
     assert_eq!(terminal_count, 1);
-    assert_eq!(events.last().unwrap()["type"], "error");
-    assert_eq!(events.last().unwrap()["exit_code"], 14);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "error");
+    assert_eq!(terminal["exit_code"], 14);
+    assert_eq!(terminal["steps_used"], 12);
+    assert_eq!(terminal["stats"]["request_count"], 12);
+    assert_eq!(terminal["stats"]["prompt_tokens"], 12);
+    assert_eq!(terminal["stats"]["completion_tokens"], 12);
 }
 
 #[cfg(unix)]

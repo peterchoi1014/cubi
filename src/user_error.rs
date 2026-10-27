@@ -12,7 +12,7 @@
 //! event keeps its `message` field for backward compatibility; the new
 //! `kind`, `exit_code`, and `hint` fields are additive.
 
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, TerminalUsage};
 use crate::style::CubiStyle;
 
 /// Coarse error classification. Each variant maps to a stable
@@ -87,6 +87,7 @@ pub struct UserError {
     pub summary: String,
     pub hint: Option<String>,
     pub cause: Option<anyhow::Error>,
+    pub terminal_usage: Option<TerminalUsage>,
 }
 
 impl std::fmt::Debug for UserError {
@@ -97,6 +98,7 @@ impl std::fmt::Debug for UserError {
             .field("summary", &self.summary)
             .field("hint", &self.hint)
             .field("cause", &self.cause.as_ref().map(|c| format!("{c}")))
+            .field("terminal_usage", &self.terminal_usage)
             .finish()
     }
 }
@@ -117,6 +119,7 @@ impl UserError {
             summary: summary.into(),
             hint: None,
             cause: None,
+            terminal_usage: None,
         }
     }
 
@@ -252,6 +255,13 @@ pub fn user_error_json(err: &UserError) -> serde_json::Value {
         );
         if let Some(hint) = &err.hint {
             obj.insert("hint".to_string(), serde_json::Value::String(hint.clone()));
+        }
+        if let Some(usage) = &err.terminal_usage {
+            obj.insert("stats".to_string(), serde_json::json!(&usage.stats));
+            obj.insert(
+                "steps_used".to_string(),
+                serde_json::json!(usage.steps_used),
+            );
         }
     }
     v

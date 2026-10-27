@@ -1713,6 +1713,7 @@ fn main() -> Result<()> {
                 },
             );
             ue.exit_code = code;
+            ue.terminal_usage = exit.terminal_usage.clone();
             ue.cause = Some(err);
             user_error::report_user_error(&ue, json_output && headless, debug);
             exit_code::exit(code);
