@@ -262,6 +262,11 @@ where
                                 {
                                     let _ = state.take_composer();
                                     state.push_history(&cmd);
+                                    if is_quit_line(&cmd) {
+                                        cancel.store(true, Ordering::SeqCst);
+                                        let _ = action_tx.send(UserAction::Quit);
+                                        break;
+                                    }
                                     // Slash commands are not echoed (they run
                                     // suspended on the real terminal).
                                     let _ = action_tx.send(UserAction::SubmitLine(cmd));
@@ -272,6 +277,13 @@ where
                                 state.push_history(&line);
                                 let trimmed = line.trim();
                                 if !trimmed.is_empty() {
+                                    // `/quit` must not wait behind a running turn:
+                                    // cancel it and leave now, like Ctrl-D.
+                                    if is_quit_line(trimmed) {
+                                        cancel.store(true, Ordering::SeqCst);
+                                        let _ = action_tx.send(UserAction::Quit);
+                                        break;
+                                    }
                                     // Echo non-slash input as a `You` role block
                                     // directly into the transcript (the render
                                     // task owns `state`), so the live turn
@@ -297,6 +309,9 @@ where
                                 cancel.store(true, Ordering::SeqCst);
                             }
                             event::Action::Quit => {
+                                // Cancel any in-flight turn so the main task drops
+                                // the model request instead of waiting for the reply.
+                                cancel.store(true, Ordering::SeqCst);
                                 let _ = action_tx.send(UserAction::Quit);
                                 break;
                             }
@@ -399,6 +414,14 @@ where
 /// achieves the same back-buffer reset + full clear (`ClearType::All`) with no
 /// stdin read. Best-effort: a failure here is swallowed so a transient hiccup
 /// on resume can never kill the render task; the next frame recovers.
+/// `/quit` or its `/exit` alias, as parsed by the shared command table.
+fn is_quit_line(line: &str) -> bool {
+    matches!(
+        crate::commands::parse(line.trim()),
+        Some((crate::commands::Cmd::Quit, _))
+    )
+}
+
 fn force_full_repaint<B>(terminal: &mut ratatui::Terminal<B>)
 where
     B: ratatui::backend::Backend,
@@ -1283,6 +1306,97 @@ mod render_loop_tests {
         drop(render_tx);
         let joined = handle.await.expect("render task join");
         assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    async fn quit_test_harness() -> (
+        mpsc::UnboundedSender<std::io::Result<Event>>,
+        mpsc::UnboundedReceiver<UserAction>,
+        Arc<AtomicBool>,
+        mpsc::UnboundedSender<RenderEvent>,
+        tokio::task::JoinHandle<std::result::Result<(), std::convert::Infallible>>,
+        mpsc::UnboundedSender<RenderControl>,
+    ) {
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderEvent>();
+        let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel::<ApprovalReply>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RenderControl>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+        let mut event_rx = Some(event_rx);
+        let handle = tokio::spawn(render_task(
+            terminal,
+            AppState::new(),
+            RenderChannels {
+                render_rx,
+                action_tx,
+                approval_tx,
+                control_rx,
+            },
+            Arc::clone(&cancel),
+            move || {
+                let mut rx = event_rx.take().expect("event stream built once");
+                futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+            },
+        ));
+        (event_tx, action_rx, cancel, render_tx, handle, control_tx)
+    }
+
+    /// Quitting while a turn is generating must cancel that turn so the main
+    /// task drops the model request instead of waiting for the full reply.
+    #[tokio::test]
+    async fn ctrl_d_cancels_the_running_turn_and_quits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (event_tx, mut action_rx, cancel, _render_tx, handle, _control_tx) =
+            quit_test_harness().await;
+
+        event_tx
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))))
+            .unwrap();
+
+        assert_eq!(action_rx.recv().await, Some(UserAction::Quit));
+        assert!(cancel.load(Ordering::SeqCst), "Ctrl-D must cancel the turn");
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn quit_command_cancels_the_running_turn_and_quits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (event_tx, mut action_rx, cancel, _render_tx, handle, _control_tx) =
+            quit_test_harness().await;
+
+        for ch in "/quit".chars() {
+            event_tx
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                ))))
+                .unwrap();
+        }
+        event_tx
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))))
+            .unwrap();
+
+        assert_eq!(action_rx.recv().await, Some(UserAction::Quit));
+        assert!(cancel.load(Ordering::SeqCst), "/quit must cancel the turn");
+        let joined = handle.await.expect("render task join");
+        assert!(joined.is_ok(), "render task should exit cleanly");
+    }
+
+    #[test]
+    fn quit_line_matches_quit_and_exit_only() {
+        assert!(is_quit_line("/quit"));
+        assert!(is_quit_line("  /exit  "));
+        assert!(!is_quit_line("/quiet"));
+        assert!(!is_quit_line("quit"));
     }
 
     /// The main loop relies on the render task ending cleanly when its render
