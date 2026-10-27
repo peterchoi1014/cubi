@@ -6,6 +6,7 @@
 //! configurations without installing process-wide state.
 
 mod child_env;
+pub(crate) mod env_key;
 mod environment;
 mod generation;
 #[cfg(test)]
