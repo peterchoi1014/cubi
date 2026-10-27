@@ -657,26 +657,17 @@ mod tests {
             .env("CUBI_STALLED_HOOK_HELPER", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            // Captured so a CI failure shows the helper's assertion. Hook
-            // descendants get null stdio, so none of them can hold this pipe.
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::null());
         configure_outer_process_group(&mut command);
-        let child = command.spawn().unwrap();
+        let mut child = command.spawn().unwrap();
         let child_pid = child.id();
         let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = status_tx.send(child.wait_with_output());
+            let _ = status_tx.send(child.wait());
         });
 
         match status_rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(output) => {
-                let output = output.unwrap();
-                assert!(
-                    output.status.success(),
-                    "stalled hook helper failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            Ok(status) => assert!(status.unwrap().success()),
             Err(error) => {
                 terminate_outer_process_tree(child_pid);
                 let _ = status_rx.recv_timeout(Duration::from_secs(5));
