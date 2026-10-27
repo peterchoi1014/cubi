@@ -30,7 +30,6 @@ use anyhow::{Context, Result};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,8 +95,8 @@ pub struct ChatCLI {
     hooks: HookRegistry,
     /// Loaded Markdown skills.
     skills: Vec<Skill>,
-    /// Per-session approved tools for untrusted directories.
-    approved_tools: HashSet<String>,
+    /// Per-session approval grants and the active TUI request/reply client.
+    approval_session: tool_dispatch::ApprovalSession,
     /// Shared with `BuiltinToolRegistry` so write/exec tools (`bash`,
     /// `edit_file`, `write_file`) observe `/plan` toggles instantly.
     plan_mode: Arc<AtomicBool>,
@@ -217,11 +216,11 @@ pub struct ChatCLI {
     cancel: Arc<AtomicBool>,
     /// Whether the interactive session is currently rendered through the
     /// full-screen TUI (`--tui`). Toggled on for the duration of
-    /// [`run_tui`](Self::run_tui). Used to (a) auto-deny interactive tool
-    /// approval (a second stdin reader would fight the render task) and (b)
-    /// suppress the handful of raw `stdout` prints that would otherwise
-    /// scribble on the alternate screen. `false` in every non-TUI path, so
-    /// default behavior is byte-identical.
+    /// [`run_tui`](Self::run_tui). Used to route interactive tool approval
+    /// through the render task instead of reading stdin (which would fight the
+    /// render task) and to suppress the handful of raw `stdout` prints that
+    /// would otherwise scribble on the alternate screen. `false` in every
+    /// non-TUI path, so default behavior is byte-identical.
     tui_active: bool,
     /// Plain-text startup output (init/loading lines, tip) captured before the
     /// TUI's alternate screen is entered, used to seed the `--tui` transcript
@@ -344,7 +343,7 @@ impl ChatCLI {
                 HookRegistry::load(&guard)
             },
             skills: skills::load_skills(),
-            approved_tools: HashSet::new(),
+            approval_session: tool_dispatch::ApprovalSession::new(),
             plan_mode,
             permissions,
             session_store: SessionStore::for_current_dir(),
@@ -5921,6 +5920,7 @@ impl ChatCLI {
         let cancel = Arc::clone(&self.cancel);
 
         let use_tools = req.use_tools;
+        let approval_mode = self.approval_mode();
         // Race the consensus run against Ctrl-C and the cooperative TUI cancel
         // flag. Cancelling an in-flight isolate/subprocess run is best-effort:
         // dropped worktrees / subprocesses may linger on disk — acceptable for
@@ -5932,13 +5932,20 @@ impl ChatCLI {
                     policy: self.policy.clone(),
                     permissions: Arc::clone(&self.permissions),
                 };
+                let mut approval = tool_dispatch::ParentApproval::new(
+                    &mut self.approval_session,
+                    self.ui.as_mut(),
+                    &self.permissions,
+                    &self.cancel,
+                    approval_mode,
+                );
                 crate::consensus::run_with_tools(
                     req,
                     &self.executor,
                     &sink,
                     &mut self.mcp_manager,
                     access,
-                    self.approved_tools.clone(),
+                    &mut approval,
                 )
                 .await
             } else {
@@ -7787,8 +7794,12 @@ mod tests {
 
     #[cfg(unix)]
     impl tool_dispatch::ToolCallHost for TrustHookTestHost {
-        fn approve_tool(&mut self, _tool_name: &str) -> bool {
-            true
+        fn approve_tool<'a>(
+            &'a mut self,
+            _call: &'a crate::ollama::ToolCall,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = tool_dispatch::Approval> + 'a>>
+        {
+            Box::pin(async { tool_dispatch::Approval::AllowOnce })
         }
 
         fn execute_authorized<'a>(
@@ -7846,11 +7857,21 @@ mod tests {
         assert!(!parent_outcome.is_failure());
         assert_eq!(host.executions, 1);
 
+        cli.approval_session.allow_tool_for_session("read_file");
+        let mode = cli.approval_mode();
+        let mut approval = tool_dispatch::ParentApproval::new(
+            &mut cli.approval_session,
+            cli.ui.as_mut(),
+            &cli.permissions,
+            &cli.cancel,
+            mode,
+        );
         let subagent = agent_loop::run_subagent(
             &cli.executor,
             &mut cli.mcp_manager,
             access,
-            HashSet::from(["read_file".to_string()]),
+            &mut approval,
+            "agent_run",
             "read the fixture",
             2,
         )

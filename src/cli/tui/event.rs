@@ -5,6 +5,7 @@
 //! The render task performs the side effects; this module only classifies.
 
 use super::app::EditAction;
+use crate::cli::tool_dispatch::Approval;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A high-level interpretation of one key press, consumed by the render task.
@@ -37,6 +38,23 @@ pub(super) enum Action {
     DismissPicker,
     /// No actionable interpretation (unhandled key).
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApprovalKey {
+    Decision(Approval),
+    DenyAndCancel,
+}
+
+pub(super) fn map_approval_key(ev: KeyEvent) -> Option<ApprovalKey> {
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    match ev.code {
+        KeyCode::Char('c') if ctrl => Some(ApprovalKey::DenyAndCancel),
+        KeyCode::Char('y' | 'Y') => Some(ApprovalKey::Decision(Approval::AllowOnce)),
+        KeyCode::Char('a' | 'A') => Some(ApprovalKey::Decision(Approval::AllowToolForSession)),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(ApprovalKey::Decision(Approval::Deny)),
+        _ => None,
+    }
 }
 
 /// Classify a key event. Ctrl-C / Ctrl-D take precedence over the character
@@ -152,5 +170,35 @@ mod tests {
     #[test]
     fn tab_maps_to_complete() {
         assert_eq!(map_key(key(KeyCode::Tab)), Action::Complete);
+    }
+
+    #[test]
+    fn approval_keys_map_to_each_decision() {
+        use crate::cli::tool_dispatch::Approval;
+
+        assert_eq!(
+            map_approval_key(key(KeyCode::Char('y'))),
+            Some(ApprovalKey::Decision(Approval::AllowOnce))
+        );
+        assert_eq!(
+            map_approval_key(key(KeyCode::Char('a'))),
+            Some(ApprovalKey::Decision(Approval::AllowToolForSession))
+        );
+        assert_eq!(
+            map_approval_key(key(KeyCode::Char('n'))),
+            Some(ApprovalKey::Decision(Approval::Deny))
+        );
+        assert_eq!(
+            map_approval_key(key(KeyCode::Esc)),
+            Some(ApprovalKey::Decision(Approval::Deny))
+        );
+    }
+
+    #[test]
+    fn approval_ctrl_c_denies_and_cancels() {
+        assert_eq!(
+            map_approval_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(ApprovalKey::DenyAndCancel)
+        );
     }
 }

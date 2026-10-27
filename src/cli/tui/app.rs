@@ -90,6 +90,14 @@ pub enum UserAction {
     Quit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ApprovalPrompt {
+    pub id: u64,
+    pub tool: String,
+    pub summary: String,
+    pub origin: String,
+}
+
 /// The entire view model for the TUI, owned by the render task.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -171,6 +179,8 @@ pub struct AppState {
     /// Latch set by [`Self::picker_dismiss`] (Esc): keeps the picker closed
     /// until the next composer edit, which resets it in [`Self::edit`].
     picker_dismissed_until_edit: bool,
+    /// The per-call tool approval modal, when one is awaiting a key decision.
+    pending_approval: Option<ApprovalPrompt>,
 }
 
 impl AppState {
@@ -200,6 +210,7 @@ impl AppState {
             picker_selected: 0,
             picker_replace_end: 0,
             picker_dismissed_until_edit: false,
+            pending_approval: None,
         }
     }
 
@@ -282,6 +293,14 @@ impl AppState {
         self.theme
     }
 
+    pub fn pending_approval(&self) -> Option<&ApprovalPrompt> {
+        self.pending_approval.as_ref()
+    }
+
+    pub fn approval_pending(&self) -> bool {
+        self.pending_approval.is_some()
+    }
+
     /// Set the active color palette. Called once by `run_tui` after resolving
     /// the persisted `/theme` choice.
     pub fn set_theme(&mut self, theme: Theme) {
@@ -344,7 +363,46 @@ impl AppState {
                 let status = format!("{glyph} {name} ({})", format_elapsed(elapsed_ms));
                 self.push_line(status, LineKind::ToolStatus);
             }
+            RenderEvent::ApprovalRequest {
+                id,
+                tool,
+                summary,
+                origin,
+            } => {
+                self.close_picker();
+                self.pending_approval = Some(ApprovalPrompt {
+                    id,
+                    tool,
+                    summary,
+                    origin,
+                });
+            }
+            RenderEvent::ApprovalCancelled { id } => {
+                if self.pending_approval.as_ref().map(|prompt| prompt.id) == Some(id) {
+                    let _ = self.resolve_approval(crate::cli::tool_dispatch::Approval::Deny);
+                }
+            }
         }
+    }
+
+    pub fn resolve_approval(
+        &mut self,
+        decision: crate::cli::tool_dispatch::Approval,
+    ) -> Option<u64> {
+        let prompt = self.pending_approval.take()?;
+        let label = match decision {
+            crate::cli::tool_dispatch::Approval::AllowOnce => "allowed once",
+            crate::cli::tool_dispatch::Approval::AllowToolForSession => "allow for session",
+            crate::cli::tool_dispatch::Approval::Deny => "denied",
+        };
+        self.push_line(
+            format!(
+                "Tool approval: `{}` {} ({})",
+                prompt.tool, label, prompt.origin
+            ),
+            LineKind::Status,
+        );
+        Some(prompt.id)
     }
 
     /// Push the (already capped) tool output as indented rows, truncating to
@@ -443,6 +501,9 @@ impl AppState {
     /// exits input-history navigation: the current buffer becomes a fresh
     /// draft.
     pub fn edit(&mut self, action: EditAction) {
+        if self.approval_pending() {
+            return;
+        }
         self.exit_history_nav();
         // Any composer edit re-arms the picker after an Esc dismissal.
         self.picker_dismissed_until_edit = false;
@@ -479,6 +540,9 @@ impl AppState {
     /// Return the composer contents, clearing the buffer and resetting the
     /// cursor. Used when the user submits a message.
     pub fn take_composer(&mut self) -> String {
+        if self.approval_pending() {
+            return String::new();
+        }
         self.cursor = 0;
         self.close_picker();
         self.picker_dismissed_until_edit = false;
@@ -506,6 +570,9 @@ impl AppState {
     /// otherwise a no-op. Panic-free and UTF-8 aware; IO errors yield no
     /// completion.
     pub fn complete(&mut self) {
+        if self.approval_pending() {
+            return;
+        }
         // Slash-command name: composer starts with '/' and the cursor sits
         // within the first (whitespace-delimited) word.
         if self.composer.starts_with('/') {
@@ -1259,6 +1326,44 @@ mod tests {
         s.apply(RenderEvent::StatusSnapshot(sample_status()));
         assert_eq!(s.status().model, "qwen3:8b");
         assert_eq!(s.status().context_used, Some(1000));
+    }
+
+    #[test]
+    fn approval_request_locks_composer_until_resolved() {
+        let mut s = AppState::new();
+        s.edit(EditAction::InsertChar('d'));
+        s.apply(RenderEvent::ApprovalRequest {
+            id: 7,
+            tool: "bash".to_string(),
+            summary: "command: cargo test".to_string(),
+            origin: "agent_run".to_string(),
+        });
+
+        s.edit(EditAction::InsertChar('x'));
+
+        assert_eq!(s.composer(), "d");
+        assert!(s.approval_pending());
+    }
+
+    #[test]
+    fn approval_decision_is_recorded_and_clears_modal() {
+        let mut s = AppState::new();
+        s.apply(RenderEvent::ApprovalRequest {
+            id: 9,
+            tool: "write_file".to_string(),
+            summary: "path: src/main.rs".to_string(),
+            origin: "consensus qwen".to_string(),
+        });
+
+        let id = s.resolve_approval(crate::cli::tool_dispatch::Approval::AllowToolForSession);
+
+        assert_eq!(id, Some(9));
+        assert!(!s.approval_pending());
+        let line = s.transcript().last().unwrap();
+        assert_eq!(line.kind, LineKind::Status);
+        assert!(line.text.contains("write_file"));
+        assert!(line.text.contains("allow for session"));
+        assert!(line.text.contains("consensus qwen"));
     }
 
     #[test]
