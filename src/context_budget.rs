@@ -11,9 +11,20 @@ pub(crate) struct ContextBudget {
 }
 
 pub(crate) fn effective_budget(model: &str, provider: &str) -> Option<ContextBudget> {
-    let (ollama_override, openai_override) =
-        crate::config::with(|config| (config.generation.num_ctx, config.generation.context_window));
-    effective_budget_with_overrides(model, provider, ollama_override, openai_override)
+    let (ollama_override, openai_override, output_cap) = crate::config::with(|config| {
+        (
+            config.generation.num_ctx,
+            config.generation.context_window,
+            config.generation.max_tokens,
+        )
+    });
+    effective_budget_with_overrides(
+        model,
+        provider,
+        ollama_override,
+        openai_override,
+        output_cap,
+    )
 }
 
 fn effective_budget_with_overrides(
@@ -21,6 +32,7 @@ fn effective_budget_with_overrides(
     provider: &str,
     ollama_override: Option<usize>,
     openai_override: Option<usize>,
+    output_cap: Option<u64>,
 ) -> Option<ContextBudget> {
     let nominal = crate::llm::context_window_for_model(model);
     let configured = match provider {
@@ -34,7 +46,9 @@ fn effective_budget_with_overrides(
         (None, Some(configured)) => configured,
         (None, None) => return None,
     };
-    let completion_reserve = (window / 10).clamp(512, 4_096).min(window);
+    let completion_reserve = output_cap
+        .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX).min(window))
+        .unwrap_or_else(|| (window / 10).clamp(512, 4_096).min(window));
     Some(ContextBudget {
         window,
         completion_reserve,
@@ -124,7 +138,8 @@ mod tests {
 
     #[test]
     fn ollama_effective_window_uses_runtime_cap() {
-        let budget = effective_budget_with_overrides("qwen3.5:9b", "ollama", None, None).unwrap();
+        let budget =
+            effective_budget_with_overrides("qwen3.5:9b", "ollama", None, None, None).unwrap();
 
         assert_eq!(budget.window, 32_768);
         assert!(budget.prompt_limit < budget.window);
@@ -133,7 +148,8 @@ mod tests {
     #[test]
     fn configured_openai_window_is_clamped_to_nominal_window() {
         let budget =
-            effective_budget_with_overrides("qwen3:8b", "openai", None, Some(65_536)).unwrap();
+            effective_budget_with_overrides("qwen3:8b", "openai", None, Some(65_536), None)
+                .unwrap();
 
         assert_eq!(budget.window, 32_768);
     }

@@ -73,7 +73,9 @@ knobs let interactive users disable the same affordances individually:
 - `CUBI_MAX_TOKENS=…` — set a positive output-token cap. Cubi sends it as
   Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider
   response that stops at this limit is reported as truncated rather than as a
-  successful completion.
+  successful completion. The configured cap is also reserved in the effective
+  context window (clamped to that window); if the cap plus a non-empty request
+  cannot fit, Cubi rejects the request locally instead of sending it.
 - `CUBI_TEMPERATURE=…` — override the model profile's temperature with a
   finite, non-negative number.
 - `CUBI_TOP_P=…` — override the model profile's nucleus probability with a
