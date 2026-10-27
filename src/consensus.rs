@@ -1478,17 +1478,24 @@ mod tests {
             crate::llm::LlmBackend::Ollama(crate::ollama::OllamaClient::new()),
             "local-model".to_string(),
         );
-        let loopback_openai = AIExecutor::with_backend(
-            crate::llm::LlmBackend::OpenAi(crate::llm::OpenAiClient::new(
-                "http://127.0.0.1:8080/v1".to_string(),
-                String::new(),
-            )),
-            "local-model".to_string(),
-        );
 
         assert_eq!(llm_subagent_permits(0, 3, &ollama), 1);
-        assert_eq!(llm_subagent_permits(0, 3, &loopback_openai), 1);
         assert_eq!(llm_subagent_permits(2, 3, &ollama), 2);
+        for base_url in [
+            "http://[::1]:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+        ] {
+            let loopback_openai = AIExecutor::with_backend(
+                crate::llm::LlmBackend::OpenAi(crate::llm::OpenAiClient::new(
+                    base_url.to_string(),
+                    String::new(),
+                )),
+                "local-model".to_string(),
+            );
+
+            assert_eq!(llm_subagent_permits(0, 3, &loopback_openai), 1);
+        }
     }
 
     #[test]
