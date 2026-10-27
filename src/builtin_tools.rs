@@ -446,7 +446,7 @@ impl BuiltinToolRegistry {
                     },
                     "base_path": {
                         "type": "string",
-                        "description": "Base directory to search from (default: current directory)",
+                        "description": "Base directory to search from (default: current directory). Explicitly named ignored directories are searched, but descendant ignore rules still apply. .git is always skipped.",
                         "default": "."
                     }
                 },
@@ -3022,13 +3022,23 @@ fn notebook_save(nb: &serde_json::Value, path: &str) -> Result<()> {
 }
 
 fn collect_search_paths(base: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(base)? {
+    // Explicit roots bypass directory ignores in WalkBuilder, but Git
+    // metadata must stay excluded even when named as the search base.
+    if base
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        return Ok(());
+    }
+    for entry in ignore::WalkBuilder::new(base)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build()
+    {
         let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        paths.push(path.clone());
-        if file_type.is_dir() {
-            collect_search_paths(&path, paths)?;
+        if entry.depth() > 0 {
+            paths.push(entry.into_path());
         }
     }
     Ok(())
@@ -3811,6 +3821,165 @@ mod tests {
         assert!(result.content[0].text.contains("fixture1.rs"));
         assert!(result.content[0].text.contains("fixture2.rs"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_glob_respects_ignore_files_and_git_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "target/\n*.generated.rs\n").unwrap();
+        fs::write(
+            dir.path().join(".ignore"),
+            "ignored/\n!keep.generated.rs\n!.git/\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".git/info/exclude"), "excluded/\n").unwrap();
+        for name in [
+            "z.rs",
+            "src/nested/b.rs",
+            "src/a.rs",
+            "keep.generated.rs",
+            ".config/visible.rs",
+            ".git/private.rs",
+            "target/debug/build.rs",
+            "ignored/generated.rs",
+            "excluded/private.rs",
+            "drop.generated.rs",
+        ] {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let registry = registry_with_trust(dir.path(), false);
+
+        let result = registry
+            .execute_search_glob(json!({ "pattern": "**/*.rs", "base_path": dir.path() }))
+            .unwrap();
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        let expected = [
+            ".config/visible.rs",
+            "keep.generated.rs",
+            "src/a.rs",
+            "src/nested/b.rs",
+            "z.rs",
+        ]
+        .iter()
+        .map(|name| format!("{}\n", dir.path().join(name).display()))
+        .collect::<String>();
+        assert_eq!(result.content[0].text, expected);
+    }
+
+    #[test]
+    fn search_glob_respects_ignore_outside_git_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("generated")).unwrap();
+        fs::write(dir.path().join(".ignore"), "generated/\n").unwrap();
+        fs::write(dir.path().join("generated/hidden.rs"), "").unwrap();
+        let visible = dir.path().join("visible.rs");
+        fs::write(&visible, "").unwrap();
+        let registry = registry_with_trust(dir.path(), false);
+
+        let result = registry
+            .execute_search_glob(json!({ "pattern": "**/*.rs", "base_path": dir.path() }))
+            .unwrap();
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert_eq!(result.content[0].text, format!("{}\n", visible.display()));
+    }
+
+    #[test]
+    fn search_glob_explicit_ignored_base_keeps_descendant_rules() {
+        for ignore_file in [".gitignore", ".ignore", ".git/info/exclude"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("target");
+            fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+            fs::create_dir_all(base.join("nested")).unwrap();
+            fs::write(dir.path().join(ignore_file), "target/\n*.tmp.rs\n").unwrap();
+            fs::write(base.join(".ignore"), "local.rs\n").unwrap();
+            for name in [
+                "visible.rs",
+                "nested/visible.rs",
+                "nested/filtered.tmp.rs",
+                "local.rs",
+            ] {
+                fs::write(base.join(name), "").unwrap();
+            }
+            let registry = registry_with_trust(dir.path(), false);
+
+            let result = registry
+                .execute_search_glob(json!({ "pattern": "**/*.rs", "base_path": base }))
+                .unwrap();
+
+            assert!(result.is_error.is_none(), "got {:?}", result);
+            assert_eq!(
+                result.content[0].text,
+                format!(
+                    "{}\n{}\n",
+                    base.join("nested/visible.rs").display(),
+                    base.join("visible.rs").display()
+                ),
+                "explicit base with {}",
+                ignore_file
+            );
+        }
+    }
+
+    #[test]
+    fn search_glob_never_searches_explicit_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::write(git.join("objects/private.rs"), "").unwrap();
+        let registry = registry_with_trust(dir.path(), false);
+
+        for base in [&git, &git.join("objects")] {
+            let result = registry
+                .execute_search_glob(json!({ "pattern": "**/*.rs", "base_path": base }))
+                .unwrap();
+
+            assert!(result.is_error.is_none(), "got {:?}", result);
+            assert!(!result.content[0].text.contains("private.rs"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_glob_does_not_follow_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("outside.rs"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("cycle")).unwrap();
+        let visible = dir.path().join("visible.rs");
+        fs::write(&visible, "").unwrap();
+        let registry = registry_with_trust(dir.path(), false);
+
+        let result = registry
+            .execute_search_glob(json!({ "pattern": "**/*.rs", "base_path": dir.path() }))
+            .unwrap();
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        assert_eq!(result.content[0].text, format!("{}\n", visible.display()));
+    }
+
+    #[test]
+    fn search_glob_keeps_shared_output_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=READ_FILE_DEFAULT_MAX_LINES {
+            fs::write(dir.path().join(format!("file-{:04}.rs", index)), "").unwrap();
+        }
+        let registry = registry_with_trust(dir.path(), false);
+
+        let result = registry
+            .execute_search_glob(json!({ "pattern": "*.rs", "base_path": dir.path() }))
+            .unwrap();
+
+        assert!(result.is_error.is_none(), "got {:?}", result);
+        let text = &result.content[0].text;
+        assert!(text.contains("file-0000.rs"));
+        assert!(!text.contains(&format!("file-{:04}.rs", READ_FILE_DEFAULT_MAX_LINES)));
+        assert!(text.contains("[tool output truncated:"));
     }
 
     #[test]
