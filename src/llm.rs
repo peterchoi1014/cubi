@@ -1052,6 +1052,7 @@ fn fake_stats() -> ChatStats {
         prompt_tokens: 1,
         completion_tokens: 1,
         elapsed_ms: 1,
+        cached_prompt_tokens: Some(5),
         request_count: 1,
         last_prompt_tokens: Some(1),
         ..ChatStats::default()

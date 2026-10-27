@@ -183,9 +183,8 @@ pub struct SubagentOutput {
     /// Tool calls observed for this subagent. LLM-only subagents report `0`;
     /// tool-enabled subagents report the runner's observed tool-call count.
     pub tool_calls: usize,
-    pub elapsed_ms: u64,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
+    #[serde(flatten)]
+    pub stats: ChatStats,
     /// `None` on success. On failure, the (truncated) error message.
     pub error: Option<String>,
 }
@@ -193,6 +192,14 @@ pub struct SubagentOutput {
 impl SubagentOutput {
     pub fn ok(&self) -> bool {
         self.error.is_none()
+    }
+}
+
+impl std::ops::Deref for SubagentOutput {
+    type Target = ChatStats;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stats
     }
 }
 
@@ -219,9 +226,7 @@ impl ConsensusResult {
     pub fn aggregate_stats(&self) -> ChatStats {
         let mut s = self.arbitration_stats.clone();
         for sub in &self.subagent_outputs {
-            s.prompt_tokens += sub.prompt_tokens;
-            s.completion_tokens += sub.completion_tokens;
-            s.elapsed_ms += sub.elapsed_ms;
+            s.add(&sub.stats);
         }
         s
     }
@@ -510,9 +515,10 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
                         output: String::new(),
                         steps_used: 0,
                         tool_calls: 0,
-                        elapsed_ms,
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
+                        stats: ChatStats {
+                            elapsed_ms,
+                            ..ChatStats::default()
+                        },
                         error: Some("consensus dispatcher semaphore closed".to_string()),
                     },
                 );
@@ -524,24 +530,26 @@ async fn run_llm_subagents(req: &ConsensusRequest, executor: &AIExecutor) -> Vec
             let res = executor.chat_with_model(&model, messages).await;
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let sub = match res {
-                Ok((msg, stats)) => SubagentOutput {
-                    model: model.clone(),
-                    output: msg.content,
-                    steps_used: 1,
-                    tool_calls: 0,
-                    elapsed_ms: elapsed_ms.max(stats.elapsed_ms),
-                    prompt_tokens: stats.prompt_tokens,
-                    completion_tokens: stats.completion_tokens,
-                    error: None,
-                },
+                Ok((msg, mut stats)) => {
+                    stats.elapsed_ms = elapsed_ms.max(stats.elapsed_ms);
+                    SubagentOutput {
+                        model: model.clone(),
+                        output: msg.content,
+                        steps_used: 1,
+                        tool_calls: 0,
+                        stats,
+                        error: None,
+                    }
+                }
                 Err(e) => SubagentOutput {
                     model: model.clone(),
                     output: String::new(),
                     steps_used: 0,
                     tool_calls: 0,
-                    elapsed_ms,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
+                    stats: ChatStats {
+                        elapsed_ms,
+                        ..ChatStats::default()
+                    },
                     error: Some(truncate(&e.to_string(), 400)),
                 },
             };
@@ -601,24 +609,26 @@ async fn run_tool_subagents(
         .await;
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let sub = match res {
-            Ok(result) => SubagentOutput {
-                model: model.clone(),
-                output: result.output,
-                steps_used: result.steps_used,
-                tool_calls: result.tool_calls,
-                elapsed_ms: elapsed_ms.max(result.stats.elapsed_ms),
-                prompt_tokens: result.stats.prompt_tokens,
-                completion_tokens: result.stats.completion_tokens,
-                error: None,
-            },
+            Ok(mut result) => {
+                result.stats.elapsed_ms = elapsed_ms.max(result.stats.elapsed_ms);
+                SubagentOutput {
+                    model: model.clone(),
+                    output: result.output,
+                    steps_used: result.steps_used,
+                    tool_calls: result.tool_calls,
+                    stats: result.stats,
+                    error: None,
+                }
+            }
             Err(e) => SubagentOutput {
                 model: model.clone(),
                 output: String::new(),
                 steps_used: 0,
                 tool_calls: 0,
-                elapsed_ms,
-                prompt_tokens: 0,
-                completion_tokens: 0,
+                stats: ChatStats {
+                    elapsed_ms,
+                    ..ChatStats::default()
+                },
                 error: Some(truncate(&e.to_string(), 400)),
             },
         };
@@ -715,9 +725,10 @@ async fn run_isolated_tool_subagents_with_runner(
                         output: String::new(),
                         steps_used: 0,
                         tool_calls: 0,
-                        elapsed_ms,
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
+                        stats: ChatStats {
+                            elapsed_ms,
+                            ..ChatStats::default()
+                        },
                         error: Some("isolated consensus dispatcher semaphore closed".to_string()),
                     },
                 );
@@ -730,9 +741,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     output: String::new(),
                     steps_used: proc.steps_used,
                     tool_calls: proc.tool_calls,
-                    elapsed_ms,
-                    prompt_tokens: proc.prompt_tokens,
-                    completion_tokens: proc.completion_tokens,
+                    stats: proc_subagent_stats(&proc, elapsed_ms),
                     error: Some(proc_error_message(
                         format!("isolated subagent timed out after {time_cap_secs}s"),
                         &proc,
@@ -743,9 +752,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     output: String::new(),
                     steps_used: proc.steps_used,
                     tool_calls: proc.tool_calls,
-                    elapsed_ms,
-                    prompt_tokens: proc.prompt_tokens,
-                    completion_tokens: proc.completion_tokens,
+                    stats: proc_subagent_stats(&proc, elapsed_ms),
                     error: Some(proc_error_message(
                         "isolated subagent reported error".to_string(),
                         &proc,
@@ -756,9 +763,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     output: String::new(),
                     steps_used: proc.steps_used,
                     tool_calls: proc.tool_calls,
-                    elapsed_ms,
-                    prompt_tokens: proc.prompt_tokens,
-                    completion_tokens: proc.completion_tokens,
+                    stats: proc_subagent_stats(&proc, elapsed_ms),
                     error: Some(proc_error_message(
                         format!("isolated subagent exited with status {:?}", proc.exit_code),
                         &proc,
@@ -769,9 +774,7 @@ async fn run_isolated_tool_subagents_with_runner(
                     output: String::new(),
                     steps_used: proc.steps_used,
                     tool_calls: proc.tool_calls,
-                    elapsed_ms,
-                    prompt_tokens: proc.prompt_tokens,
-                    completion_tokens: proc.completion_tokens,
+                    stats: proc_subagent_stats(&proc, elapsed_ms),
                     error: Some(proc_error_message(
                         format!(
                             "isolated subagent produced empty output (exit code {:?})",
@@ -780,24 +783,26 @@ async fn run_isolated_tool_subagents_with_runner(
                         &proc,
                     )),
                 },
-                Ok(proc) => SubagentOutput {
-                    model: model.clone(),
-                    output: proc.output,
-                    steps_used: proc.steps_used,
-                    tool_calls: proc.tool_calls,
-                    elapsed_ms,
-                    prompt_tokens: proc.prompt_tokens,
-                    completion_tokens: proc.completion_tokens,
-                    error: None,
-                },
+                Ok(proc) => {
+                    let stats = proc_subagent_stats(&proc, elapsed_ms);
+                    SubagentOutput {
+                        model: model.clone(),
+                        output: proc.output,
+                        steps_used: proc.steps_used,
+                        tool_calls: proc.tool_calls,
+                        stats,
+                        error: None,
+                    }
+                }
                 Err(e) => SubagentOutput {
                     model: model.clone(),
                     output: String::new(),
                     steps_used: 0,
                     tool_calls: 0,
-                    elapsed_ms,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
+                    stats: ChatStats {
+                        elapsed_ms,
+                        ..ChatStats::default()
+                    },
                     error: Some(truncate(&e.to_string(), 400)),
                 },
             };
@@ -812,6 +817,18 @@ async fn run_isolated_tool_subagents_with_runner(
     }
     indexed.sort_by_key(|(i, _)| *i);
     indexed.into_iter().map(|(_, o)| o).collect()
+}
+
+fn proc_subagent_stats(
+    proc: &crate::proc_subagent::ProcSubagentResult,
+    elapsed_ms: u64,
+) -> ChatStats {
+    ChatStats {
+        prompt_tokens: proc.prompt_tokens,
+        completion_tokens: proc.completion_tokens,
+        elapsed_ms,
+        ..ChatStats::default()
+    }
 }
 
 fn proc_error_message(base: String, proc: &crate::proc_subagent::ProcSubagentResult) -> String {
@@ -2179,6 +2196,8 @@ fn main() {
         assert_eq!(r.arbitration_stats.completion_tokens, 1);
         assert_eq!(agg.prompt_tokens, 3);
         assert_eq!(agg.completion_tokens, 3);
+        assert_eq!(agg.request_count, 3);
+        assert_eq!(agg.cached_prompt_tokens, Some(15));
     }
 
     #[tokio::test]

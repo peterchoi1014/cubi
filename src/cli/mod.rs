@@ -6689,18 +6689,12 @@ impl crate::consensus::ConsensusEventSink for CliConsensusSink {
     }
 
     fn subagent_result(&self, sub: &crate::consensus::SubagentOutput) {
-        let stats = crate::ollama::ChatStats {
-            prompt_tokens: sub.prompt_tokens,
-            completion_tokens: sub.completion_tokens,
-            elapsed_ms: sub.elapsed_ms,
-            ..crate::ollama::ChatStats::default()
-        };
         let payload = crate::json_events::consensus_subagent_result(
             &sub.model,
             sub.ok(),
             sub.steps_used,
             sub.tool_calls,
-            stats,
+            sub.stats.clone(),
             sub.error.as_deref(),
         );
         crate::json_events::emit(self.json_enabled, &payload);
@@ -9041,9 +9035,12 @@ mod tests {
             output: "ok".into(),
             steps_used: 4,
             tool_calls: 7,
-            elapsed_ms: 12,
-            prompt_tokens: 3,
-            completion_tokens: 5,
+            stats: ChatStats {
+                elapsed_ms: 12,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                ..ChatStats::default()
+            },
             error: None,
         };
 
