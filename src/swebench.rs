@@ -756,42 +756,28 @@ async fn run_one_instance(
         .kill_on_drop(true);
     crate::bench::configure_isolated_child_env(&mut cmd, home_dir.path());
 
-    let agent_output = match cmd.spawn() {
-        Ok(child) => {
-            let timeout = Duration::from_secs(args.time_cap_seconds);
-            match crate::bench::capture_child(child, timeout).await {
-                Ok(output) if !output.timed_out => output,
-                Ok(output) => {
-                    return (
-                        empty_pred(String::new()),
-                        InstanceResult {
-                            agent_stderr_tail: (!output.stderr_tail.is_empty())
-                                .then_some(output.stderr_tail),
-                            ..err_result(
-                                format!("exceeded time cap {}s", args.time_cap_seconds),
-                                start.elapsed().as_secs_f64(),
-                                None,
-                            )
-                        },
-                    );
-                }
-                Err(e) => {
-                    return (
-                        empty_pred(String::new()),
-                        err_result(
-                            format!("cubi wait error: {e}"),
-                            start.elapsed().as_secs_f64(),
-                            None,
-                        ),
-                    );
-                }
-            }
+    let timeout = Duration::from_secs(args.time_cap_seconds);
+    let agent_output = match crate::bench::capture_child(&mut cmd, timeout).await {
+        Ok(output) if !output.timed_out => output,
+        Ok(output) => {
+            return (
+                empty_pred(String::new()),
+                InstanceResult {
+                    agent_stderr_tail: (!output.stderr_tail.is_empty())
+                        .then_some(output.stderr_tail),
+                    ..err_result(
+                        format!("exceeded time cap {}s", args.time_cap_seconds),
+                        start.elapsed().as_secs_f64(),
+                        None,
+                    )
+                },
+            );
         }
         Err(e) => {
             return (
                 empty_pred(String::new()),
                 err_result(
-                    format!("spawn cubi: {e}"),
+                    format!("spawn or wait for cubi: {e}"),
                     start.elapsed().as_secs_f64(),
                     None,
                 ),
