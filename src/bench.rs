@@ -82,6 +82,16 @@ pub struct Summary {
     pub per_task: Vec<TaskResult>,
 }
 
+/// Tools advertised to the agent for a bench task, as a
+/// [`crate::agent_loop::TOOL_ALLOWLIST_ENV`] value.
+///
+/// The suite's tasks are single-file fixes in tiny repos and each prompt names
+/// the file to change, so reading, editing/writing and a shell to run the
+/// project's tests is the whole job. Deliberately excludes the browser, LSP,
+/// repo-map, notebook, messaging and meta-tool families: advertising them only
+/// inflates the prompt the model re-reads on every step.
+const BENCH_TOOL_ALLOWLIST: &str = "bash,edit_file,list_files,read_file,write_file";
+
 /// CLI arguments parsed in `main.rs`.
 #[derive(Debug, Clone)]
 pub struct BenchArgs {
@@ -589,6 +599,17 @@ async fn run_one_task(
         .stderr(Stdio::null());
     let _ = quiet_stdout; // reserved: a future verbose mode may stream cubi output through.
 
+    // Advertise only the tools these tasks actually need. Every tool's schema
+    // is re-sent on every round-trip, and with ~33 built-ins the schemas
+    // dominate the prompt — a six-task run measured ~241k prompt tokens, about
+    // 6.5k per step. On a CPU-only host prompt processing is the bottleneck, so
+    // trimming this is worth more than raising the time caps. Respect an
+    // allowlist the caller already set (inherited through the environment)
+    // rather than overriding it, so a run can opt back into the full surface.
+    if std::env::var_os(crate::agent_loop::TOOL_ALLOWLIST_ENV).is_none() {
+        cmd.env(crate::agent_loop::TOOL_ALLOWLIST_ENV, BENCH_TOOL_ALLOWLIST);
+    }
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn cubi for task {}", task.id))?;
@@ -884,6 +905,34 @@ mod tests {
         // would time every task out instantly.
         for bad in [0.0, -2.0, f64::NAN, f64::INFINITY] {
             assert_eq!(scaled_time_cap(120, Some(bad)), 120, "bad = {bad}");
+        }
+    }
+
+    /// A typo in [`BENCH_TOOL_ALLOWLIST`] would silently drop that tool from
+    /// the advertised set — the agent would just never see it, and the suite
+    /// would score worse for a reason no output explains. Pin every name
+    /// against the real built-in registry.
+    #[test]
+    fn bench_tool_allowlist_names_only_real_builtin_tools() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let registry = crate::builtin_tools::BuiltinToolRegistry::new(
+            Arc::new(Mutex::new(crate::permissions::Permissions::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let known: std::collections::BTreeSet<&str> = registry
+            .list_tools()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(!known.is_empty(), "registry should expose tools");
+
+        for name in BENCH_TOOL_ALLOWLIST.split(',') {
+            assert!(
+                known.contains(name),
+                "`{name}` in BENCH_TOOL_ALLOWLIST is not a built-in tool; known: {known:?}"
+            );
         }
     }
 
