@@ -19,8 +19,14 @@ name: bench
 #     this was tuned, the bench step took *exactly* the sum of the caps every
 #     night and scored 0% for months.
 #
-# If 4B turns out too weak at tool calling to score, the knob to try next is
-# a larger model with a larger multiplier (watch `timeout-minutes`).
+# `cubi bench` additionally advertises only a handful of tools to the agent
+# (see BENCH_TOOL_ALLOWLIST in src/bench.rs); on this runner the re-sent tool
+# schemas, not generation, are the dominant prompt cost.
+#
+# Observed: scores swing between 6/6 and mostly-timeout night to night, because
+# per-step throughput on shared runners varies by ~4-5x. If timeouts dominate
+# again, prefer trimming prompt cost over raising the multiplier further — the
+# worst case already approaches `timeout-minutes`.
 #
 # This workflow deliberately does NOT fail the build on a score
 # regression — once we have several stable baseline runs we can

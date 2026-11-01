@@ -75,6 +75,21 @@ cubi bench --task rust-fizzbuzz --keep-workdir
 cubi bench --time-cap-multiplier 3
 ```
 
+### Advertised tool surface
+
+Every tool's JSON schema is re-sent to the model on every round-trip, so with
+~33 built-ins the schemas dominate the prompt: a six-task run measured ~241k
+prompt tokens, roughly 6.5k per step. On a CPU-only host, where prompt
+processing is the bottleneck, that is often the difference between a task
+finishing inside its cap and hitting it.
+
+`cubi bench` therefore advertises only `bash,edit_file,list_files,read_file,
+write_file` — the suite's tasks are single-file fixes and each prompt names the
+file. Set `CUBI_TOOL_ALLOWLIST` yourself (a comma-separated list of tool names)
+to override that, including to measure the agent against the full tool surface.
+The variable trims what is *advertised*; it is not a permission grant, and
+execution is still gated by the trust/permission checks.
+
 ### Time caps and slow hosts
 
 Each task's `time_cap_seconds` assumes GPU-class inference. On a CPU-only

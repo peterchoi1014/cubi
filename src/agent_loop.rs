@@ -63,6 +63,21 @@ pub const CONSENSUS_TOOL_NAME: &str = "consensus_run";
 /// subagent/consensus spawning.
 pub const DISABLE_META_TOOLS_ENV: &str = "CUBI_DISABLE_META_TOOLS";
 
+/// Environment flag restricting the *advertised* tool list to a
+/// comma-separated allowlist of tool names (e.g. `read_file,edit_file,bash`).
+///
+/// This trims the prompt, not just what may execute. Every tool's JSON schema
+/// is re-sent on every model round-trip, so with ~33 built-ins the schemas
+/// dominate the prompt: a `cubi bench` run over six one-line fixes burned
+/// ~241k prompt tokens, about 6.5k per step. On a CPU-only host, where prompt
+/// processing is the bottleneck, that is the difference between a task
+/// finishing inside its time cap and hitting it. Unset (or empty) means
+/// advertise everything, which stays the default for interactive use.
+///
+/// Permissions (`Permissions::check_tool_allowed`) gate *execution* and are
+/// unaffected by this; a name listed here is advertised, not pre-approved.
+pub const TOOL_ALLOWLIST_ENV: &str = "CUBI_TOOL_ALLOWLIST";
+
 /// System prompt prepended to every subagent's context. Kept terse — the
 /// subagent inherits the model's general capabilities, but we want to keep
 /// it focused on the single goal and discourage it from chatting back.
@@ -99,7 +114,37 @@ pub fn build_tool_specs(mcp: &McpManager) -> Option<Vec<ToolSpec>> {
         specs.push(agent_run_spec());
         specs.push(crate::consensus::consensus_run_spec());
     }
-    Some(specs)
+    apply_tool_allowlist(Some(specs))
+}
+
+/// Parses [`TOOL_ALLOWLIST_ENV`] into a set of tool names. Returns `None`
+/// when the variable is unset, or set to something with no usable names, so
+/// a stray empty value can never silently advertise zero tools.
+pub fn tool_allowlist_from_env() -> Option<std::collections::BTreeSet<String>> {
+    let raw = std::env::var(TOOL_ALLOWLIST_ENV).ok()?;
+    let names: std::collections::BTreeSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Retains only the tools named by [`TOOL_ALLOWLIST_ENV`]. A no-op when the
+/// variable is unset. Names in the allowlist that no tool provides are simply
+/// ignored — the caller is describing an intent ("these are the tools this run
+/// needs"), not asserting which backends happen to be connected.
+pub fn apply_tool_allowlist(tools: Option<Vec<ToolSpec>>) -> Option<Vec<ToolSpec>> {
+    let Some(allow) = tool_allowlist_from_env() else {
+        return tools;
+    };
+    tools.and_then(|mut v| {
+        v.retain(|t| allow.contains(&t.function.name));
+        // Mirror the no-tools-at-all case above and skip the field entirely
+        // rather than sending `tools: []`, which some backends reject.
+        (!v.is_empty()).then_some(v)
+    })
 }
 
 pub fn meta_tools_disabled_by_env() -> bool {
@@ -451,5 +496,95 @@ mod tests {
         let stripped = without_meta_tools(specs).unwrap();
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0].function.name, "bash");
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Sets [`TOOL_ALLOWLIST_ENV`] for the duration of `f`, restoring it
+    /// afterwards. Serialized behind the shared env lock because the variable
+    /// is process-global and other modules' tests read the environment too.
+    fn with_allowlist<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _lock = crate::compat::test_env::env_guard();
+        let prev = std::env::var_os(TOOL_ALLOWLIST_ENV);
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(TOOL_ALLOWLIST_ENV, v),
+                None => std::env::remove_var(TOOL_ALLOWLIST_ENV),
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(TOOL_ALLOWLIST_ENV, v),
+                None => std::env::remove_var(TOOL_ALLOWLIST_ENV),
+            }
+        }
+        out
+    }
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            tool_type: "function".into(),
+            function: ToolFunction {
+                name: name.into(),
+                description: "d".into(),
+                parameters: json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn allowlist_parses_trims_and_ignores_blanks() {
+        with_allowlist(Some(" read_file , edit_file ,, "), || {
+            let got = tool_allowlist_from_env().expect("some");
+            assert_eq!(got.len(), 2);
+            assert!(got.contains("read_file") && got.contains("edit_file"));
+        });
+    }
+
+    #[test]
+    fn allowlist_is_none_when_unset_or_blank() {
+        with_allowlist(None, || assert!(tool_allowlist_from_env().is_none()));
+        // A stray empty value must not mean "advertise nothing".
+        with_allowlist(Some("   ,, "), || {
+            assert!(tool_allowlist_from_env().is_none())
+        });
+    }
+
+    #[test]
+    fn apply_retains_only_named_tools() {
+        let tools = Some(vec![spec("read_file"), spec("bash"), spec("browser_open")]);
+        with_allowlist(Some("read_file,bash"), || {
+            let kept = apply_tool_allowlist(tools.clone()).expect("some");
+            let names: Vec<&str> = kept.iter().map(|t| t.function.name.as_str()).collect();
+            assert_eq!(names, vec!["read_file", "bash"]);
+        });
+    }
+
+    #[test]
+    fn apply_is_a_noop_without_the_env_var() {
+        let tools = Some(vec![spec("read_file"), spec("browser_open")]);
+        with_allowlist(None, || {
+            assert_eq!(apply_tool_allowlist(tools.clone()).unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn apply_yields_none_rather_than_an_empty_tools_array() {
+        let tools = Some(vec![spec("read_file")]);
+        with_allowlist(Some("nonexistent_tool"), || {
+            assert!(apply_tool_allowlist(tools.clone()).is_none());
+        });
+    }
+
+    #[test]
+    fn apply_handles_none() {
+        with_allowlist(Some("read_file"), || {
+            assert!(apply_tool_allowlist(None).is_none())
+        });
     }
 }
